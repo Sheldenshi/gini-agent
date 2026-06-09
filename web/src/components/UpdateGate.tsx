@@ -5,6 +5,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useMemo,
   useState,
   type ReactNode
 } from "react";
@@ -45,7 +46,12 @@ const STORAGE_KEY = "gini.update.gate";
 
 interface PersistedGate {
   phase: "updating" | "complete";
+  // The revision the runtime should report once the update lands. Set after the
+  // POST returns; absent if a reload interrupts the POST.
   targetSha?: string;
+  // The revision when the update started. Lets a resumed gate detect completion
+  // by "HEAD moved" even without a targetSha.
+  beforeSha?: string;
 }
 
 function readPersistedGate(): PersistedGate | null {
@@ -73,22 +79,22 @@ function writePersistedGate(value: PersistedGate | null): void {
 // Hold the "complete" confirmation on screen this long before reloading onto the
 // freshly built assets.
 const COMPLETE_RELOAD_DELAY_MS = 1_500;
-// If the restarted runtime never reports the new revision, release the gate
-// after this rather than trap the user behind a permanent blur.
-const STALL_TIMEOUT_MS = 30_000;
+// Generous ceiling for the whole update (git + bun install in both roots, then
+// the restart). If the runtime never reports the new revision within this, the
+// gate releases rather than trapping the user behind a permanent blur. The
+// completion detector normally tears the gate down long before this fires.
+const STALL_TIMEOUT_MS = 120_000;
 
 export function UpdateGateProvider({ children }: { children: ReactNode }) {
   const qc = useQueryClient();
   const [phase, setPhase] = useState<UpdatePhase>("idle");
   const [targetSha, setTargetSha] = useState<string | null>(null);
-  // Armed once we're genuinely waiting for the restarted runtime to report back
-  // (the POST returned, or we resumed mid-update after a reload). Gates the
-  // stall timer so a slow `bun install` during the POST itself can't trip it.
-  const [stallArmed, setStallArmed] = useState(false);
+  const [beforeSha, setBeforeSha] = useState<string | null>(null);
 
   // Poll status fast while updating so the new revision is picked up promptly.
   const status = useStatus({ refetchInterval: phase === "updating" ? 1_500 : 60_000 });
   const statusVersion = status.data?.version;
+  const statusSha = statusVersion?.git.sha ?? null;
   const updateSupported = statusVersion?.update.supported === true;
 
   const versionCheck = useQuery({
@@ -103,54 +109,9 @@ export function UpdateGateProvider({ children }: { children: ReactNode }) {
   const reset = useCallback(() => {
     setPhase("idle");
     setTargetSha(null);
-    setStallArmed(false);
+    setBeforeSha(null);
     writePersistedGate(null);
   }, []);
-
-  // Resume an in-flight gate after a restart-triggered reload.
-  useEffect(() => {
-    const persisted = readPersistedGate();
-    if (!persisted) return;
-    if (persisted.phase === "complete") {
-      setPhase("complete");
-      return;
-    }
-    setTargetSha(persisted.targetSha ?? null);
-    setStallArmed(true);
-    setPhase("updating");
-  }, []);
-
-  // The restarted runtime reports the target revision → the update landed.
-  useEffect(() => {
-    if (phase !== "updating") return;
-    if (targetSha && statusVersion?.git.sha === targetSha) {
-      setPhase("complete");
-      writePersistedGate({ phase: "complete" });
-    }
-  }, [phase, targetSha, statusVersion?.git.sha]);
-
-  // Once complete, reload onto the fresh assets. Clear the persisted gate first
-  // so the reloaded page comes up clean.
-  useEffect(() => {
-    if (phase !== "complete") return;
-    const timer = setTimeout(() => {
-      writePersistedGate(null);
-      window.location.reload();
-    }, COMPLETE_RELOAD_DELAY_MS);
-    return () => clearTimeout(timer);
-  }, [phase]);
-
-  // Safety net for an update that applied but never reported back.
-  useEffect(() => {
-    if (phase !== "updating" || !stallArmed) return;
-    const timer = setTimeout(() => {
-      reset();
-      toast.error("Update applied, but the runtime hasn't reported back. Reload to check.");
-      qc.invalidateQueries({ queryKey: ["status"] });
-      qc.invalidateQueries({ queryKey: ["version", "check"] });
-    }, STALL_TIMEOUT_MS);
-    return () => clearTimeout(timer);
-  }, [phase, stallArmed, reset, qc]);
 
   const update = useMutation({
     mutationFn: () => api<GiniUpdateResult>("/update", { method: "POST" }),
@@ -164,28 +125,101 @@ export function UpdateGateProvider({ children }: { children: ReactNode }) {
       }
       // Keep the gate up; now wait for the restarted runtime to report this sha.
       setTargetSha(result.afterSha);
-      setStallArmed(true);
-      writePersistedGate({ phase: "updating", targetSha: result.afterSha });
+      writePersistedGate({ phase: "updating", targetSha: result.afterSha, beforeSha: beforeSha ?? undefined });
     },
     onError: (error: Error) => {
+      // A dropped connection (fetch rejects with TypeError) most likely means
+      // the gateway applied the update and restarted before the response could
+      // flush. Keep the blur up and let the new-revision detector / stall timer
+      // resolve it rather than handing the app back mid-update. A structured
+      // gateway error is a genuine pre-flight failure → release and surface it.
+      if (error instanceof TypeError) return;
       reset();
       toast.error(error.message);
     }
   });
+  const { mutate, isPending } = update;
 
   const start = useCallback(() => {
     if (phase !== "idle") return;
     // Blur immediately on click — the POST itself (git + bun install) is the
     // slow part, so the gate must go up before awaiting it.
+    setBeforeSha(statusSha);
     setPhase("updating");
-    writePersistedGate({ phase: "updating" });
-    update.mutate();
-  }, [phase, update]);
+    writePersistedGate({ phase: "updating", beforeSha: statusSha ?? undefined });
+    mutate();
+  }, [phase, statusSha, mutate]);
 
+  // Resume an in-flight gate after a restart-triggered reload.
+  useEffect(() => {
+    const persisted = readPersistedGate();
+    if (!persisted) return;
+    if (persisted.phase === "complete") {
+      setPhase("complete");
+      return;
+    }
+    setTargetSha(persisted.targetSha ?? null);
+    setBeforeSha(persisted.beforeSha ?? null);
+    setPhase("updating");
+  }, []);
+
+  // The restarted runtime reports the new revision → the update landed. Match
+  // the explicit target when we have it; otherwise (a reload interrupted the
+  // POST) fall back to "HEAD moved off the starting revision". The fallback is
+  // gated on the POST having settled so a status poll during the slow POST —
+  // when HEAD has been reset on disk but the runtime is still installing —
+  // can't complete the gate early.
+  useEffect(() => {
+    if (phase !== "updating" || !statusSha) return;
+    const matchedTarget = targetSha != null && statusSha === targetSha;
+    const movedOffStart = !isPending && beforeSha != null && statusSha !== beforeSha;
+    if (matchedTarget || movedOffStart) {
+      setPhase("complete");
+      writePersistedGate({ phase: "complete" });
+    }
+  }, [phase, targetSha, beforeSha, statusSha, isPending]);
+
+  // Once complete, reload onto the fresh assets. Clear the persisted gate first
+  // so the reloaded page comes up clean.
+  useEffect(() => {
+    if (phase !== "complete") return;
+    const timer = setTimeout(() => {
+      writePersistedGate(null);
+      window.location.reload();
+    }, COMPLETE_RELOAD_DELAY_MS);
+    return () => clearTimeout(timer);
+  }, [phase]);
+
+  // Safety net spanning the whole updating phase: release if the update never
+  // reports back (a hung POST, a failed restart, or a reload that lost the
+  // target revision). Status polling doesn't reset this — its deps are stable
+  // while updating — so it fires once, STALL_TIMEOUT_MS after the gate goes up.
+  useEffect(() => {
+    if (phase !== "updating") return;
+    const timer = setTimeout(() => {
+      reset();
+      toast.error("Update is taking longer than expected. Reload to check on it.");
+      qc.invalidateQueries({ queryKey: ["status"] });
+      qc.invalidateQueries({ queryKey: ["version", "check"] });
+    }, STALL_TIMEOUT_MS);
+    return () => clearTimeout(timer);
+  }, [phase, reset, qc]);
+
+  const value = useMemo<UpdateGateValue>(
+    () => ({ version, updateSupported, updateAvailable, phase, start }),
+    [version, updateSupported, updateAvailable, phase, start]
+  );
+
+  const active = phase !== "idle";
   return (
-    <UpdateGateContext.Provider value={{ version, updateSupported, updateAvailable, phase, start }}>
-      {children}
-      {phase !== "idle" ? <UpdateOverlay complete={phase === "complete"} /> : null}
+    <UpdateGateContext.Provider value={value}>
+      {/* `inert` while a gate is up makes the whole app unreachable — not just
+          unclickable behind the overlay, but un-tabbable for keyboard users.
+          display:contents keeps the wrapper out of layout. */}
+      <div className="contents" inert={active}>
+        {children}
+      </div>
+      {active ? <UpdateOverlay complete={phase === "complete"} /> : null}
     </UpdateGateContext.Provider>
   );
 }
