@@ -860,14 +860,14 @@ describe("chat-blocks threading", () => {
       streaming: false
     });
     // Two real messages in the thread.
-    insertChatBlock(instance, {
+    const firstMessage = insertChatBlock(instance, {
       kind: "user_text",
       sessionId: session,
       text: "Run the check",
       threadId: "thread_c",
       parentBlockId: root.id
     });
-    insertChatBlock(instance, {
+    const lastMessage = insertChatBlock(instance, {
       kind: "assistant_text",
       sessionId: session,
       text: "Done.",
@@ -904,7 +904,7 @@ describe("chat-blocks threading", () => {
       threadId: "thread_c",
       parentBlockId: root.id
     });
-    insertChatBlock(instance, {
+    const trailingNote = insertChatBlock(instance, {
       kind: "system_note",
       sessionId: session,
       text: "note",
@@ -912,10 +912,26 @@ describe("chat-blocks threading", () => {
       parentBlockId: root.id
     });
 
+    // Pin created_at into a fixed order so the auxiliary trailing block is
+    // strictly NEWER than the last message — the real shape after a run, where
+    // a "Completed" phase / system_note lands after the reply text. Inserts in
+    // a test fire within the same millisecond and `now()` follows the wall
+    // clock, so force every relevant timestamp to make the check hermetic.
+    const db = getMemoryDb(instance);
+    const firstTs = "2020-01-01T00:00:01.000Z";
+    const messageTs = "2020-01-01T00:00:02.000Z";
+    const auxTs = "2020-01-01T00:00:03.000Z";
+    db.run("UPDATE chat_blocks SET created_at = ? WHERE id = ?", [firstTs, firstMessage.id]);
+    db.run("UPDATE chat_blocks SET created_at = ? WHERE id = ?", [messageTs, lastMessage.id]);
+    db.run("UPDATE chat_blocks SET created_at = ? WHERE id = ?", [auxTs, trailingNote.id]);
+
     const summaries = summarizeThreads(instance, session);
     const thread = summaries.find((s) => s.threadId === "thread_c");
     // Only the user_text + assistant_text blocks count toward replies.
     expect(thread?.replyCount).toBe(2);
+    // lastReplyAt tracks the last MESSAGE, not the trailing auxiliary block —
+    // otherwise the unread badge re-flags a thread the user already opened.
+    expect(thread?.lastReplyAt).toBe(messageTs);
   });
 
   test("summarizeThreadsForInstance scopes to the supplied agent sessions", () => {

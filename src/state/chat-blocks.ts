@@ -852,6 +852,15 @@ function textFromPayload(payloadJson: string): string {
 // Aggregate row backing the thread-summary queries. One row per distinct
 // thread_id in scope, with the reply count, last-reply timestamp, and the
 // parent_block_id the thread branched from.
+//
+// `last_reply_at` is the newest MESSAGE block (user_text / assistant_text) —
+// not the newest block of any kind. A run appends auxiliary blocks (a trailing
+// `phase` "Completed", tool_call / tool_result, system_note) AFTER the reply
+// text, and counting those would push the timestamp past the message the user
+// actually reads. Since the unread badge compares a per-device "last seen"
+// against this value, an auxiliary trailing block would re-flag a thread the
+// user has already opened. Keeping this message-only also matches reply_count,
+// lastReplyPreview, and lastReplyAuthor, which are already message-derived.
 interface ThreadAggRow {
   thread_id: string;
   session_id: string;
@@ -913,7 +922,10 @@ export function summarizeThreads(instance: Instance, sessionId: string): ThreadS
               MAX(agent_id) AS agent_id,
               MAX(parent_block_id) AS parent_block_id,
               SUM(CASE WHEN kind IN ('user_text','assistant_text') THEN 1 ELSE 0 END) AS reply_count,
-              MAX(created_at) AS last_reply_at
+              COALESCE(
+                MAX(CASE WHEN kind IN ('user_text','assistant_text') THEN created_at END),
+                MAX(created_at)
+              ) AS last_reply_at
        FROM chat_blocks
        WHERE session_id = ? AND thread_id IS NOT NULL
        GROUP BY thread_id, session_id
@@ -942,7 +954,10 @@ export function summarizeThreadsForInstance(
               MAX(agent_id) AS agent_id,
               MAX(parent_block_id) AS parent_block_id,
               SUM(CASE WHEN kind IN ('user_text','assistant_text') THEN 1 ELSE 0 END) AS reply_count,
-              MAX(created_at) AS last_reply_at
+              COALESCE(
+                MAX(CASE WHEN kind IN ('user_text','assistant_text') THEN created_at END),
+                MAX(created_at)
+              ) AS last_reply_at
        FROM chat_blocks
        WHERE instance = ? AND thread_id IS NOT NULL AND session_id IN (${placeholders})
        GROUP BY thread_id, session_id
