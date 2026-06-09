@@ -58,19 +58,16 @@ export function SettingsTab({ agentId }: { agentId?: string }) {
   const value: ModelSelection | null = resolved
     ? { provider: resolved.name, model: resolved.model }
     : null;
-  // The DEFAULT agent always carries a seeded override equal to the instance
-  // default (boot reseed + the default-model write keep it mirrored), so for
-  // it a matching override IS "on the default" and surfacing it as an
-  // override would be noise. A NON-default agent's override is a copy, not a
+  // The DEFAULT agent's pair IS the default model (the Settings control
+  // displays it; new agents copy it), so it is always "on the default" —
+  // surfacing its own pair as an override would contradict the Settings
+  // page, and a clear action would silently swap the real default for the
+  // instance fallback. A NON-default agent's override is a copy, not a
   // link — even when it currently equals the instance pair it will not
   // follow later default changes, so it must read as an override and keep
   // the clear affordance. "profile_default" is the legacy pre-rename id.
   const isDefaultAgent = agentId === "agent_default" || agentId === "profile_default";
-  const isDefault =
-    activeAgent?.providerSource !== "agent" ||
-    (isDefaultAgent &&
-      resolved?.name === instanceProvider?.name &&
-      resolved?.model === instanceProvider?.model);
+  const isDefault = isDefaultAgent || activeAgent?.providerSource !== "agent";
 
   const save = useMutation({
     // The default agent's pair IS the default model, so its picks route
@@ -145,7 +142,10 @@ export function SettingsTab({ agentId }: { agentId?: string }) {
                 {isDefault ? (
                   <p className="text-xs text-muted-foreground">
                     Using the default model
-                    {instanceProvider ? (
+                    {/* The default agent's own pair IS the default — the
+                        trigger already names it, and the instance pair could
+                        lag behind a /setup/provider write. */}
+                    {!isDefaultAgent && instanceProvider ? (
                       <>
                         {" "}· {instanceLabel} ·{" "}
                         <span className="font-mono">{instanceProvider.model}</span>

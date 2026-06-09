@@ -8,6 +8,7 @@ import { useInvalidate, useStatus } from "@/lib/queries";
 import { DefaultModelControl } from "./_components/DefaultModelControl";
 import { ProviderCard } from "./_components/ProviderCard";
 import type { ProviderCatalogItem } from "@/lib/providers";
+import type { AgentRow } from "@/lib/view-types";
 import { ToolsetsCard, type ToolsetRow } from "./_components/ToolsetsCard";
 import { McpCard, type McpRow } from "./_components/McpCard";
 import { MessagingCard, type MessagingRow } from "./_components/MessagingCard";
@@ -22,6 +23,16 @@ export default function SettingsPage() {
     queryFn: () => api<ProviderCatalogItem[]>("/providers/catalog"),
     refetchInterval: 60_000
   });
+  // The default agent's provider — the route the default model actually
+  // rides. Threaded into ProviderCard so its removal gate covers it even
+  // when a /setup/provider write has moved config.provider elsewhere.
+  const agents = useQuery({
+    queryKey: ["agents"],
+    queryFn: () => api<{ agents: AgentRow[]; activeAgentId?: string }>("/agents")
+  });
+  const defaultAgent =
+    agents.data?.agents.find((agent) => agent.id === "agent_default") ??
+    agents.data?.agents.find((agent) => agent.id === "profile_default");
   const toolsets = useQuery({
     queryKey: ["toolsets"],
     queryFn: () => api<{ toolsets: ToolsetRow[] }>("/toolsets")
@@ -106,6 +117,7 @@ export default function SettingsPage() {
           activeProviderModel={activeProviderModel}
           activeProviderAwsRegion={activeProviderAwsRegion}
           activeProvider={activeProvider}
+          defaultModelProviderName={defaultAgent?.providerName}
         />
 
         <BrowserSettingsCard />

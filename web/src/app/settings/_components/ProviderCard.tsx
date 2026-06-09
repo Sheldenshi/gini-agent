@@ -69,11 +69,12 @@ export function ProviderCard({
   activeProviderName,
   activeProviderModel,
   activeProviderAwsRegion,
-  activeProvider
+  activeProvider,
+  defaultModelProviderName
 }: {
   catalog: ProviderCatalogItem[];
-  // The INSTANCE provider (config.provider) — the transport the default
-  // model rides and the fallback for override-less agents. Used to mark
+  // The INSTANCE provider (config.provider) — the fallback for
+  // override-less agents and the embeddings/reranker anchor. Used to mark
   // which row's removal would strand the instance, and to prefill Edit.
   activeProviderName?: string;
   activeProviderModel?: string;
@@ -84,6 +85,11 @@ export function ProviderCard({
   // the transport fields the static catalog doesn't — baseUrl + Azure
   // routing — so the Edit dialog can prefill them.
   activeProvider?: ProviderConfig;
+  // The provider the DEFAULT MODEL rides (the default agent's pair). Can
+  // diverge from config.provider when a /setup/provider write (add-provider,
+  // Edit dialog, CLI) moved the instance underneath it — the removal gate
+  // must cover both or the default model's provider becomes removable.
+  defaultModelProviderName?: string;
 }) {
   const rows = SELECTABLE_PROVIDERS
     .map((name) => catalog.find((c) => c.name === name))
@@ -202,12 +208,16 @@ export function ProviderCard({
                       variant="outline"
                       size="icon"
                       aria-label={`Remove ${displayProviderName(row)}`}
-                      // Block removal of the provider currently backing the
-                      // instance default — point the default model somewhere
-                      // else first, then delete. Avoids surprise fallbacks
-                      // mid-conversation.
-                      disabled={isInstanceProvider}
-                      title={isInstanceProvider ? "Switch the default model off this provider before removing it." : undefined}
+                      // Block removal of the provider backing the instance
+                      // fallback OR the default model — point the default
+                      // model somewhere else first, then delete. Avoids
+                      // surprise fallbacks mid-conversation.
+                      disabled={isInstanceProvider || row.name === defaultModelProviderName}
+                      title={
+                        isInstanceProvider || row.name === defaultModelProviderName
+                          ? "Switch the default model off this provider before removing it."
+                          : undefined
+                      }
                       onClick={() => setRemovingRow(row)}
                     >
                       <Trash2Icon className="size-4 text-muted-foreground" />
