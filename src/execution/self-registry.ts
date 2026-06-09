@@ -303,7 +303,11 @@ async function setProvider(
   // awsRegion, and letting a (possibly prompt-injected) model repoint the
   // first-party Anthropic endpoint would exfil the Anthropic key — that stays a
   // human-only action via the CLI / web setup.
-  if (typeof args.baseUrl === "string" && args.provider !== "anthropic" && args.provider !== "bedrock") payload.baseUrl = args.baseUrl.trim();
+  // Gate on the RESOLVED targetProvider, not raw args.provider: when `provider`
+  // is omitted (or whitespace-padded) the call patches the ACTIVE provider, so
+  // checking args.provider would let `set_provider({ baseUrl })` repoint a live
+  // anthropic endpoint and exfil its key.
+  if (typeof args.baseUrl === "string" && targetProvider !== "anthropic" && targetProvider !== "bedrock") payload.baseUrl = args.baseUrl.trim();
   if (typeof args.apiVersion === "string") payload.apiVersion = args.apiVersion.trim();
   if (typeof args.deployment === "string") payload.deployment = args.deployment.trim();
   if (args.authScheme === "api-key" || args.authScheme === "bearer") payload.authScheme = args.authScheme;
