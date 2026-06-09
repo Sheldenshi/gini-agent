@@ -22,7 +22,7 @@ Keep ADRs current when architecture changes.
 ## Boundaries
 
 - Prefer existing module patterns over new abstractions.
-- API handlers should delegate behavior to bounded runtime modules (`src/execution`, `src/memory`, `src/jobs`, `src/governance`, `src/capabilities`, `src/integrations`, `src/runtime`).
+- API handlers should delegate behavior to bounded runtime modules (`src/execution`, `src/memory`, `src/jobs`, `src/hooks`, `src/governance`, `src/capabilities`, `src/integrations`, `src/runtime`).
 - Storage and low-level persistence belong in `src/state/*`.
 - CLI commands should prefer the public runtime API for product behavior.
 - Browser code must not receive gateway bearer tokens; token injection stays server-side in the Next.js BFF.

@@ -44,6 +44,7 @@ import { gwsSessionStatus } from "./integrations/connectors/gws-session";
 import { listProviders } from "./integrations/connectors/registry";
 import { runConnectorDetection } from "./jobs/connector-detection";
 import { createScheduledJob, listJobRuns, removeJob, replayJobRun, runJobNow, updateJob, updateJobStatus } from "./jobs";
+import { addEmailWatcher, listEmailWatchers, removeEmailWatcher, setEmailWatcherEnabled } from "./state/email-watchers";
 import { migrateLegacyMemories, recall, reflect, retain } from "./memory";
 import { embeddingStatus, reembedAllBanks, reembedBank } from "./memory/embedding";
 import { rerankerStatus } from "./memory/reranker";
@@ -1349,6 +1350,30 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["POST", /^\/api\/job-runs\/([^/]+)\/replay$/, async (_request, params) => json(await replayJobRun(config, params[0]))],
     ["POST", /^\/api\/jobs\/([^/]+)\/pause$/, async (_request, params) => json(await updateJobStatus(config, params[0], "paused"))],
     ["POST", /^\/api\/jobs\/([^/]+)\/resume$/, async (_request, params) => json(await updateJobStatus(config, params[0], "active"))],
+    // Email watchers (ADR email-watch.md). Thin handlers over the state
+    // module: list, add (builds the query + dedicated chat session), remove.
+    ["GET", /^\/api\/email\/watchers$/, () => json(listEmailWatchers(config))],
+    ["POST", /^\/api\/email\/watchers$/, async (request) => {
+      const payload = await body(request);
+      return json(await addEmailWatcher(config, {
+        sender: typeof payload.sender === "string" ? payload.sender : undefined,
+        query: typeof payload.query === "string" ? payload.query : undefined,
+        account: typeof payload.account === "string" ? payload.account : undefined
+      }), 201);
+    }],
+    ["DELETE", /^\/api\/email\/watchers\/([^/]+)$/, async (_request, params) => json(await removeEmailWatcher(config, params[0]))],
+    // PATCH toggles a watcher's enabled flag, rebuilding the shared job's watch
+    // list (disabling the last enabled watcher tears the shared job down; enabling
+    // recreates it).
+    ["PATCH", /^\/api\/email\/watchers\/([^/]+)$/, async (request, params) => {
+      const payload = await body(request);
+      if (typeof payload.enabled !== "boolean") {
+        return json({ error: "Invalid input: enabled must be a boolean" }, 400);
+      }
+      const updated = await setEmailWatcherEnabled(config, params[0], payload.enabled);
+      if (!updated) return json({ error: `Email watcher not found: ${params[0]}` }, 404);
+      return json(updated);
+    }],
     ["GET", /^\/api\/connectors$/, async () => {
       const connectors = readState(config.instance).connectors;
       // Enrich google-oauth-desktop records with the SEPARATE sign-in

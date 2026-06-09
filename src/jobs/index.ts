@@ -1,7 +1,8 @@
 import { submitTask } from "../agent";
 import type { JobRecord, JobRunRecord, RuntimeConfig, RuntimeState } from "../types";
-import { addAudit, appendEvent, appendLog, appendTrace, createChatSession, createJob, createJobRun, createRun, isTerminalTaskStatus, mutateState, now, readState } from "../state";
+import { addAudit, appendEvent, appendLog, appendTrace, createChatMessage, createChatSession, createJob, createJobRun, createRun, insertChatBlock, isTerminalTaskStatus, mutateState, now, readState } from "../state";
 import { resolveEffectiveContext } from "../execution/effective-context";
+import { isKnownHook, runHook, type HookConfig } from "../hooks";
 import { spawn } from "bun";
 import { Cron } from "croner";
 
@@ -188,6 +189,35 @@ export async function createScheduledJob(
     }
     oneShot = input.oneShot;
   }
+  // Pre-LLM hook. Validate shape up-front so a bad payload returns a typed
+  // `Invalid input: …` (400 at the HTTP layer) instead of persisting a job
+  // whose hook can never resolve. The handlerId MUST be a key in the trusted
+  // registry — a model/user can't smuggle in an arbitrary handler.
+  let preRunHook: HookConfig | undefined;
+  if (input.preRunHook !== undefined && input.preRunHook !== null) {
+    if (typeof input.preRunHook !== "object" || Array.isArray(input.preRunHook)) {
+      throw new Error(`Invalid input: preRunHook must be an object`);
+    }
+    const hook = input.preRunHook as { handlerId?: unknown; config?: unknown; timeoutMs?: unknown };
+    if (typeof hook.handlerId !== "string" || hook.handlerId.length === 0) {
+      throw new Error(`Invalid input: preRunHook.handlerId must be a non-empty string`);
+    }
+    if (!isKnownHook(hook.handlerId)) {
+      throw new Error(`Invalid input: preRunHook.handlerId "${hook.handlerId}" is not a known hook handler`);
+    }
+    if (hook.config === undefined || typeof hook.config !== "object" || Array.isArray(hook.config)) {
+      throw new Error(`Invalid input: preRunHook.config must be an object`);
+    }
+    let timeoutMs: number | undefined;
+    if (hook.timeoutMs !== undefined && hook.timeoutMs !== null) {
+      timeoutMs = assertPositiveInt("preRunHook.timeoutMs", hook.timeoutMs);
+    }
+    preRunHook = {
+      handlerId: hook.handlerId,
+      config: hook.config as Record<string, unknown>,
+      ...(timeoutMs !== undefined ? { timeoutMs } : {})
+    };
+  }
   // Per-job auto-approve envelope. All fields are optional; reject malformed
   // payloads up-front so a typo doesn't silently fall back to legacy behavior.
   // See ADR approval-mode.md ("Per-job scope") for the approval model.
@@ -334,6 +364,7 @@ export async function createScheduledJob(
       costBudget: typeof input.costBudget === "number" ? input.costBudget : undefined,
       chatSessionId: resolvedChatSessionId,
       oneShot,
+      preRunHook,
       dangerouslyAutoApprove,
       approvalMode,
       autoApproveCommands,
@@ -400,6 +431,276 @@ export function advanceCronNextRunAt(
   return { nextRunAtMs: next.getTime(), missed };
 }
 
+// Runs the job's preRun hook (if any) and returns what the dispatch loop should
+// do next. No hook => { action: "proceed", context: [] }, byte-identical to the
+// pre-hook behavior. This is a thin adapter over the generic hooks primitive:
+// the runner (src/hooks) resolves the trusted handler, enforces the per-hook
+// timeout, validates + renders the typed result, and reports a neutral
+// `transient` flag. This adapter applies the JOBS-side fatality policy:
+//   - TRANSIENT error (timeout / handler throw): fatal:false — the run fails but
+//     the scheduled job stays active so it self-recovers on its next tick.
+//     Deactivating a watcher on a transient stall would silently kill it.
+//   - NON-transient error (unknown handlerId, a handler-returned { kind:"error" }
+//     — the skill-script handler uses this for a missing/unknown skill|script or
+//     malformed script output — or a malformed result): fatal:true — a draft is
+//     meaningless and retrying won't fix it, so the scheduled job is deactivated.
+// The runner decided transience; jobs decides what that means for a SCHEDULE.
+async function runPreRunHook(
+  config: RuntimeConfig,
+  job: JobRecord,
+  _run: JobRunRecord
+): Promise<
+  | { action: "proceed"; context: string[]; onDispatched?: () => void | Promise<void>; state?: Record<string, unknown> }
+  | { action: "shortCircuit"; summary?: string; state?: Record<string, unknown> }
+  | { action: "error"; message: string; fatal: boolean }
+> {
+  const hook = job.preRunHook;
+  if (!hook) return { action: "proceed", context: [] };
+
+  // The JOB owns the hook's state: thread the current blob in as the run's input
+  // (the runner merges `payload` into the handler's hookConfig, so a pure handler
+  // reads hookConfig.state) and carry the handler's newState back out. The
+  // persistence TIMING below preserves at-least-once across the delivery boundary.
+  const outcome = await runHook(config, hook, { state: job.hookState });
+  if (outcome.kind === "shortCircuit") {
+    return {
+      action: "shortCircuit",
+      summary: outcome.summary,
+      ...(outcome.state !== undefined ? { state: outcome.state } : {})
+    };
+  }
+  if (outcome.kind === "context") {
+    return {
+      action: "proceed",
+      context: outcome.context,
+      ...(outcome.onDispatched ? { onDispatched: outcome.onDispatched } : {}),
+      ...(outcome.state !== undefined ? { state: outcome.state } : {})
+    };
+  }
+  return { action: "error", message: outcome.message, fatal: !outcome.transient };
+}
+
+// Persist a pure handler's new state onto the backing job inside the per-instance
+// lock. Used at the at-least-once commit boundary: immediately for a shortCircuit
+// (nothing was delivered), and only after the drafting turn dispatches for a
+// context result (so a dispatch failure leaves the OLD state and the matches
+// re-detect next tick). No state = no-op.
+async function persistHookState(
+  config: RuntimeConfig,
+  jobId: string,
+  state: Record<string, unknown> | undefined
+): Promise<void> {
+  if (state === undefined) return;
+  await mutateState(config.instance, (s) => {
+    const job = s.jobs.find((candidate) => candidate.id === jobId);
+    if (job) job.hookState = state;
+  });
+}
+
+// Post a hook's short-circuit summary into the job's chat session as a
+// runtime-authored assistant message — NO model turn, no spawned task. This is
+// the generic "a hook can notify without a model turn" capability: a hook that
+// short-circuits (skipping the drafting turn) can still deliver a one-off notice
+// (e.g. the gmail-watch backlog notice). It mirrors the assistant-message
+// materialization syncChatTaskResult uses (a legacy ChatMessageRecord via
+// createChatMessage) AND emits the assistant_text chat block so the same
+// SSE/APNs notify path the chat UI listens on fires. The caller has already
+// filtered out the empty/"[SILENT]" case, so this always has real content to
+// deliver.
+async function deliverHookSummary(
+  config: RuntimeConfig,
+  sessionId: string,
+  summary: string
+): Promise<void> {
+  const message = await mutateState(config.instance, (state) => {
+    // A session deleted between the claim and here drops the delivery — match
+    // syncChatTaskResult's "missing session" handling (skip, don't orphan).
+    if (!state.chatSessions.some((s) => s.id === sessionId)) return undefined;
+    return createChatMessage(state, { sessionId, role: "assistant", content: summary });
+  });
+  if (!message) return;
+  // Dual-publish the assistant_text ChatBlock so the per-session SSE stream (and
+  // the block-protocol web/mobile UI) sees the message. Best-effort: a SQLite
+  // failure here must not roll back the legacy ChatMessageRecord above (mirrors
+  // submitChatMessage's user_text dual-publish tolerance).
+  try {
+    const block = insertChatBlock(config.instance, {
+      kind: "assistant_text",
+      sessionId,
+      text: summary,
+      streaming: false
+    });
+    if (block.kind === "assistant_text") {
+      // The APNs dispatcher fires its completion alert on a terminal `phase`
+      // block, so emit one so a backgrounded device is woken for the notice.
+      insertChatBlock(config.instance, { kind: "phase", sessionId, label: "Completed" });
+    }
+  } catch (error) {
+    appendLog(config.instance, "job.hook.notify.error", {
+      sessionId,
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
+}
+
+// Finalize a short-circuited run with NO model turn. The run never spawned a
+// task (no taskId), so we finalize it INLINE by run.id rather than routing a
+// synthetic Task through finalizeJobRunFromTask — that path's chat sync calls
+// syncChatTaskResult, which throws "Task not found" for a task that was never in
+// state.tasks (the dominant idle 60s email path), leaving the [SILENT]
+// suppression dead and spamming job.chat.sync.error every tick. Binding by
+// run.id is exact (no order-dependent "most-recent running run" heuristic, which
+// mis-binds under concurrent manual/replay runs). We replicate the parts of the
+// completed-run finalize that apply with no task: completed status, job
+// lastSuccessAt + cleared lastError, oneShot auto-pause + its audit, and the
+// job.run.completed event.
+//
+// Delivery: a silent/empty summary delivers nothing and emits the
+// chat.message.suppressed_silent audit explicitly (preserving the suppression
+// audit the dead path used to produce only by a swallowed throw). A genuinely
+// NON-silent summary IS delivered — posted directly into the job's chat session
+// as a runtime-authored assistant message via deliverHookSummary (no model turn,
+// no spawned task), which is how a short-circuiting hook surfaces a one-off
+// notice (the gmail-watch backlog notice).
+//
+// A cancelTask that landed between the claim and here already flipped the run
+// terminal, so the `status === "running"` guard makes this a no-op (no double
+// finalize).
+async function finalizeShortCircuit(
+  config: RuntimeConfig,
+  job: JobRecord,
+  run: JobRunRecord,
+  summary?: string
+): Promise<void> {
+  // Empty / "[SILENT]" suppresses chat + bridge delivery — a "nothing new" tick
+  // delivers nothing. The match is exact-trimmed, mirroring the chat-side
+  // suppression contract (src/execution/chat.ts) and the cron-hint instruction.
+  const effectiveSummary = summary ?? "[SILENT]";
+  const trimmed = effectiveSummary.trim();
+  const isSilent = trimmed.length === 0 || trimmed === "[SILENT]";
+
+  const outcome = await mutateState(config.instance, (state) => {
+    const runItem = state.jobRuns.find((candidate) => candidate.id === run.id);
+    const jobItem = state.jobs.find((candidate) => candidate.id === job.id);
+    if (!runItem) return undefined;
+    if (runItem.status !== "running") return undefined;
+    const completedAt = now();
+    runItem.status = "completed";
+    runItem.summary = effectiveSummary;
+    runItem.error = undefined;
+    runItem.completedAt = completedAt;
+    runItem.updatedAt = completedAt;
+    if (jobItem) {
+      jobItem.lastSuccessAt = completedAt;
+      jobItem.lastError = undefined;
+      // One-shot reminders auto-pause after the FIRST terminal run, matching
+      // finalizeJobRunFromTask's oneShot handling.
+      if (jobItem.oneShot === true && jobItem.status === "active") {
+        jobItem.status = "paused";
+        jobItem.updatedAt = completedAt;
+        addAudit(
+          state,
+          {
+            actor: "runtime",
+            action: "job.oneshot.completed",
+            target: jobItem.id,
+            risk: "low",
+            evidence: { runId: run.id, runStatus: runItem.status }
+          },
+          { jobId: jobItem.id, agentId: jobItem.agentId }
+        );
+      }
+    }
+    // The silent/empty short-circuit delivers nothing — record the suppression
+    // audit explicitly so the audit trail still shows the run produced no chat
+    // message (the chat-side suppression path never runs because no task synced).
+    if (isSilent && job.chatSessionId) {
+      addAudit(
+        state,
+        {
+          actor: "runtime",
+          action: "chat.message.suppressed_silent",
+          target: job.chatSessionId,
+          risk: "low",
+          evidence: { runId: run.id }
+        },
+        { jobId: job.id, agentId: job.agentId }
+      );
+    }
+    appendEvent(
+      state,
+      {
+        kind: "job",
+        action: "job.run.completed",
+        target: job.id,
+        jobId: job.id,
+        risk: "low",
+        summary: "Pre-run hook short-circuited the run.",
+        data: { runId: run.id, shortCircuit: true }
+      },
+      { jobId: job.id, agentId: job.agentId }
+    );
+    return { taskId: runItem.taskId };
+  });
+
+  // Deliver a genuinely non-silent summary as a runtime-authored assistant
+  // message (no model turn) so a short-circuiting hook can still surface a
+  // one-off notice. Only runs when the run actually finalized here (outcome
+  // defined) and the job is bound to a chat session.
+  if (outcome && !isSilent && job.chatSessionId) {
+    await deliverHookSummary(config, job.chatSessionId, trimmed);
+  }
+}
+
+// Finalize a run that the hook failed. No model turn, no draft. Mirrors
+// dispatchPromptRun's catch shape: guard run.status === "running" (cancel race),
+// stamp the run failed, stamp lastFailureAt + lastError on the job.
+//
+// `fatal` decides whether a scheduled job is DEACTIVATED. A CONFIG error
+// (fatal: unknown handler, missing watcher, malformed result) flips
+// job.status="failed" so a job that can never succeed stops claiming the
+// scheduler. A TRANSIENT error (non-fatal: timeout or handler throw) leaves
+// job.status="active" so the job self-recovers on its next tick — flipping it to
+// "failed" on a transient stall would silently kill a watcher (and the orphaned
+// handler promise could later write a healthy-looking status, masking the death).
+async function finalizeHookError(
+  config: RuntimeConfig,
+  job: JobRecord,
+  run: JobRunRecord,
+  message: string,
+  trigger: "schedule" | "manual" | "replay",
+  fatal: boolean
+): Promise<void> {
+  await mutateState(config.instance, (state) => {
+    const runItem = state.jobRuns.find((candidate) => candidate.id === run.id);
+    const jobItem = state.jobs.find((candidate) => candidate.id === job.id);
+    if (!runItem) return;
+    if (runItem.status !== "running") return;
+    runItem.status = "failed";
+    runItem.error = message;
+    runItem.completedAt = now();
+    runItem.updatedAt = runItem.completedAt;
+    if (jobItem) {
+      jobItem.lastFailureAt = runItem.completedAt;
+      jobItem.lastError = message;
+      if (fatal && trigger === "schedule") jobItem.status = "failed";
+    }
+    appendEvent(
+      state,
+      {
+        kind: "job",
+        action: "job.run.failed",
+        target: job.id,
+        jobId: job.id,
+        risk: "low",
+        summary: "Pre-run hook failed.",
+        data: { runId: run.id, error: message }
+      },
+      { jobId: job.id, agentId: job.agentId }
+    );
+  });
+}
+
 export async function runDueJobs(config: RuntimeConfig): Promise<void> {
   // Atomic claim: select due jobs, skip ones that already have a running
   // run (overlap protection), advance nextRunAt drift-free, and create the
@@ -457,7 +758,29 @@ export async function runDueJobs(config: RuntimeConfig): Promise<void> {
         await executeScriptJob(config, job.id, run.id, job.script, job.timeoutSeconds, "schedule");
         continue;
       }
-      await dispatchPromptRun(config, job, run, "schedule");
+      // Pre-LLM hook runs between the claim and the model turn. shortCircuit
+      // finalizes the run with NO turn; error finalizes it failed with no
+      // draft; proceed dispatches the drafting turn with any injected context.
+      const hook = await runPreRunHook(config, job, run);
+      if (hook.action === "shortCircuit") {
+        // A shortCircuit delivered nothing, so the handler's new state commits
+        // IMMEDIATELY (no at-least-once concern).
+        await persistHookState(config, job.id, hook.state);
+        await finalizeShortCircuit(config, job, run, hook.summary);
+        continue;
+      }
+      if (hook.action === "error") {
+        await finalizeHookError(config, job, run, hook.message, "schedule", hook.fatal);
+        continue;
+      }
+      await dispatchPromptRun(config, job, run, "schedule", hook.context);
+      // Commit the hook's deferred post-delivery state ONLY after dispatch
+      // resolved (the drafting turn is spawned). dispatchPromptRun finalizes its
+      // own run + rethrows on a spawn failure, so a throw skips this — leaving
+      // the handler's newState un-committed so the matches re-detect next tick
+      // (at-least-once across the delivery boundary).
+      await persistHookState(config, job.id, hook.state);
+      if (hook.onDispatched) await hook.onDispatched();
     } catch (error) {
       appendLog(config.instance, "scheduler.iteration.error", {
         jobId: job.id,
@@ -529,9 +852,14 @@ async function dispatchPromptRun(
   config: RuntimeConfig,
   job: JobRecord,
   run: JobRunRecord,
-  trigger: "schedule" | "manual" | "replay"
+  trigger: "schedule" | "manual" | "replay",
+  hookContext: string[] = []
 ): Promise<{ jobId: string; runId: string; taskId: string }> {
-  const prompt = withCronHint(job.prompt, job.context);
+  // Hook context joins the job's static context block at the single assembly
+  // point, traveling alongside the prompt into the same model turn (Claude
+  // Code's additionalContext-alongside-the-prompt semantics). Default [] keeps
+  // every non-hook caller byte-identical.
+  const prompt = withCronHint(job.prompt, [...job.context, ...hookContext]);
   // Per-job approval envelope: clone the RuntimeConfig (NEVER mutate the
   // original — it's the per-instance runtime-wide config) and overlay the
   // job's opt-in fields before handing it to submitTask. The spawned task
@@ -729,7 +1057,26 @@ export async function runJobNow(
   if (!claim) return undefined;
   const { job, run } = claim;
   if (job.script) return executeScriptJob(config, job.id, run.id, job.script, job.timeoutSeconds, trigger);
-  return dispatchPromptRun(config, job, run, trigger);
+  // Manual/replay runs honor the preRun hook too.
+  const hook = await runPreRunHook(config, job, run);
+  if (hook.action === "shortCircuit") {
+    // Nothing delivered => commit the handler's new state immediately.
+    await persistHookState(config, job.id, hook.state);
+    await finalizeShortCircuit(config, job, run, hook.summary);
+    return { jobId: job.id, runId: run.id, shortCircuited: true };
+  }
+  if (hook.action === "error") {
+    await finalizeHookError(config, job, run, hook.message, trigger, hook.fatal);
+    return { jobId: job.id, runId: run.id, error: hook.message };
+  }
+  const dispatched = await dispatchPromptRun(config, job, run, trigger, hook.context);
+  // Commit the hook's deferred post-delivery state only after dispatch resolved.
+  // A spawn failure rethrows from dispatchPromptRun (skipping this), so the
+  // un-committed newState leaves the matches to re-detect on the next fire
+  // (at-least-once).
+  await persistHookState(config, job.id, hook.state);
+  if (hook.onDispatched) await hook.onDispatched();
+  return dispatched;
 }
 
 export async function updateJobStatus(

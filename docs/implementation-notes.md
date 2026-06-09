@@ -16,6 +16,7 @@ These notes describe the current source layout and boundaries. Product direction
 - `src/memory/` contains retain, recall, reflect, reinforce, embeddings/reranker status, entity, temporal, migration, and schema logic.
 - `src/data/` contains the deterministic tabular (CSV/XLSX) → table importer for the agent database.
 - `src/jobs/` contains scheduler job creation, execution, replay, and run history behavior.
+- `src/hooks/` contains the domain-agnostic pre-run hook primitive: a trusted handler registry, the runner (per-hook timeout, typed result, untrusted-content fence), and its barrel. It imports only `src/types`; the scheduler and any other caller consume it, and handlers self-register from their own domains.
 - `src/governance/` contains approvals-adjacent runtime workflows such as pairing, improvements, and promotions.
 - `src/capabilities/` contains skills, toolsets, agents, and subagent records.
 - `src/integrations/` contains connectors, MCP, messaging, import inspection, relay, and notification behavior.

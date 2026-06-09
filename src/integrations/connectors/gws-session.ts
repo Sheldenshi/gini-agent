@@ -139,8 +139,15 @@ async function runGwsAuthStatus(): Promise<GwsSessionStatus> {
       try { proc.kill(); } catch { /* already exited */ }
     }, SPAWN_TIMEOUT_MS);
     try {
-      const stdout = await new Response(proc.stdout).text();
-      await proc.exited;
+      // Drain stdout AND stderr concurrently: an unread piped stream can fill
+      // its OS buffer (~64KB) and deadlock the child until the kill timer
+      // fires. gws emits its keyring preamble to stderr, so it always has
+      // bytes waiting there.
+      const [stdout] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+        proc.exited
+      ]);
       return parseGwsAuthStatus(stdout);
     } finally {
       clearTimeout(timeout);

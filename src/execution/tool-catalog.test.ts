@@ -74,7 +74,7 @@ function stateWithToolsets(toolsets: ToolsetRecord[]): RuntimeState {
     connectors: [], improvements: [], pairingCodes: [], pairingRequests: [], devices: [],
     promotions: [], snapshots: [], tools: [], toolsets, subagents: [],
     mcpServers: [], messagingBridges: [], importReports: [], agents: [],
-    activeAgentId: undefined, relays: [], notifications: [], events: [],
+    activeAgentId: undefined, relays: [], notifications: [], emailWatchers: [], events: [],
     jobRuns: [], chatSessions: [], chatMessages: [], messagingMessages: [],
     runs: [], planSteps: []
   };
@@ -98,6 +98,9 @@ const ALWAYS_ON = new Set([
   "update_job",
   "delete_job",
   "run_job",
+  // email_watch lives under the "email" toolset (not in defaults); always-on
+  // so a fresh instance can set up an email watcher from chat. Config-only.
+  "email_watch",
   "mcp_call",
   // skill_run is the generic dispatch surface for skill-bundled
   // procedures (signed-URL uploads/downloads, format conversions,

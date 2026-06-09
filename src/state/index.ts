@@ -197,3 +197,15 @@ export {
   activateAgent,
   updateConnectorHealth
 } from "./records";
+export {
+  createEmailWatcher,
+  addEmailWatcher,
+  buildWatcherQuery,
+  listEmailWatchers,
+  getEmailWatcher,
+  updateEmailWatcher,
+  setEmailWatcherEnabled,
+  removeEmailWatcher,
+  backfillEmailWatcherJobs
+} from "./email-watchers";
+export type { AddEmailWatcherInput } from "./email-watchers";

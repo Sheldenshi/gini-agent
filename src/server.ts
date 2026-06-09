@@ -2,6 +2,7 @@ import { writeFileSync } from "node:fs";
 import { createHandler, isWebProxyPath, proxyWebSocketUpgrade, relaySessionGateRequired, sessionCookieValue, webSocketProxyHandler, writePid } from "./http";
 import { webBoundRequestAllowed } from "./lib/origin-trust";
 import { resolveSessionFromCookie } from "./governance/pairing";
+import "./hooks/builtins"; // registers trusted hook handlers (skill-script) before the scheduler/backfill run
 import { runDueJobs } from "./jobs";
 import { runConnectorReprobe } from "./jobs/connector-reprobe";
 import { runConnectorDetection } from "./jobs/connector-detection";
@@ -9,7 +10,7 @@ import { syncProviderMcpServers } from "./integrations/mcp-sync";
 import { install } from "./runtime";
 import { migrateIfNeeded } from "./memory";
 import { loadConfig, parseInstance, runtimePortPath } from "./paths";
-import { appendLog, mutateState, readState } from "./state";
+import { appendLog, backfillEmailWatcherJobs, mutateState, readState } from "./state";
 import { loadSkillsFromDisk } from "./capabilities/skill-loader";
 import { consumeAutostartRefresh } from "./runtime/autostart-refresh";
 import { reconcileAutostartPlistOnStartup } from "./runtime/autostart-reconcile";
@@ -181,6 +182,26 @@ syncProviderMcpServers(config)
   })
   .catch((error) => {
     appendLog(config.instance, "mcp.auto_register.error", {
+      error: error instanceof Error ? error.message : String(error)
+    });
+  });
+
+// Email-watch migration backfill (ADR job-pre-run-hooks.md). Provisions a
+// backing scheduled job (with a skill-script preRunHook running gmail-watch's
+// detect script) for any enabled watcher that lacks a resolvable jobId — legacy
+// watchers created before the hooks cutover, or a watcher whose job was removed
+// out-of-band. Idempotent: it finds existing jobs and does nothing, so it's safe
+// to run on every startup. The detection cursor lives on the backing job's
+// hookState, so a migrated watcher re-seeds on its first fire. Best-effort: a
+// failure logs and lets startup continue.
+backfillEmailWatcherJobs(config)
+  .then((provisioned) => {
+    if (provisioned > 0) {
+      appendLog(config.instance, "email.watch.backfill", { provisioned });
+    }
+  })
+  .catch((error) => {
+    appendLog(config.instance, "email.watch.backfill.error", {
       error: error instanceof Error ? error.message : String(error)
     });
   });

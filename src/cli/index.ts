@@ -1,6 +1,7 @@
 // CLI entry point. Parses global flags, resolves the instance and runtime
 // config, builds a CliContext, and dispatches to the right command module.
 
+import "../hooks/builtins"; // registers trusted hook handlers (skill-script) so any in-process createScheduledJob path resolves isKnownHook
 import { defaultWebPort, loadConfig, parseInstance } from "../paths";
 import type { RuntimeConfig } from "../types";
 import { applyGlobalEnvOverrides, flagValue, hasFlag, stripGlobalArgs } from "./args";
@@ -15,6 +16,7 @@ import { embedding } from "./commands/embedding";
 import { reranker } from "./commands/reranker";
 import { skill } from "./commands/skills";
 import { job } from "./commands/jobs";
+import { email } from "./commands/email";
 import { connector } from "./commands/connectors";
 import { improvement } from "./commands/improvements";
 import { pairing, device } from "./commands/pairing";
@@ -118,6 +120,7 @@ export async function run(): Promise<void> {
     case "skills": await skill(ctx); break;
     case "job":
     case "jobs": await job(ctx); break;
+    case "email": await email(ctx); break;
     case "connector":
     case "connectors": await connector(ctx); break;
     case "improvement":

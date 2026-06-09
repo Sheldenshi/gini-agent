@@ -180,6 +180,29 @@ process.stdout.write(JSON.stringify({
     });
   });
 
+  test("forwards benign ambient session vars (USER/LOGNAME) to the script", async () => {
+    const instance = "skinv-ambient";
+    const skillDir = `${ROOT}/${instance}-skills/probe`;
+    writeScript(join(skillDir, "scripts"), "env.ts", `
+process.stdout.write(JSON.stringify({
+  ok: true,
+  USER: process.env.USER ?? null,
+  LOGNAME: process.env.LOGNAME ?? null
+}));
+`);
+    await mutateState(instance, (s) => {
+      pushSkill(s, { name: "probe", manifestPath: `${skillDir}/SKILL.md` });
+    });
+    const handle = findSkillScript(readState(instance), "probe", "env");
+    const result = await invokeSkillScript(config(instance), handle!, {});
+    expect(result.ok).toBe(true);
+    expect(result.parsed).toMatchObject({
+      ok: true,
+      USER: process.env.USER ?? null,
+      LOGNAME: process.env.LOGNAME ?? null
+    });
+  });
+
   test("non-zero exit + stderr surfaces as ok=false with error containing stderr", async () => {
     const instance = "skinv-fail";
     const skillDir = `${ROOT}/${instance}-skills/broken`;

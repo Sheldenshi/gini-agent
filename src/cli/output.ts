@@ -90,6 +90,7 @@ Usage:
   bun run gini reranker status
   bun run gini skills list|add|show|search|validate|test|enable|disable|rollback
   bun run gini jobs list|add|run|pause|resume|remove|runs|replay
+  bun run gini email list|add --from <sender>|remove <id>
   bun run gini connectors list|providers|add|remove|rotate|health
   bun run gini improvements list|propose|approve|reject
   bun run gini pairing create|claim
