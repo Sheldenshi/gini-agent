@@ -299,6 +299,21 @@ remote previews, screen readers) would need the same translation code.
   - SSE frames carry `id: <blockId>\nevent: chat_block\ndata: <json>\n\n`.
     Browsers' `EventSource` auto-attaches the last `id` as
     `Last-Event-ID` on reconnect.
+  - Clients treat `/blocks` as the reconciliation source of truth, not
+    just the initial seed. A half-open `EventSource` (readyState stuck
+    `OPEN`, so `onerror` never fires and the browser never reconnects —
+    e.g. a backgrounded tab whose socket silently died) can drop the
+    terminal frame; trusting the stream alone would strand the UI on the
+    last non-terminal phase with a dead stop button. So the web client
+    re-fetches `/blocks` and merges it (`mergeSeedWithLive`: freshest
+    committed copy wins on an `id` collision via `updatedAt ?? createdAt`,
+    so a finalized `streaming: false` row replaces a stranded
+    `streaming: true` one; ties keep the live frame) while a turn is in
+    flight (a ~3s poll, evaluated per conversation — main and each thread
+    — so a thread's terminal phase can't mask a still-running main turn),
+    on tab focus / visibility regained, and when the user hits stop. This
+    bounds recovery from a half-open stream to one poll interval without
+    depending on the `EventSource` noticing it died.
   - The same SSE connection also delivers a second event kind,
     `chat_session`, carrying the current `ChatSessionRecord` payload.
     The gateway emits it once on initial connect (so the client has
@@ -355,10 +370,15 @@ Pro:
   renderers of typed blocks.
 - New client surfaces (CLI bridges, screen readers, future
   embeddings) ship one renderer pass instead of one translation pass.
-- The protocol is reconnect-clean. `Last-Event-ID` resumes mid-stream
-  with no replay of already-seen blocks, and `assistant_text` deltas
-  always carry the full accreted text so a reconnect during a stream
-  never observes torn state.
+- The protocol is reconnect-clean *when the browser actually
+  reconnects*. `Last-Event-ID` resumes mid-stream with no replay of
+  already-seen blocks, and `assistant_text` deltas always carry the full
+  accreted text so a reconnect during a stream never observes torn
+  state. A half-open `EventSource` never fires `onerror` and so never
+  reconnects, so the durable `/blocks` list — not the live stream — is
+  the client's source of truth; clients reconcile against it (poll
+  while in flight, refetch on focus / stop) rather than trusting a
+  single stream (see Read paths).
 - Tests can pin block shapes directly instead of inferring rendering
   from `Task.currentStep` strings.
 
