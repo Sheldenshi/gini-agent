@@ -14,6 +14,7 @@ import { MarkdownContent } from "@/components/chat/MarkdownContent";
 import { api } from "@/lib/api";
 import { useConnectors, useInvalidate, useProviders, useSkills, type ProviderDescriptor } from "@/lib/queries";
 import { AddConnectorDialog, type CreateConnectorBody } from "@/components/AddConnectorDialog";
+import { GoogleAccountsCard } from "./_components/GoogleAccountsCard";
 import { deriveActivation, type Activation } from "./_activation";
 import type { ChatSession } from "@/lib/view-types";
 import type { ConnectorRecord, SkillRecord } from "@runtime/types";
@@ -369,7 +370,8 @@ export default function SkillsPage() {
                         );
                         const dependentCount = countDependentSkills(filtered, credentialName);
                         return (
-                          <li key={credentialName} className="flex items-center justify-between gap-2 text-xs">
+                          <li key={credentialName} className="space-y-2 text-xs">
+                            <div className="flex items-center justify-between gap-2">
                             <span className="font-mono">
                               {credentialName}
                             </span>
@@ -497,6 +499,14 @@ export default function SkillsPage() {
                                 Set up {provider.label}
                               </Button>
                             )}
+                            </div>
+                            {/* Tagged Google accounts live on the
+                                google-oauth-desktop connector once it's
+                                configured. Surface them so the user can
+                                retag / remove / add another. */}
+                            {satisfying?.provider === "google-oauth-desktop" ? (
+                              <GoogleAccountsCard accounts={satisfying.accounts ?? []} />
+                            ) : null}
                           </li>
                         );
                       })}

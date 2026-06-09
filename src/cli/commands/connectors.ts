@@ -54,5 +54,45 @@ export async function connector(ctx: CliContext): Promise<void> {
     return;
   }
 
+  if (sub === "accounts") {
+    const action = cliArgs[2] ?? "list";
+
+    if (action === "list") {
+      print(await api(config, "/api/google/accounts"));
+      return;
+    }
+
+    if (action === "retag") {
+      const id = restAfter(cliArgs, action)[0];
+      const tag = flagValue(cliArgs, "--tag");
+      if (!id || id.startsWith("--") || !tag) {
+        throw new Error("Usage: gini connector accounts retag <id> --tag <tag>");
+      }
+      const body = { tag };
+      print(await api(config, `/api/google/accounts/${id}`, { method: "PATCH", body: JSON.stringify(body) }));
+      return;
+    }
+
+    if (action === "remove") {
+      const id = restAfter(cliArgs, action)[0];
+      if (!id) throw new Error("Usage: gini connector accounts remove <id>");
+      print(await api(config, `/api/google/accounts/${id}`, { method: "DELETE" }));
+      return;
+    }
+
+    if (action === "add") {
+      // Adding a Google account requires the browser OAuth flow, which only
+      // the agent can drive (the google-account-login skill). The CLI can't
+      // open a browser and complete consent, so route the user into chat.
+      print({
+        message:
+          "Adding a Google account needs the browser OAuth flow. Ask Gini in chat — e.g. \"connect another google account\" — and it runs the google-workspace-setup / google-account-login flow."
+      });
+      return;
+    }
+
+    throw new Error("Usage: gini connector accounts [list|retag <id> --tag <tag>|remove <id>|add]");
+  }
+
   print(await api(config, "/api/connectors"));
 }
