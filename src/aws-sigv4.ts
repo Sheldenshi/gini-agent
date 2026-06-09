@@ -125,25 +125,20 @@ export function signAwsRequest(opts: {
   return headers;
 }
 
-// Resolve AWS credentials for signing. Precedence: the env vars named in config
-// (default AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN), then
+// Resolve AWS credentials for signing. Precedence: the standard
+// AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN env vars, then
 // the `~/.aws/credentials` profile (AWS_PROFILE, else "default"). Returns null
-// when no usable credentials are found. Secret values never enter config — only
-// env-var names do — so this reads them from the environment / ~/.aws at call
-// time. This covers only STATIC credentials (the two sources above), NOT the
-// full AWS CLI provider chain: SSO, `assume-role` profiles in ~/.aws/config,
-// process/web-identity sources, and IMDS/container roles are out of scope —
-// those users export a session into the AWS_* env vars first (e.g. `aws
-// configure export-credentials`).
-export function resolveAwsCredentials(opts: {
-  accessKeyIdEnv?: string;
-  secretAccessKeyEnv?: string;
-  sessionTokenEnv?: string;
-}): AwsCredentials | null {
-  const accessKeyId = process.env[opts.accessKeyIdEnv ?? "AWS_ACCESS_KEY_ID"];
-  const secretAccessKey = process.env[opts.secretAccessKeyEnv ?? "AWS_SECRET_ACCESS_KEY"];
+// when no usable credentials are found. Secrets never enter config — these are
+// read from the environment / ~/.aws at call time, the same static sources the
+// `aws` CLI reads. NOT the full AWS CLI provider chain: SSO, `assume-role`
+// profiles in ~/.aws/config, process/web-identity, and IMDS/container roles are
+// out of scope — those users export a session into the AWS_* env vars first
+// (e.g. `aws configure export-credentials`).
+export function resolveAwsCredentials(): AwsCredentials | null {
+  const accessKeyId = process.env.AWS_ACCESS_KEY_ID;
+  const secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY;
   if (accessKeyId && secretAccessKey) {
-    const sessionToken = process.env[opts.sessionTokenEnv ?? "AWS_SESSION_TOKEN"];
+    const sessionToken = process.env.AWS_SESSION_TOKEN;
     return { accessKeyId, secretAccessKey, sessionToken: sessionToken || undefined };
   }
   return readAwsProfileCredentials(process.env.AWS_PROFILE ?? "default");

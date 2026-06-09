@@ -113,17 +113,13 @@ describe("signAwsRequest", () => {
 describe("resolveAwsCredentials", () => {
   test("reads the standard env vars including the session token", () => {
     withEnv({ AWS_ACCESS_KEY_ID: "AKIAENV", AWS_SECRET_ACCESS_KEY: "secretenv", AWS_SESSION_TOKEN: "tokenenv" }, () => {
-      expect(resolveAwsCredentials({})).toEqual({ accessKeyId: "AKIAENV", secretAccessKey: "secretenv", sessionToken: "tokenenv" });
+      expect(resolveAwsCredentials()).toEqual({ accessKeyId: "AKIAENV", secretAccessKey: "secretenv", sessionToken: "tokenenv" });
     });
   });
 
-  test("honors custom env-var names and omits an absent session token", () => {
-    withEnv({ MY_AK: "AKIACUST", MY_SK: "skcust", AWS_SESSION_TOKEN: undefined }, () => {
-      expect(resolveAwsCredentials({ accessKeyIdEnv: "MY_AK", secretAccessKeyEnv: "MY_SK" })).toEqual({
-        accessKeyId: "AKIACUST",
-        secretAccessKey: "skcust",
-        sessionToken: undefined
-      });
+  test("omits an absent session token", () => {
+    withEnv({ AWS_ACCESS_KEY_ID: "AKIACUST", AWS_SECRET_ACCESS_KEY: "skcust", AWS_SESSION_TOKEN: undefined }, () => {
+      expect(resolveAwsCredentials()).toEqual({ accessKeyId: "AKIACUST", secretAccessKey: "skcust", sessionToken: undefined });
     });
   });
 
@@ -133,7 +129,7 @@ describe("resolveAwsCredentials", () => {
       withEnv(
         { AWS_ACCESS_KEY_ID: undefined, AWS_SECRET_ACCESS_KEY: undefined, AWS_SHARED_CREDENTIALS_FILE: file, AWS_PROFILE: undefined },
         () => {
-          expect(resolveAwsCredentials({})).toEqual({ accessKeyId: "AKIAFILE", secretAccessKey: "skfile", sessionToken: undefined });
+          expect(resolveAwsCredentials()).toEqual({ accessKeyId: "AKIAFILE", secretAccessKey: "skfile", sessionToken: undefined });
         }
       );
     } finally {

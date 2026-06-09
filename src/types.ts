@@ -173,15 +173,6 @@ export interface ProviderConfig {
   // default (us-east-1); the Converse host is then derived from it. Ignored by
   // every other provider.
   awsRegion?: string;
-  // Env vars holding the AWS credentials the `bedrock` provider signs with. When
-  // omitted, the standard AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY /
-  // AWS_SESSION_TOKEN are read, falling back to ~/.aws/credentials for the
-  // AWS_PROFILE (or "default") profile — the same chain the `aws` CLI uses. Only
-  // env-var NAMES live in config; the secret values stay in the environment /
-  // ~/.aws and never touch config.json — same boundary as apiKeyEnv.
-  awsAccessKeyIdEnv?: string;
-  awsSecretAccessKeyEnv?: string;
-  awsSessionTokenEnv?: string;
   // Provider-specific request fields merged into chat-completions request
   // bodies (tool-calling, structured JSON, vision, and the chat-completions
   // branch of generateTaskSummary). The local, openrouter, deepseek, and azure

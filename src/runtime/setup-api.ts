@@ -268,15 +268,13 @@ export async function setSetupProvider(
   }
   if (providerName === "bedrock") {
     // Like codex, bedrock holds no gini-managed key: it signs each Converse
-    // request with the caller's AWS credentials (~/.aws or AWS_*). "Configured"
-    // therefore means those credentials resolve — reject up front with a clear
-    // hint when they don't, mirroring codex's "run codex --login" gate. Only
-    // model + region are persisted (env-var NAMES, never secret values).
-    // Honor an existing bedrock config's custom credential env-var names (only
-    // reachable via a hand-edited config.json today) so the gate matches what a
-    // signed request would actually resolve.
+    // request with the caller's AWS credentials (AWS_* env or the
+    // ~/.aws/credentials profile). "Configured" therefore means those
+    // credentials resolve — reject up front with a clear hint when they don't,
+    // mirroring codex's "run codex --login" gate. Only model + region are
+    // persisted (never secret values).
     const existing = config.provider?.name === "bedrock" ? config.provider : undefined;
-    if (!hasUsableAwsCredentials(existing)) {
+    if (!hasUsableAwsCredentials()) {
       return {
         ok: false,
         provider: providerHealth(config),
@@ -310,13 +308,8 @@ export async function setSetupProvider(
       name: "bedrock",
       model: model ?? "",
       ...(awsRegion ? { awsRegion } : {}),
-      // Preserve custom AWS credential env-var names + a CLI-set extraBody across
-      // an edit/save — the setup gate already probes them (hasUsableAwsCredentials
-      // above), so dropping them here would make a working hand-edited config
-      // read as unconfigured after the next save.
-      ...(existing?.awsAccessKeyIdEnv ? { awsAccessKeyIdEnv: existing.awsAccessKeyIdEnv } : {}),
-      ...(existing?.awsSecretAccessKeyEnv ? { awsSecretAccessKeyEnv: existing.awsSecretAccessKeyEnv } : {}),
-      ...(existing?.awsSessionTokenEnv ? { awsSessionTokenEnv: existing.awsSessionTokenEnv } : {}),
+      // Preserve a CLI-set extraBody across an edit/save (no web surface sends it,
+      // so a model-only save must not silently drop it).
       ...(existing?.extraBody ? { extraBody: existing.extraBody } : {})
     });
     writeRuntimeConfig(config);

@@ -28,7 +28,7 @@ Dispatch arms route `bedrock` in `generateToolCallingResponse`, `generateTaskSum
 
 ## Auth and Trust Boundary
 
-`config.json` stores only the **names** of the credential env vars (`awsAccessKeyIdEnv`/`awsSecretAccessKeyEnv`/`awsSessionTokenEnv`, defaulting to the AWS standard names) plus `awsRegion` and the (informational) `baseUrl` — never the secret values, which stay in env or `~/.aws`. `signAwsRequest` (`src/aws-sigv4.ts`, `node:crypto`, no AWS SDK) computes the canonical request → `kDate→kRegion→kService→aws4_request` signing key → signature, emitting `Authorization`/`x-amz-date`/`x-amz-content-sha256` (and `x-amz-security-token` for temporary creds). The canonical URI **double-URI-encodes** the path (non-S3 SigV4 rule), so a model id's `:` (`…v1:0` → wire `%3A` → canonical `%253A`) signs correctly. `redactSecrets` masks `AKIA…`/`ASIA…` access-key ids and the computed `Signature=…` hex so neither leaks through `providerHealth` / `/api/status` / trace records. Region resolves from explicit `awsRegion`, else the Bedrock host, else `AWS_REGION`/`AWS_DEFAULT_REGION`, else `us-east-1`.
+`config.json` stores only `awsRegion` and the (informational) `baseUrl` — never any credentials. The access key / secret / session token come from the standard `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` env vars, else the `~/.aws/credentials` profile, read at call time. `signAwsRequest` (`src/aws-sigv4.ts`, `node:crypto`, no AWS SDK) computes the canonical request → `kDate→kRegion→kService→aws4_request` signing key → signature, emitting `Authorization`/`x-amz-date`/`x-amz-content-sha256` (and `x-amz-security-token` for temporary creds). The canonical URI **double-URI-encodes** the path (non-S3 SigV4 rule), so a model id's `:` (`…v1:0` → wire `%3A` → canonical `%253A`) signs correctly. `redactSecrets` masks `AKIA…`/`ASIA…` access-key ids and the computed `Signature=…` hex so neither leaks through `providerHealth` / `/api/status` / trace records. Region resolves from explicit `awsRegion`, else `AWS_REGION`/`AWS_DEFAULT_REGION`, else `us-east-1`.
 
 Setup mirrors codex: `setSetupProvider`'s bedrock branch requires no `apiKey`, rejects up front when no AWS creds resolve (`hasUsableAwsCredentials`), and persists model + region. The web Add Provider form's bedrock panel shows an explanatory note, a free-text model id, and an optional region — no key field; `gini provider set bedrock [model] [--aws-region]` is the CLI equivalent.
 
@@ -41,8 +41,7 @@ Setup mirrors codex: `setSetupProvider`'s bedrock branch requires no `apiKey`, r
 
 ## Out Of Scope, Linked Follow-Ups
 
-- Full IAM-role / `AssumeRole` sourcing, IMDS/container credentials, and `~/.aws/config` SSO. The signer uses static access keys from env or the `~/.aws/credentials` profile.
-- Custom AWS credential env-var names (`awsAccessKeyIdEnv` etc.) exist on `ProviderConfig` and are honored by the signer, `providerHealth`, and the setup gate, but no CLI/web/tool surface sets them and the catalog `configured` status (`isProviderConfigured`) still probes the canonical `AWS_*` names. Reachable only via a hand-edited `config.json`; the catalog gap closes when `providerCatalogWithStatus` takes the full active `ProviderConfig` instead of positional bits.
+- Full IAM-role / `AssumeRole` sourcing, IMDS/container credentials, and `~/.aws/config` SSO. The signer uses static credentials only: the standard `AWS_*` env vars or the `~/.aws/credentials` profile.
 - A live model picker (`ListFoundationModels` / `ListInferenceProfiles`); the catalog ships a cross-family starter list and the UI accepts any id.
 - Bedrock Guardrails, prompt-management resources, and `additionalModelRequestFields` passthrough.
 

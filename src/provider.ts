@@ -82,13 +82,7 @@ export function providerHealth(config: RuntimeConfig) {
   }
 
   if (provider.name === "bedrock") {
-    const configured = Boolean(
-      resolveAwsCredentials({
-        accessKeyIdEnv: provider.awsAccessKeyIdEnv,
-        secretAccessKeyEnv: provider.awsSecretAccessKeyEnv,
-        sessionTokenEnv: provider.awsSessionTokenEnv
-      })
-    );
+    const configured = Boolean(resolveAwsCredentials());
     return {
       ok: configured,
       provider,
@@ -145,14 +139,8 @@ const PROVIDER_API_KEY_ENV: Record<string, string> = {
 // (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY[/AWS_SESSION_TOKEN]) or the
 // ~/.aws/credentials profile. The bedrock analogue of hasUsableCodexCredentials:
 // there's no gini-held secret, so "configured" means the AWS chain has creds.
-export function hasUsableAwsCredentials(provider?: ProviderConfig): boolean {
-  return Boolean(
-    resolveAwsCredentials({
-      accessKeyIdEnv: provider?.awsAccessKeyIdEnv,
-      secretAccessKeyEnv: provider?.awsSecretAccessKeyEnv,
-      sessionTokenEnv: provider?.awsSessionTokenEnv
-    })
-  );
+export function hasUsableAwsCredentials(): boolean {
+  return Boolean(resolveAwsCredentials());
 }
 
 // Whether a provider has usable credentials in the current process env.
@@ -1890,12 +1878,8 @@ function bedrockConverseUrl(region: string, modelId: string, stream: boolean): s
 
 // SigV4-sign a Converse request (service "bedrock"). content-type is folded into
 // the signature because fetch sends it.
-function bedrockAuthHeaders(provider: ProviderConfig, region: string, url: string, body: string): Record<string, string> {
-  const credentials = resolveAwsCredentials({
-    accessKeyIdEnv: provider.awsAccessKeyIdEnv,
-    secretAccessKeyEnv: provider.awsSecretAccessKeyEnv,
-    sessionTokenEnv: provider.awsSessionTokenEnv
-  });
+function bedrockAuthHeaders(region: string, url: string, body: string): Record<string, string> {
+  const credentials = resolveAwsCredentials();
   if (!credentials) {
     throw new Error(
       "bedrock provider needs AWS credentials but none resolved (set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY or ~/.aws/credentials)."
@@ -2082,7 +2066,7 @@ async function callBedrockConverse(
     method: "POST",
     headers: {
       "content-type": "application/json",
-      ...bedrockAuthHeaders(provider, region, url, bodyJson)
+      ...bedrockAuthHeaders(region, url, bodyJson)
     },
     body: bodyJson
   });
@@ -3051,9 +3035,6 @@ export function normalizeProvider(provider: ProviderConfig): ProviderConfig {
       // host can never drift from the host requests actually sign and hit.
       baseUrl: bedrockRuntimeBaseUrl(awsRegion),
       awsRegion,
-      ...(provider.awsAccessKeyIdEnv ? { awsAccessKeyIdEnv: provider.awsAccessKeyIdEnv } : {}),
-      ...(provider.awsSecretAccessKeyEnv ? { awsSecretAccessKeyEnv: provider.awsSecretAccessKeyEnv } : {}),
-      ...(provider.awsSessionTokenEnv ? { awsSessionTokenEnv: provider.awsSessionTokenEnv } : {}),
       ...(provider.extraBody ? { extraBody: provider.extraBody } : {})
     };
   }
