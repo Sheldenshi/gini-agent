@@ -240,16 +240,16 @@ function UpdateOverlay({ complete }: { complete: boolean }) {
       aria-label={complete ? "Update complete" : "Updating Gini"}
       className="fixed inset-0 z-[100] flex items-center justify-center bg-black/50 backdrop-blur-md"
     >
-      <div className="flex flex-col items-center gap-3 rounded-2xl border border-[#2E2E34] bg-[#101014]/90 px-8 py-7 text-center shadow-2xl">
+      <div className="flex flex-col items-center gap-3 rounded-2xl border border-border bg-popover/95 px-8 py-7 text-center shadow-2xl">
         {complete ? (
-          <CheckCircle2 className="size-7 text-emerald-400" />
+          <CheckCircle2 className="size-7 text-emerald-500" />
         ) : (
-          <Loader2 className="size-7 animate-spin text-[#C2C2C8]" />
+          <Loader2 className="size-7 animate-spin text-muted-foreground" />
         )}
-        <div className="text-sm font-semibold text-white">
+        <div className="text-sm font-semibold text-popover-foreground">
           {complete ? "Update complete" : "Updating Gini"}
         </div>
-        <div className="max-w-[240px] text-xs text-[#9A9AA0]">
+        <div className="max-w-[240px] text-xs text-muted-foreground">
           {complete
             ? "Reloading the app…"
             : "Gini is updating. The app will be unavailable until it finishes."}
