@@ -25,6 +25,7 @@ import {
   readTrace
 } from "../state";
 import { id as makeId } from "../state/ids";
+import { readGoogleAccounts } from "../state/google-accounts";
 import { ApprovedActionFailedError, findTask, scheduleAutoRetain } from "../agent";
 import { recall } from "../memory";
 import {
@@ -63,6 +64,7 @@ import { loadInstructions, loadSoul, loadUserProfile } from "../runtime/identity
 import type {
   AgentIdentity,
   CostRecord,
+  GoogleAccount,
   IdentitySnapshotRecord,
   JobRecord,
   PendingToolCall,
@@ -554,6 +556,10 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
     (skill) => skill.status === "enabled" && !isSkillActive(state, skill)
   );
   const inactiveSkillsBlock = buildInactiveSkillsBlock(inactiveSkills, state);
+  // Connected Google accounts (multi-account): surface tag/email/config-dir so
+  // the model can target the right account per `gws` command and ask when the
+  // request is ambiguous. Registry is machine-global; read it directly.
+  const connectedAccountsBlock = buildConnectedAccountsBlock(readGoogleAccounts());
   // Bound-jobs block: if this chat session has one or more JobRecords whose
   // chatSessionId matches, surface them in the system prompt so the model
   // can act on "this job" / "the reminder" without first calling list_jobs.
@@ -595,6 +601,7 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
   ];
   if (skillsBlock) sections.push(skillsBlock);
   if (inactiveSkillsBlock) sections.push(inactiveSkillsBlock);
+  if (connectedAccountsBlock) sections.push(connectedAccountsBlock);
   if (mcpServersBlock) sections.push(mcpServersBlock);
   if (skillScriptsBlock) sections.push(skillScriptsBlock);
   if (deferredBlock) sections.push(deferredBlock);
@@ -1316,6 +1323,33 @@ export function buildInactiveSkillsBlock(skills: SkillRecord[], state?: RuntimeS
     );
   }
   return sections.join("\n");
+}
+
+// Connected Google accounts block. Multiple Google accounts can be tagged and
+// authorized against the single google-workspace-oauth client; each one is a
+// `gws` config dir. We surface every account's tag, email, and config dir so
+// the model can target the right one per `gws` command (by inline-prefixing
+// GOOGLE_WORKSPACE_CLI_CONFIG_DIR) and ask the user when the request doesn't
+// name an account. Byte-stable for a given registry: preserves registry order
+// and carries no timestamps, so it doesn't churn the prefix cache.
+//
+// Exported for unit testing; production callers use it via runChatTask.
+export function buildConnectedAccountsBlock(accounts: GoogleAccount[]): string {
+  if (accounts.length === 0) return "";
+  const rows = accounts.map((a) => {
+    const email = a.email || "(sign-in pending)";
+    return `- ${a.tag} — ${email} — config dir: ${a.configDir}`;
+  });
+  const selectionRule =
+    accounts.length === 1
+      ? "Only one account is connected — use it (still pass its config dir)."
+      : "Two or more accounts are connected — use the one the user named or clearly implied (an explicit tag, an email address, or unambiguous context). If you cannot tell which account the user means, ASK which one before running — never guess on sends, deletes, or other writes.";
+  return [
+    "Connected Google accounts:",
+    "These Google accounts are connected. Any `gws` command can target a specific one by prefixing it with `GOOGLE_WORKSPACE_CLI_CONFIG_DIR=\"<configDir>\" gws ...`.",
+    ...rows,
+    selectionRule
+  ].join("\n");
 }
 
 // Advertise configured http MCP servers in the system prompt. The model

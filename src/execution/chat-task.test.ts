@@ -35,10 +35,11 @@ import {
 } from "../state";
 import { echoEmbed } from "../embeddings";
 import { resolveDefaultPriorContextTokenBudget } from "../provider-capabilities";
-import type { AgentIdentity, JobRecord, RuntimeConfig, RuntimeState, SkillRecord, Task, ToolsetRecord } from "../types";
+import type { AgentIdentity, GoogleAccount, JobRecord, RuntimeConfig, RuntimeState, SkillRecord, Task, ToolsetRecord } from "../types";
 import { createSkillFromInput, setSkillStatus } from "../capabilities/skills";
 import {
   buildAgentIdentity,
+  buildConnectedAccountsBlock,
   buildEnabledSkillsBlock,
   buildInactiveSkillsBlock,
   buildMcpServersBlock,
@@ -3135,6 +3136,50 @@ describe("buildEnabledSkillsBlock", () => {
     expect(block).not.toContain("- skill-40: skill-40 description");
     expect(block).toContain("5 more skills not shown");
     expect(block).toContain("nameContains/status filters");
+  });
+});
+
+describe("buildConnectedAccountsBlock", () => {
+  function account(opts: { tag: string; email?: string; configDir?: string }): GoogleAccount {
+    return {
+      id: `gacct_${opts.tag}`,
+      tag: opts.tag,
+      email: opts.email ?? `${opts.tag}@example.com`,
+      configDir: opts.configDir ?? `/home/u/.gini/google-accounts/gacct_${opts.tag}`,
+      addedAt: "2026-01-01T00:00:00.000Z"
+    };
+  }
+
+  test("returns empty string when no accounts are connected", () => {
+    expect(buildConnectedAccountsBlock([])).toBe("");
+  });
+
+  test("renders a single account's tag, email, and config dir plus the prefix guidance", () => {
+    const block = buildConnectedAccountsBlock([
+      account({ tag: "personal", email: "me@gmail.com", configDir: "/home/u/.config/gws" })
+    ]);
+    expect(block).toContain("Connected Google accounts");
+    expect(block).toContain("personal");
+    expect(block).toContain("me@gmail.com");
+    expect(block).toContain("/home/u/.config/gws");
+    expect(block).toContain("GOOGLE_WORKSPACE_CLI_CONFIG_DIR");
+    expect(block).toContain("use it");
+  });
+
+  test("surfaces both accounts and the ask-which-one guidance when 2+ are connected", () => {
+    const block = buildConnectedAccountsBlock([
+      account({ tag: "personal" }),
+      account({ tag: "work" })
+    ]);
+    expect(block).toContain("personal");
+    expect(block).toContain("work");
+    expect(block).toContain("ASK which one before running");
+  });
+
+  test("shows the sign-in-pending placeholder for an account with no email yet", () => {
+    const block = buildConnectedAccountsBlock([account({ tag: "school", email: "" })]);
+    expect(block).toContain("school");
+    expect(block).toContain("(sign-in pending)");
   });
 });
 

@@ -5,7 +5,7 @@ license: MIT
 compatibility: "macOS and Linux. Requires the `gws` CLI authenticated against a Google account with Gmail scopes."
 metadata:
   gini:
-    version: 1.1.0
+    version: 1.1.1
     author: Gini
     platforms: [macos, linux]
     prerequisites:
@@ -34,6 +34,16 @@ Use `gws gmail` to read, search, send, reply, forward, draft, label, and triage 
   - Reply, reply-all, forward: `gmail.modify` — upstream helpers fetch the original message to thread `In-Reply-To` / `References` headers, which `gmail.send` alone cannot do
   - Drafts and labels: `gmail.modify` (or `https://mail.google.com/` for full access including permanent delete)
   - Watch for new mail (`+watch`): `gmail.modify` AND `https://www.googleapis.com/auth/pubsub` — Cloud Pub/Sub is a separate Google API and its scope must be granted alongside the Gmail scope
+
+## Selecting a Google account
+
+The connected Google accounts (each with its tag, email, and config dir) are listed in your system context under **"Connected Google accounts"**. To target a specific account, prefix the command with its config dir:
+
+```bash
+GOOGLE_WORKSPACE_CLI_CONFIG_DIR="<configDir>" gws gmail +triage
+```
+
+Selection rule: one account connected → just use it. Two or more → use the one the user named or clearly implied (an explicit tag, an email address, or unambiguous context); if you can't tell which one they mean, ASK before running — never guess on writes (sends, deletes, edits). If no accounts are connected yet, fall back to the setup flow in Prerequisites (`read_skill` with `google-workspace-setup`).
 
 ## When to Use
 
