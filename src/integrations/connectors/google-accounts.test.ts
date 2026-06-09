@@ -11,7 +11,7 @@ import { join } from "node:path";
 
 import { listAccountsWithStatus, registerAccount } from "./google-accounts";
 import type { GwsSessionStatus } from "./gws-session";
-import { readGoogleAccounts } from "../../state/google-accounts";
+import { configDirForAccount, googleAccountsRoot, readGoogleAccounts } from "../../state/google-accounts";
 
 let scratchHome: string;
 let prevHome: string | undefined;
@@ -80,6 +80,27 @@ describe("registerAccount", () => {
       registerAccount({ tag: "work", configDir: "/tmp/gws-empty" }, { statusForDir: fetcher })
     ).rejects.toThrow("No signed-in Google session in /tmp/gws-empty");
     expect(readGoogleAccounts()).toEqual([]);
+  });
+
+  test("a configDir under the gini root takes its id from the dir basename", async () => {
+    const configDir = configDirForAccount("gacct_abc12345");
+    const account = await registerAccount(
+      { tag: "personal", configDir },
+      { statusForDir: async () => signedIn("me@example.com") }
+    );
+    expect(account.id).toBe("gacct_abc12345");
+    // The dir↔id coupling holds, so removeAccount can reconstruct the dir.
+    expect(configDirForAccount(account.id)).toBe(account.configDir);
+    expect(account.configDir.startsWith(googleAccountsRoot())).toBe(true);
+  });
+
+  test("an adopted dir outside the root keeps a minted id", async () => {
+    const account = await registerAccount(
+      { tag: "default-gws", configDir: "/tmp/outside/.config/gws", adopt: true },
+      { statusForDir: async () => signedIn("me@example.com") }
+    );
+    expect(account.id).toMatch(/^gacct_/);
+    expect(account.id).not.toBe("gws");
   });
 
   test("re-registering the same configDir reuses the existing id", async () => {

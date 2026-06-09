@@ -9,6 +9,7 @@
 // unit-tested without a real `gws` binary on PATH.
 
 import { rmSync } from "node:fs";
+import { basename } from "node:path";
 
 import type { GoogleAccount, GoogleAccountStatus } from "../../types";
 import {
@@ -65,8 +66,12 @@ export async function listAccountsWithStatus(deps: AccountDeps = {}): Promise<Go
 // Register (or refresh) a tagged account for an already-signed-in gws config
 // dir. Reads `gws auth status` for the dir to confirm a live session and
 // capture the email; throws when not signed in so we never register an empty
-// dir. Reuses the existing account id when a registry entry already points at
-// this configDir, else mints a new one.
+// dir. The account id is derived from the config-dir basename when the dir is a
+// gini-managed one (under googleAccountsRoot()), so the dir↔id coupling
+// configDirForAccount(id) === account.configDir holds and removeAccount cleans
+// the dir up. For an adopted dir outside the root (e.g. ~/.config/gws), reuse
+// the existing id when a registry entry already points at this configDir, else
+// mint a new one.
 export async function registerAccount(
   input: { tag: string; configDir: string; adopt?: boolean },
   deps: AccountDeps = {}
@@ -77,8 +82,9 @@ export async function registerAccount(
     throw new Error(`No signed-in Google session in ${input.configDir}`);
   }
   const existing = readGoogleAccounts().find((a) => a.configDir === input.configDir);
+  const managed = input.configDir.startsWith(googleAccountsRoot());
   const account: GoogleAccount = {
-    id: existing?.id ?? newAccountId(),
+    id: managed ? basename(input.configDir) : existing?.id ?? newAccountId(),
     tag: input.tag,
     email: status.email ?? "",
     configDir: input.configDir,

@@ -5,7 +5,7 @@ license: MIT
 compatibility: "macOS and Linux. Requires Homebrew (or another package manager) and a Google account."
 metadata:
   gini:
-    version: 3.7.0
+    version: 3.8.0
     author: Gini
     platforms: [macos, linux]
     prerequisites:
@@ -32,14 +32,14 @@ This is the **exact first-time sequence** (Step 0 short-circuits the re-auth cas
 4. Run `gcloud auth login`, which pops up the user's default browser for sign-in.
 5. After they sign in, create the Cloud project and enable the seven Workspace APIs in the background.
 6. Send a single chat bubble with the last-step instructions (two Cloud Console URLs) and call `request_connector` — the inline form renders below the bubble.
-7. After the user pastes the credentials and clicks **Save**, run `gws auth login`, which pops up the user's default browser for OAuth consent.
+7. After the user pastes the credentials and clicks **Save**, ask for a tag for this account and call `skill_run google-account-login`, which pops up the user's default browser for OAuth consent and registers the tagged account.
 8. After they sign in, the original ask resumes.
 
 ## Step 0 — First-time or re-auth?
 
 Before anything else, call `list_connectors` and look for a connector named `google-workspace-oauth`.
 
-- **It exists** → the OAuth client is already provisioned and only the user's `gws` session expired. This is a **re-auth**, not setup. Ask once ("Your Google sign-in expired — want me to sign you back in?") and on yes go **straight to Step 6** (`gws auth login`), then Step 8 (smoke test). Do **not** run `gcloud`, create a project, or call `request_connector` — provisioning already happened and none of it is needed again. (Edge case: if `gws` is not on `$PATH`, run Step 2's install first, then Step 6. If `gws auth login` fails with `invalid_client`, the stored client is broken — fall through to the full first-time flow to re-provision it.)
+- **It exists** → the OAuth client is already provisioned and only the user's `gws` session expired. This is a **re-auth**, not setup. Ask once ("Your Google sign-in expired — want me to sign you back in?") and on yes go **straight to Step 6**, which now signs in by calling `skill_run google-account-login` with the relevant account's tag (re-use that account's tag and, when re-authing the default-dir session, pass `adopt: true`). Then run Step 8 (smoke test). Do **not** run `gcloud`, create a project, or call `request_connector` — provisioning already happened and none of it is needed again. (Edge case: if `gws` is not on `$PATH`, run Step 2's install first, then Step 6. If login fails with `invalid_client`, the stored client is broken — fall through to the full first-time flow to re-provision it.)
 - **It does not exist** → true first-time setup. Continue to Step 1.
 
 ## Step 1 — Confirm setup
@@ -220,76 +220,50 @@ Do NOT post a separate chat message before the tool call. Do NOT `open <url>` fo
 
 On Save, the connector is created with env bindings (`GOOGLE_WORKSPACE_CLI_CLIENT_ID`, `GOOGLE_WORKSPACE_CLI_CLIENT_SECRET`), and the chat-task resumes at Step 6.
 
-## Step 6 — Run `gws auth login`
+## Tagging the account
 
-`gws` reads the Client ID and Client Secret from the env vars Gini binds (`GOOGLE_WORKSPACE_CLI_CLIENT_ID`, `GOOGLE_WORKSPACE_CLI_CLIENT_SECRET`) and starts a local HTTP server on a random port to receive the OAuth callback. It then prints a URL like:
+Before login, ask the user for a short **tag** for THIS account — e.g. "personal", "work", "school". On first-time setup it's fine to ask "What should I call this account?" The tag labels the account everywhere (it's how Gini will later refer to it and how the user picks which account to use). Tags are unique across accounts.
+
+## Step 6 — Sign in with `skill_run google-account-login`
+
+Now that the `google-workspace-oauth` connector exists, **delegate the login to the `google-account-login` skill** — do NOT run `gws auth login` from `terminal_exec` yourself. That skill's script gets the Client ID/Secret injected into its env, mints this account's own config dir, opens the user's browser to the consent screen, waits for them to finish, and registers the tagged account:
 
 ```text
-Open this URL in your browser to authenticate:
-
-  https://accounts.google.com/o/oauth2/auth?...&redirect_uri=http://localhost:NNNN&...
+skill_run {
+  skill: "google-account-login",
+  script: "account-login",
+  args: { tag: "<the tag the user chose>", services: ["drive","gmail","calendar","docs","sheets","meet","forms"] }
+}
 ```
 
-and blocks waiting for the user to complete consent. **It does NOT spawn the browser itself** — despite what `gws auth login --help` claims. If you just run `gws auth login` from `terminal_exec`, the URL goes into Gini's captured stdout and the user never sees it.
+The script opens the user's default browser automatically and blocks until they complete consent — sign-in is human-in-the-loop, so don't type their email or password. It returns `{ ok, id, tag, email, configDir, scopes }` on success, or `{ ok: false, error }` on failure. On success, tell the user which account (by email + tag) is now connected, then go to Step 8.
 
-**Always pass every service we enabled APIs for to `-s`, regardless of what the user originally asked.** The user enabled APIs for all seven Workspace products in Step 4, and Google's consent screen renders each scope as its own row with per-scope checkboxes (for unverified apps in testing mode) — the user picks which to grant *there*, not by us pre-filtering the `-s` list. Narrowing `-s` to just "calendar" because the user's first ask was a calendar question silently locks them out of Drive / Gmail / Docs / etc. for the rest of the session.
+If `ok` is false, surface the `error` verbatim and act on it:
 
-To actually pop the browser, run gws in the background, scrape the URL out of its log, hand it to `open`, then wait for gws to finish. One `terminal_exec` call, single shell pipeline:
+- `"gws never printed the consent URL"` or a `gws auth login` failure → the user may have closed the browser without approving; just call `skill_run` again (idempotent). If it mentions `invalid_client`, the stored Client ID/Secret are wrong — re-run `request_connector` for `google-oauth-desktop` (Step 5). A `redirect_uri mismatch` means the OAuth client was created as Web type, not Desktop — re-create as Desktop and re-paste.
+- `"Login did not produce a valid session."` → the user didn't finish consent; offer to try again.
 
-```bash
-LOG=$(mktemp -t gws-auth.XXXXXX.log)
-gws auth login -s drive,gmail,calendar,docs,sheets,meet,forms > "$LOG" 2>&1 &
-GWS_PID=$!
-# Poll for the URL (gws prints it within a second of starting).
-URL=""
-for i in 1 2 3 4 5 6 7 8 9 10; do
-  URL=$(grep -o 'https://accounts.google.com[^[:space:]]*' "$LOG" 2>/dev/null | head -1)
-  [ -n "$URL" ] && break
-  sleep 1
-done
-if [ -n "$URL" ]; then
-  open "$URL"
-else
-  echo "gws never printed the consent URL — aborting."
-  kill $GWS_PID 2>/dev/null
-  exit 1
-fi
-# Wait for the user to complete OAuth consent in the browser; gws exits when
-# its local callback server receives the code.
-wait $GWS_PID
-GWS_EXIT=$?
-cat "$LOG"
-rm -f "$LOG"
-exit $GWS_EXIT
-```
-
-The user's default browser pops to Google's consent page listing every requested scope with its own checkbox; they tick the ones they want, click Continue, gws receives the callback, the command exits. `terminal_exec`'s timeout should be generous (≥ 3 min) — most users take 20-60 s, but a forgotten 2FA prompt can stretch it.
-
-If `wait $GWS_PID` returns non-zero, gws's exit reason is in `$LOG` (printed before exit). Common cases:
-
-- "Token exchange failed: invalid_client" → Client ID or Client Secret entered in Step 5 was wrong; re-run `request_connector` for `google-oauth-desktop`.
-- "redirect_uri mismatch" → the Cloud Console OAuth client was created as Web type, not Desktop. Re-create as Desktop and re-paste.
-- The user closed the browser without approving → just re-run the same block. Idempotent.
+**Always request every service we enabled APIs for in `services`, regardless of what the user originally asked.** The user enabled APIs for all seven Workspace products in Step 4, and Google's consent screen renders each scope as its own row with per-scope checkboxes (for unverified apps in testing mode) — the user picks which to grant *there*, not by us pre-filtering the `services` list. Narrowing `services` to just "calendar" because the user's first ask was a calendar question silently locks them out of Drive / Gmail / Docs / etc. for the rest of the session.
 
 ### When the user wants different scopes than the default
 
-Two cases warrant deviating from the all-seven-services default:
+Two cases warrant deviating from the all-seven-services default — pass them through the `args`:
 
-- **The user explicitly asks for a narrower or read-only grant** ("I only use Gmail, skip the rest" / "give Gini read-only access"). Trust them, and run with their narrower picks.
-- **The user is on a personal `@gmail.com` account AND wants the "full" Gmail scope** (`https://mail.google.com/`, which includes permanent delete). The default `recommended` preset will fail on unverified personal apps; you have to pass the full scope URL via `--scopes`.
+- **The user explicitly asks for a narrower or read-only grant** ("I only use Gmail, skip the rest" / "give Gini read-only access"). Trust them: pass `services: ["gmail"]` and/or `readonly: true`.
+- **The user is on a personal `@gmail.com` account AND wants the "full" Gmail scope** (`https://mail.google.com/`, which includes permanent delete). The default `recommended` preset will fail on unverified personal apps; pass the full scope URL(s) via `scopes` instead, which overrides `services`.
 
-```bash
+```text
 # Read-only across the user's chosen services
-gws auth login --readonly -s gmail,drive
+args: { tag: "...", services: ["gmail","drive"], readonly: true }
 
 # Exact per-scope picks (full URLs) — for the rare case the user names a
-# specific scope shape `-s` can't express
-gws auth login --scopes "https://www.googleapis.com/auth/gmail.readonly,https://www.googleapis.com/auth/drive"
+# specific scope shape service names can't express
+args: { tag: "...", scopes: ["https://www.googleapis.com/auth/gmail.readonly","https://www.googleapis.com/auth/drive"] }
 ```
 
-`-s` takes **service names**, not scope strings — `-s gmail.readonly` is silently dropped.
+`services` takes **service names**, not scope strings — `services: ["gmail.readonly"]` is silently dropped; use `scopes` with full URLs for that.
 
-Reference table of `-s` shorthand ↔ full scope URL (only useful when the user names a specific scope shape; the default is the full seven-service `-s` list, not anything from this table):
+Reference table of `services` name ↔ full scope URL (only useful when the user names a specific scope shape; the default is the full seven-service `services` list, not anything from this table):
 
 - **Gmail** — `-s gmail` ↔ `https://www.googleapis.com/auth/gmail.modify` (read + send + reply + label + draft; NOT permanent delete). Narrower: `.readonly` / `.send` / `.compose`.
 - **Gmail (full, incl. permanent delete)** — `--scopes "https://mail.google.com/"`. No `-s` shorthand.
@@ -300,7 +274,40 @@ Reference table of `-s` shorthand ↔ full scope URL (only useful when the user 
 - **Meet** — `-s meet` ↔ `https://www.googleapis.com/auth/meetings.space.created` (`.readonly` available).
 - **Forms** — `-s forms` ↔ `https://www.googleapis.com/auth/forms.body` (`.body.readonly`, `.responses.readonly` available).
 
-Never pass `--full` or the default `recommended` preset on a personal `@gmail.com` account — those expand to 80+ scopes including pubsub and cloud-platform, which an unverified app cannot grant. The seven-service `-s` list stays under the ~25-scope cap.
+Never pass `--full` or the default `recommended` preset on a personal `@gmail.com` account — those expand to 80+ scopes including pubsub and cloud-platform, which an unverified app cannot grant. The seven-service list stays under the ~25-scope cap.
+
+## Adding another account later
+
+When the user wants to connect an **additional** Google account (one OAuth client can authorize many accounts), there's no new project, connector, or `gcloud` work — the existing `google-workspace-oauth` connector / Cloud project is re-used. Just:
+
+1. Ask the user for a **tag** for the new account ("What should I call this one?").
+2. If the Cloud app is still in testing mode, the new account's email must be a **Test user** on the OAuth consent screen, or consent will fail. Give them the consent-screen URL to add it (substitute the project id):
+   `https://console.cloud.google.com/apis/credentials/consent?project=<PROJECT_ID>`
+3. Call `skill_run google-account-login` with the new tag (NOT `adopt`):
+
+   ```text
+   skill_run {
+     skill: "google-account-login",
+     script: "account-login",
+     args: { tag: "<new tag>", services: ["drive","gmail","calendar","docs","sheets","meet","forms"] }
+   }
+   ```
+
+This signs the second account into its own config dir and registers it alongside the first.
+
+## Adopting the existing sign-in
+
+If `~/.config/gws` already has a signed-in session (e.g. from a pre-existing `gws` setup) and you just want to register it as a tagged account WITHOUT a fresh login, call `skill_run google-account-login` with `adopt: true`:
+
+```text
+skill_run {
+  skill: "google-account-login",
+  script: "account-login",
+  args: { tag: "<tag>", adopt: true }
+}
+```
+
+This records the default-dir session in place — it never opens the browser and never touches `~/.config/gws`'s tokens. It fails if that dir has no live session.
 
 ## Step 7 — Stop the per-call approval prompt (optional)
 
@@ -332,13 +339,13 @@ If that returns JSON without an auth error, the setup is complete. Resume the us
 
 ## Rules
 
-1. Walk this skill end-to-end on **first-time** setup. Do not skip to `request_connector` or `gws auth login` without the install + project + APIs in place. The one exception is the **re-auth** path (Step 0): when the `google-workspace-oauth` connector already exists, `gws auth login` alone is the whole job — `gcloud`, project creation, and `request_connector` are provisioning-only and must not re-run.
-2. **Sign-in is a human-in-the-loop step.** Never attempt to type the user's email or password. `gcloud auth login` and `gws auth login` both open the default browser — wait for the command to return.
+1. Walk this skill end-to-end on **first-time** setup. Do not skip to `request_connector` or the `google-account-login` skill without the install + project + APIs in place. The one exception is the **re-auth** path (Step 0): when the `google-workspace-oauth` connector already exists, `skill_run google-account-login` alone is the whole job — `gcloud`, project creation, and `request_connector` are provisioning-only and must not re-run.
+2. **Sign-in is a human-in-the-loop step.** Never attempt to type the user's email or password. `gcloud auth login` and the `google-account-login` script both open the default browser — wait for the command (or `skill_run`) to return.
 3. **Capture credentials through the inline form, not files.** Always use `request_connector { provider: "google-oauth-desktop" }`. Never ask the user for a path to `client_secret.json`, never write a JSON file under `~/.config/gws/`, and never `cat` or echo the credentials back into chat.
 4. **Enable all seven Workspace APIs in Step 4 regardless of which product triggered setup.** One `gcloud services enable` call covers them all; this lets the user pivot to another product later without re-running setup.
 5. **Status messages are action-oriented and ungrouped.** Do not list "Installed gws, installed gcloud, signed in, created project, enabled APIs." The user sees a chat bubble per milestone (confirm setup, last-step form, done) — not a retrospective changelog.
 6. **Fail gracefully.** If `gcloud` errors with `PERMISSION_DENIED` or `ALREADY_EXISTS`, surface the error verbatim and ask the user. If an install fails, STOP — do not retry in a loop, hand off to the user with the one-line manual command.
-7. **`gws auth login -s` includes every service we enabled APIs for in Step 4, not just the one the user happened to ask about.** Google's consent screen renders each scope as its own checkbox row in testing mode — the user picks there. Narrowing `-s` based on the current request silently locks the user out of the other six surfaces; they'd have to re-run setup the next time they want anything else. The only time you narrow is when the user explicitly says so ("read-only," "Gmail only," etc.).
+7. **The `services` you pass to `google-account-login` include every service we enabled APIs for in Step 4, not just the one the user happened to ask about.** Google's consent screen renders each scope as its own checkbox row in testing mode — the user picks there. Narrowing `services` based on the current request silently locks the user out of the other six surfaces; they'd have to re-run setup the next time they want anything else. The only time you narrow is when the user explicitly says so ("read-only," "Gmail only," etc.).
 8. If the user is in a CI or headless environment, point them at the export flow (`gws auth export --unmasked > credentials.json` on a desktop machine, then `GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=…` on the headless one).
 
 ## Manual Fallback
