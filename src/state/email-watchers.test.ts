@@ -339,10 +339,13 @@ describe("shared backing job lifecycle", () => {
     expect(w2.jobId).toBe(sharedJobId);
 
     // An ORPHAN duplicate gmail-watch job (watches:[]) with its own session — the
-    // residue of a pre-atomicity-fix race.
-    const orphanSession = await mutateState(config.instance, (state) =>
-      createChatSession(state, "Email watch: stale@x.com", undefined, undefined, "job", "channel")
-    );
+    // residue of a pre-atomicity-fix race. The session carries the email-watch
+    // feature marker the way every real shared session does.
+    const orphanSession = await mutateState(config.instance, (state) => {
+      const created = createChatSession(state, "Email watch: stale@x.com", undefined, undefined, "job", "channel");
+      created.feature = "email-watch";
+      return created;
+    });
     const orphanJob = await createScheduledJob(config, {
       name: "Email watch",
       prompt: "stale",
@@ -354,13 +357,18 @@ describe("shared backing job lifecycle", () => {
 
     // The shared session AND job were ADOPTED from old per-sender code and never
     // renamed (both keep the "Email watch: <sender>" label the sidebar renders),
-    // plus a truly-orphan "Email watch: <sender>" channel referenced by nothing
-    // (its job was already removed out-of-band).
-    const trulyOrphanChannel = await mutateState(config.instance, (state) => {
+    // plus a truly-orphan (marker-carrying) "Email watch: <sender>" channel
+    // referenced by nothing (its job was already removed out-of-band). A DECOY
+    // channel is titled like an email-watch channel but carries NO feature
+    // marker — it must survive (proves cleanup is identity-based, not by title).
+    const { trulyOrphanChannel, decoyChannel } = await mutateState(config.instance, (state) => {
       renameChatSession(state, sharedSessionId, "Email watch: alice@x.com");
       const sharedJobRecord = state.jobs.find((j) => j.id === sharedJobId);
       if (sharedJobRecord) sharedJobRecord.name = "Email watch: alice@x.com";
-      return createChatSession(state, "Email watch: bob@x.com", undefined, undefined, "job", "channel");
+      const orphan = createChatSession(state, "Email watch: bob@x.com", undefined, undefined, "job", "channel");
+      orphan.feature = "email-watch";
+      const decoy = createChatSession(state, "Email watch: decoy@x.com", undefined, undefined, "job", "channel");
+      return { trulyOrphanChannel: orphan, decoyChannel: decoy };
     });
 
     await backfillEmailWatcherJobs(config);
@@ -375,16 +383,19 @@ describe("shared backing job lifecycle", () => {
     // The adopted job's name was renamed to the canonical "Email watch" so the
     // sidebar (which renders job.name) no longer shows "Email watch: <sender>".
     expect(gmailJobs[0]!.name).toBe("Email watch");
-    // Exactly ONE email-watch session, titled exactly "Email watch" (adopted
-    // title renamed); the orphan job's session + the truly-orphan channel swept.
-    const emailSessions = state.chatSessions.filter(
-      (s) => s.title === "Email watch" || /^Email watch:/.test(s.title)
-    );
+    // Exactly ONE MARKED email-watch session, titled exactly "Email watch"
+    // (adopted title renamed + marker backfilled); the orphan job's session + the
+    // marker-carrying truly-orphan channel swept by identity.
+    const emailSessions = state.chatSessions.filter((s) => s.feature === "email-watch");
     expect(emailSessions).toHaveLength(1);
     expect(emailSessions[0]!.id).toBe(sharedSessionId);
     expect(emailSessions[0]!.title).toBe("Email watch");
+    expect(emailSessions[0]!.feature).toBe("email-watch");
     expect(state.chatSessions.some((s) => s.id === orphanSession.id)).toBe(false);
     expect(state.chatSessions.some((s) => s.id === trulyOrphanChannel.id)).toBe(false);
+    // The decoy — titled like an email-watch channel but WITHOUT the marker — is
+    // NOT swept: cleanup matches by identity (feature marker), not by title.
+    expect(state.chatSessions.some((s) => s.id === decoyChannel.id)).toBe(true);
     // Watchers still point at the shared job + session.
     expect(getEmailWatcher(config, w1.id)?.jobId).toBe(sharedJobId);
     expect(getEmailWatcher(config, w2.id)?.jobId).toBe(sharedJobId);
@@ -397,7 +408,7 @@ describe("shared backing job lifecycle", () => {
     const after = readState(config.instance);
     expect(after.jobs).toHaveLength(jobsBefore);
     expect(after.chatSessions).toHaveLength(sessionsBefore);
-    expect(after.chatSessions.filter((s) => /^Email watch/.test(s.title))).toHaveLength(1);
+    expect(after.chatSessions.filter((s) => s.feature === "email-watch")).toHaveLength(1);
   });
 });
 

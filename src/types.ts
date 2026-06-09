@@ -863,6 +863,14 @@ export interface ChatSessionRecord {
   // sessions may leave this undefined; the new UI treats undefined as
   // hidden.
   kind?: "agent" | "channel";
+  // Stable marker identifying a channel as belonging to the email-watch
+  // feature, used for PRECISE identity-based cleanup of orphan email-watch
+  // channels — NOT title-based matching (which could catch an unrelated
+  // channel that merely happens to be titled "Email watch: ..."). Set when
+  // the shared email-watch session is created and backfilled by the
+  // self-heal migration. DISTINCT from `source` (messaging-bridge routing).
+  // Optional, so legacy sessions just lack it — no normalizeState backfill.
+  feature?: "email-watch";
 }
 
 // `lastInboundMessageId` is the most recent originating-message id the
