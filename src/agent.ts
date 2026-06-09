@@ -89,7 +89,7 @@ import {
   finalizeAssistantText,
   resolveEmitContext
 } from "./execution/chat-task-emit";
-import { approvalToolCallId } from "./execution/tool-dispatch";
+import { approvalToolCallId, capToolResultText } from "./execution/tool-dispatch";
 import { findSelfOperation } from "./execution/self-registry";
 import { redactSensitiveToolArgs } from "./execution/tool-args-redact";
 import { resolveApprovalPolicy, type PolicyAction } from "./execution/policy";
@@ -1552,13 +1552,18 @@ async function executeApprovedAction(
     // effect that already wrote its normal audit row. Pass
     // `shouldResumeChat: false` to `runApprovedAction` and call
     // `resumeChatTask` AFTER releasing.
-    const result = await runApprovedAction(config, approval, guardController!.signal, {
+    const rawResult = await runApprovedAction(config, approval, guardController!.signal, {
       shouldResumeChat: false,
       extraEvidence,
       chatToolCallId
     });
     releaseApproval(config.instance, approval.id);
     guardController = undefined;
+    // The approved side effect's result becomes a role:"tool" message via
+    // resumeChatTask, a path that does NOT pass through dispatchToolCall's
+    // cap. Apply the same universal per-tool ceiling here so a large
+    // terminal/self-op result can't dominate the model context.
+    const result = typeof rawResult === "string" ? capToolResultText(rawResult, approval.action) : rawResult;
     if (shouldResumeChat && chatToolCallId && approval.taskId && typeof result === "string") {
       await resumeChatTask(config, approval.taskId, chatToolCallId, result);
     }

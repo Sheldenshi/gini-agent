@@ -92,6 +92,41 @@ export type DispatchResult =
   | { kind: "sync"; result: string }
   | { kind: "pending"; approvalId: string };
 
+// Universal ceiling on a single tool result, mirroring Codex's per-call
+// truncation. Most tools already self-cap well below this (browser 32k,
+// file/web/mcp 12k chars), but a few (read_skill, vision_query,
+// search_history, db_schema, file_list/search, subagent summaries) are
+// uncapped — a single huge result could otherwise dominate the model
+// context and sit inside the in-loop elision's protected-recent window.
+// 40k chars ≈ 10k tokens (the chars/4 estimate). It sits ABOVE the
+// browser 32k self-cap so nothing that works today regresses.
+const MAX_TOOL_RESULT_CHARS = 40_000;
+
+// Cap a single tool result to MAX_TOOL_RESULT_CHARS, truncating middle-out.
+//
+// Performance-safe by construction: for every result at or under the cap
+// this is a single `.length` compare that returns the SAME string
+// reference unchanged, so normal agent behavior is byte-identical and
+// there is zero quality or runtime cost on the common path. Only the rare
+// oversized outlier pays a substring. Truncation is middle-out — keep the
+// head (where a tool's summary/header usually lives) and the tail (where
+// closing structure/totals usually live) and drop the middle — so quality
+// degrades minimally, and the marker tells the model exactly how to
+// recover the omitted middle. This is an ADDITIONAL ceiling on top of each
+// tool's own cap, never a replacement for it.
+export function capToolResultText(result: string, toolName: string): string {
+  if (result.length <= MAX_TOOL_RESULT_CHARS) return result;
+  const elided = result.length - MAX_TOOL_RESULT_CHARS;
+  const marker = `\n\n[... ${elided} characters elided from ${toolName} to fit the context window. Re-run this tool with a narrower scope (offset/limit or a more specific query) to see the omitted middle. ...]\n\n`;
+  // Reserve room for the marker, then split the remaining budget ~60% head
+  // / ~40% tail. Floor on both ends keeps the final string at or under the
+  // cap even after the marker is inserted.
+  const budget = Math.max(0, MAX_TOOL_RESULT_CHARS - marker.length);
+  const headLen = Math.floor(budget * 0.6);
+  const tailLen = budget - headLen;
+  return `${result.slice(0, headLen)}${marker}${result.slice(result.length - tailLen)}`;
+}
+
 // A tool failure whose model-facing message (the thrown `message`, fed back
 // as the tool result so the model can steer itself) differs from what the
 // user should see in the chat UI. `displayMessage` is the short, calm line
@@ -109,10 +144,31 @@ export class ToolDisplayError extends Error {
   }
 }
 
-// Top-level entry. Routes the tool call to its handler. Throws on unknown
+// Top-level entry. Routes the tool call to its handler and caps any sync
+// result at the universal per-tool ceiling so a single oversized result
+// can't dominate the model context. The cap lives at this boundary so
+// EVERY caller (chat-task loop, subagents) is covered once, regardless of
+// which tool ran. Pending/approval results pass through untouched — the
+// approval path caps its result string separately when it resumes the
+// loop (see agent.executeApprovedAction).
+export async function dispatchToolCall(
+  config: RuntimeConfig,
+  taskId: string,
+  toolName: string,
+  toolCallId: string,
+  rawArgs: string,
+  messageHistory?: readonly unknown[]
+): Promise<DispatchResult> {
+  const result = await dispatchToolCallInner(config, taskId, toolName, toolCallId, rawArgs, messageHistory);
+  return result.kind === "sync"
+    ? { kind: "sync", result: capToolResultText(result.result, toolName) }
+    : result;
+}
+
+// Routes the tool call to its handler. Throws on unknown
 // tool names so the loop can surface that to the model as an error
 // (instead of silently ignoring a hallucinated tool).
-export async function dispatchToolCall(
+async function dispatchToolCallInner(
   config: RuntimeConfig,
   taskId: string,
   toolName: string,
