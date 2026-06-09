@@ -337,6 +337,100 @@ describe("runtime api", () => {
     expect(response.status).toBe(400);
   });
 
+  test("POST /api/agents/:id/provider sets the agent's provider and /status reflects it", async () => {
+    const config = testConfig("agents-set-provider");
+    const handler = createHandler(config);
+    const created = await call(handler, config, "/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "research" })
+    });
+    await call(handler, config, `/api/agents/${created.id}/use`, { method: "POST" });
+
+    const updated = await call(handler, config, `/api/agents/${created.id}/provider`, {
+      method: "POST",
+      body: JSON.stringify({ providerName: "openai", model: "gpt-4o" })
+    });
+    expect(updated.providerName).toBe("openai");
+    expect(updated.model).toBe("gpt-4o");
+
+    // The override drives inference: the active-agent block resolves the
+    // agent's provider, not the instance default (echo in this config).
+    const status = await call(handler, config, "/api/status");
+    expect(status.activeAgent.resolvedProvider.name).toBe("openai");
+    expect(status.activeAgent.resolvedProvider.model).toBe("gpt-4o");
+    expect(status.activeAgent.providerSource).toBe("agent");
+  });
+
+  test("POST /api/agents/:id/provider with blank fields clears the override", async () => {
+    const config = testConfig("agents-clear-provider");
+    const handler = createHandler(config);
+    const created = await call(handler, config, "/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "research", providerName: "openai", model: "gpt-4o" })
+    });
+    await call(handler, config, `/api/agents/${created.id}/use`, { method: "POST" });
+
+    const cleared = await call(handler, config, `/api/agents/${created.id}/provider`, {
+      method: "POST",
+      body: JSON.stringify({ providerName: "", model: "" })
+    });
+    expect(cleared.providerName).toBeUndefined();
+    expect(cleared.model).toBeUndefined();
+
+    // With no agent override, the active-agent block falls back to the
+    // instance provider (echo) and reports the instance source.
+    const status = await call(handler, config, "/api/status");
+    expect(status.activeAgent.providerSource).toBe("instance");
+    expect(status.activeAgent.resolvedProvider.name).toBe("echo");
+  });
+
+  test("POST /api/agents/:id/provider returns 404 for an unknown agent", async () => {
+    const config = testConfig("agents-set-provider-missing");
+    const handler = createHandler(config);
+    const response = await rawCall(
+      handler,
+      config,
+      "/api/agents/agent_does_not_exist/provider",
+      { method: "POST", body: JSON.stringify({ providerName: "openai", model: "gpt-4o" }) },
+      config.token
+    );
+    expect(response.status).toBe(404);
+  });
+
+  test("POST /api/agents/:id/provider returns 400 for a lone providerName", async () => {
+    const config = testConfig("agents-set-provider-partial");
+    const handler = createHandler(config);
+    const created = await call(handler, config, "/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "research" })
+    });
+    const response = await rawCall(
+      handler,
+      config,
+      `/api/agents/${created.id}/provider`,
+      { method: "POST", body: JSON.stringify({ providerName: "openai" }) },
+      config.token
+    );
+    expect(response.status).toBe(400);
+  });
+
+  test("POST /api/agents/:id/provider returns 400 for an unknown provider", async () => {
+    const config = testConfig("agents-set-provider-unknown");
+    const handler = createHandler(config);
+    const created = await call(handler, config, "/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "research" })
+    });
+    const response = await rawCall(
+      handler,
+      config,
+      `/api/agents/${created.id}/provider`,
+      { method: "POST", body: JSON.stringify({ providerName: "bogus", model: "x" }) },
+      config.token
+    );
+    expect(response.status).toBe(400);
+  });
+
   test("supports relay degraded health and notification delivery records", async () => {
     const config = testConfig("relay-notifications");
     const handler = createHandler(config);

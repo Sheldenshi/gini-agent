@@ -1,6 +1,6 @@
 import { cn } from "@/lib/utils";
 
-export type ChatTab = "messages" | "threads" | "jobs";
+export type ChatTab = "messages" | "threads" | "jobs" | "settings";
 
 interface TabSpec {
   id: ChatTab;
@@ -11,24 +11,29 @@ interface TabSpec {
 // Chat tab bar — design `i2BaA`. The active tab gets a 2px white bottom
 // border; inactive labels are muted. Threads/Jobs carry an optional count
 // pill. Underline lives on the label row so it hugs the text width like the
-// design.
+// design. Jobs and Settings are per-agent surfaces; the caller hides Jobs on
+// channels and Settings on any pinned session (both can show another agent's
+// session), so their visibility flags are passed separately.
 export function ChatTabBar({
   active,
   onChange,
   threadCount,
   jobCount,
-  hideJobsTab
+  hideJobsTab,
+  hideSettingsTab
 }: {
   active: ChatTab;
   onChange: (tab: ChatTab) => void;
   threadCount?: number;
   jobCount?: number;
   hideJobsTab?: boolean;
+  hideSettingsTab?: boolean;
 }) {
   const tabs: TabSpec[] = [
     { id: "messages", label: "Messages" },
     { id: "threads", label: "Threads", count: threadCount },
-    ...(hideJobsTab ? [] : [{ id: "jobs", label: "Jobs", count: jobCount } as TabSpec])
+    ...(hideJobsTab ? [] : [{ id: "jobs", label: "Jobs", count: jobCount } as TabSpec]),
+    ...(hideSettingsTab ? [] : [{ id: "settings", label: "Settings" } as TabSpec])
   ];
   return (
     <div className="flex shrink-0 items-end gap-1.5 border-b border-border px-7">

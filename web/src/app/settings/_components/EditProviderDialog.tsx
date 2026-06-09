@@ -18,7 +18,7 @@ import { BedrockModelSelect } from "./BedrockModelSelect";
 import { BedrockRegionSelect } from "./BedrockRegionSelect";
 import { api } from "@/lib/api";
 import type { ProviderConfig } from "@runtime/types";
-import { displayProviderName, type ProviderCatalogItem } from "./ProviderCard";
+import { displayProviderName, type ProviderCatalogItem } from "@/lib/providers";
 
 interface SetProviderResult {
   ok: boolean;

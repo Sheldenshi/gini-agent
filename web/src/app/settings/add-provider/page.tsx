@@ -19,7 +19,7 @@ import { AnthropicLogo, AzureLogo, BedrockLogo, DeepSeekLogo, OllamaLogo, OpenAI
 import { BedrockModelSelect } from "../_components/BedrockModelSelect";
 import { BedrockRegionSelect } from "../_components/BedrockRegionSelect";
 import { api } from "@/lib/api";
-import { displayProviderName, type ProviderCatalogItem } from "../_components/ProviderCard";
+import { displayProviderName, type ProviderCatalogItem } from "@/lib/providers";
 
 // Codex stays first so it lines up with where the Settings list shows
 // its row. Echo is dev-only and never appears here.
