@@ -66,8 +66,11 @@ export default function AddProviderPage() {
   // baseUrl is shared: optional first-party/proxy override for anthropic and
   // OpenAI-compatible providers, and the required resource endpoint for azure.
   const [baseUrl, setBaseUrl] = useState("");
-  // AWS region for the bedrock provider; the picker defaults to us-east-1.
-  const [awsRegion, setAwsRegion] = useState("us-east-1");
+  // AWS region for the bedrock provider. Empty by default so a save that doesn't
+  // touch it persists no region and the runtime resolves AWS_REGION /
+  // AWS_DEFAULT_REGION / us-east-1 at request time (matching `gini provider set`).
+  // The picker shows a "Select a region" placeholder until one is chosen.
+  const [awsRegion, setAwsRegion] = useState("");
   // Azure transport fields. The rest default server-side when blank.
   const [apiVersion, setApiVersion] = useState("");
   const [deployment, setDeployment] = useState("");
@@ -88,7 +91,7 @@ export default function AddProviderPage() {
     setSelectedModel(entry?.models[0] ?? "");
     setApiKey("");
     setBaseUrl("");
-    setAwsRegion("us-east-1");
+    setAwsRegion("");
     setApiVersion("");
     setDeployment("");
     setAuthScheme("api-key");
