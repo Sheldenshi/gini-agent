@@ -1881,7 +1881,10 @@ function bedrockConverseUrl(region: string, modelId: string, stream: boolean): s
 function bedrockAuthHeaders(region: string, url: string, body: string): Record<string, string> {
   const credentials = resolveAwsCredentials();
   if (!credentials) {
-    throw new Error(
+    // Typed so the chat-task classifier routes it to the AWS reauth CTA
+    // (providerReauth("bedrock") → kind "aws") instead of a generic failure.
+    throw new ProviderAuthError(
+      "bedrock",
       "bedrock provider needs AWS credentials but none resolved (set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY or ~/.aws/credentials)."
     );
   }

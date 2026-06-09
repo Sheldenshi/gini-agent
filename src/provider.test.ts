@@ -18,6 +18,7 @@ import {
   providerAuthNote,
   providerCatalog,
   providerCatalogWithStatus,
+  ProviderAuthError,
   providerDisplayLabel,
   providerHealth,
   providerReauth,
@@ -4471,9 +4472,15 @@ describe("anthropic provider", () => {
       const health = providerHealth(config(provider));
       expect(health.configured).toBe(false);
       expect(health.message).toMatch(/Set AWS credentials/);
-      await expect(
-        generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], [])
-      ).rejects.toThrow(/needs AWS credentials/);
+      // Must surface as a typed ProviderAuthError("bedrock") so the chat-task
+      // classifier routes it to the AWS reauth CTA, not a generic failure.
+      const err = await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], []).catch(
+        (e) => e
+      );
+      expect(err).toBeInstanceOf(ProviderAuthError);
+      expect((err as ProviderAuthError).provider).toBe("bedrock");
+      expect((err as Error).message).toMatch(/needs AWS credentials/);
+      expect(providerReauth("bedrock")).toEqual({ kind: "aws", url: "/settings" });
     } finally {
       fetchStub.restore();
       restoreProfile();
