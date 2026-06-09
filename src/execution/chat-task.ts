@@ -1569,7 +1569,14 @@ async function runLoop(
     if (!parent) return "no-parent"; // First-ever turn — stay in main chat.
     const threadId = makeId("thread");
     const parentBlockId = parent.id;
+    const mainCtx = emitCtx; // Pre-switch (main) context — no threadId.
     emitCtx = { ...emitCtx, threadId, parentBlockId };
+    // The turn began in the main chat (user_text + a "Thinking" phase already
+    // landed there) but its visible work now moves to the thread. Close the
+    // main chat's in-flight phase here so it can't strand on "Thinking" — the
+    // turn's own terminal phase (Completed/Cancelled/Failed) is emitted into
+    // the thread from this point on and never reaches the main chat.
+    emitPhase(mainCtx, "Completed");
     await mutateState(config.instance, (state) => {
       const item = state.tasks.find((t) => t.id === taskId);
       if (item) {

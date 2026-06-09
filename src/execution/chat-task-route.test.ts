@@ -157,6 +157,18 @@ describe("chat-task route directive", () => {
     // (c) The thread id is persisted on the task.
     expect(finished.threadId).toBe(threadId);
     expect(finished.parentBlockId).toBe(parentBlockId);
+
+    // (d) The main chat's in-flight indicator is closed, not stranded on
+    //     "Thinking". The turn opened a "Thinking" phase in the main chat
+    //     before its work moved to the thread, so the switch must close it
+    //     with a TERMINAL phase the client recognizes ("Completed") — the
+    //     turn's own terminal phase lands in the thread and never reaches main.
+    const mainAfter = listMainChatBlocks(config.instance, sessionId);
+    const lastMainPhase = [...mainAfter].reverse().find((b) => b.kind === "phase");
+    expect(lastMainPhase).toBeDefined();
+    expect(lastMainPhase!.kind === "phase" && lastMainPhase!.label).toBe("Completed");
+    // The answer stays in the thread — the main chat carries none of it.
+    expect(mainAfter.some((b) => b.kind === "assistant_text" && b.taskId === second.taskId)).toBe(false);
   });
 
   test("<route>chat</route> stays in the main chat and strips the directive", async () => {
@@ -310,6 +322,15 @@ describe("chat-task route directive", () => {
     expect(finished.parentBlockId).toBe(parentBlockId);
     const threadBlocks = listThreadBlocks(config.instance, sessionId, threadId!);
     expect(threadBlocks.length).toBeGreaterThan(0);
+
+    // The main chat's in-flight phase is closed with a TERMINAL "Completed"
+    // marker when the turn switches to a thread, so its indicator can't strand
+    // on "Thinking"; the answer itself lives only in the thread.
+    const mainAfter = listMainChatBlocks(config.instance, sessionId);
+    const lastMainPhase = [...mainAfter].reverse().find((b) => b.kind === "phase");
+    expect(lastMainPhase).toBeDefined();
+    expect(lastMainPhase!.kind === "phase" && lastMainPhase!.label).toBe("Completed");
+    expect(mainAfter.some((b) => b.kind === "assistant_text" && b.taskId === second.taskId)).toBe(false);
   });
 
   test("start_thread with no prior assistant stays in the main chat", async () => {
