@@ -17,6 +17,7 @@ This is the long-form version of the short list in the [README](README.md#roadma
 - ✅ **Paired-device auth.** Mobile bootstrap contract and device records are in place so a future mobile client can pair once and hold its own token.
 - ✅ **Instance-local snapshots.** Snapshots and promotion proposal records preserve the "before trying a candidate" state.
 - ✅ **Hermes / OpenClaw parity primitives.** Memory, skills, jobs, search, providers, toolsets, subagents, MCP records, messaging records, and import inspection.
+- ✅ **Pre-run job hooks + email watcher.** A domain-agnostic pre-run hook primitive (`src/hooks/`) runs a trusted, deterministic step before a model turn — short-circuiting it or injecting fenced context — with the scheduler as its first consumer. The email watcher is the first feature built on it: one shared recurring job per agent watches senders via a bundled `gmail-watch` skill script and drafts replies for review (never auto-sends). See [Pre-LLM Job Hooks](docs/adr/job-pre-run-hooks.md) and [Email Watch](docs/adr/email-watch.md).
 
 ## Planned
 
