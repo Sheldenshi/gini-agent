@@ -8,7 +8,7 @@
 // The current value is always reachable: if it isn't one of the catalog ids the
 // picker opens in custom mode with that value prefilled.
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Input } from "@/components/ui/input";
 import {
   Select,
@@ -78,6 +78,14 @@ export function BedrockModelSelect({
   const groups = groupBedrockModels(models);
   const isKnown = models.includes(value);
   const [custom, setCustom] = useState(!isKnown && value.trim() !== "");
+
+  // Resync the custom-mode flag when the controlled value (or catalog) changes
+  // externally — e.g. a background status refetch resets the edit form. Keyed on
+  // value/models, it never fires on the in-component "Custom…" toggle (which
+  // leaves value untouched), so it can't yank the user out of custom mode.
+  useEffect(() => {
+    setCustom(!models.includes(value) && value.trim() !== "");
+  }, [value, models]);
 
   const handleSelect = (next: string) => {
     if (next === CUSTOM) {

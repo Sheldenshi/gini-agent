@@ -7,7 +7,7 @@
 // covers anything not enumerated (other GovCloud/opt-in regions, new ones), and
 // a value not in the list opens the picker in custom mode prefilled.
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Input } from "@/components/ui/input";
 import {
   Select,
@@ -46,6 +46,14 @@ export function BedrockRegionSelect({
   triggerClassName?: string;
 }) {
   const [custom, setCustom] = useState(!ALL_REGIONS.has(value) && value.trim() !== "");
+
+  // Resync the custom-mode flag when the controlled value changes externally
+  // (e.g. a background status refetch resets the edit form). Keyed on value, it
+  // never fires on the in-component "Custom region…" toggle (which leaves value
+  // untouched), so it can't yank the user out of custom mode.
+  useEffect(() => {
+    setCustom(!ALL_REGIONS.has(value) && value.trim() !== "");
+  }, [value]);
 
   const handleSelect = (next: string) => {
     if (next === CUSTOM) {
