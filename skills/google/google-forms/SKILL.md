@@ -5,7 +5,7 @@ license: MIT
 compatibility: "macOS and Linux. Requires the `gws` CLI authenticated with Forms scopes."
 metadata:
   gini:
-    version: 1.1.0
+    version: 1.1.1
     author: Gini
     platforms: [macos, linux]
     prerequisites:
@@ -33,6 +33,16 @@ Use `gws forms` to create new forms, add questions to them, change publish setti
   - Read form structure only (e.g. mapping `questionId → title` for summaries): `forms.body.readonly`
   - Read submitted responses: `forms.responses.readonly`
   - Summarize responses by question text: `forms.responses.readonly` AND `forms.body.readonly` (or `forms.body`). `forms.responses.readonly` is NOT on `forms.get`'s authorized scope list — you need a body scope to fetch the structure separately.
+
+## Selecting a Google account
+
+The connected Google accounts (each with its tag, email, and config dir) are listed in your system context under **"Connected Google accounts"**. To target a specific account, prefix the command with its config dir:
+
+```bash
+GOOGLE_WORKSPACE_CLI_CONFIG_DIR="<configDir>" gws forms forms create --json '{"info":{"title":"Survey"}}'
+```
+
+Selection rule: one account connected → just use it. Two or more → use the one the user named or clearly implied (an explicit tag, an email address, or unambiguous context); if you can't tell which one they mean, ASK before running — never guess on writes (sends, deletes, edits). If no accounts are connected yet, fall back to the setup flow in Prerequisites (`read_skill` with `google-workspace-setup`).
 
 ## When to Use
 
