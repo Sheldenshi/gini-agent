@@ -92,6 +92,7 @@ Usage:
   bun run gini jobs list|add|run|pause|resume|remove|runs|replay
   bun run gini email list|add --from <sender>|remove <id>
   bun run gini connectors list|providers|add|remove|rotate|health
+  bun run gini connector accounts list|retag <id> --tag <tag>|remove <id>|add
   bun run gini improvements list|propose|approve|reject
   bun run gini pairing create|claim
   bun run gini devices list|revoke
