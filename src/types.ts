@@ -1715,6 +1715,37 @@ export interface ConnectorRecord {
     services?: Record<string, boolean>;
     message: string;
   };
+  // Transient, API-enrichment-only. Never persisted to state — GET
+  // /api/connectors attaches the machine-global tagged Google accounts
+  // (each with live `gws auth status` per its config dir) to
+  // google-oauth-desktop records, alongside `session`, so clients can
+  // show the connected accounts. The accounts registry itself lives
+  // machine-globally under ~/.gini/google-accounts (src/state/google-accounts.ts);
+  // the connector keeps holding only the OAuth *client* creds.
+  accounts?: GoogleAccountStatus[];
+}
+
+// A tagged Google account in the machine-global registry. Account identity ==
+// its `gws` config dir (GOOGLE_WORKSPACE_CLI_CONFIG_DIR); one OAuth client can
+// authorize many accounts (each its own config dir). Persisted under
+// ~/.gini/google-accounts/accounts.json. See src/state/google-accounts.ts.
+export interface GoogleAccount {
+  id: string;          // stable slug, e.g. "gacct_<rand>"
+  tag: string;         // user label: "personal" | "work" | "school" | ...
+  email: string;       // signed-in email from `gws auth status` .user ("" until known)
+  configDir: string;   // absolute path to this account's gws config dir
+  addedAt: string;     // ISO
+}
+
+// A registry account enriched with its live `gws auth status` (per config dir).
+// `services` mirrors the connector `session.services` shape — keyed by the
+// google-* skill suffix (calendar, gmail, drive, docs, sheets, forms, meet) —
+// and is typed as Record<string, boolean> rather than importing GwsService from
+// the connectors layer so this foundational types module stays import-free.
+export interface GoogleAccountStatus extends GoogleAccount {
+  signedIn: boolean;
+  services: Record<string, boolean>;
+  message: string;
 }
 
 export interface ImprovementProposal {

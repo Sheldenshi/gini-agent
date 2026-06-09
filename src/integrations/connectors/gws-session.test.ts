@@ -8,15 +8,17 @@ import { parseGwsAuthStatus } from "./gws-session";
 
 describe("parseGwsAuthStatus", () => {
   test("signed in when token_valid is true; scopes map to per-service grants", () => {
+    const scopes = [
+      "https://www.googleapis.com/auth/calendar",
+      "https://www.googleapis.com/auth/gmail.modify"
+    ];
     const status = parseGwsAuthStatus(
       JSON.stringify({
         client_config_exists: true,
         token_valid: true,
         has_refresh_token: true,
-        scopes: [
-          "https://www.googleapis.com/auth/calendar",
-          "https://www.googleapis.com/auth/gmail.modify"
-        ]
+        user: "me@example.com",
+        scopes
       })
     );
     expect(status).toEqual({
@@ -24,6 +26,8 @@ describe("parseGwsAuthStatus", () => {
       clientConfigured: true,
       signedIn: true,
       services: { calendar: true, gmail: true, drive: false, docs: false, sheets: false, forms: false, meet: false },
+      scopes,
+      email: "me@example.com",
       message: "Signed in to Google"
     });
   });
@@ -70,8 +74,26 @@ describe("parseGwsAuthStatus", () => {
       clientConfigured: false,
       signedIn: false,
       services: { calendar: false, gmail: false, drive: false, docs: false, sheets: false, forms: false, meet: false },
+      scopes: [],
       message: "Google sign-in needed"
     });
+  });
+
+  test("surfaces the signed-in email from `user` and the raw scopes", () => {
+    const scopes = ["https://www.googleapis.com/auth/drive"];
+    const status = parseGwsAuthStatus(
+      JSON.stringify({ client_config_exists: true, token_valid: true, user: "work@corp.com", scopes })
+    );
+    expect(status.email).toBe("work@corp.com");
+    expect(status.scopes).toEqual(scopes);
+  });
+
+  test("absent `user` → email omitted; absent `scopes` → []", () => {
+    const status = parseGwsAuthStatus(
+      JSON.stringify({ client_config_exists: true, token_valid: true })
+    );
+    expect(status.email).toBeUndefined();
+    expect(status.scopes).toEqual([]);
   });
 
   test("non-JSON output (gws missing / errored) → not installed", () => {
@@ -81,6 +103,7 @@ describe("parseGwsAuthStatus", () => {
       clientConfigured: false,
       signedIn: false,
       services: { calendar: false, gmail: false, drive: false, docs: false, sheets: false, forms: false, meet: false },
+      scopes: [],
       message: "gws not installed"
     });
   });

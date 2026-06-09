@@ -41,6 +41,8 @@ import { runMessagingRemoveConnect } from "./execution/messaging-remove-connect"
 import { mobileBootstrap, publicState } from "./runtime/views";
 import { checkConnector, createConnector, credentialTemplateForProvider, deleteConnector, firstUngrantedCredential, isSkillActive, updateConnector } from "./integrations/connectors";
 import { gwsSessionStatus } from "./integrations/connectors/gws-session";
+import { listAccountsWithStatus, registerAccount, removeAccount, retagAccount } from "./integrations/connectors/google-accounts";
+import { getGoogleAccount } from "./state/google-accounts";
 import { listProviders } from "./integrations/connectors/registry";
 import { runConnectorDetection } from "./jobs/connector-detection";
 import { createScheduledJob, listJobRuns, removeJob, replayJobRun, runJobNow, updateJob, updateJobStatus } from "./jobs";
@@ -1382,12 +1384,16 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       // valid" (session). Health stays presence-only; this never feeds
       // the connector.request /complete drop path. Other providers are
       // returned untouched.
-      const session = connectors.some((c) => c.provider === "google-oauth-desktop")
-        ? await gwsSessionStatus()
-        : undefined;
+      const hasGoogle = connectors.some((c) => c.provider === "google-oauth-desktop");
+      const session = hasGoogle ? await gwsSessionStatus() : undefined;
+      // The tagged accounts registry is machine-global, so resolve it once and
+      // attach to every google-oauth-desktop record alongside `session`.
+      const accounts = hasGoogle ? await listAccountsWithStatus() : undefined;
       return json(
         connectors.map((c) =>
-          c.provider === "google-oauth-desktop" && session ? { ...c, session } : c
+          c.provider === "google-oauth-desktop" && session
+            ? { ...c, session, accounts }
+            : c
         )
       );
     }],
@@ -1460,6 +1466,43 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     // On-demand auto-detection — Skills page "Refresh detection" button
     // calls this. Same job that runs at gateway startup; idempotent.
     ["POST", /^\/api\/connectors\/detect$/, async () => json(await runConnectorDetection(config))],
+    // Machine-global tagged Google accounts (multi-account support). The
+    // registry + per-account gws config dirs live under ~/.gini/google-accounts;
+    // these routes are NOT instance-scoped. registerAccount throws
+    // "No signed-in Google session in <dir>" when the dir has no live session.
+    ["GET", /^\/api\/google\/accounts$/, async () => json(await listAccountsWithStatus())],
+    ["POST", /^\/api\/google\/accounts$/, async (request) => {
+      const payload = await body(request);
+      const tag = typeof payload.tag === "string" ? payload.tag.trim() : "";
+      const configDir = typeof payload.configDir === "string" ? payload.configDir.trim() : "";
+      if (!tag || !configDir) {
+        return json({ error: "Invalid input: tag and configDir are required" }, 400);
+      }
+      const adopt = payload.adopt === true;
+      try {
+        return json(await registerAccount({ tag, configDir, adopt }), 201);
+      } catch (err) {
+        return json({ error: err instanceof Error ? err.message : "Failed to register account" }, 400);
+      }
+    }],
+    ["PATCH", /^\/api\/google\/accounts\/([^/]+)$/, async (request, params) => {
+      const payload = await body(request);
+      const tag = typeof payload.tag === "string" ? payload.tag.trim() : "";
+      if (!tag) return json({ error: "Invalid input: tag is required" }, 400);
+      if (!getGoogleAccount(params[0])) {
+        return json({ error: `Google account not found: ${params[0]}` }, 404);
+      }
+      try {
+        retagAccount(params[0], tag);
+      } catch (err) {
+        return json({ error: err instanceof Error ? err.message : "Failed to retag account" }, 400);
+      }
+      return json(getGoogleAccount(params[0]));
+    }],
+    ["DELETE", /^\/api\/google\/accounts\/([^/]+)$/, (_request, params) => {
+      removeAccount(params[0]);
+      return json({ id: params[0] });
+    }],
     ["GET", /^\/api\/improvements$/, () => json(readState(config.instance).improvements)],
     ["POST", /^\/api\/improvements$/, async (request) => json(await proposeImprovement(config, await body(request)), 201)],
     ["POST", /^\/api\/improvements\/([^/]+)\/approve$/, async (_request, params) => json(await reviewImprovement(config, params[0], "approve"))],

@@ -29,6 +29,11 @@ export interface GwsSessionStatus {
   // google-* skill suffix. A partial consent (e.g. only Gmail) is still
   // signedIn:true but lights up only its own keys.
   services: Record<GwsService, boolean>;
+  // Signed-in account email (from `gws auth status` `.user`). Omitted when gws
+  // doesn't report one (signed out / not installed).
+  email?: string;
+  // The granted OAuth scopes (from `.scopes`); [] when absent.
+  scopes: string[];
   // Short human string for the UI / model.
   message: string;
 }
@@ -77,11 +82,14 @@ export function parseGwsAuthStatus(stdout: string): GwsSessionStatus {
   const scopes = Array.isArray(obj.scopes)
     ? obj.scopes.filter((s): s is string => typeof s === "string")
     : [];
+  const email = typeof obj.user === "string" && obj.user.length > 0 ? obj.user : undefined;
   return {
     installed: true,
     clientConfigured,
     signedIn,
     services: servicesFromScopes(scopes),
+    scopes,
+    ...(email ? { email } : {}),
     message: signedIn
       ? "Signed in to Google"
       : clientConfigured
@@ -96,6 +104,7 @@ function notInstalled(): GwsSessionStatus {
     clientConfigured: false,
     signedIn: false,
     services: servicesFromScopes([]),
+    scopes: [],
     message: "gws not installed"
   };
 }
@@ -112,6 +121,11 @@ const TTL_MS = 15_000;
 // profile could otherwise hang the connectors list until the HTTP idle timeout.
 const SPAWN_TIMEOUT_MS = 4_000;
 let cached: { at: number; promise: Promise<GwsSessionStatus> } | undefined;
+// Per-config-dir cache for multi-account status. Same TTL + in-flight-promise
+// sharing as `cached`, keyed by configDir so each tagged account spawns at most
+// one `gws auth status` per ~15s window even under concurrent /api/connectors
+// and /api/google/accounts reads.
+const cachedByDir = new Map<string, { at: number; promise: Promise<GwsSessionStatus> }>();
 
 // Resolve the current Google Workspace sign-in liveness. Cached ~15s. gws
 // missing / command error / timeout / non-JSON output → installed:false. Never
@@ -124,16 +138,33 @@ export function gwsSessionStatus(): Promise<GwsSessionStatus> {
   return promise;
 }
 
+// Sign-in liveness for a specific gws config dir (a tagged account). Same spawn
+// + cache semantics as `gwsSessionStatus`, but passes GOOGLE_WORKSPACE_CLI_CONFIG_DIR
+// so gws reads that account's token instead of the default ~/.config/gws.
+// Never rejects (best-effort, like the no-arg variant).
+export function gwsSessionStatusForDir(configDir: string): Promise<GwsSessionStatus> {
+  const now = Date.now();
+  const hit = cachedByDir.get(configDir);
+  if (hit && now - hit.at < TTL_MS) return hit.promise;
+  const promise = runGwsAuthStatus(configDir);
+  cachedByDir.set(configDir, { at: now, promise });
+  return promise;
+}
+
 // Runs `gws auth status` through a login shell so gws is on PATH (mirroring how
 // terminal_exec spawns in src/agent.ts), bounded by a kill-on-timeout. stdin is
-// ignored so neither the login shell nor gws can block waiting on input.
-async function runGwsAuthStatus(): Promise<GwsSessionStatus> {
+// ignored so neither the login shell nor gws can block waiting on input. When
+// `configDir` is supplied, GOOGLE_WORKSPACE_CLI_CONFIG_DIR is set so gws reads
+// that account's token; otherwise it reads the default config dir.
+async function runGwsAuthStatus(configDir?: string): Promise<GwsSessionStatus> {
   try {
     const proc = spawn(["zsh", "-lc", "gws auth status"], {
       stdin: "ignore",
       stdout: "pipe",
       stderr: "pipe",
-      env: { ...process.env }
+      env: configDir
+        ? { ...process.env, GOOGLE_WORKSPACE_CLI_CONFIG_DIR: configDir }
+        : { ...process.env }
     });
     const timeout = setTimeout(() => {
       try { proc.kill(); } catch { /* already exited */ }
@@ -157,7 +188,8 @@ async function runGwsAuthStatus(): Promise<GwsSessionStatus> {
   }
 }
 
-// Test seam: drop the cache so a unit test can assert fresh behavior.
+// Test seam: drop both caches so a unit test can assert fresh behavior.
 export function resetGwsSessionCache(): void {
   cached = undefined;
+  cachedByDir.clear();
 }
