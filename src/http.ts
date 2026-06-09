@@ -75,7 +75,7 @@ import { addMcpServer, checkMcpServer, invokeMcpTool, removeMcpServer } from "./
 import { addMessagingBridge, allowChat, checkMessagingBridge, denyChat, disableMessagingBridge, listAllowedChats, listMessagingMessages, receiveMessagingInput, rejectPendingChat, removeMessagingBridge, sendMessagingOutput } from "./integrations/messaging";
 import { inspectImportSource } from "./integrations/importers";
 import { providerCatalogWithStatus } from "./provider";
-import { createAgent, deleteAgent, listAgents, renameAgent, useAgent } from "./capabilities/agents";
+import { createAgent, deleteAgent, listAgents, renameAgent, setAgentProvider, useAgent } from "./capabilities/agents";
 import {
   approveSoul,
   approveUserProfile,
@@ -1661,6 +1661,10 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["GET", /^\/api\/agents$/, () => json(listAgents(config))],
     ["POST", /^\/api\/agents$/, async (request) => json(await createAgent(config, await body(request)), 201)],
     ["POST", /^\/api\/agents\/([^/]+)\/use$/, async (_request, params) => json(await useAgent(config, params[0]))],
+    // Select (or clear) this agent's provider/model. Body: { providerName, model }
+    // to set, or both blank/omitted to clear and fall back to the instance
+    // default. Credential setup stays on the instance-level setup/provider route.
+    ["POST", /^\/api\/agents\/([^/]+)\/provider$/, async (request, params) => json(await setAgentProvider(config, decodeURIComponent(params[0]), await body(request)))],
     ["PATCH", /^\/api\/agents\/([^/]+)$/, async (request, params) => json(await renameAgent(config, decodeURIComponent(params[0]), String((await body(request)).name ?? "")))],
     ["DELETE", /^\/api\/agents\/([^/]+)$/, async (_request, params) => json(await deleteAgent(config, params[0]))],
     ["GET", /^\/api\/parity\/hermes$/, () => json(hermesParityChecks(config))],

@@ -1,4 +1,4 @@
-import type { RuntimeConfig } from "../types";
+import type { AgentRecord, RuntimeConfig } from "../types";
 import {
   activateAgent,
   bankIdForAgent,
@@ -10,6 +10,7 @@ import {
 } from "../state";
 import { addAudit } from "../state/audit";
 import { now } from "../state/ids";
+import { providerCatalog } from "../provider";
 import { renameSeededSoulName, seedAgentSoulFile } from "../runtime/identity-files";
 import { DEFAULT_AGENT_TOOLSETS } from "../state/defaults";
 
@@ -150,6 +151,86 @@ export async function renameAgent(
   // Best-effort: never clobbers a customized SOUL (see renameSeededSoulName).
   renameSeededSoulName(config.instance, result.record.id, result.oldName, newName);
   return result.record;
+}
+
+// Set (or clear) an agent's provider/model override. `AgentRecord.providerName`
+// + `model` are the per-agent control surface that resolveEffectiveContext
+// reads (see ADR agents-replace-profiles.md): an override applies only when
+// BOTH fields are set, so this helper enforces that pairing rather than letting
+// a half-configured agent silently fall through to the instance default.
+//
+// Modes:
+//   - SET — both providerName and model present. Validate the provider name
+//     against the catalog and store both; the chat path then routes this
+//     agent's inference through the chosen provider.
+//   - CLEAR — both absent/blank. Drop the override so the agent inherits the
+//     instance default again (providerSource flips back to "instance").
+//   - A lone providerName or model is rejected ("Invalid input" → 400) instead
+//     of being half-applied.
+//
+// Credentials are NOT managed here. API keys, AWS, and Codex auth live at the
+// instance level (secrets.env, ~/.aws, ~/.codex); this helper only selects
+// which provider/model the agent uses. It validates the provider NAME against
+// the catalog but does not require the provider to be configured — the
+// configured-only restriction is a UI affordance (see ADR
+// per-agent-provider-settings.md). A no-op (the agent already carries the
+// requested selection) skips the state write, audit, and updatedAt bump —
+// same hygiene as renameAgent.
+export async function setAgentProvider(
+  config: RuntimeConfig,
+  idOrName: string,
+  input: Record<string, unknown>
+): Promise<AgentRecord> {
+  const providerName = typeof input.providerName === "string" ? input.providerName.trim() : "";
+  const model = typeof input.model === "string" ? input.model.trim() : "";
+  if (providerName && !model) {
+    throw new Error("Invalid input: model is required when providerName is set.");
+  }
+  if (!providerName && model) {
+    throw new Error("Invalid input: providerName is required when model is set.");
+  }
+  if (providerName) {
+    const known = new Set(providerCatalog().map((item) => item.name));
+    if (!known.has(providerName)) {
+      throw new Error(`Invalid input: unknown provider '${providerName}'.`);
+    }
+  }
+  // Resolve id-first, then name, so an agent whose NAME happens to equal
+  // another agent's id can't shadow the intended target (same rule as
+  // renameAgent).
+  const agents = readState(config.instance).agents;
+  const target = agents.find((a) => a.id === idOrName) ?? agents.find((a) => a.name === idOrName);
+  if (!target) throw new Error(`Agent not found: ${idOrName}`);
+  const nextProvider = providerName ? (providerName as AgentRecord["providerName"]) : undefined;
+  const nextModel = model || undefined;
+  return mutateState(config.instance, (state) => {
+    const agent = state.agents.find((a) => a.id === target.id);
+    if (!agent) throw new Error(`Agent not found: ${idOrName}`);
+    // No-op when the selection is unchanged: return without bumping updatedAt
+    // or writing an audit row so a redundant save doesn't churn history. The
+    // check lives inside mutateState (the serialized write boundary) so two
+    // concurrent identical calls can't both slip past it and emit duplicate
+    // agent.provider_set audit rows.
+    if (agent.providerName === nextProvider && agent.model === nextModel) {
+      return agent;
+    }
+    const from = { providerName: agent.providerName, model: agent.model };
+    agent.providerName = nextProvider;
+    agent.model = nextModel;
+    agent.updatedAt = now();
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: "agent.provider_set",
+        target: agent.id,
+        risk: "low",
+        evidence: { from, to: { providerName: nextProvider, model: nextModel }, agentId: agent.id }
+      },
+      { agentId: agent.id }
+    );
+    return agent;
+  });
 }
 
 // Hard-deletes an agent and cascades cleanup across its memory pools.

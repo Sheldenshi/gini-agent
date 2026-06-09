@@ -8,7 +8,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createAgent, deleteAgent, renameAgent, useAgent } from "./agents";
+import { createAgent, deleteAgent, listAgents, renameAgent, setAgentProvider, useAgent } from "./agents";
 import { soulPath } from "../runtime/identity-files";
 import { install } from "../runtime";
 import {
@@ -350,4 +350,142 @@ describe("createAgent", () => {
   // SOUL.md is per-agent and never inherited at create time, and
   // Hindsight banks are created fresh per agent. See ADR
   // runtime-identity-files.md.
+
+  test("listAgents returns the active agent id and the agent roster", async () => {
+    const config = buildConfig(workspaceRoot, "list-agents", root);
+    await install(config);
+    const created = await createAgent(config, { name: "research" });
+    const listed = listAgents(config);
+    expect(listed.agents.some((agent) => agent.id === created.id)).toBe(true);
+    expect(listed.agents.some((agent) => agent.id === "agent_default")).toBe(true);
+    expect(typeof listed.activeAgentId).toBe("string");
+  });
+
+  test("setAgentProvider sets providerName+model and audits agent.provider_set", async () => {
+    const config = buildConfig(workspaceRoot, "set-agent-provider", root);
+    await install(config);
+    const created = await createAgent(config, {
+      name: "research",
+      providerName: "codex",
+      model: "gpt-5.5"
+    });
+    const updated = await setAgentProvider(config, created.id, {
+      providerName: "openai",
+      model: "gpt-4o"
+    });
+    expect(updated.id).toBe(created.id);
+    expect(updated.providerName).toBe("openai");
+    expect(updated.model).toBe("gpt-4o");
+    const after = readState(config.instance);
+    const stored = after.agents.find((agent) => agent.id === created.id);
+    expect(stored?.providerName).toBe("openai");
+    expect(stored?.model).toBe("gpt-4o");
+    const audit = after.audit.find(
+      (event) => event.action === "agent.provider_set" && event.target === created.id
+    );
+    expect(audit).toBeDefined();
+    expect(audit?.evidence).toMatchObject({
+      from: { providerName: "codex", model: "gpt-5.5" },
+      to: { providerName: "openai", model: "gpt-4o" },
+      agentId: created.id
+    });
+  });
+
+  test("setAgentProvider resolves the target by name", async () => {
+    const config = buildConfig(workspaceRoot, "set-agent-provider-by-name", root);
+    await install(config);
+    const created = await createAgent(config, { name: "research" });
+    const updated = await setAgentProvider(config, "research", {
+      providerName: "anthropic",
+      model: "claude-opus-4-8"
+    });
+    expect(updated.id).toBe(created.id);
+    expect(updated.providerName).toBe("anthropic");
+    expect(updated.model).toBe("claude-opus-4-8");
+  });
+
+  test("setAgentProvider clears the override when both fields are blank", async () => {
+    const config = buildConfig(workspaceRoot, "set-agent-provider-clear", root);
+    await install(config);
+    const created = await createAgent(config, {
+      name: "research",
+      providerName: "openai",
+      model: "gpt-4o"
+    });
+    const cleared = await setAgentProvider(config, created.id, { providerName: "", model: "" });
+    expect(cleared.providerName).toBeUndefined();
+    expect(cleared.model).toBeUndefined();
+    const after = readState(config.instance);
+    const stored = after.agents.find((agent) => agent.id === created.id);
+    expect(stored?.providerName).toBeUndefined();
+    expect(stored?.model).toBeUndefined();
+  });
+
+  test("setAgentProvider rejects a lone providerName", async () => {
+    const config = buildConfig(workspaceRoot, "set-agent-provider-lone-name", root);
+    await install(config);
+    const created = await createAgent(config, { name: "research" });
+    await expect(setAgentProvider(config, created.id, { providerName: "openai" })).rejects.toThrow(
+      "Invalid input: model is required when providerName is set."
+    );
+  });
+
+  test("setAgentProvider rejects a lone model", async () => {
+    const config = buildConfig(workspaceRoot, "set-agent-provider-lone-model", root);
+    await install(config);
+    const created = await createAgent(config, { name: "research" });
+    await expect(setAgentProvider(config, created.id, { model: "gpt-4o" })).rejects.toThrow(
+      "Invalid input: providerName is required when model is set."
+    );
+  });
+
+  test("setAgentProvider rejects an unknown provider", async () => {
+    const config = buildConfig(workspaceRoot, "set-agent-provider-unknown", root);
+    await install(config);
+    const created = await createAgent(config, { name: "research" });
+    await expect(
+      setAgentProvider(config, created.id, { providerName: "bogus", model: "x" })
+    ).rejects.toThrow("Invalid input: unknown provider 'bogus'.");
+  });
+
+  test("setAgentProvider throws when the agent does not exist", async () => {
+    const config = buildConfig(workspaceRoot, "set-agent-provider-missing", root);
+    await install(config);
+    await expect(
+      setAgentProvider(config, "agent_nope", { providerName: "openai", model: "gpt-4o" })
+    ).rejects.toThrow("Agent not found: agent_nope");
+  });
+
+  test("setAgentProvider is a no-op when the selection is unchanged", async () => {
+    // A redundant save must not bump updatedAt or write an agent.provider_set
+    // audit row, mirroring renameAgent's same-name no-op.
+    const config = buildConfig(workspaceRoot, "set-agent-provider-noop", root);
+    await install(config);
+    const created = await createAgent(config, {
+      name: "research",
+      providerName: "openai",
+      model: "gpt-4o"
+    });
+    // Stamp a fixed, distinctly-old updatedAt so a regression that rewrites it
+    // with now() is caught — capturing the create-time value could be masked by
+    // a same-millisecond write.
+    const sentinel = "2000-01-01T00:00:00.000Z";
+    await mutateState(config.instance, (state) => {
+      const agent = state.agents.find((a) => a.id === created.id)!;
+      agent.updatedAt = sentinel;
+      return agent;
+    });
+    const same = await setAgentProvider(config, created.id, {
+      providerName: "openai",
+      model: "gpt-4o"
+    });
+    expect(same.id).toBe(created.id);
+    const after = readState(config.instance);
+    expect(after.agents.find((agent) => agent.id === created.id)?.updatedAt).toBe(sentinel);
+    expect(
+      after.audit.some(
+        (event) => event.action === "agent.provider_set" && event.target === created.id
+      )
+    ).toBe(false);
+  });
 });

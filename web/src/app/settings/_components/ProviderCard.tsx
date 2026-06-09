@@ -24,6 +24,7 @@ import {
 import { AnthropicLogo, AzureLogo, BedrockLogo, DeepSeekLogo, OllamaLogo, OpenAILogo } from "@/components/provider-logos";
 import { api } from "@/lib/api";
 import { useInvalidate } from "@/lib/queries";
+import { displayProviderName, type ProviderCatalogItem } from "@/lib/providers";
 import { EditProviderDialog } from "./EditProviderDialog";
 
 // Providers whose credentials are env-keyed and therefore safe to remove
@@ -37,30 +38,6 @@ import { EditProviderDialog } from "./EditProviderDialog";
 // Azure is managed by switch + re-add via Add Provider; key cleanup is the
 // CLI `gini provider` path.
 const REMOVABLE_PROVIDERS = new Set(["openai", "openrouter", "deepseek", "anthropic"]);
-
-export interface ProviderCatalogItem {
-  id: string;
-  name: string;
-  displayName: string;
-  auth: string;
-  models: string[];
-  baseUrl?: string;
-  // True when credentials for this provider are available in the running
-  // gateway (env var set, codex auth.json present, or local explicitly
-  // activated). Settings hides un-configured rows; Add Provider treats the
-  // flag as informational.
-  configured?: boolean;
-}
-
-// Trim suffixes that the static catalog stacks on top of the brand name.
-// The Pencil mocks reference providers by short name (OpenAI, OpenRouter,
-// Codex, …); the auth badge alongside each row carries the "how" (OAuth /
-// API key / Local) so the brand label doesn't need to repeat it.
-export function displayProviderName(item: { displayName: string; name: string }): string {
-  if (item.name === "local") return "Local";
-  if (item.name === "codex") return "Codex";
-  return item.displayName.replace(/\s+Compatible$/i, "");
-}
 
 // Providers selectable on the Settings page. Echo is dev-only; the four
 // real providers map onto the Pencil mock (Codex, OpenAI, DeepSeek, Ollama

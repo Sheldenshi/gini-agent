@@ -18,6 +18,7 @@ import { ReplyInThreadButton } from "@/components/chat/ReplyInThreadButton";
 import { ThreadPanel } from "@/components/chat/ThreadPanel";
 import { ThreadsTab } from "@/components/chat/ThreadsTab";
 import { JobsTab } from "@/components/chat/JobsTab";
+import { SettingsTab } from "@/components/chat/SettingsTab";
 import { api, type UploadRef } from "@/lib/api";
 import { useChatReadState, useThreadReadState } from "@/lib/use-chat-read-state";
 import { groupExchanges, type ChatRenderItem } from "@/lib/group-exchanges";
@@ -79,7 +80,7 @@ export default function ChatPage() {
       {!sessionId ? (
         <section className="flex min-h-0 min-w-0 flex-1 flex-col">
           <AgentChatHeader name={headerName} seed={headerSeed} showAvatar={!isChannel} />
-          <ChatTabBar active="messages" onChange={() => {}} hideJobsTab={isChannel} />
+          <ChatTabBar active="messages" onChange={() => {}} hideJobsTab={isChannel} hideSettingsTab={Boolean(pinnedSessionId)} />
           <div className="flex flex-1 items-center justify-center p-6 text-sm text-muted-foreground">
             {resolving ? "Loading…" : "No chat yet — say hello below."}
           </div>
@@ -95,6 +96,7 @@ export default function ChatPage() {
           headerName={headerName}
           headerSeed={headerSeed}
           isChannel={isChannel}
+          isPinned={Boolean(pinnedSessionId)}
           messageAgent={messageAgent}
           activeAgentId={activeAgentId}
         />
@@ -109,6 +111,7 @@ function ChatSurface({
   headerName,
   headerSeed,
   isChannel,
+  isPinned,
   messageAgent,
   activeAgentId
 }: {
@@ -117,10 +120,19 @@ function ChatSurface({
   headerName: string;
   headerSeed: string;
   isChannel: boolean;
+  isPinned: boolean;
   messageAgent?: { id: string; name: string };
   activeAgentId?: string;
 }) {
   const [tab, setTab] = useState<ChatTab>("messages");
+  // Fall back to Messages if the active tab becomes hidden without a remount.
+  // ChatSurface is keyed by sessionId, so pinning the *same* session you're
+  // viewing (e.g. opening its own ?session= link) flips isPinned true in place —
+  // which hides Settings while `tab` could still be "settings". Reset so a
+  // hidden tab's body can't linger.
+  useEffect(() => {
+    if (isPinned && tab === "settings") setTab("messages");
+  }, [isPinned, tab]);
   const [openThread, setOpenThread] = useState<ThreadSummary | null>(null);
   const [text, setText] = useState("");
   // In-chat search: client-side find over the loaded transcript. `query` is the
@@ -314,6 +326,7 @@ function ChatSurface({
           onChange={setTab}
           threadCount={unreadThreadCount}
           hideJobsTab={isChannel}
+          hideSettingsTab={isPinned}
         />
 
         {tab === "messages" ? (
@@ -424,9 +437,15 @@ function ChatSurface({
           </>
         ) : tab === "threads" ? (
           <ThreadsTab threads={threads} agentName={headerName} onOpen={(t) => setOpenThread(t)} />
-        ) : (
+        ) : tab === "jobs" ? (
           <JobsTab />
-        )}
+        ) : tab === "settings" && !isPinned ? (
+          // Settings only renders on the active agent's canonical chat. The
+          // !isPinned guard (plus the reset effect above) keeps its body from
+          // showing on a pinned surface even for a frame, and the exhaustive
+          // switch keeps a stray tab value from falling through to it.
+          <SettingsTab agentId={activeAgentId} />
+        ) : null}
       </section>
 
       {openThread ? (
