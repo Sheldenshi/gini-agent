@@ -41,6 +41,14 @@ beforeAll(async () => {
   mock.module("./RuntimeStreamBridge", () => ({
     RuntimeStreamBridge: () => <div data-testid="stream-bridge-stub" />
   }));
+  // Same rationale as RuntimeStreamBridge: don't pull the real UpdateGate src
+  // (and its query/mutation deps) into the coverage gate. The stub renders its
+  // children so the wrapped app still appears on non-/pair routes.
+  mock.module("./UpdateGate", () => ({
+    UpdateGateProvider: ({ children }: { children: React.ReactNode }) => (
+      <div data-testid="update-gate-stub">{children}</div>
+    )
+  }));
   // Cache-bust suffix in a variable so tsc doesn't try to resolve the path.
   const providersPath = "./providers?providers-test";
   ({ Providers } = (await import(providersPath)) as typeof import("./providers"));
@@ -63,15 +71,17 @@ describe("Providers", () => {
     pathname = "/chat";
     render(<Providers>{CHILD}</Providers>);
     expect(screen.queryByTestId("stream-bridge-stub")).not.toBeNull();
+    expect(screen.queryByTestId("update-gate-stub")).not.toBeNull();
     expect(screen.queryByTestId("child")).not.toBeNull();
     expect(screen.queryByTestId("toaster-stub")).not.toBeNull();
     expect(screen.queryByTestId("theme-provider")).not.toBeNull();
   });
 
-  test("/pair: skips the RuntimeStreamBridge but still renders children", () => {
+  test("/pair: skips the RuntimeStreamBridge and update gate but still renders children", () => {
     pathname = "/pair";
     render(<Providers>{CHILD}</Providers>);
     expect(screen.queryByTestId("stream-bridge-stub")).toBeNull();
+    expect(screen.queryByTestId("update-gate-stub")).toBeNull();
     expect(screen.queryByTestId("child")).not.toBeNull();
   });
 

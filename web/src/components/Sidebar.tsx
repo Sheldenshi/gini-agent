@@ -6,7 +6,6 @@ import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { cn } from "@/lib/utils";
 import {
   ChevronDown,
-  Loader2,
   Menu,
   MessagesSquare,
   Moon,
@@ -21,8 +20,8 @@ import { useTheme } from "next-themes";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from "@/components/ui/sheet";
-import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMemo, useState, useSyncExternalStore } from "react";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { api } from "@/lib/api";
 import { useInvalidate, useStatus, useThreadsInbox } from "@/lib/queries";
@@ -30,8 +29,9 @@ import { useChatReadState, useThreadReadState } from "@/lib/use-chat-read-state"
 import { AgentAvatar } from "@/components/chat/AgentAvatar";
 import { CreateAgentDialog } from "@/components/CreateAgentDialog";
 import { TunnelMenu } from "@/components/tunnel/TunnelMenu";
+import { useUpdateGate } from "@/components/UpdateGate";
 import type { AgentRow, ChatSession } from "@/lib/view-types";
-import type { GiniUpdateResult, GiniVersionInfo, JobRecord } from "@runtime/types";
+import type { JobRecord } from "@runtime/types";
 
 function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
   const pathname = usePathname();
@@ -314,56 +314,12 @@ function useMounted() {
   );
 }
 
+// The update lifecycle (mutation, polling, the full-app blur overlay) lives in
+// UpdateGateProvider; this row is just its trigger + version line. The button
+// hides once an update is in flight because the gate's overlay takes over.
 function UpdateReminder() {
-  const qc = useQueryClient();
-  const [appliedSha, setAppliedSha] = useState<string | null>(null);
-  const status = useStatus({ refetchInterval: appliedSha ? 1_500 : 60_000 });
-  const statusVersion = status.data?.version;
-  const updateSupported = statusVersion?.update.supported === true;
-  const versionCheck = useQuery({
-    queryKey: ["version", "check"],
-    queryFn: () => api<GiniVersionInfo>("/update/check", { method: "POST" }),
-    enabled: updateSupported,
-    refetchInterval: 5 * 60_000
-  });
-  const version = versionCheck.data ?? statusVersion;
-  const updateAvailable = version?.git.updateAvailable === true;
-
-  useEffect(() => {
-    if (!appliedSha) return;
-    if (statusVersion?.git.sha === appliedSha) {
-      setAppliedSha(null);
-      qc.invalidateQueries({ queryKey: ["version", "check"] });
-    }
-  }, [appliedSha, statusVersion?.git.sha, qc]);
-
-  useEffect(() => {
-    if (!appliedSha) return;
-    const timer = setTimeout(() => {
-      setAppliedSha(null);
-      toast.error("Update applied, but the runtime hasn't reported back. Reload to check.");
-      qc.invalidateQueries({ queryKey: ["status"] });
-      qc.invalidateQueries({ queryKey: ["version", "check"] });
-    }, 30_000);
-    return () => clearTimeout(timer);
-  }, [appliedSha, qc]);
-
-  const update = useMutation({
-    mutationFn: () => api<GiniUpdateResult>("/update", { method: "POST" }),
-    onSuccess: (result) => {
-      if (result.upToDate) {
-        toast.success("Gini is already current");
-        qc.invalidateQueries({ queryKey: ["status"] });
-        qc.invalidateQueries({ queryKey: ["version", "check"] });
-        return;
-      }
-      toast.success("Gini updated. Restarting...");
-      setAppliedSha(result.afterSha);
-    },
-    onError: (error: Error) => toast.error(error.message)
-  });
-
-  const showUpdate = updateAvailable && !appliedSha;
+  const { version, updateSupported, updateAvailable, phase, start } = useUpdateGate();
+  const showUpdate = updateAvailable && phase === "idle";
 
   return (
     <div className="flex items-center justify-between gap-2 px-3 pb-[18px] pt-3">
@@ -380,15 +336,11 @@ function UpdateReminder() {
       {showUpdate ? (
         <button
           type="button"
-          disabled={update.isPending || !updateSupported}
-          onClick={() => update.mutate()}
+          disabled={!updateSupported}
+          onClick={start}
           className="flex shrink-0 items-center gap-1.5 rounded-[7px] border border-sidebar-border bg-sidebar-accent px-[11px] py-[7px] text-xs font-semibold text-sidebar-accent-foreground disabled:opacity-60"
         >
-          {update.isPending ? (
-            <Loader2 className="size-[13px] animate-spin text-sidebar-foreground/80" />
-          ) : (
-            <RefreshCw className="size-[13px] text-sidebar-foreground/80" />
-          )}
+          <RefreshCw className="size-[13px] text-sidebar-foreground/80" />
           Update
         </button>
       ) : null}

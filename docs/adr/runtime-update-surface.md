@@ -52,6 +52,15 @@ installer-origin guardrails rather than adding a browser-only shortcut.
   accidentally mutating a different installed runtime.
 - Browser-triggered updates schedule a post-response restart helper so the
   HTTP response can flush before the current gateway exits.
+- The web client treats a browser-triggered update as a modal operation:
+  it blurs and locks the whole app until the restarted runtime reports the
+  new revision, then confirms completion and reloads onto the new assets.
+  Because the restart only fires after the response flushes (above), a
+  dropped `POST /api/update` connection is read as "restarting, not failed"
+  — the blur is held and released only on a structured (HTTP-status-bearing)
+  gateway error. The in-flight state is persisted to `sessionStorage` so the
+  restart-triggered reload resumes the blur instead of briefly exposing a
+  half-updated app.
 - The scheduled restart is supervisor-aware. On a launchd-supervised
   instance the runtime self-SIGTERMs (drains, exits 0) and `KeepAlive`
   respawns it with the freshly checked-out code — no detached stop+start
@@ -71,6 +80,9 @@ installer-origin guardrails rather than adding a browser-only shortcut.
 - The sidebar shows a package/git version and an Update button.
 - Clicking Update calls `POST /api/update`; when commits changed, the
   current runtime is restarted without asking for manual stop/start.
+- A web-triggered update blurs and locks the app for the duration, then
+  shows a completion confirmation before reloading; the blur survives the
+  restart-triggered reload rather than briefly exposing the app.
 - `gini update` no longer prints a manual restart instruction.
 - Existing guardrails still reject missing runtimes and unexpected git
   origins.

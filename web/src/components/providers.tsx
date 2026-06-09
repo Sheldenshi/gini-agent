@@ -6,6 +6,7 @@ import { useState, type ReactNode } from "react";
 import { usePathname } from "next/navigation";
 import { Toaster } from "sonner";
 import { RuntimeStreamBridge } from "./RuntimeStreamBridge";
+import { UpdateGateProvider } from "./UpdateGate";
 
 // React 19 warns whenever a component renders a `<script>` tag — the tag is
 // non-functional on client re-renders. `next-themes` 0.4.6 (last released
@@ -59,7 +60,11 @@ export function Providers({ children }: { children: ReactNode }) {
     <ThemeProvider attribute="class" defaultTheme="light" enableSystem={false} disableTransitionOnChange>
       <QueryClientProvider client={client}>
         {!onPairPage && <RuntimeStreamBridge />}
-        {children}
+        {/* The update gate blurs the app while a self-update applies. It needs
+            /status, so skip it on the pre-auth /pair screen (same as the
+            stream bridge); Toaster stays outside it so error toasts render
+            above the blur. */}
+        {onPairPage ? children : <UpdateGateProvider>{children}</UpdateGateProvider>}
         <Toaster richColors position="bottom-right" />
       </QueryClientProvider>
     </ThemeProvider>

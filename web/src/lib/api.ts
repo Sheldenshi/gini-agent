@@ -11,7 +11,15 @@ export async function api<T = unknown>(path: string, init: RequestInit = {}): Pr
   // actionable message instead of falling back to "HTTP 400".
   const value = (await response.json()) as { error?: string; message?: string; ok?: boolean };
   if (!response.ok) {
-    throw new Error(value.error ?? value.message ?? `HTTP ${response.status}`);
+    // Tag the gateway's HTTP status so callers can distinguish a structured
+    // error response (the gateway replied non-2xx) from a transport failure
+    // (fetch rejecting, or response.json() throwing on a truncated body when
+    // the gateway drops the connection — neither of which reaches here).
+    const error = new Error(value.error ?? value.message ?? `HTTP ${response.status}`) as Error & {
+      status?: number;
+    };
+    error.status = response.status;
+    throw error;
   }
   return value as T;
 }
