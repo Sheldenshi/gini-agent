@@ -4,7 +4,7 @@
 // dynamic import via __setTransformersLoaderForTests so the local-provider
 // code path runs without the network or the native binding.
 
-import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
 import {
   __setTransformersLoaderForTests,
@@ -30,10 +30,28 @@ afterAll(() => {
   __setTransformersLoaderForTests(null);
 });
 
+// Snapshot the env vars these tests mutate and restore prior values after each,
+// so a developer's/CI's ambient provider keys aren't clobbered by an
+// unconditional delete (these run in the same process as other suites).
+const SNAPSHOT_ENV = [
+  "GINI_EMBEDDING_PROVIDER",
+  "GINI_LOCAL_EMBEDDING_MODEL",
+  "OPENAI_API_KEY",
+  "ANTHROPIC_API_KEY",
+  "OPENROUTER_API_KEY"
+];
+let envSnapshot: Record<string, string | undefined> = {};
+
+beforeEach(() => {
+  envSnapshot = {};
+  for (const key of SNAPSHOT_ENV) envSnapshot[key] = process.env[key];
+});
+
 afterEach(() => {
-  delete process.env.GINI_EMBEDDING_PROVIDER;
-  delete process.env.GINI_LOCAL_EMBEDDING_MODEL;
-  delete process.env.OPENAI_API_KEY;
+  for (const key of SNAPSHOT_ENV) {
+    if (envSnapshot[key] === undefined) delete process.env[key];
+    else process.env[key] = envSnapshot[key];
+  }
   __setTransformersLoaderForTests(null);
 });
 
@@ -162,7 +180,6 @@ describe("embedOpenAIBatch endpoint routing", () => {
       expect(stub.calls[0]!.auth).not.toContain("sk-ant-secret");
     } finally {
       stub.restore();
-      delete process.env.ANTHROPIC_API_KEY;
     }
   });
 
@@ -179,7 +196,6 @@ describe("embedOpenAIBatch endpoint routing", () => {
       expect(stub.calls[0]!.auth).toBe("Bearer sk-or-key");
     } finally {
       stub.restore();
-      delete process.env.OPENROUTER_API_KEY;
     }
   });
 });
