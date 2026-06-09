@@ -143,6 +143,13 @@ In `src/state/chat-blocks.ts`, surfaced through the `src/state` barrel:
 `ThreadSummary` (`src/types.ts`) carries `threadId`, `sessionId`,
 optional `agentId` / `parentBlockId` / `rootPreview`, `replyCount`,
 `lastReplyAt`, and optional `lastReplyPreview` / `lastReplyAuthor`.
+`lastReplyAt` is the newest **message** block's `createdAt`
+(`user_text` / `assistant_text`), not the newest block of any kind: a run
+appends auxiliary blocks (trailing `phase` "Completed", `tool_call` /
+`tool_result`, `system_note`) after the reply text, and the client unread
+compare keys on `lastReplyAt`, so counting those would re-flag a thread the
+user already opened. This matches `replyCount` / `lastReplyPreview` /
+`lastReplyAuthor`, which are also message-derived.
 
 ### Channels
 
