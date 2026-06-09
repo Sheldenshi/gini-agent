@@ -217,8 +217,10 @@ export function providerCatalog(): ProviderCatalogItem[] {
       // Nova, Meta Llama, Mistral, DeepSeek, and more behind one transport.
       // Signed with AWS SigV4 from the caller's ~/.aws / AWS_* credentials (no
       // API key), so its `auth` is "aws", mirroring how codex is "codex-oauth".
-      // Models are cross-region inference-profile ids sent verbatim to Converse;
-      // the list below is a cross-family starter set and the UI accepts any id.
+      // Models are cross-region inference-profile ids sent verbatim to Converse.
+      // The list below is what the picker offers, grouped by family in the UI and
+      // covering the common us/eu/apac geos; the picker also has a custom-id
+      // escape hatch and the runtime accepts any id, so this isn't a hard allowlist.
       id: "bedrock",
       name: "bedrock",
       displayName: "Amazon Bedrock",
@@ -226,13 +228,26 @@ export function providerCatalog(): ProviderCatalogItem[] {
       auth: "aws",
       models: [
         "us.anthropic.claude-opus-4-8",
+        "us.anthropic.claude-opus-4-7",
         "us.anthropic.claude-sonnet-4-6",
         "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        "eu.anthropic.claude-sonnet-4-6",
+        "apac.anthropic.claude-sonnet-4-6",
+        "global.anthropic.claude-sonnet-4-6",
+        "us.amazon.nova-premier-v1:0",
         "us.amazon.nova-pro-v1:0",
         "us.amazon.nova-lite-v1:0",
+        "us.amazon.nova-micro-v1:0",
+        "eu.amazon.nova-pro-v1:0",
+        "eu.amazon.nova-lite-v1:0",
+        "apac.amazon.nova-pro-v1:0",
+        "apac.amazon.nova-lite-v1:0",
         "us.meta.llama3-3-70b-instruct-v1:0",
-        "us.deepseek.r1-v1:0",
-        "us.mistral.pixtral-large-2502-v1:0"
+        "us.meta.llama4-maverick-17b-instruct-v1:0",
+        "us.meta.llama4-scout-17b-instruct-v1:0",
+        "us.mistral.pixtral-large-2502-v1:0",
+        "us.mistral.mistral-large-2407-v1:0",
+        "us.deepseek.r1-v1:0"
       ],
       capabilities: ["converse", "tool-calling", "streaming", "vision"],
       costHint: "external"

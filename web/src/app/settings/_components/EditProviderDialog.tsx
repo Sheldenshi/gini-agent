@@ -14,6 +14,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { BedrockModelSelect } from "./BedrockModelSelect";
 import { api } from "@/lib/api";
 import { displayProviderName, type ProviderCatalogItem } from "./ProviderCard";
 
@@ -197,18 +198,16 @@ export function EditProviderDialog({
           <div className="space-y-2">
             <div className="flex items-center justify-between">
               <Label htmlFor="edit-model" className="text-[13px] font-semibold text-[#C2C2C8]">Default model</Label>
-              {isBedrock ? null : <span className="text-xs text-[#6A6A70]">{row.models.length} available</span>}
+              <span className="text-xs text-[#6A6A70]">{row.models.length} available</span>
             </div>
             {isBedrock ? (
-              <Input
+              <BedrockModelSelect
                 id="edit-model"
-                type="text"
-                autoComplete="off"
-                placeholder="us.anthropic.claude-opus-4-8"
+                models={row.models}
                 value={model}
-                onChange={(e) => setModel(e.target.value)}
+                onChange={setModel}
                 disabled={save.isPending}
-                className="h-11 border-[#2A2A2E] bg-[#0E0E11] font-mono text-[13px]"
+                triggerClassName="h-11 border-[#2A2A2E] bg-[#0E0E11] font-mono text-[13px]"
               />
             ) : (
               <Select value={model} onValueChange={setModel} disabled={save.isPending}>

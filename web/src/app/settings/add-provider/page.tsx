@@ -16,6 +16,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { AnthropicLogo, BedrockLogo, DeepSeekLogo, OllamaLogo, OpenAILogo } from "@/components/provider-logos";
+import { BedrockModelSelect } from "../_components/BedrockModelSelect";
 import { api } from "@/lib/api";
 import { displayProviderName, type ProviderCatalogItem } from "../_components/ProviderCard";
 
@@ -239,21 +240,16 @@ export default function AddProviderPage() {
                   or your <code className="mx-1 rounded bg-[#1C1C22] px-1 py-0.5 font-mono text-[11px]">~/.aws/credentials</code> profile. No API key. SSO or assumed-role users: export the session first with <code className="mx-1 rounded bg-[#1C1C22] px-1 py-0.5 font-mono text-[11px]">aws configure export-credentials</code>.
                 </p>
                 <div className="grid gap-2">
-                  <Label htmlFor="bedrock-model">Model (cross-region inference profile id)</Label>
-                  <Input
+                  <Label htmlFor="bedrock-model">Model (cross-region inference profile)</Label>
+                  <BedrockModelSelect
                     id="bedrock-model"
-                    type="text"
-                    autoComplete="off"
-                    placeholder="us.anthropic.claude-opus-4-8"
+                    models={entry?.models ?? []}
                     value={selectedModel}
-                    onChange={(e) => setSelectedModel(e.target.value)}
-                    disabled={save.isPending}
-                    className="font-mono"
+                    onChange={setSelectedModel}
+                    disabled={!entry || save.isPending}
                   />
                   <p className="text-xs text-muted-foreground">
-                    Any Bedrock model — e.g. <code className="rounded bg-[#1C1C22] px-1 py-0.5 font-mono text-[11px]">us.amazon.nova-pro-v1:0</code>,{" "}
-                    <code className="rounded bg-[#1C1C22] px-1 py-0.5 font-mono text-[11px]">us.meta.llama3-3-70b-instruct-v1:0</code>,{" "}
-                    <code className="rounded bg-[#1C1C22] px-1 py-0.5 font-mono text-[11px]">us.deepseek.r1-v1:0</code>.
+                    Pick a model, or choose <span className="font-medium">Custom model id…</span> to enter any Bedrock inference-profile id.
                   </p>
                 </div>
                 <div className="grid gap-2">
