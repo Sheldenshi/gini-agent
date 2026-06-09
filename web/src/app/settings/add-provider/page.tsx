@@ -17,6 +17,7 @@ import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { AnthropicLogo, AzureLogo, BedrockLogo, DeepSeekLogo, OllamaLogo, OpenAILogo } from "@/components/provider-logos";
 import { BedrockModelSelect } from "../_components/BedrockModelSelect";
+import { BedrockRegionSelect } from "../_components/BedrockRegionSelect";
 import { api } from "@/lib/api";
 import { displayProviderName, type ProviderCatalogItem } from "../_components/ProviderCard";
 
@@ -65,8 +66,8 @@ export default function AddProviderPage() {
   // baseUrl is shared: optional first-party/proxy override for anthropic and
   // OpenAI-compatible providers, and the required resource endpoint for azure.
   const [baseUrl, setBaseUrl] = useState("");
-  // Optional AWS region for the bedrock provider (defaults to us-east-1).
-  const [awsRegion, setAwsRegion] = useState("");
+  // AWS region for the bedrock provider; the picker defaults to us-east-1.
+  const [awsRegion, setAwsRegion] = useState("us-east-1");
   // Azure transport fields. The rest default server-side when blank.
   const [apiVersion, setApiVersion] = useState("");
   const [deployment, setDeployment] = useState("");
@@ -87,7 +88,7 @@ export default function AddProviderPage() {
     setSelectedModel(entry?.models[0] ?? "");
     setApiKey("");
     setBaseUrl("");
-    setAwsRegion("");
+    setAwsRegion("us-east-1");
     setApiVersion("");
     setDeployment("");
     setAuthScheme("api-key");
@@ -284,16 +285,11 @@ export default function AddProviderPage() {
                   </p>
                 </div>
                 <div className="grid gap-2">
-                  <Label htmlFor="bedrock-region">
-                    AWS region <span className="text-muted-foreground">(optional)</span>
-                  </Label>
-                  <Input
+                  <Label htmlFor="bedrock-region">AWS region</Label>
+                  <BedrockRegionSelect
                     id="bedrock-region"
-                    type="text"
-                    autoComplete="off"
-                    placeholder="us-east-1"
                     value={awsRegion}
-                    onChange={(e) => setAwsRegion(e.target.value)}
+                    onChange={setAwsRegion}
                     disabled={save.isPending}
                   />
                 </div>

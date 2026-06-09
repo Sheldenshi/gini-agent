@@ -15,6 +15,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { BedrockModelSelect } from "./BedrockModelSelect";
+import { BedrockRegionSelect } from "./BedrockRegionSelect";
 import { api } from "@/lib/api";
 import type { ProviderConfig } from "@runtime/types";
 import { displayProviderName, type ProviderCatalogItem } from "./ProviderCard";
@@ -206,19 +207,13 @@ export function EditProviderDialog({
 
           {isBedrock ? (
             <div className="space-y-2">
-              <div className="flex items-center justify-between">
-                <Label htmlFor="edit-aws-region" className="text-[13px] font-semibold text-[#C2C2C8]">AWS region</Label>
-                <span className="text-xs text-[#6A6A70]">optional</span>
-              </div>
-              <Input
+              <Label htmlFor="edit-aws-region" className="text-[13px] font-semibold text-[#C2C2C8]">AWS region</Label>
+              <BedrockRegionSelect
                 id="edit-aws-region"
-                type="text"
-                autoComplete="off"
-                placeholder="us-east-1"
                 value={awsRegion}
-                onChange={(e) => setAwsRegion(e.target.value)}
+                onChange={setAwsRegion}
                 disabled={save.isPending}
-                className="h-11 border-border bg-secondary font-mono text-[13px]"
+                triggerClassName="h-11 border-border bg-secondary font-mono text-[13px]"
               />
               <p className="text-xs text-muted-foreground">Signs with your AWS credentials (AWS_ACCESS_KEY_ID/SECRET env vars or ~/.aws/credentials). No API key needed.</p>
             </div>
