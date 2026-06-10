@@ -43,6 +43,59 @@ turn, and stamps the chat block so every client renders the same thing:
   actionable line via `syncChatTaskResult` (`src/execution/chat.ts`), which
   reads `task.authErrorProvider`.
 
+### Persistent needs-reauth state (issue #233)
+
+The chat note alone is transient and per-session; without a durable record,
+every persistent surface (Settings → Providers, connector health, setup
+Verify) keeps reporting "Connected" against a dead credential. The runtime
+therefore also persists a per-provider auth-failure record:
+
+- **Shape.** `RuntimeState.providerAuthFailures` maps provider name → `{
+  provider, detail, at, taskId? }` (`ProviderAuthFailureRecord`). Only
+  failures are stored — absence of a record means OK. `detail` is the
+  provider's error after `redactSecrets`; `at` is the ISO failure time;
+  `taskId` is the task whose provider call observed it. The field is optional
+  on `RuntimeState`, so legacy state files need no migration.
+- **Write seams.** The same two places that stamp `task.authErrorProvider`
+  write the record via `recordProviderAuthFailure`
+  (`src/state/provider-auth.ts`): `failTask` (`src/agent.ts`) and the
+  chat-task summary-failure path (`src/execution/chat-task.ts`, which settles
+  the task itself rather than routing through `failTask`). Repeated failures
+  refresh the record's detail/timestamp; the `provider.auth.needs_reauth`
+  audit/event fires only on the ok→needs_reauth transition.
+- **Clear seams.** The record drops (with a `provider.auth.cleared`
+  audit/event) at the seams that prove the credential works again:
+  1. a successful provider call in the chat-task loop (main loop AND the
+     iteration-cap summary call) — guarded by a lock-free existence check
+     (`clearProviderAuthFailureIfPresent`), so the common healthy path writes
+     no state;
+  2. a successful provider-config write through the setup API
+     (`setSetupProvider`) for that provider — this covers the Add Provider
+     key form, key rotation, the Settings Edit dialog, `set_provider`
+     self-tool writes, and the codex setup **Verify** (whose presence gate
+     passing is the verify signal);
+  3. provider removal (`removeSetupProvider`) — a removed provider must not
+     resurface a stale record when re-added.
+- **Exposure.** `GET /api/providers/catalog` enriches each row with
+  `authStatus: "ok" | "needs_reauth"` plus, when flagged, a `reauth` payload
+  `{ detail, at, reauthKind, reauthUrl }` (`withProviderAuthStatus`,
+  `src/provider.ts`) — the same `providerReauth` routing the chat note
+  carries, derived at read time. Settings → Providers renders needs-reauth
+  rows with an amber "Needs re-authentication" status, the redacted detail,
+  and a kind-routed CTA (docs slide-over for `docs`, the row's key-edit
+  dialog for `settings`, AWS-credentials guidance for `aws`); the
+  `provider.auth.*` events invalidate the web `providers` query through the
+  runtime stream so an open Settings page updates live.
+- **Connector-probe honesty.** The codex connector probe
+  (`src/integrations/connectors/codex.ts`) resolves credentials through the
+  provider's own reader (`probeCodexCredentials`, honoring `CODEX_AUTH_JSON`)
+  instead of a bare `existsSync(~/.codex/auth.json)`, and decodes the OAuth
+  access token's JWT `exp` claim locally: an expired token probes unhealthy
+  with the expiry time and a `codex login` instruction. The probe makes no
+  network calls; an unparseable token means "expiry unknown", not unhealthy,
+  and `OPENAI_API_KEY`-shaped credentials stay presence-only (no exp to
+  read).
+
 ## Context
 
 Provider auth fails mid-chat (an expired Codex OAuth token, a revoked or
@@ -93,6 +146,15 @@ avoids that entirely.
 - A non-auth failure renders the raw message unchanged (no `authError`).
 - Text-only clients (CLI/messaging) receive the same actionable line, not the
   raw provider error.
+- After a `ProviderAuthError` task failure, `/api/providers/catalog` reports
+  `authStatus: "needs_reauth"` for that provider and Settings → Providers
+  shows the amber state with the redacted detail and kind-routed CTA — until
+  a successful provider call, a setup-API config write for that provider, or
+  its removal clears it.
+- With an expired-`exp` access token in the codex auth file, the codex
+  connector probe reports unhealthy naming the expiry time and `codex login`,
+  without any network call; a valid or unparseable token keeps the
+  presence-based result.
 
 ## Related
 
