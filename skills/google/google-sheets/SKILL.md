@@ -5,7 +5,7 @@ license: MIT
 compatibility: "macOS and Linux. Requires the `gws` CLI authenticated with Sheets scopes."
 metadata:
   gini:
-    version: 1.1.1
+    version: 1.1.2
     author: Gini
     platforms: [macos, linux]
     prerequisites:
@@ -41,7 +41,13 @@ The connected Google accounts (each with its tag, email, and config dir) are lis
 GOOGLE_WORKSPACE_CLI_CONFIG_DIR="<configDir>" gws sheets spreadsheets create --json '{"properties":{"title":"Tracker"}}'
 ```
 
-Selection rule: one account connected → just use it. Two or more → use the one the user named or clearly implied (an explicit tag, an email address, or unambiguous context); if you can't tell which one they mean, ASK before running — never guess on writes (sends, deletes, edits). If no accounts are connected yet, fall back to the setup flow in Prerequisites (`read_skill` with `google-workspace-setup`).
+Selection rule: one account connected → just use it. Two or more:
+
+- The user named or clearly implied one account (a tag, an email, or unambiguous context) → use only that account.
+- A read/lookup/search the user didn't tie to an account (e.g. listing events, searching mail, finding a doc) → run it against **every** connected account (one `gws` call per config dir) and aggregate, labeling each result by its tag and email. Don't pick just one, and don't ask — the user wants the whole picture across accounts.
+- A write (send, create, edit, delete) with no account named → ASK which account first; never guess.
+
+If no accounts are connected yet, fall back to the setup flow in Prerequisites (`read_skill` with `google-workspace-setup`).
 
 ## When to Use
 
