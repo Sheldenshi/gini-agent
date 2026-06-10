@@ -109,6 +109,16 @@ interface Session {
   // navigation (reload) resets refs.
   lastSnapshotText?: string;
   lastSnapshotUrl?: string;
+  // Stable tab handles. Each Page gets a permanent session-scoped handle
+  // ("t1", "t2", …) the first time browser_tabs sees it — on open for
+  // agent-created tabs, lazily on list for user-opened tabs and
+  // window.open popups. The counter is monotonic and a handle is NEVER
+  // reused, so a stale plan addressing a closed tab's handle fails
+  // loudly instead of acting on whichever tab inherited its position
+  // (the failure mode of positional indexes). Entries are pruned when
+  // the page closes. See ADR browser-automation-engine.md.
+  tabHandles: Map<string, Page>;
+  nextTabHandleId: number;
 }
 
 // Discriminated union describing the currently-installed shared handle.
@@ -674,7 +684,9 @@ async function getOrCreate(taskId: string): Promise<Session> {
       lastActivity: Date.now(),
       inFlight: 0,
       ownedPageIds,
-      nextRefId: 1
+      nextRefId: 1,
+      tabHandles: new Map(),
+      nextTabHandleId: 1
     };
     sessions.set(taskId, session);
     // Attach console capture eagerly so page.goto errors before the
@@ -2810,11 +2822,38 @@ export async function browserWaitFor(taskId: string, args: Record<string, unknow
   }
 }
 
+// Return the stable handle for `page`, assigning the next "tN" id when the
+// page hasn't been seen before — this is how user-opened tabs and
+// window.open popups get handles lazily on their first list.
+function tabHandleFor(session: Session, page: Page): string {
+  for (const [handle, existing] of session.tabHandles) {
+    if (existing === page) return handle;
+  }
+  const handle = `t${session.nextTabHandleId++}`;
+  session.tabHandles.set(handle, page);
+  return handle;
+}
+
+// Resolve a tN handle to its live Page. Returns undefined for an unknown
+// handle AND for a handle whose page has closed since it was listed
+// (pruning the dead entry on the way out) — both mean the model is acting
+// on a stale tab list and must re-list.
+function resolveTabHandle(session: Session, id: string): Page | undefined {
+  const page = session.tabHandles.get(id);
+  if (!page) return undefined;
+  if (!session.context.pages().includes(page)) {
+    session.tabHandles.delete(id);
+    return undefined;
+  }
+  return page;
+}
+
 // Multi-tab management. Drives BrowserContext.pages() and context.newPage()
-// for list / new / switch / close. Critically, every action that swaps the
-// active page clears `session.refs` BEFORE assigning `session.page` so any
-// concurrent stale ref lookup fails fast against the old refs map rather
-// than silently resolving against the new page.
+// for list / new / switch / close. Tabs are addressed by stable tN handles
+// (see Session.tabHandles), never by position. Critically, every action that
+// swaps the active page clears `session.refs` BEFORE assigning
+// `session.page` so any concurrent stale ref lookup fails fast against the
+// old refs map rather than silently resolving against the new page.
 export async function browserTabs(taskId: string, args: Record<string, unknown>): Promise<string> {
   const action = str(args.action);
   if (!action) return fail("Missing required string argument: action");
@@ -2825,9 +2864,16 @@ export async function browserTabs(taskId: string, args: Record<string, unknown>)
     return await withSession(taskId, async (session) => {
       if (action === "list") {
         const pages = session.context.pages();
+        // Prune handles whose page has closed (user-closed tabs, crashed
+        // renderers) so the map doesn't accumulate dead Page references.
+        // The handle itself stays retired — the counter only moves forward.
+        const open = new Set(pages);
+        for (const [handle, p] of session.tabHandles) {
+          if (!open.has(p)) session.tabHandles.delete(handle);
+        }
         const tabs = await Promise.all(
-          pages.map(async (p, i) => ({
-            index: i,
+          pages.map(async (p) => ({
+            id: tabHandleFor(session, p),
             url: p.url(),
             title: await p.title().catch(() => ""),
             active: p === session.page
@@ -2851,6 +2897,9 @@ export async function browserTabs(taskId: string, args: Record<string, unknown>)
         // awaits) still leaves the tab tracked for closeSession to reap.
         // Without this, an orphan tab survives task teardown.
         session.ownedPageIds.add(page);
+        // Assign the stable handle up front so the response can tell the
+        // model how to address the tab it just opened without re-listing.
+        const id = tabHandleFor(session, page);
         attachConsole(taskId, page);
         if (url) {
           await page.goto(url, { waitUntil: "domcontentloaded" });
@@ -2868,6 +2917,7 @@ export async function browserTabs(taskId: string, args: Record<string, unknown>)
         const snap = await snapshot(session.page, false, taskId);
         session.refs = snap.refs;
         return ok({
+          id,
           url: session.page.url(),
           title: await session.page.title(),
           snapshot: snap.text,
@@ -2876,11 +2926,10 @@ export async function browserTabs(taskId: string, args: Record<string, unknown>)
         }, taskId);
       }
       if (action === "switch") {
-        if (typeof args.index !== "number" || !Number.isInteger(args.index) || args.index < 0) {
-          return fail("Argument 'index' must be a non-negative integer.");
-        }
-        const target = session.context.pages()[args.index];
-        if (!target) return fail(`No tab at index ${args.index}.`);
+        const id = str(args.id);
+        if (!id) return fail("Missing required string argument: id (a tab handle like \"t2\" from browser_tabs list).");
+        const target = resolveTabHandle(session, id);
+        if (!target) return fail(`No tab with id ${id}. Tab handles are never reused; call browser_tabs action:"list" for the current tabs.`);
         // Page swap = navigation for ref purposes (the target tab may
         // carry stamps from an earlier visit — clear and renumber).
         session.refs = new Map();
@@ -2898,17 +2947,18 @@ export async function browserTabs(taskId: string, args: Record<string, unknown>)
         }, taskId);
       }
       // close
-      if (typeof args.index !== "number" || !Number.isInteger(args.index) || args.index < 0) {
-        return fail("Argument 'index' must be a non-negative integer.");
-      }
-      const target = session.context.pages()[args.index];
-      if (!target) return fail(`No tab at index ${args.index}.`);
+      const id = str(args.id);
+      if (!id) return fail("Missing required string argument: id (a tab handle like \"t2\" from browser_tabs list).");
+      const target = resolveTabHandle(session, id);
+      if (!target) return fail(`No tab with id ${id}. Tab handles are never reused; call browser_tabs action:"list" for the current tabs.`);
       const wasActive = target === session.page;
       await target.close();
-      // Drop the closed page from agent ownership if we had it. If the
+      // Retire the handle (never reassigned — the counter is monotonic)
+      // and drop the closed page from agent ownership if we had it. If the
       // page wasn't agent-owned (rare in practice — the agent normally
       // only addresses tabs it can see, and it opens new ones via
       // browser_tabs:new), the delete is a harmless no-op.
+      session.tabHandles.delete(id);
       session.ownedPageIds.delete(target);
       if (wasActive) {
         // Match the invariant the new/switch branches follow: clear refs
@@ -3353,7 +3403,9 @@ export const __test = {
       lastActivity: Date.now(),
       inFlight,
       ownedPageIds: new Set<Page>([fakePage]),
-      nextRefId: 1
+      nextRefId: 1,
+      tabHandles: new Map(),
+      nextTabHandleId: 1
     });
   },
   // Install a synthetic session with a caller-provided `page` so tool
@@ -3368,7 +3420,9 @@ export const __test = {
       lastActivity: Date.now(),
       inFlight: 0,
       ownedPageIds: new Set<Page>([realPage]),
-      nextRefId: 1
+      nextRefId: 1,
+      tabHandles: new Map(),
+      nextTabHandleId: 1
     });
   },
   // Install a synthetic session with both a `page` and `context` so tab-
@@ -3387,7 +3441,9 @@ export const __test = {
       lastActivity: Date.now(),
       inFlight: 0,
       ownedPageIds: new Set<Page>([realPage]),
-      nextRefId: 1
+      nextRefId: 1,
+      tabHandles: new Map(),
+      nextTabHandleId: 1
     });
   },
   // Read the currently-installed page on a fake session so tests can

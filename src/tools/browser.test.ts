@@ -2643,7 +2643,7 @@ describe("browserTabs", () => {
     browserTest.setInFlightDisconnectsForTest(0);
   });
 
-  test("list returns one entry per page with active flag", async () => {
+  test("list returns one entry per page with a stable tN handle and active flag", async () => {
     const p0 = makeFakeTabPage("p0", "https://a.example/");
     const p1 = makeFakeTabPage("p1", "https://b.example/");
     const pages = [p0, p1];
@@ -2657,15 +2657,16 @@ describe("browserTabs", () => {
     const parsed = JSON.parse(raw) as {
       success: boolean;
       url?: string;
-      tabs?: Array<{ index: number; url: string; title: string; active: boolean }>;
+      tabs?: Array<{ id: string; url: string; title: string; active: boolean }>;
     };
     expect(parsed.success).toBe(true);
     expect(parsed.url).toBe("https://b.example/");
     expect(parsed.tabs).toBeDefined();
     expect(parsed.tabs!.length).toBe(2);
-    expect(parsed.tabs![0]!.index).toBe(0);
+    expect(parsed.tabs![0]!.id).toBe("t1");
     expect(parsed.tabs![0]!.url).toBe("https://a.example/");
     expect(parsed.tabs![0]!.active).toBe(false);
+    expect(parsed.tabs![1]!.id).toBe("t2");
     expect(parsed.tabs![1]!.active).toBe(true);
   });
 
@@ -2692,9 +2693,12 @@ describe("browserTabs", () => {
     browserTest.setFakeSessionRefsForTest("tabs-new", staleRefs);
 
     const raw = await browserTabs("tabs-new", { action: "new", url: "https://c.example/" });
-    const parsed = JSON.parse(raw) as { success: boolean; url?: string };
+    const parsed = JSON.parse(raw) as { success: boolean; url?: string; id?: string };
     expect(parsed.success).toBe(true);
     expect(parsed.url).toBe("https://c.example/");
+    // The response carries the new tab's stable handle so the model can
+    // address it without re-listing.
+    expect(parsed.id).toMatch(/^t\d+$/);
     expect(gotoCalls.length).toBe(1);
     expect(gotoCalls[0]!.url).toBe("https://c.example/");
     // session.page should have been swapped to the new tab.
@@ -2725,7 +2729,7 @@ describe("browserTabs", () => {
     expect(newPageCalls).toBe(0);
   });
 
-  test("switch swaps the active page and clears refs", async () => {
+  test("switch swaps the active page by handle and clears refs", async () => {
     const p0 = makeFakeTabPage("p0", "https://a.example/");
     const p1 = makeFakeTabPage("p1", "https://b.example/");
     const pages = [p0, p1];
@@ -2734,11 +2738,13 @@ describe("browserTabs", () => {
       newPage: (async () => p0) as unknown as import("playwright-core").BrowserContext["newPage"]
     };
     browserTest.installFakeSessionWithPageAndContextForTest("tabs-switch", p0, context);
+    // Handles are assigned lazily on list — t1=p0, t2=p1.
+    await browserTabs("tabs-switch", { action: "list" });
     const stale = new Map<string, unknown>();
     stale.set("@e1", {});
     browserTest.setFakeSessionRefsForTest("tabs-switch", stale);
 
-    const raw = await browserTabs("tabs-switch", { action: "switch", index: 1 });
+    const raw = await browserTabs("tabs-switch", { action: "switch", id: "t2" });
     const parsed = JSON.parse(raw) as { success: boolean };
     expect(parsed.success).toBe(true);
     const active = browserTest.getFakeSessionPageForTest("tabs-switch") as FakeTabPage | undefined;
@@ -2746,18 +2752,20 @@ describe("browserTabs", () => {
     expect(browserTest.getFakeSessionRefsForTest("tabs-switch")?.size ?? 0).toBe(0);
   });
 
-  test("switch fails for an out-of-range index", async () => {
+  test("switch fails for an unknown handle and points the model at list", async () => {
     const p0 = makeFakeTabPage("p0", "https://a.example/");
     const context: Partial<import("playwright-core").BrowserContext> = {
       pages: (() => [p0]) as unknown as import("playwright-core").BrowserContext["pages"],
       newPage: (async () => p0) as unknown as import("playwright-core").BrowserContext["newPage"]
     };
     browserTest.installFakeSessionWithPageAndContextForTest("tabs-switch-bad", p0, context);
-    const raw = await browserTabs("tabs-switch-bad", { action: "switch", index: 5 });
-    expect(JSON.parse(raw).error).toContain("No tab at index 5");
+    const raw = await browserTabs("tabs-switch-bad", { action: "switch", id: "t5" });
+    const error = JSON.parse(raw).error as string;
+    expect(error).toContain("No tab with id t5");
+    expect(error).toMatch(/list/);
   });
 
-  test("close closes the page, swaps if needed, and clears refs", async () => {
+  test("close closes the page by handle, swaps if needed, and clears refs", async () => {
     const p0 = makeFakeTabPage("p0", "https://a.example/");
     const p1 = makeFakeTabPage("p1", "https://b.example/");
     const pages = [p0, p1];
@@ -2767,11 +2775,12 @@ describe("browserTabs", () => {
     };
     // Active page is p1; we'll close it and expect the session to swap to p0.
     browserTest.installFakeSessionWithPageAndContextForTest("tabs-close-active", p1, context);
+    await browserTabs("tabs-close-active", { action: "list" });
     const stale = new Map<string, unknown>();
     stale.set("@e1", {});
     browserTest.setFakeSessionRefsForTest("tabs-close-active", stale);
 
-    const raw = await browserTabs("tabs-close-active", { action: "close", index: 1 });
+    const raw = await browserTabs("tabs-close-active", { action: "close", id: "t2" });
     const parsed = JSON.parse(raw) as { success: boolean };
     expect(parsed.success).toBe(true);
     expect(p1._closed).toBe(true);
@@ -2794,14 +2803,65 @@ describe("browserTabs", () => {
       }) as unknown as import("playwright-core").BrowserContext["newPage"]
     };
     browserTest.installFakeSessionWithPageAndContextForTest("tabs-close-last", only, context);
+    await browserTabs("tabs-close-last", { action: "list" });
 
-    const raw = await browserTabs("tabs-close-last", { action: "close", index: 0 });
+    const raw = await browserTabs("tabs-close-last", { action: "close", id: "t1" });
     const parsed = JSON.parse(raw) as { success: boolean };
     expect(parsed.success).toBe(true);
     expect(only._closed).toBe(true);
     expect(newPageCalls).toBe(1);
     const active = browserTest.getFakeSessionPageForTest("tabs-close-last") as FakeTabPage | undefined;
     expect(active?._label).toBe("after");
+  });
+
+  test("handles are stable across a close: t2 still addresses the same page after t1 closes", async () => {
+    const p0 = makeFakeTabPage("p0", "https://a.example/");
+    const p1 = makeFakeTabPage("p1", "https://b.example/");
+    const p2 = makeFakeTabPage("p2", "https://c.example/");
+    const pages = [p0, p1, p2];
+    const context: Partial<import("playwright-core").BrowserContext> = {
+      pages: (() => pages.filter((p) => !p._closed)) as unknown as import("playwright-core").BrowserContext["pages"],
+      newPage: (async () => makeFakeTabPage("fresh", "about:blank")) as unknown as import("playwright-core").BrowserContext["newPage"]
+    };
+    browserTest.installFakeSessionWithPageAndContextForTest("tabs-stable", p2, context);
+    await browserTabs("tabs-stable", { action: "list" }); // t1=p0, t2=p1, t3=p2
+
+    const closeRaw = await browserTabs("tabs-stable", { action: "close", id: "t1" });
+    expect(JSON.parse(closeRaw).success).toBe(true);
+    // After closing t1, a positional scheme would now call p1 "tab 0" — the
+    // stable handle t2 must still reach p1.
+    const listRaw = await browserTabs("tabs-stable", { action: "list" });
+    const listed = JSON.parse(listRaw) as { tabs?: Array<{ id: string; url: string }> };
+    expect(listed.tabs!.map((t) => t.id)).toEqual(["t2", "t3"]);
+    const switchRaw = await browserTabs("tabs-stable", { action: "switch", id: "t2" });
+    expect(JSON.parse(switchRaw).success).toBe(true);
+    const active = browserTest.getFakeSessionPageForTest("tabs-stable") as FakeTabPage | undefined;
+    expect(active?._label).toBe("p1");
+  });
+
+  test("a closed tab's handle is never reused: a new tab gets a fresh handle and the old one stays dead", async () => {
+    const p0 = makeFakeTabPage("p0", "https://a.example/");
+    const p1 = makeFakeTabPage("p1", "https://b.example/");
+    const fresh = makeFakeTabPage("fresh", "https://c.example/");
+    const pages = [p0, p1];
+    const context: Partial<import("playwright-core").BrowserContext> = {
+      pages: (() => pages.filter((p) => !p._closed)) as unknown as import("playwright-core").BrowserContext["pages"],
+      newPage: (async () => {
+        pages.push(fresh);
+        return fresh;
+      }) as unknown as import("playwright-core").BrowserContext["newPage"]
+    };
+    browserTest.installFakeSessionWithPageAndContextForTest("tabs-no-reuse", p0, context);
+    await browserTabs("tabs-no-reuse", { action: "list" }); // t1=p0, t2=p1
+
+    await browserTabs("tabs-no-reuse", { action: "close", id: "t2" });
+    const newRaw = await browserTabs("tabs-no-reuse", { action: "new" });
+    const opened = JSON.parse(newRaw) as { success: boolean; id?: string };
+    expect(opened.success).toBe(true);
+    // The fresh tab must NOT inherit the retired t2 — the counter is monotonic.
+    expect(opened.id).toBe("t3");
+    const switchRaw = await browserTabs("tabs-no-reuse", { action: "switch", id: "t2" });
+    expect(JSON.parse(switchRaw).error).toContain("No tab with id t2");
   });
 
   test("rejects an unknown action", async () => {
@@ -2815,17 +2875,17 @@ describe("browserTabs", () => {
     expect(JSON.parse(raw).error).toMatch(/action.*list.*new.*switch.*close/);
   });
 
-  test("rejects missing index on switch/close", async () => {
+  test("rejects missing id on switch/close", async () => {
     const p0 = makeFakeTabPage("p0", "https://a.example/");
     const context: Partial<import("playwright-core").BrowserContext> = {
       pages: (() => [p0]) as unknown as import("playwright-core").BrowserContext["pages"],
       newPage: (async () => p0) as unknown as import("playwright-core").BrowserContext["newPage"]
     };
-    browserTest.installFakeSessionWithPageAndContextForTest("tabs-missing-index", p0, context);
-    const rawSwitch = await browserTabs("tabs-missing-index", { action: "switch" });
-    expect(JSON.parse(rawSwitch).error).toMatch(/non-negative integer/);
-    const rawClose = await browserTabs("tabs-missing-index", { action: "close" });
-    expect(JSON.parse(rawClose).error).toMatch(/non-negative integer/);
+    browserTest.installFakeSessionWithPageAndContextForTest("tabs-missing-id", p0, context);
+    const rawSwitch = await browserTabs("tabs-missing-id", { action: "switch" });
+    expect(JSON.parse(rawSwitch).error).toMatch(/id.*tab handle/);
+    const rawClose = await browserTabs("tabs-missing-id", { action: "close" });
+    expect(JSON.parse(rawClose).error).toMatch(/id.*tab handle/);
   });
 });
 

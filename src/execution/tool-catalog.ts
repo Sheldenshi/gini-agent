@@ -545,7 +545,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "browser_tabs",
-      description: "Manage browser tabs: list current tabs, open a new tab, switch the active tab, or close a tab. `index` (zero-based) is required for switch and close. `url` is optional for `new` (the new tab is created blank if omitted).",
+      description: "Manage browser tabs: list current tabs, open a new tab, switch the active tab, or close a tab. Tabs are addressed by stable handles like 't2' (from `list` or the `id` returned by `new`); handles never change and are never reused, even after the tab closes. `id` is required for switch and close. `url` is optional for `new` (the new tab is created blank if omitted).",
       parameters: {
         type: "object",
         properties: {
@@ -555,7 +555,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
             description: "Tab operation to perform."
           },
           url: { type: "string", description: "Absolute http(s) URL to load when action='new'. Optional." },
-          index: { type: "number", description: "Zero-based tab index for action='switch' or action='close'." }
+          id: { type: "string", description: "Stable tab handle like 't2' for action='switch' or action='close'. Get handles from action='list' (or the id returned by action='new')." }
         },
         required: ["action"]
       }
