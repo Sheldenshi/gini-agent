@@ -63,10 +63,25 @@ const SNAPSHOT_CHAR_BUDGET = 32_000;
 const IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 const SWEEP_INTERVAL_MS = 30_000;
 
+// Per-ref target recorded at snapshot time. `locator` is the stamped
+// [data-gini-ref] fast path; role/name/nth describe the element as the
+// walker emitted it so action tools can self-heal a lost stamp (an SPA
+// re-render replacing the stamped node) by re-querying — see
+// resolveRefForAction. `nth` is the element's index among entries
+// sharing the same role+name in the walk that emitted the ref; it
+// disambiguates repeated controls (three "Delete" buttons). See ADR
+// browser-automation-engine.md.
+interface RefTarget {
+  locator: Locator;
+  role: string;
+  name: string;
+  nth: number;
+}
+
 interface Session {
   context: BrowserContext;
   page: Page;
-  refs: Map<string, Locator>;
+  refs: Map<string, RefTarget>;
   lastActivity: number;
   // In-flight call counter. Incremented by withSession around each tool
   // invocation so the idle sweeper can skip sessions that are mid-call
@@ -1189,7 +1204,7 @@ const SNAPSHOT_CLICKABLE_BUDGET = 75;
 
 interface SnapshotResult {
   text: string;
-  refs: Map<string, Locator>;
+  refs: Map<string, RefTarget>;
   elementCount: number;
   truncated: boolean;
   // True when this snapshot detected a navigation (URL change since the
@@ -1590,7 +1605,10 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
     { attr: REF_ATTR, fullMode: full, hiddenBudget: SNAPSHOT_HIDDEN_BUDGET, clickableBudget: SNAPSHOT_CLICKABLE_BUDGET, startId }
   );
 
-  const refs = new Map<string, Locator>();
+  const refs = new Map<string, RefTarget>();
+  // nth assignment for stale-ref healing: an element's index among
+  // entries sharing its role+name in THIS walk, in emission (DOM) order.
+  const nthByRoleName = new Map<string, number>();
   const lines: string[] = [];
   let charCount = 0;
   let truncated = false;
@@ -1632,7 +1650,15 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
     lines.push(line);
     charCount += line.length + 1;
     if (entry.ref) {
-      refs.set(entry.ref, page.locator(`[${REF_ATTR}="${entry.ref.slice(1)}"]`));
+      const nthKey = `${entry.role}\u0000${entry.name}`;
+      const nth = nthByRoleName.get(nthKey) ?? 0;
+      nthByRoleName.set(nthKey, nth + 1);
+      refs.set(entry.ref, {
+        locator: page.locator(`[${REF_ATTR}="${entry.ref.slice(1)}"]`),
+        role: entry.role,
+        name: entry.name,
+        nth
+      });
       elementCount++;
     }
   }
@@ -1774,6 +1800,103 @@ async function snapshotAfterAction(
     }
   }
   return { snapshot: snap.text, snapshotMode: "full", elementCount: snap.elementCount, truncated: snap.truncated };
+}
+
+// Resolve a ref for an action tool (click / type / hover / drag /
+// select_option / wait_for), self-healing a lost stamp. The fast path is
+// the stamped [data-gini-ref] locator recorded at snapshot time; when it
+// no longer matches anything (an SPA re-render destroyed the stamped
+// node), re-query by the recorded role/name/nth, restamp the survivor
+// with the SAME ref id, and report healed: true so the caller can flag
+// `healedRef` in its result. See ADR browser-automation-engine.md.
+//
+// Deliberately NOT used by browser_fill_secrets or the upload paths:
+// those act only on the exact stamped element and fail loudly on stamp
+// loss — mis-resolution there is a credential-leak / approval-bypass
+// hazard (trust boundary; see ADR browser-fill-secret.md and the
+// comments at those call sites).
+//
+// Returns undefined when the ref was never issued or healing found no
+// candidate; callers emit the standard "Unknown ref" error.
+async function resolveRefForAction(
+  session: Session,
+  ref: string
+): Promise<{ locator: Locator; healed: boolean } | undefined> {
+  const target = session.refs.get(ref);
+  if (!target) return undefined;
+  // Unit tests plant minimal locator stubs without count(); treat those
+  // as live (same typeof-guard pattern snapshot() uses for page.url).
+  if (typeof target.locator.count !== "function") {
+    return { locator: target.locator, healed: false };
+  }
+  let stampedCount = 0;
+  try {
+    stampedCount = await target.locator.count();
+  } catch {
+    // A failing count (page navigating mid-call, context churn) is
+    // handled like a lost stamp: healing below either re-finds the
+    // element or the action fails with the standard message.
+  }
+  if (stampedCount > 0) return { locator: target.locator, healed: false };
+  const healed = await healLostRef(session, target, ref);
+  return healed ? { locator: healed, healed: true } : undefined;
+}
+
+// Re-find an element whose data-gini-ref stamp was destroyed. ARIA-role
+// entries re-query the accessibility tree via getByRole(role, { name,
+// exact: true }) and take the recorded nth match; role "clickable" is
+// synthetic (cursor-detected, not a real ARIA role — see the walker) so
+// it falls back to exact-text matching, as does any role Playwright's
+// role engine rejects. A found candidate is restamped with the SAME id
+// so later resolutions take the stamped fast path and the next snapshot
+// keeps the ref stable.
+async function healLostRef(session: Session, target: RefTarget, ref: string): Promise<Locator | undefined> {
+  // Nothing to re-query by: hidden-budget entries are emitted nameless.
+  if (!target.name) return undefined;
+  const page = session.page;
+  if (typeof page.getByRole !== "function" || typeof page.getByText !== "function") return undefined;
+  let candidate: Locator | undefined;
+  if (target.role !== "clickable") {
+    const byRole = page
+      .getByRole(target.role as Parameters<Page["getByRole"]>[0], { name: target.name, exact: true })
+      .nth(target.nth);
+    try {
+      if ((await byRole.count()) > 0) {
+        candidate = byRole;
+      } else {
+        // A role Playwright supports that matches nothing means the
+        // element is genuinely gone — fail rather than guess by text.
+        return undefined;
+      }
+    } catch {
+      // The role engine rejected the role string (the walker emits some
+      // non-ARIA roles) — fall through to the text strategy.
+    }
+  }
+  if (!candidate) {
+    const byText = page.getByText(target.name, { exact: true }).nth(target.nth);
+    try {
+      if ((await byText.count()) === 0) return undefined;
+    } catch {
+      return undefined;
+    }
+    candidate = byText;
+  }
+  // Restamp with the SAME id so the ref stays stable for future actions
+  // and snapshots. Best-effort: acting on the candidate locator is
+  // correct even if the stamp write fails (a later action just re-heals).
+  try {
+    await candidate.evaluate(
+      (el: Element, arg: { attr: string; id: string }) => el.setAttribute(arg.attr, arg.id),
+      { attr: REF_ATTR_GLOBAL, id: ref.slice(1) }
+    );
+    if (typeof page.locator === "function") {
+      session.refs.set(ref, { ...target, locator: page.locator(`[${REF_ATTR_GLOBAL}="${ref.slice(1)}"]`) });
+    }
+  } catch {
+    // Best-effort restamp only — see above.
+  }
+  return candidate;
 }
 
 // Build a browser tool response, applying a redaction pass over
@@ -1952,15 +2075,16 @@ export async function browserClick(taskId: string, args: Record<string, unknown>
   if (!ref) return fail("Missing required string argument: ref");
   try {
     return await withSession(taskId, async (session) => {
-      const locator = session.refs.get(ref);
-      if (!locator) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
-      await locator.click({ timeout: 10_000 });
+      const resolved = await resolveRefForAction(session, ref);
+      if (!resolved) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
+      await resolved.locator.click({ timeout: 10_000 });
       await session.page.waitForLoadState("domcontentloaded").catch(() => undefined);
       const snapFields = await snapshotAfterAction(session, taskId);
       return ok({
         url: session.page.url(),
         title: await session.page.title(),
-        ...snapFields
+        ...snapFields,
+        ...(resolved.healed ? { healedRef: true } : {})
       }, taskId);
     });
   } catch (error) {
@@ -1975,13 +2099,14 @@ export async function browserType(taskId: string, args: Record<string, unknown>)
   if (text === undefined) return fail("Missing required string argument: text");
   try {
     return await withSession(taskId, async (session) => {
-      const locator = session.refs.get(ref);
-      if (!locator) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
-      await locator.fill(text, { timeout: 10_000 });
+      const resolved = await resolveRefForAction(session, ref);
+      if (!resolved) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
+      await resolved.locator.fill(text, { timeout: 10_000 });
       const snapFields = await snapshotAfterAction(session, taskId);
       return ok({
         url: session.page.url(),
-        ...snapFields
+        ...snapFields,
+        ...(resolved.healed ? { healedRef: true } : {})
       }, taskId);
     });
   } catch (error) {
@@ -2181,6 +2306,11 @@ export async function browserFillByLocator(
           } as const;
         }
       }
+      // Trust boundary: @-refs resolve ONLY via the literal stamped
+      // [data-gini-ref] selector — never resolveRefForAction's stale-ref
+      // self-healing. Mis-resolution here would type a credential into
+      // the wrong element, so a lost stamp must fail loudly instead
+      // (see ADR browser-fill-secret.md).
       const selector = args.locator.startsWith("@")
         ? `[${REF_ATTR_GLOBAL}="${args.locator.slice(1)}"]`
         : args.locator;
@@ -2471,14 +2601,15 @@ export async function browserHover(taskId: string, args: Record<string, unknown>
   if (!ref) return fail("Missing required string argument: ref");
   try {
     return await withSession(taskId, async (session) => {
-      const locator = session.refs.get(ref);
-      if (!locator) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
-      await locator.hover({ timeout: 10_000 });
+      const resolved = await resolveRefForAction(session, ref);
+      if (!resolved) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
+      await resolved.locator.hover({ timeout: 10_000 });
       const snapFields = await snapshotAfterAction(session, taskId);
       return ok({
         url: session.page.url(),
         title: await session.page.title(),
-        ...snapFields
+        ...snapFields,
+        ...(resolved.healed ? { healedRef: true } : {})
       }, taskId);
     });
   } catch (error) {
@@ -2496,17 +2627,18 @@ export async function browserDrag(taskId: string, args: Record<string, unknown>)
   if (!toRef) return fail("Missing required string argument: toRef");
   try {
     return await withSession(taskId, async (session) => {
-      const fromLoc = session.refs.get(fromRef);
-      if (!fromLoc) return fail(`Unknown ref ${fromRef}. Take a fresh snapshot first.`);
-      const toLoc = session.refs.get(toRef);
-      if (!toLoc) return fail(`Unknown ref ${toRef}. Take a fresh snapshot first.`);
-      await fromLoc.dragTo(toLoc, { timeout: 10_000 });
+      const from = await resolveRefForAction(session, fromRef);
+      if (!from) return fail(`Unknown ref ${fromRef}. Take a fresh snapshot first.`);
+      const to = await resolveRefForAction(session, toRef);
+      if (!to) return fail(`Unknown ref ${toRef}. Take a fresh snapshot first.`);
+      await from.locator.dragTo(to.locator, { timeout: 10_000 });
       await session.page.waitForLoadState("domcontentloaded").catch(() => undefined);
       const snapFields = await snapshotAfterAction(session, taskId);
       return ok({
         url: session.page.url(),
         title: await session.page.title(),
-        ...snapFields
+        ...snapFields,
+        ...(from.healed || to.healed ? { healedRef: true } : {})
       }, taskId);
     });
   } catch (error) {
@@ -2543,8 +2675,9 @@ export async function browserSelectOption(taskId: string, args: Record<string, u
   }
   try {
     return await withSession(taskId, async (session) => {
-      let locator = session.refs.get(ref);
-      if (!locator) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
+      const resolved = await resolveRefForAction(session, ref);
+      if (!resolved) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
+      let locator = resolved.locator;
 
       // Detect whether the resolved element is an <option>. If so, walk
       // up to the containing <select> and (when no explicit value/values
@@ -2588,7 +2721,8 @@ export async function browserSelectOption(taskId: string, args: Record<string, u
       return ok({
         url: session.page.url(),
         ...snapFields,
-        selected: selection
+        selected: selection,
+        ...(resolved.healed ? { healedRef: true } : {})
       }, taskId);
     });
   } catch (error) {
@@ -2628,11 +2762,24 @@ export async function browserWaitFor(taskId: string, args: Record<string, unknow
   }
   try {
     return await withSession(taskId, async (session) => {
+      let healedRef = false;
       try {
         if (ref) {
-          const locator = session.refs.get(ref);
-          if (!locator) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
-          await locator.waitFor({ state: waitState, timeout: timeoutMs });
+          if (waitState === "visible" || waitState === "attached") {
+            // Self-heal only the "element should be present" states. For
+            // hidden/detached, a lost stamp often IS the disappearance
+            // being awaited — healing onto a re-rendered replacement
+            // would invert the wait's meaning — so those keep the raw
+            // stamped locator.
+            const resolved = await resolveRefForAction(session, ref);
+            if (!resolved) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
+            healedRef = resolved.healed;
+            await resolved.locator.waitFor({ state: waitState, timeout: timeoutMs });
+          } else {
+            const target = session.refs.get(ref);
+            if (!target) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
+            await target.locator.waitFor({ state: waitState, timeout: timeoutMs });
+          }
         } else {
           // text-mode: poll the page for the substring. Playwright's
           // waitForFunction handles the timing for us; we pass the needle in
@@ -2654,7 +2801,8 @@ export async function browserWaitFor(taskId: string, args: Record<string, unknow
       return ok({
         url: session.page.url(),
         title: await session.page.title(),
-        ...snapFields
+        ...snapFields,
+        ...(healedRef ? { healedRef: true } : {})
       }, taskId);
     });
   } catch (error) {
@@ -3032,9 +3180,15 @@ export async function browserUploadFile(
   }
   try {
     return await withSession(taskId, async (session) => {
-      const locator = session.refs.get(ref);
-      if (!locator) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
-      await locator.setInputFiles(resolved.absolute, { timeout: 10_000 });
+      // Trust boundary: uploads act ONLY on the exact stamped element —
+      // no resolveRefForAction self-healing here. The user's approval
+      // names this specific target; re-resolving by role/name could hand
+      // the file to a different input. A lost stamp fails loudly instead
+      // (same stance as browser_fill_secrets; see ADR
+      // browser-fill-secret.md).
+      const target = session.refs.get(ref);
+      if (!target) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
+      await target.locator.setInputFiles(resolved.absolute, { timeout: 10_000 });
       const snap = await snapshot(session.page, false, taskId);
       session.refs = snap.refs;
       return ok({
@@ -3077,9 +3231,12 @@ export async function browserUploadFileApproved(
   }
   try {
     return await withSession(taskId, async (session) => {
-      const locator = session.refs.get(ref);
-      if (!locator) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
-      await locator.setInputFiles(resolved.absolute, { timeout: 10_000 });
+      // Trust boundary: the approval was granted for the exact stamped
+      // element — no resolveRefForAction self-healing here; a lost stamp
+      // fails loudly (see ADR browser-fill-secret.md).
+      const target = session.refs.get(ref);
+      if (!target) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
+      await target.locator.setInputFiles(resolved.absolute, { timeout: 10_000 });
       const snap = await snapshot(session.page, false, taskId);
       session.refs = snap.refs;
       return ok({
@@ -3251,14 +3408,36 @@ export const __test = {
   },
   // Read the currently-installed refs map so tests can assert it was
   // cleared (e.g. tab switch / new / close should clear the refs).
-  getFakeSessionRefsForTest(taskId: string): Map<string, Locator> | undefined {
+  getFakeSessionRefsForTest(taskId: string): Map<string, RefTarget> | undefined {
     return sessions.get(taskId)?.refs;
   },
   // Set the refs map on a fake session so tests can plant a fake locator
   // keyed by `@eN` before invoking a tool that needs to resolve it.
+  // Values are either RefTarget-shaped objects (locator is an OBJECT —
+  // tests exercising stale-ref healing pass role/name/nth metadata) or
+  // bare locator stubs, which get wrapped with empty healing metadata.
+  // The discrimination key is `typeof value.locator`: a real Locator's
+  // own `.locator` property is a sub-locator FACTORY (function), so a
+  // bare stub that happens to expose `.locator(sel)` still normalizes
+  // as a locator, not a RefTarget.
   setFakeSessionRefsForTest(taskId: string, refs: Map<string, unknown>): void {
     const session = sessions.get(taskId);
-    if (session) session.refs = refs as Map<string, Locator>;
+    if (!session) return;
+    const normalized = new Map<string, RefTarget>();
+    for (const [key, value] of refs) {
+      const maybe = value as { locator?: unknown; role?: unknown; name?: unknown; nth?: unknown };
+      if (maybe !== null && typeof maybe === "object" && typeof maybe.locator === "object" && maybe.locator !== null) {
+        normalized.set(key, {
+          locator: maybe.locator as Locator,
+          role: typeof maybe.role === "string" ? maybe.role : "",
+          name: typeof maybe.name === "string" ? maybe.name : "",
+          nth: typeof maybe.nth === "number" ? maybe.nth : 0
+        });
+      } else {
+        normalized.set(key, { locator: value as Locator, role: "", name: "", nth: 0 });
+      }
+    }
+    session.refs = normalized;
   },
   setFakeSessionInFlight(taskId: string, inFlight: number): void {
     const session = sessions.get(taskId);
