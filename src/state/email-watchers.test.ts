@@ -52,11 +52,11 @@ describe("buildWatcherQuery", () => {
   test("raw query wins over sender", () => {
     expect(buildWatcherQuery({ sender: "a@x.com", query: "subject:urgent" })).toBe("subject:urgent");
   });
-  test("sender builds from:<sender> is:unread", () => {
-    expect(buildWatcherQuery({ sender: "a@x.com" })).toBe("from:a@x.com is:unread");
+  test("sender builds from:<sender> — no is:unread (read-elsewhere race)", () => {
+    expect(buildWatcherQuery({ sender: "a@x.com" })).toBe("from:a@x.com");
   });
-  test("no sender/query falls back to is:unread", () => {
-    expect(buildWatcherQuery({})).toBe("is:unread");
+  test("no sender/query falls back to in:inbox, never an empty q", () => {
+    expect(buildWatcherQuery({})).toBe("in:inbox");
   });
 });
 
@@ -66,7 +66,7 @@ describe("watcher CRUD", () => {
     const watcher = await addEmailWatcher(config, { sender: "alice@x.com" });
     expect(watcher.enabled).toBe(true);
     expect(watcher.status).toBe("ok");
-    expect(watcher.query).toBe("from:alice@x.com is:unread");
+    expect(watcher.query).toBe("from:alice@x.com");
     expect(watcher.chatSessionId).toBeDefined();
     // The dedicated chat session exists.
     const state = readState(config.instance);
@@ -340,6 +340,28 @@ describe("shared backing job lifecycle", () => {
     expect(sharedJob(config)).toBeDefined();
     expect(reenabled?.jobId).toBe(sharedJob(config)!.id);
     expect(watches(config).map((w) => w.watcherId)).toEqual([watcher.id]);
+  });
+
+  test("backfill heals EXACT legacy auto-built query shapes only", async () => {
+    const config = buildConfig("ew-job-heal-queries");
+    const bySender = await addEmailWatcher(config, { sender: "alice@x.com" });
+    const catchAll = await addEmailWatcher(config, { query: "placeholder" });
+    const rawWithUnread = await addEmailWatcher(config, { query: "subject:invoice is:unread" });
+    // Model legacy records: the retired auto-built shapes plus a raw query that
+    // merely CONTAINS is:unread (must never be rewritten).
+    await mutateState(config.instance, (state) => {
+      state.emailWatchers.find((w) => w.id === bySender.id)!.query = "from:alice@x.com is:unread";
+      state.emailWatchers.find((w) => w.id === catchAll.id)!.query = "is:unread";
+    });
+    await backfillEmailWatcherJobs(config);
+    // Exact legacy shapes rewritten...
+    expect(getEmailWatcher(config, bySender.id)?.query).toBe("from:alice@x.com");
+    expect(getEmailWatcher(config, catchAll.id)?.query).toBe("in:inbox");
+    // ...and the user-supplied raw query untouched.
+    expect(getEmailWatcher(config, rawWithUnread.id)?.query).toBe("subject:invoice is:unread");
+    // The shared job's watch list carries the healed queries.
+    const queries = new Set(watches(config).map((w) => w.query));
+    expect(queries).toEqual(new Set(["from:alice@x.com", "in:inbox", "subject:invoice is:unread"]));
   });
 
   test("backfill self-heals adopted titles + orphan jobs/sessions from old->new transitions", async () => {

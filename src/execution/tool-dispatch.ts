@@ -1973,7 +1973,7 @@ async function emailWatchTool(
   }
 
   // action === "add". Build the Gmail query: a raw `query` wins; otherwise
-  // `from:<sender> is:unread`; otherwise just `is:unread`.
+  // `from:<sender>`; otherwise the whole inbox (`in:inbox`).
   let sender: string | undefined;
   if (args.sender !== undefined && args.sender !== null) {
     if (typeof args.sender !== "string" || args.sender.length === 0) {

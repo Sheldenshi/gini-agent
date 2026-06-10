@@ -1296,7 +1296,7 @@ export interface EmailWatcherRecord {
   // Forward-looking per-account credential handle. Unused in v1 (gws holds
   // one identity); recorded so the multi-account phase has a stable key.
   credentialName?: string;
-  // Gmail search query the worker polls (e.g. "from:alice@x.com is:unread").
+  // Gmail search query the worker polls (e.g. "from:alice@x.com").
   query: string;
   // The explicitly watched sender address (set when the watcher was created via
   // the `sender` input, not a raw query). The detection script bypasses the

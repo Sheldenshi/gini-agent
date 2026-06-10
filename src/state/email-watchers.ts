@@ -126,7 +126,7 @@ function findSharedJobId(state: RuntimeState, agentId: string | undefined): stri
 }
 
 export interface AddEmailWatcherInput {
-  // Watch for mail from this address (builds `from:<sender> is:unread`).
+  // Watch for mail from this address (builds `from:<sender>`).
   sender?: string;
   // Raw Gmail search query; wins over `sender` when both are given.
   query?: string;
@@ -140,11 +140,16 @@ export interface AddEmailWatcherInput {
 }
 
 // Build the Gmail query for a watcher: a raw query wins; otherwise
-// `from:<sender> is:unread`; otherwise all unread mail.
+// `from:<sender>`; otherwise the whole inbox. No `is:unread` in the auto-built
+// shapes: the `after:` watermark + boundary seen set already define newness,
+// and `is:unread` loses any mail the user reads on another device before the
+// ~60s poll tick (read-elsewhere race). The no-sender default is `in:inbox`,
+// never the empty string — an empty Gmail q lists EVERYTHING (sent, spam,
+// trash), which would trigger on our own outbound mail's listing.
 export function buildWatcherQuery(input: { sender?: string; query?: string }): string {
   if (input.query) return input.query;
-  if (input.sender) return `from:${input.sender} is:unread`;
-  return "is:unread";
+  if (input.sender) return `from:${input.sender}`;
+  return "in:inbox";
 }
 
 // Add a watcher to the agent's shared email-watch job + session. Ensures the
@@ -467,6 +472,10 @@ export async function setEmailWatcherEnabled(
 // provisioned. Returns the count of shared jobs NEWLY provisioned (a reconcile of
 // an existing job is not counted).
 export async function backfillEmailWatcherJobs(config: RuntimeConfig): Promise<number> {
+  // Heal retired auto-built query shapes BEFORE the per-agent reconcile, so
+  // the rebuild below pushes the healed queries into the shared job's watch
+  // list in the same pass.
+  await healLegacyWatcherQueries(config);
   // Group enabled watchers by owning agent — each agent shares one job.
   const enabled = readState(config.instance).emailWatchers.filter((w) => w.enabled);
   const agentIds = new Set<string | undefined>(enabled.map((w) => w.agentId));
@@ -485,6 +494,35 @@ export async function backfillEmailWatcherJobs(config: RuntimeConfig): Promise<n
     await healEmailWatchOrphans(config, agentId);
   }
   return provisioned;
+}
+
+// The retired sender-keyed auto-built query shape (`from:<sender> is:unread`).
+const LEGACY_SENDER_QUERY = /^from:(\S+) is:unread$/;
+
+// Rewrite stored queries that EXACTLY match the retired auto-built shapes:
+// `from:<sender> is:unread` → `from:<sender>` and bare `is:unread` →
+// `in:inbox`. The old shapes lost mail to the read-elsewhere race (mail read
+// on another device before the ~60s tick stopped matching `is:unread` and was
+// missed forever; the `after:` watermark + seen set already handle newness).
+// ONLY the exact auto-built shapes are touched — a user-supplied raw query may
+// include `is:unread` on purpose and is never rewritten.
+async function healLegacyWatcherQueries(config: RuntimeConfig): Promise<void> {
+  const needsHeal = readState(config.instance).emailWatchers.some(
+    (w) => w.query === "is:unread" || LEGACY_SENDER_QUERY.test(w.query)
+  );
+  if (!needsHeal) return;
+  await mutateState(config.instance, (state) => {
+    for (const w of state.emailWatchers) {
+      const match = w.query.match(LEGACY_SENDER_QUERY);
+      if (match) {
+        w.query = `from:${match[1]}`;
+        w.updatedAt = now();
+      } else if (w.query === "is:unread") {
+        w.query = "in:inbox";
+        w.updatedAt = now();
+      }
+    }
+  });
 }
 
 // Collapse duplicate gmail-watch jobs for one agent down to a single survivor,
