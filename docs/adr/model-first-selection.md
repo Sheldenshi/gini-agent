@@ -39,14 +39,24 @@ Three pieces implement this:
    (`web/src/components/provider-logos.tsx`), which the Settings provider
    rows reuse. The same component serves the Settings page and the
    per-agent chat Settings tab.
-3. **A default-model write path that updates both layers.**
-   `setDefaultModel` (`src/runtime/default-model.ts`), exposed at
-   `POST /api/settings/default-model` with body `{ provider, model }`,
+3. **A default-model write path that updates both layers and detaches
+   followers.** `setDefaultModel` (`src/runtime/default-model.ts`), exposed
+   at `POST /api/settings/default-model` with body `{ provider, model }`,
    writes `RuntimeConfig.provider` via `setSetupProvider` (preserving stored
    transport config on a same-provider save) **and** mirrors the persisted
    pair onto the default agent's override via `setAgentProvider`. The
    default agent is resolved the same way the boot seeding does —
    `agent_default`, or the legacy pre-rename `profile_default` id.
+4. **Agents are snapshots, never live links.** Changing the default must
+   not rewrite the model an existing agent runs on. An agent carrying an
+   override is untouched; an agent WITHOUT one — which resolves through
+   `config.provider` live (the runtime fallback contract of ADR
+   per-agent-provider-settings.md, unchanged) — is pinned by
+   `setDefaultModel` to the pair it was resolving to before the change.
+   Adopting a newer default is an explicit act: the chat tab's "Use default
+   model" copies the current default pair onto the agent as a new pin (it
+   never clears the override), so the agent stays unsynced from future
+   default changes.
 
 The Settings page's per-provider "active" radio is replaced by a "Default
 model" control at the top of the providers area; the provider rows remain
@@ -99,11 +109,12 @@ catalog.
   For a non-default agent it writes the existing
   `POST /api/agents/:id/provider` contract (ADR
   per-agent-provider-settings.md) with the route pair; "Use default model"
-  clears the override. For the DEFAULT agent — whose pair is the default
-  model itself — picks route through `POST /api/settings/default-model`
-  instead, so the mirror with `config.provider` holds no matter which
-  surface the default was changed from. Selection applies immediately on
-  pick — no staged save bar.
+  writes the CURRENT default pair as a new pin (the endpoint's blank-pair
+  clear remains an API affordance the UI no longer uses). For the DEFAULT
+  agent — whose pair is the default model itself — picks route through
+  `POST /api/settings/default-model` instead, so the mirror with
+  `config.provider` holds no matter which surface the default was changed
+  from. Selection applies immediately on pick — no staged save bar.
 - Routes are derived only from **configured** providers, so the picker never
   offers a route the next turn can't authenticate. Azure's configured-gate
   (active instance provider only) means a cross-provider Azure override
@@ -120,9 +131,10 @@ catalog.
   the reranker keep reading it (ADR agents-replace-profiles.md), the Edit
   provider dialog still writes its model field as the instance fallback, and
   removal of the provider backing it stays blocked in the UI.
-- Other agents' overrides are copies, not links — changing the default model
-  does not rewrite agents that already carry a pair. Their chat Settings tab
-  shows their own selection.
+- Changing the default model never rewrites an existing agent: pinned
+  agents keep their pair, and previously override-less agents are pinned to
+  the prior default by the write itself. Their chat Settings tab shows their
+  own selection with an explicit "Use default model" pin action.
 - Two routes can share a provider (Bedrock geo profiles); a route label is
   therefore provider label + qualifier, and the picker treats the pair
   `(provider, providerModelId)` — not the provider name — as the selection

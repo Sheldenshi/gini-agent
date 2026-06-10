@@ -105,6 +105,53 @@ describe("setDefaultModel", () => {
     expect(after?.model).toBe(before?.model);
   });
 
+  test("pins override-less agents to the previous default and leaves pinned agents untouched", async () => {
+    process.env.OPENAI_API_KEY = "sk-test";
+    await mutateState(config.instance, (state) => {
+      // An agent without an override resolves through config.provider live;
+      // one with an override is already a snapshot.
+      state.agents.push({
+        id: "agent_following",
+        instance: config.instance,
+        name: "Following",
+        status: "active",
+        toolsets: [],
+        messagingTargets: [],
+        createdAt: "2026-06-09T00:00:00.000Z",
+        updatedAt: "2026-06-09T00:00:00.000Z"
+      });
+      state.agents.push({
+        id: "agent_pinned",
+        instance: config.instance,
+        name: "Pinned",
+        status: "active",
+        providerName: "bedrock",
+        model: "us.amazon.nova-pro-v1:0",
+        toolsets: [],
+        messagingTargets: [],
+        createdAt: "2026-06-09T00:00:00.000Z",
+        updatedAt: "2026-06-09T00:00:00.000Z"
+      });
+    });
+
+    const result = await setDefaultModel(config, { provider: "openai", model: "gpt-5.4" });
+    expect(result.ok).toBe(true);
+    const agents = readState(config.instance).agents;
+    // The follower keeps the model it was actually using — the PREVIOUS
+    // default (codex platform default), pinned, not the new one.
+    const following = agents.find((a) => a.id === "agent_following");
+    expect(following?.providerName).toBe("codex");
+    expect(following?.model).toBe("gpt-5.5");
+    // An existing pin is never rewritten.
+    const pinned = agents.find((a) => a.id === "agent_pinned");
+    expect(pinned?.providerName).toBe("bedrock");
+    expect(pinned?.model).toBe("us.amazon.nova-pro-v1:0");
+    // The default agent mirrors the new pair.
+    const defaultAgent = agents.find((a) => a.id === "agent_default");
+    expect(defaultAgent?.providerName).toBe("openai");
+    expect(defaultAgent?.model).toBe("gpt-5.4");
+  });
+
   test("mirrors onto the legacy profile_default id when the instance pre-dates the rename", async () => {
     await mutateState(config.instance, (state) => {
       const agent = state.agents.find((a) => a.id === "agent_default");

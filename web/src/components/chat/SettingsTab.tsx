@@ -4,10 +4,10 @@ import Link from "next/link";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { Button } from "@/components/ui/button";
 import { api } from "@/lib/api";
 import { useInvalidate, useStatus } from "@/lib/queries";
 import type { ProviderCatalogItem } from "@/lib/providers";
+import type { AgentRow } from "@/lib/view-types";
 import { ModelPicker, type ModelSelection } from "@/components/ModelPicker";
 
 interface AgentProviderResult {
@@ -20,10 +20,12 @@ interface AgentProviderResult {
 // use. Picking a model in the ModelPicker saves the agent's provider/model
 // override immediately (the exact { provider, model } route pair —
 // resolveEffectiveContext reads it; see ADRs per-agent-provider-settings.md
-// and model-first-selection.md). "Use default model" clears the override so
-// the agent follows the instance default again. Credential setup (API keys,
-// AWS, Codex) stays on the instance-level Settings page; the picker only
-// offers routes through already-configured providers.
+// and model-first-selection.md). Agents are snapshots, not live links: "Use
+// default model" copies the CURRENT default pair onto the agent as a new
+// pin — it never clears the override, so a later default change can't
+// silently move this agent. Credential setup (API keys, AWS, Codex) stays
+// on the instance-level Settings page; the picker only offers routes
+// through already-configured providers.
 //
 // `agentId` is the mutation target and the displayed current selection is
 // read from `/status.activeAgent`. The chat surface renders this tab only on
@@ -39,33 +41,47 @@ export function SettingsTab({ agentId }: { agentId?: string }) {
     queryFn: () => api<ProviderCatalogItem[]>("/providers/catalog"),
     refetchInterval: 60_000
   });
+  // The default agent's pair is the default model ("Use default model"
+  // copies it). Legacy instances carry the pre-rename "profile_default" id.
+  const agents = useQuery({
+    queryKey: ["agents"],
+    queryFn: () => api<{ agents: AgentRow[]; activeAgentId?: string }>("/agents")
+  });
+  const defaultAgent =
+    agents.data?.agents.find((agent) => agent.id === "agent_default") ??
+    agents.data?.agents.find((agent) => agent.id === "profile_default");
 
   const activeAgent = status.data?.activeAgent;
-  // The agent's CURRENT effective selection — override or inherited.
+  // The instance fallback an override-less agent resolves through.
+  const instanceProvider = status.data?.provider?.provider;
+  // The agent's CURRENT effective selection — pinned or inherited.
   const resolved = activeAgent?.resolvedProvider;
   const value: ModelSelection | null = resolved
     ? { provider: resolved.name, model: resolved.model }
     : null;
-  // The DEFAULT agent's pair IS the default model (the Settings control
-  // displays it; new agents copy it), so it is always "on the default" —
-  // surfacing its own pair as an override would contradict the Settings
-  // page, and a clear action would silently swap the real default for the
-  // instance fallback. A NON-default agent's override is a copy, not a
-  // link — even when it currently equals the instance pair it will not
-  // follow later default changes, so it must read as an override and keep
-  // the clear affordance. "profile_default" is the legacy pre-rename id.
+  // The current default pair — what "Use default model" copies onto the
+  // agent. The default agent's pair is authoritative; the instance provider
+  // is the pre-seed fallback.
+  const defaultPair: ModelSelection | null =
+    defaultAgent?.providerName && defaultAgent.model
+      ? { provider: defaultAgent.providerName, model: defaultAgent.model }
+      : instanceProvider
+        ? { provider: instanceProvider.name, model: instanceProvider.model }
+        : null;
+  // "profile_default" is the legacy pre-rename id for the default agent.
   const isDefaultAgent = agentId === "agent_default" || agentId === "profile_default";
-  const isDefault = isDefaultAgent || activeAgent?.providerSource !== "agent";
+  // An override-less agent still resolves through config.provider live (the
+  // runtime fallback); the next default change pins it where it stands.
+  const isFollowing = !isDefaultAgent && activeAgent?.providerSource !== "agent";
 
   const save = useMutation({
     // The default agent's pair IS the default model, so its picks route
     // through the two-layer default-model write — a bare agent-override
     // write would move what new chats start with while config.provider
     // (embeddings/reranker anchor, provider-removal gate) stayed behind.
-    // Other agents save their own override; clearing one (blank pair) is
-    // always the per-agent endpoint's contract.
+    // Other agents save their own pinned pair.
     mutationFn: (vars: { providerName: string; model: string }) =>
-      isDefaultAgent && vars.providerName
+      isDefaultAgent
         ? api("/settings/default-model", {
             method: "POST",
             body: JSON.stringify({ provider: vars.providerName, model: vars.model })
@@ -76,11 +92,9 @@ export function SettingsTab({ agentId }: { agentId?: string }) {
           }),
     onSuccess: (_result, vars) => {
       toast.success(
-        vars.providerName
-          ? isDefaultAgent
-            ? `Default model: ${vars.model} via ${vars.providerName}`
-            : `${vars.model} via ${vars.providerName} for this agent`
-          : "Reverted to the default model"
+        isDefaultAgent
+          ? `Default model: ${vars.model} via ${vars.providerName}`
+          : `${vars.model} via ${vars.providerName} for this agent`
       );
       invalidate(["status", "agents", "state", "providers"]);
     },
@@ -120,25 +134,7 @@ export function SettingsTab({ agentId }: { agentId?: string }) {
                   .
                 </p>
               </div>
-              <div className="flex flex-wrap items-center gap-2.5">
-                {isDefault ? (
-                  // The trigger already names the pair and its route — the
-                  // caption only states where it comes from.
-                  <p className="text-xs text-muted-foreground">Using the default model</p>
-                ) : (
-                  <>
-                    <p className="text-xs text-muted-foreground">Overriding the default model</p>
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      disabled={save.isPending}
-                      onClick={() => save.mutate({ providerName: "", model: "" })}
-                    >
-                      Use default model
-                    </Button>
-                  </>
-                )}
+              <div className="flex flex-col items-end gap-1.5">
                 <ModelPicker
                   value={value}
                   onSelect={(selection) =>
@@ -147,6 +143,36 @@ export function SettingsTab({ agentId }: { agentId?: string }) {
                   disabled={save.isPending}
                   ariaLabel={`Model for ${activeAgent?.name ?? "this agent"}`}
                 />
+                {/* Status line under the control: the trigger already names
+                    the pair and its route, so this only states where the
+                    selection comes from. */}
+                {isDefaultAgent ? (
+                  <p className="text-xs text-muted-foreground">This is the default model</p>
+                ) : isFollowing ? (
+                  <p className="text-xs text-muted-foreground">Using the default model</p>
+                ) : (
+                  <p className="text-xs text-muted-foreground">
+                    Pinned for this agent
+                    {defaultPair ? (
+                      <>
+                        {" "}·{" "}
+                        <button
+                          type="button"
+                          disabled={save.isPending}
+                          onClick={() =>
+                            // Copy the CURRENT default as a new pin — the
+                            // agent stays a snapshot, unsynced from future
+                            // default changes.
+                            save.mutate({ providerName: defaultPair.provider, model: defaultPair.model })
+                          }
+                          className="font-medium text-foreground underline-offset-2 hover:underline disabled:opacity-50"
+                        >
+                          Use default model
+                        </button>
+                      </>
+                    ) : null}
+                  </p>
+                )}
               </div>
             </section>
           )}
