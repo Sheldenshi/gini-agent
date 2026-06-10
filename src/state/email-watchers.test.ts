@@ -250,6 +250,26 @@ describe("shared backing job lifecycle", () => {
     expect((list.find((w) => w.watcherId === byQuery.id) as { sender?: string }).sender).toBeUndefined();
   });
 
+  test("the shared job's playbook pins thread reading, objective, needs-input, and follow-up rules", async () => {
+    const config = buildConfig("ew-job-playbook");
+    await addEmailWatcher(config, { sender: "alice@x.com" });
+    const prompt = sharedJob(config)!.prompt;
+    // The drafting turn reads the whole conversation, not just the message.
+    expect(prompt).toContain("read the FULL Gmail THREAD the message belongs to");
+    // Objective awareness: authoritative standing instructions per watch.
+    expect(prompt).toContain("accompanied by an Objective");
+    expect(prompt).toContain("authoritative for what the reply should achieve");
+    // Needs-input rule: never invent missing facts; surface them in-chat.
+    expect(prompt).toContain("⏸ Needs your input");
+    expect(prompt).toContain("[PLACEHOLDER:");
+    // Follow-up nudges draft a polite follow-up as a normal proposed reply.
+    expect(prompt).toContain("gone silent on a watched thread");
+    // The standing safety rules survive the rewrite.
+    expect(prompt).toContain("UNTRUSTED quoted data");
+    expect(prompt).toContain("Do NOT send it.");
+    expect(prompt).toContain("[SILENT]");
+  });
+
   test("a second add reuses the SAME shared job + session and appends to watches", async () => {
     const config = buildConfig("ew-job-share");
     const w1 = await addEmailWatcher(config, { sender: "alice@x.com" });
