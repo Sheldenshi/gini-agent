@@ -3166,14 +3166,17 @@ describe("buildConnectedAccountsBlock", () => {
     expect(block).toContain("use it");
   });
 
-  test("surfaces both accounts and the ask-which-one guidance when 2+ are connected", () => {
+  test("surfaces both accounts, aggregate-on-read, and ask-on-write guidance when 2+ are connected", () => {
     const block = buildConnectedAccountsBlock([
       account({ tag: "personal" }),
       account({ tag: "work" })
     ]);
     expect(block).toContain("personal");
     expect(block).toContain("work");
-    expect(block).toContain("ASK which one before running");
+    // Unscoped reads fan out across every account instead of picking one.
+    expect(block).toContain("EVERY connected account");
+    // Writes still ask when no account is named.
+    expect(block).toContain("ASK which account first");
   });
 
   test("shows the sign-in-pending placeholder for an account with no email yet", () => {

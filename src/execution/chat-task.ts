@@ -1329,9 +1329,10 @@ export function buildInactiveSkillsBlock(skills: SkillRecord[], state?: RuntimeS
 // authorized against the single google-workspace-oauth client; each one is a
 // `gws` config dir. We surface every account's tag, email, and config dir so
 // the model can target the right one per `gws` command (by inline-prefixing
-// GOOGLE_WORKSPACE_CLI_CONFIG_DIR) and ask the user when the request doesn't
-// name an account. Byte-stable for a given registry: preserves registry order
-// and carries no timestamps, so it doesn't churn the prefix cache.
+// GOOGLE_WORKSPACE_CLI_CONFIG_DIR). For an unscoped read/search it queries
+// every account and aggregates; for a write with no account named it asks.
+// Byte-stable for a given registry: preserves registry order and carries no
+// timestamps, so it doesn't churn the prefix cache.
 //
 // Exported for unit testing; production callers use it via runChatTask.
 export function buildConnectedAccountsBlock(accounts: GoogleAccount[]): string {
@@ -1343,7 +1344,12 @@ export function buildConnectedAccountsBlock(accounts: GoogleAccount[]): string {
   const selectionRule =
     accounts.length === 1
       ? "Only one account is connected — use it (still pass its config dir)."
-      : "Two or more accounts are connected — use the one the user named or clearly implied (an explicit tag, an email address, or unambiguous context). If you cannot tell which account the user means, ASK which one before running — never guess on sends, deletes, or other writes.";
+      : [
+          "Two or more accounts are connected. Choose the target account by the operation:",
+          "- The user named or clearly implied one account (an explicit tag, an email address, or unambiguous context) → use only that account.",
+          "- A read / lookup / search the user did NOT tie to a specific account (e.g. \"what's on my calendar\", \"find the budget doc\", \"search my email\") → run it against EVERY connected account (one `gws` call per config dir) and aggregate the results, labeling each by the account's tag and email. Don't pick just one, and don't ask — the user wants the whole picture across accounts.",
+          "- A write (send, create, edit, delete) with no account named → ASK which account first; never guess."
+        ].join("\n");
   return [
     "Connected Google accounts:",
     "These Google accounts are connected. Any `gws` command can target a specific one by prefixing it with `GOOGLE_WORKSPACE_CLI_CONFIG_DIR=\"<configDir>\" gws ...`.",
