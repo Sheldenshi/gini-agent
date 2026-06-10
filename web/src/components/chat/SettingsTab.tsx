@@ -1,14 +1,13 @@
 "use client";
 
 import Link from "next/link";
-import { useMemo } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Button } from "@/components/ui/button";
 import { api } from "@/lib/api";
 import { useInvalidate, useStatus } from "@/lib/queries";
-import { displayProviderName, type ProviderCatalogItem } from "@/lib/providers";
+import type { ProviderCatalogItem } from "@/lib/providers";
 import { ModelPicker, type ModelSelection } from "@/components/ModelPicker";
 
 interface AgentProviderResult {
@@ -42,17 +41,6 @@ export function SettingsTab({ agentId }: { agentId?: string }) {
   });
 
   const activeAgent = status.data?.activeAgent;
-  // The instance default the agent falls back to when it carries no override.
-  const instanceProvider = status.data?.provider?.provider;
-  // Clean brand label for the instance provider, resolved through the catalog
-  // so the default-model line reads "OpenAI" / "Amazon Bedrock" rather than a
-  // raw lowercase id.
-  const instanceLabel = useMemo(() => {
-    if (!instanceProvider) return "";
-    const row = (catalog.data ?? []).find((r) => r.name === instanceProvider.name);
-    return displayProviderName(row ?? { displayName: instanceProvider.name, name: instanceProvider.name });
-  }, [catalog.data, instanceProvider?.name]);
-
   // The agent's CURRENT effective selection — override or inherited.
   const resolved = activeAgent?.resolvedProvider;
   const value: ModelSelection | null = resolved
@@ -140,18 +128,9 @@ export function SettingsTab({ agentId }: { agentId?: string }) {
                   ariaLabel={`Model for ${activeAgent?.name ?? "this agent"}`}
                 />
                 {isDefault ? (
-                  <p className="text-xs text-muted-foreground">
-                    Using the default model
-                    {/* The default agent's own pair IS the default — the
-                        trigger already names it, and the instance pair could
-                        lag behind a /setup/provider write. */}
-                    {!isDefaultAgent && instanceProvider ? (
-                      <>
-                        {" "}· {instanceLabel} ·{" "}
-                        <span className="font-mono">{instanceProvider.model}</span>
-                      </>
-                    ) : null}
-                  </p>
+                  // The trigger already names the pair and its route — the
+                  // caption only states where it comes from.
+                  <p className="text-xs text-muted-foreground">Using the default model</p>
                 ) : (
                   <div className="flex items-center gap-2.5">
                     <p className="text-xs text-muted-foreground">Overriding the default model</p>
