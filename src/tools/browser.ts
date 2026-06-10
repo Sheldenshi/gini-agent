@@ -1390,8 +1390,11 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
       // the DOM disagree (bfcache restore carrying stamps the counter
       // never saw, or a unit-test walk with no session).
       let nextId = startId;
+      // Ids are bounded to 9 digits: beyond that a page-planted stamp
+      // could push the counter into float-imprecision territory (2^53)
+      // where ++ stops incrementing and every fresh allocation collides.
       for (const el of Array.from(document.querySelectorAll(`[${attr}]`))) {
-        const m = /^e(\d+)$/.exec(el.getAttribute(attr) ?? "");
+        const m = /^e(\d{1,9})$/.exec(el.getAttribute(attr) ?? "");
         if (m) nextId = Math.max(nextId, Number(m[1]) + 1);
       }
       // Reuse an existing stamp (refs are stable within a page lifetime);
@@ -1405,7 +1408,7 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
       const stampsThisWalk = new Set<string>();
       const refFor = (el: Element): string => {
         const existing = el.getAttribute(attr);
-        if (existing && /^e\d+$/.test(existing) && !stampsThisWalk.has(existing)) {
+        if (existing && /^e\d{1,9}$/.test(existing) && !stampsThisWalk.has(existing)) {
           stampsThisWalk.add(existing);
           return `@${existing}`;
         }
@@ -1938,39 +1941,44 @@ async function healLostRef(session: Session, target: RefTarget, ref: string): Pr
   // walker's synthetic "clickable" entries do — getByText also matches
   // same-text bystanders (headings, plain spans) the walker never
   // emitted. Both cases bail to the standard Unknown-ref failure.
+  //
+  // The checks and the restamp run in ONE evaluate: a candidate locator
+  // re-resolves on every call, so checking in one round trip and writing
+  // in another would let a racing re-render shift the nth match between
+  // them — the element that passed the checks must be the element that
+  // gets the stamp. The short timeout keeps a candidate that detached
+  // after count() from auto-waiting the action's whole budget here.
+  let restamped = false;
   try {
     const verdict = await candidate.evaluate(
-      (el: Element, arg: { attr: string; id: string }) => {
+      (el: Element, arg: { attr: string; id: string; requireInteractive: boolean }) => {
         const stamp = el.getAttribute(arg.attr);
         const tabindexAttr = el.getAttribute("tabindex");
-        return {
-          foreignStamp: stamp !== null && stamp !== arg.id,
-          cursorInteractive:
-            window.getComputedStyle(el as HTMLElement).cursor === "pointer" ||
-            el.getAttribute("onclick") !== null ||
-            (tabindexAttr !== null && Number.parseInt(tabindexAttr, 10) >= 0),
-        };
+        const foreignStamp = stamp !== null && stamp !== arg.id;
+        const cursorInteractive =
+          window.getComputedStyle(el as HTMLElement).cursor === "pointer" ||
+          el.getAttribute("onclick") !== null ||
+          (tabindexAttr !== null && Number.parseInt(tabindexAttr, 10) >= 0);
+        const accepted = !foreignStamp && (!arg.requireInteractive || cursorInteractive);
+        if (accepted) el.setAttribute(arg.attr, arg.id);
+        return accepted;
       },
-      { attr: REF_ATTR_GLOBAL, id: ref.slice(1) }
+      { attr: REF_ATTR_GLOBAL, id: ref.slice(1), requireInteractive: viaText },
+      { timeout: 2_000 }
     );
-    if (verdict.foreignStamp) return undefined;
-    if (viaText && !verdict.cursorInteractive) return undefined;
+    if (!verdict) return undefined;
+    restamped = true;
   } catch {
     return undefined;
   }
-  // Restamp with the SAME id so the ref stays stable for future actions
-  // and snapshots. Best-effort: acting on the candidate locator is
-  // correct even if the stamp write fails (a later action just re-heals).
-  try {
-    await candidate.evaluate(
-      (el: Element, arg: { attr: string; id: string }) => el.setAttribute(arg.attr, arg.id),
-      { attr: REF_ATTR_GLOBAL, id: ref.slice(1) }
-    );
-    if (typeof page.locator === "function") {
-      session.refs.set(ref, { ...target, locator: page.locator(`[${REF_ATTR_GLOBAL}="${ref.slice(1)}"]`) });
-    }
-  } catch {
-    // Best-effort restamp only — see above.
+  // The verified element now carries the SAME id, so the ref stays
+  // stable for future actions and snapshots — and acting through the
+  // stamped selector (instead of the re-resolving role/text candidate)
+  // pins this action to exactly the element that passed the checks.
+  if (restamped && typeof page.locator === "function") {
+    const stampedLocator = page.locator(`[${REF_ATTR_GLOBAL}="${ref.slice(1)}"]`);
+    session.refs.set(ref, { ...target, locator: stampedLocator });
+    return stampedLocator;
   }
   return candidate;
 }
@@ -3175,7 +3183,7 @@ export async function browserVision(
             // itself); a badge citing a ref the agent can't act on would
             // send it chasing Unknown-ref failures.
             const knownIds = Array.from(session.refs.keys()).map((r) => r.slice(1));
-            await session.page.evaluate((arg: { cap: number; ids: string[] }) => {
+            await session.page.evaluate((arg: { cap: number; ids: string[]; fullPage: boolean }) => {
               const known = new Set(arg.ids);
               const stamped = Array.from(document.querySelectorAll("[data-gini-ref]"));
               let placed = 0;
@@ -3185,9 +3193,12 @@ export async function browserVision(
                 if (el.getAttribute("data-gini-secret") !== null) continue;
                 const rect = el.getBoundingClientRect();
                 if (rect.width <= 0 || rect.height <= 0) continue;
+                // A fullPage capture includes below-fold content, so the
+                // viewport filter only applies to viewport captures.
                 if (
-                  rect.bottom <= 0 || rect.right <= 0
-                  || rect.top >= window.innerHeight || rect.left >= window.innerWidth
+                  !arg.fullPage
+                  && (rect.bottom <= 0 || rect.right <= 0
+                    || rect.top >= window.innerHeight || rect.left >= window.innerWidth)
                 ) {
                   continue;
                 }
@@ -3206,7 +3217,7 @@ export async function browserVision(
                 document.documentElement.appendChild(badge);
                 placed++;
               }
-            }, { cap: VISION_ANNOTATE_BADGE_CAP, ids: knownIds });
+            }, { cap: VISION_ANNOTATE_BADGE_CAP, ids: knownIds, fullPage: full });
           }
         } catch { /* best-effort overlay — an unannotated screenshot is still useful */ }
       }

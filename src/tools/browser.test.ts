@@ -1184,6 +1184,25 @@ describe("snapshot stable refs and post-action diffs", () => {
     }
   });
 
+  test("a well-formed but oversized planted stamp neither sticks nor poisons the allocator", async () => {
+    // Number("9007199254740991") + 1 stops incrementing at float
+    // precision, so an unbounded scan would make every fresh allocation
+    // collide on one id. Ids beyond 9 digits are treated as unstamped.
+    const planted = makeEl({ tagName: "BUTTON", textContent: "Huge", attrs: { "data-gini-ref": "e9007199254740991" } });
+    const next = makeEl({ tagName: "BUTTON", textContent: "Next" });
+    const body = makeEl({ tagName: "BODY", children: [planted, next] });
+    const restore = installFakeDom(body);
+    const page = makeFakePage({ url: "https://example.com/" });
+    try {
+      const result = await browserTest.snapshotForTest(page, false);
+      expect(result.text).toContain('[@e1] button "Huge"');
+      expect(result.text).toContain('[@e2] button "Next"');
+      expect(planted._attrs["data-gini-ref"]).toBe("e1");
+    } finally {
+      restore();
+    }
+  });
+
   test("a stamp that doesn't match the e<N> format is never honored", async () => {
     // Only the walker writes well-formed stamps; any other value means
     // the page set the attribute itself, and honoring it would let page
@@ -1435,6 +1454,36 @@ describe("stale-ref self-healing", () => {
       getByText: [] as Array<{ text: string; options?: Record<string, unknown>; nth?: number }>,
       locator: [] as string[]
     };
+    // page.locator stubs record actions per selector — after a heal the
+    // action runs through the freshly-stamped selector, not the
+    // role/text candidate, and tests assert it landed there.
+    type LocatorStub = {
+      __sel: string;
+      clicks: Array<{ timeout?: number } | undefined>;
+      waits: Array<{ state?: string; timeout?: number } | undefined>;
+      click(o?: { timeout?: number }): Promise<void>;
+      waitFor(o?: { state?: string; timeout?: number }): Promise<void>;
+    };
+    const locatorStubs = new Map<string, LocatorStub>();
+    const locatorOf = (sel: string): LocatorStub => {
+      let stub = locatorStubs.get(sel);
+      if (!stub) {
+        const made: LocatorStub = {
+          __sel: sel,
+          clicks: [],
+          waits: [],
+          click: async (o?: { timeout?: number }) => {
+            made.clicks.push(o);
+          },
+          waitFor: async (o?: { state?: string; timeout?: number }) => {
+            made.waits.push(o);
+          }
+        };
+        locatorStubs.set(sel, made);
+        stub = made;
+      }
+      return stub;
+    };
     const page = {
       url: () => "https://example.com/app",
       title: async () => "App",
@@ -1442,7 +1491,7 @@ describe("stale-ref self-healing", () => {
       evaluate: async () => ({ entries: [], hiddenEmitted: 0, hiddenTotal: 0, hiddenBudget: 0 }),
       locator: (sel: string) => {
         calls.locator.push(sel);
-        return { __sel: sel };
+        return locatorOf(sel);
       },
       getByRole: (role: string, options?: Record<string, unknown>) => {
         const entry = { role, options, nth: undefined as number | undefined };
@@ -1465,7 +1514,7 @@ describe("stale-ref self-healing", () => {
         };
       }
     };
-    return { page: page as unknown as Partial<import("playwright-core").Page>, calls };
+    return { page: page as unknown as Partial<import("playwright-core").Page>, calls, locatorOf };
   }
 
   // A healing candidate that exists (count 1) and records the action +
@@ -1519,7 +1568,7 @@ describe("stale-ref self-healing", () => {
 
   test("click self-heals a lost stamp via role/name/nth, restamps the survivor, and flags healedRef", async () => {
     const { candidate, record } = makeCandidate();
-    const { page, calls } = makeHealPage({ roleCandidate: candidate });
+    const { page, calls, locatorOf } = makeHealPage({ roleCandidate: candidate });
     browserTest.installFakeSessionWithPageForTest("heal-click", page);
     const refs = new Map<string, unknown>();
     // Stamped locator matches nothing — the node was re-rendered away.
@@ -1536,13 +1585,16 @@ describe("stale-ref self-healing", () => {
     expect(calls.getByRole[0]!.options).toEqual({ name: "Submit", exact: true });
     expect(calls.getByRole[0]!.nth).toBe(1);
     expect(calls.getByText.length).toBe(0);
-    // The click landed on the healed candidate with the standard timeout.
-    expect(record.clicks.length).toBe(1);
-    expect(record.clicks[0]!.timeout).toBe(10_000);
-    // The survivor was restamped with the SAME id, and the fast-path
-    // locator was rebuilt against the stamped selector.
+    // The survivor was restamped with the SAME id, and the click ran
+    // through the freshly-stamped selector (pinning the action to the
+    // exact element that passed the heal checks) with the standard
+    // timeout.
     expect(record.restamps).toEqual([{ attr: "data-gini-ref", id: "e5" }]);
     expect(calls.locator).toContain('[data-gini-ref="e5"]');
+    const stamped = locatorOf('[data-gini-ref="e5"]');
+    expect(stamped.clicks.length).toBe(1);
+    expect(stamped.clicks[0]!.timeout).toBe(10_000);
+    expect(record.clicks.length).toBe(0);
   });
 
   test("a live stamp resolves on the fast path without any re-query or healedRef flag", async () => {
@@ -1587,8 +1639,8 @@ describe("stale-ref self-healing", () => {
   });
 
   test("role clickable heals via exact-text matching, not getByRole", async () => {
-    const { candidate, record } = makeCandidate({ cursor: "pointer" });
-    const { page, calls } = makeHealPage({ textCandidate: candidate });
+    const { candidate } = makeCandidate({ cursor: "pointer" });
+    const { page, calls, locatorOf } = makeHealPage({ textCandidate: candidate });
     browserTest.installFakeSessionWithPageForTest("heal-clickable", page);
     const refs = new Map<string, unknown>();
     refs.set("@e3", { locator: { count: async () => 0 }, role: "clickable", name: "Open card", nth: 2 });
@@ -1603,7 +1655,7 @@ describe("stale-ref self-healing", () => {
     expect(calls.getByText[0]!.text).toBe("Open card");
     expect(calls.getByText[0]!.options).toEqual({ exact: true });
     expect(calls.getByText[0]!.nth).toBe(2);
-    expect(record.clicks.length).toBe(1);
+    expect(locatorOf('[data-gini-ref="e3"]').clicks.length).toBe(1);
   });
 
   test("a candidate carrying a different stamp is never healed onto", async () => {
@@ -1644,8 +1696,8 @@ describe("stale-ref self-healing", () => {
   });
 
   test("an own-onclick text candidate qualifies without cursor:pointer", async () => {
-    const { candidate, record } = makeCandidate({ onclick: true });
-    const { page } = makeHealPage({ textCandidate: candidate });
+    const { candidate } = makeCandidate({ onclick: true });
+    const { page, locatorOf } = makeHealPage({ textCandidate: candidate });
     browserTest.installFakeSessionWithPageForTest("heal-onclick", page);
     const refs = new Map<string, unknown>();
     refs.set("@e3", { locator: { count: async () => 0 }, role: "clickable", name: "Open card", nth: 0 });
@@ -1653,12 +1705,12 @@ describe("stale-ref self-healing", () => {
 
     const raw = await browserClick("heal-onclick", { ref: "@e3" });
     expect(JSON.parse(raw).success).toBe(true);
-    expect(record.clicks.length).toBe(1);
+    expect(locatorOf('[data-gini-ref="e3"]').clicks.length).toBe(1);
   });
 
   test("wait_for state visible self-heals and flags healedRef", async () => {
-    const { candidate, record } = makeCandidate();
-    const { page, calls } = makeHealPage({ roleCandidate: candidate });
+    const { candidate } = makeCandidate();
+    const { page, calls, locatorOf } = makeHealPage({ roleCandidate: candidate });
     browserTest.installFakeSessionWithPageForTest("heal-wait", page);
     const refs = new Map<string, unknown>();
     refs.set("@e4", { locator: { count: async () => 0 }, role: "status", name: "Saved", nth: 0 });
@@ -1669,8 +1721,9 @@ describe("stale-ref self-healing", () => {
     expect(parsed.success).toBe(true);
     expect(parsed.healedRef).toBe(true);
     expect(calls.getByRole.length).toBe(1);
-    expect(record.waits.length).toBe(1);
-    expect(record.waits[0]!.state).toBe("visible");
+    const waits = locatorOf('[data-gini-ref="e4"]').waits;
+    expect(waits.length).toBe(1);
+    expect(waits[0]!.state).toBe("visible");
   });
 
   test("wait_for visible polls the stamped locator when resolution and healing both miss", async () => {
@@ -2435,6 +2488,30 @@ describe("browserVision annotated screenshots", () => {
       expect(cssAtScreenshot).toContain("position:absolute");
       expect(cssAtScreenshot).toContain("left:15px");
       expect(cssAtScreenshot).toContain("top:1010px");
+    } finally {
+      restore();
+    }
+  });
+
+  test("full:true badges below-fold elements the viewport filter would drop", async () => {
+    const belowFold = makeStamped("e1", { rect: { top: 5000, bottom: 5020 } });
+    const { badges, restore } = installFakeDom([belowFold]);
+    let badgeTextsAtScreenshot: string[] = [];
+    const fakePage = {
+      evaluate: evalLocally,
+      screenshot: async () => {
+        badgeTextsAtScreenshot = badges.map((b) => b.textContent);
+        return Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+      },
+      url: () => "https://example.com/long"
+    };
+    browserTest.installFakeSessionWithPageForTest("vision-fullpage", fakePage);
+    setSessionRefIds("vision-fullpage", ["e1"]);
+    setEchoVisionResponse({ text: "fullpage answer" });
+    try {
+      const raw = await browserVision("vision-fullpage", { question: "what?", annotate: true, full: true }, config);
+      expect(JSON.parse(raw).success).toBe(true);
+      expect(badgeTextsAtScreenshot).toEqual(["e1"]);
     } finally {
       restore();
     }
