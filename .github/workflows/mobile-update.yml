@@ -50,9 +50,11 @@ jobs:
           fi
           echo "needs_build=false" >> "$GITHUB_OUTPUT"
 
+      # Same Bun pin as ci.yml: 1.3.13 has subprocess bugs that can wedge a
+      # bun process at exit (issue #289); keep at 1.3.14 or newer.
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.3.13
+          bun-version: 1.3.14
 
       - uses: expo/expo-github-action@v9
         with:

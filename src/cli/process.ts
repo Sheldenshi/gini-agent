@@ -195,7 +195,18 @@ export async function start(config: RuntimeConfig, options: WebOptions): Promise
       if (await isRunning(config)) { healthy = true; break; }
       await Bun.sleep(100);
     }
-    if (!healthy) throw new Error("Runtime did not become healthy within 5 seconds.");
+    if (!healthy) {
+      // Reap the child we just spawned before surfacing the error. The
+      // caller never receives the handle on this path (we throw before
+      // returning `children`), so nothing downstream can kill it — without
+      // this, a slow-booting runtime outlives the CLI as an orphan bun
+      // process that binds the port and runs its scheduler loops forever
+      // (issue #289's orphan shape). SIGKILL is deliberate: the runtime
+      // never served /api/status, so it has no state worth a graceful
+      // drain, and the CLI is about to exit and cannot wait for one.
+      try { child.kill("SIGKILL"); } catch { /* already gone */ }
+      throw new Error("Runtime did not become healthy within 5 seconds.");
+    }
     runtimeStarted = true;
   } else {
     // Even if the runtime was already up, refresh the recorded port so

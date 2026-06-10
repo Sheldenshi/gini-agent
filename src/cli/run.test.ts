@@ -4,8 +4,8 @@
 // signal-handling and child-teardown contract end-to-end. Each test gets a
 // unique instance + state/log roots under /tmp so they do not collide with
 // developer state or with each other when bun test runs them in parallel.
-import { describe, expect, test } from "bun:test";
-import { spawn } from "node:child_process";
+import { afterAll, describe, expect, test } from "bun:test";
+import { spawn, type ChildProcess } from "node:child_process";
 import { createServer } from "node:net";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
@@ -64,13 +64,72 @@ interface RunHarness {
   logRoot: string;
 }
 
+// Every spawned CLI child and every harness, so the afterAll reaper can
+// sweep anything a failed or timed-out test left running. A leaked CLI
+// child pins this worker's event loop through its piped stdout/stderr,
+// which under `bun test --parallel` hangs the whole run after all tests
+// pass (issue #289) — the reaper guarantees the worker can always exit.
+// afterAll (not afterEach): these tests run with test.concurrent, and an
+// afterEach reaper would kill the children of still-running siblings.
+const liveChildren = new Set<ChildProcess>();
+const liveHarnesses: RunHarness[] = [];
+
+function childAlive(child: ChildProcess): boolean {
+  return child.exitCode === null && child.signalCode === null;
+}
+
+// The runtime child records its pid here once booted (pidPath layout:
+// <base state root>/instances/<instance>/runtime.pid — see src/paths.ts).
+function runtimePidPath(h: RunHarness): string {
+  return join(h.stateRoot, "instances", h.instance, "runtime.pid");
+}
+
+function recordedRuntimePid(h: RunHarness): number | null {
+  const path = runtimePidPath(h);
+  if (!existsSync(path)) return null;
+  const pid = Number(readFileSync(path, "utf8").trim());
+  return Number.isFinite(pid) && pid > 0 ? pid : null;
+}
+
+afterAll(async () => {
+  // SIGTERM first so a still-functioning CLI cascades teardown to its
+  // runtime child, then poll (never a fixed sleep) and escalate.
+  for (const child of liveChildren) {
+    if (childAlive(child)) {
+      try { child.kill("SIGTERM"); } catch { /* already gone */ }
+    }
+  }
+  const deadline = Date.now() + 8_000;
+  while (Date.now() < deadline && [...liveChildren].some(childAlive)) {
+    await Bun.sleep(50);
+  }
+  for (const child of liveChildren) {
+    if (childAlive(child)) {
+      try { child.kill("SIGKILL"); } catch { /* already gone */ }
+    }
+  }
+  liveChildren.clear();
+  // Grandchild sweep: a runtime whose CLI died without forwarding the kill
+  // is not in liveChildren (we never owned its handle) — find it via the
+  // pidfile it wrote at boot and make sure it cannot outlive the suite.
+  for (const h of liveHarnesses) {
+    const pid = recordedRuntimePid(h);
+    if (pid !== null && (await pidAlive(pid))) {
+      try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
+    }
+  }
+  liveHarnesses.length = 0;
+});
+
 function makeHarness(tag: string): RunHarness {
   const instance = uniqueInstance(tag);
   const stateRoot = `/tmp/gini-run-tests/${instance}`;
   const logRoot = `/tmp/gini-run-tests-logs/${instance}`;
   rmSync(stateRoot, { recursive: true, force: true });
   rmSync(logRoot, { recursive: true, force: true });
-  return { instance, stateRoot, logRoot };
+  const harness = { instance, stateRoot, logRoot };
+  liveHarnesses.push(harness);
+  return harness;
 }
 
 async function spawnRun(h: RunHarness): Promise<{
@@ -101,6 +160,7 @@ async function spawnRun(h: RunHarness): Promise<{
     stdio: ["ignore", "pipe", "pipe"],
     env: { ...process.env, ...FAST_LOOP_ENV }
   });
+  liveChildren.add(child);
   const chunks: Buffer[] = [];
   child.stdout?.on("data", (chunk) => { chunks.push(Buffer.from(chunk)); });
   child.stderr?.on("data", (chunk) => { chunks.push(Buffer.from(chunk)); });
@@ -156,6 +216,13 @@ describe("gini run", () => {
     // Capture all child PIDs we spawned so we can confirm none survive teardown.
     const directChildPid = child.pid!;
     expect(await pidAlive(directChildPid)).toBe(true);
+    // The banner means the health poll passed, so the runtime child has
+    // booted and recorded its pid — capture it so we can assert the
+    // GRANDCHILD dies too, not just the CLI. A leaked runtime is exactly
+    // the orphan `bun` process CI cleanup reported in issue #289.
+    const runtimePid = recordedRuntimePid(h);
+    expect(runtimePid).not.toBeNull();
+    expect(await pidAlive(runtimePid!)).toBe(true);
 
     child.kill("SIGTERM");
     const result = await exit;
@@ -163,8 +230,12 @@ describe("gini run", () => {
     expect(result.code === 143 || result.signal === "SIGTERM").toBe(true);
     // Parent should be reaped.
     expect(await pidAlive(directChildPid)).toBe(false);
-    // Pid file under the state root must be gone (stopRuntime cleanup).
-    expect(existsSync(join(h.stateRoot, "runtime.pid"))).toBe(false);
+    // The runtime child must be reaped with it.
+    expect(await pidAlive(runtimePid!)).toBe(false);
+    // Pid file must be gone (stopRuntime cleanup). pidPath nests under
+    // instances/<instance>/ — asserting at the state root itself would be
+    // vacuously true whether or not cleanup ran.
+    expect(existsSync(runtimePidPath(h))).toBe(false);
   }, 30_000);
 
   test.concurrent("SIGHUP (terminal close) tears children down within 5s", async () => {
@@ -262,6 +333,7 @@ describe("gini run", () => {
         "--log-root",
         h.logRoot
       ], { cwd: PROJECT_ROOT, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, ...FAST_LOOP_ENV } });
+      liveChildren.add(blocked);
       let stderr = "";
       blocked.stderr?.on("data", (chunk) => { stderr += chunk.toString("utf8"); });
       const code = await new Promise<number | null>((resolveCode) => {

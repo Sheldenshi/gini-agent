@@ -164,6 +164,16 @@ async function loadTextClassifier(modelId: string): Promise<TextClassifier> {
     process.env.HF_HOME ??= cacheDir;
     process.env.TRANSFORMERS_CACHE ??= cacheDir;
 
+    // Never import the real module under bun test: it dlopens the
+    // onnxruntime NAPI addon, whose deferred finalizers can fire after a
+    // --parallel/--isolate worker has swapped globals and segfault the
+    // worker (napi_open_escapable_handle_scope; surfaced via issue #289).
+    // Tests that exercise this path inject __setTransformersLoaderForTests;
+    // everything else degrades through the catch below, same as a failed
+    // model load in production.
+    if (!transformersLoader && process.env.NODE_ENV === "test") {
+      throw new Error("@huggingface/transformers is not loaded under bun test; inject __setTransformersLoaderForTests");
+    }
     const mod = transformersLoader
       ? await transformersLoader()
       : (await import("@huggingface/transformers")) as unknown as TransformersModule;

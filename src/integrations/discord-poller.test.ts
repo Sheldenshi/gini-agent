@@ -3,7 +3,7 @@ import { rmSync } from "node:fs";
 import type { RuntimeConfig } from "../types";
 import { readState } from "../state";
 import { addMessagingBridge, resetMessagingDeps, setMessagingDeps } from "./messaging";
-import { createDiscordPollerSupervisor, __internalsForTests as discordInternals } from "./discord-poller";
+import { createDiscordPollerSupervisor, __internalsForTests as discordInternals, type PollerSupervisor } from "./discord-poller";
 import type { DiscordGatewayHandle } from "./discord-gateway";
 
 // No-op Gateway connector for tests so the supervisor doesn't open a
@@ -183,7 +183,31 @@ function makeMessage(overrides: Partial<DiscordMessage>): DiscordMessage {
 }
 
 describe("discord poller supervisor", () => {
-  afterEach(() => {
+  // Track every supervisor a test creates so a failed assertion before the
+  // in-body stopAll() can't strand a poll loop. A stranded loop re-arms a
+  // ref'd setTimeout forever (sleepUnlessAbortedOrWoken), which pins the
+  // bun test worker's event loop after the suite finishes — the file's
+  // output stays buffered under --parallel, so the run hangs with no
+  // visible failure. Same guard as telegram-poller.test.ts.
+  const liveSupervisors: PollerSupervisor[] = [];
+  function createTrackedSupervisor(
+    ...args: Parameters<typeof createDiscordPollerSupervisor>
+  ): PollerSupervisor {
+    const s = createDiscordPollerSupervisor(...args);
+    liveSupervisors.push(s);
+    return s;
+  }
+
+  afterEach(async () => {
+    // Stop newest-first so the most-recently-created loop unwinds first,
+    // matching the LIFO shape the tests would have used with their own
+    // in-body stopAll() at the bottom.
+    while (liveSupervisors.length > 0) {
+      const s = liveSupervisors.pop();
+      if (s) {
+        try { await s.stopAll(); } catch { /* shutdown best-effort */ }
+      }
+    }
     resetMessagingDeps();
     // Belt-and-suspenders reset: if a test crashes mid-flight or a
     // future change moves to `bun test --concurrent`, a process-global
@@ -203,7 +227,7 @@ describe("discord poller supervisor", () => {
       botToken: "TOK"
     });
 
-    const supervisor = createDiscordPollerSupervisor(config, {
+    const supervisor = createTrackedSupervisor(config, {
       clientFactory: () => client,
       gatewayConnector: stubGateway,
       pollIntervalMs: 20,
@@ -244,7 +268,7 @@ describe("discord poller supervisor", () => {
       makeMessage({ id: "100", content: "old a" })
     ]);
 
-    const supervisor = createDiscordPollerSupervisor(config, {
+    const supervisor = createTrackedSupervisor(config, {
       clientFactory: () => client,
       gatewayConnector: stubGateway,
       pollIntervalMs: 20,
@@ -336,7 +360,7 @@ describe("discord poller supervisor", () => {
       })
     ]);
 
-    const supervisor = createDiscordPollerSupervisor(config, {
+    const supervisor = createTrackedSupervisor(config, {
       clientFactory: () => client,
       gatewayConnector: stubGateway,
       pollIntervalMs: 20,
@@ -377,7 +401,7 @@ describe("discord poller supervisor", () => {
       makeMessage({ id: "500", content: "hi gini", author: { id: "user-1", username: "lo", bot: false } })
     ]);
 
-    const supervisor = createDiscordPollerSupervisor(config, {
+    const supervisor = createTrackedSupervisor(config, {
       clientFactory: () => client,
       gatewayConnector: stubGateway,
       pollIntervalMs: 20,
@@ -437,7 +461,7 @@ describe("discord poller supervisor", () => {
       makeMessage({ id: "700", content: "i am a bot", author: { id: "100", username: "Gini", bot: true } })
     ]);
 
-    const supervisor = createDiscordPollerSupervisor(config, {
+    const supervisor = createTrackedSupervisor(config, {
       clientFactory: () => client,
       gatewayConnector: stubGateway,
       pollIntervalMs: 20,
@@ -472,7 +496,7 @@ describe("discord poller supervisor", () => {
       botToken: "TOK"
     });
 
-    const supervisor = createDiscordPollerSupervisor(config, {
+    const supervisor = createTrackedSupervisor(config, {
       clientFactory: () => client,
       gatewayConnector: stubGateway,
       pollIntervalMs: 20,
@@ -517,7 +541,7 @@ describe("discord poller supervisor", () => {
       botToken: "TOK"
     });
 
-    const supervisor = createDiscordPollerSupervisor(config, {
+    const supervisor = createTrackedSupervisor(config, {
       clientFactory: () => client,
       gatewayConnector: stubGateway,
       pollIntervalMs: 20,
@@ -565,7 +589,7 @@ describe("discord poller supervisor", () => {
       makeMessage({ id: "999000000000000000", content: "first real message" })
     ]);
 
-    const supervisor = createDiscordPollerSupervisor(config, {
+    const supervisor = createTrackedSupervisor(config, {
       clientFactory: () => client,
       gatewayConnector: stubGateway,
       pollIntervalMs: 20,
@@ -635,7 +659,7 @@ describe("discord poller supervisor", () => {
       }));
     }
 
-    const supervisor = createDiscordPollerSupervisor(config, {
+    const supervisor = createTrackedSupervisor(config, {
       clientFactory: () => client,
       gatewayConnector: stubGateway,
       pollIntervalMs: 20,
@@ -847,7 +871,7 @@ describe("discord poller supervisor", () => {
     });
 
     const slot: { fire?: (event: { channelId: string }) => void } = {};
-    const supervisor = createDiscordPollerSupervisor(config, {
+    const supervisor = createTrackedSupervisor(config, {
       clientFactory: () => client,
       gatewayConnector: capturingGateway(slot),
       pollIntervalMs: 10000,
@@ -895,7 +919,7 @@ describe("discord poller supervisor", () => {
     });
 
     const slot: { fire?: (event: { channelId: string }) => void } = {};
-    const supervisor = createDiscordPollerSupervisor(config, {
+    const supervisor = createTrackedSupervisor(config, {
       clientFactory: () => client,
       gatewayConnector: capturingGateway(slot),
       // Keep the periodic tick comfortably longer than the negative-window

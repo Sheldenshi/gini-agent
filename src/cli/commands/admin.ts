@@ -612,7 +612,10 @@ export async function runForeground(ctx: CliContext): Promise<void> {
     printStartBanner(banner);
   } catch (error) {
     // Startup failed — clean up any partial state and surface the error.
-    shuttingDown = true;
+    // Do NOT pre-set shuttingDown: shutdown() early-returns when the flag is
+    // already set, which would turn this cleanup into a no-op and skip the
+    // stopRuntime() state-file sweep (a leaked child from a failed start()
+    // is reaped inside start() itself; see process.ts).
     await shutdown("startup-error");
     throw error;
   }
@@ -634,6 +637,16 @@ export async function runForeground(ctx: CliContext): Promise<void> {
   }
   watch(runtimeChild, "runtime");
   watch(webChild, "web");
+
+  // A signal that landed while startLifecycle was still running found
+  // aliveChildren() empty (the handles weren't assigned yet), so its
+  // shutdown() killed nothing and already resolved `done`. Reap the
+  // now-known children before falling through to the resolved await.
+  if (shuttingDown) {
+    for (const child of aliveChildren()) {
+      try { child.kill("SIGKILL"); } catch { /* already gone */ }
+    }
+  }
 
   // Edge: --no-web AND runtime was already running (we'd have thrown above) —
   // so at least one child must exist by here. Defensive fallback for typing.
