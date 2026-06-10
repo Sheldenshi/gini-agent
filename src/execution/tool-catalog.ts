@@ -610,7 +610,8 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
         type: "object",
         properties: {
           question: { type: "string", description: "Question to ask about the page screenshot." },
-          full: { type: "boolean", default: false, description: "If true, capture the full scrollable page; otherwise just the viewport." }
+          full: { type: "boolean", default: false, description: "If true, capture the full scrollable page; otherwise just the viewport." },
+          annotate: { type: "boolean", default: false, description: "If true, overlay numbered badges showing element refs (@eN from the latest snapshot) on the screenshot so the answer can cite specific elements. Secret-bearing elements are never badged." }
         },
         required: ["question"]
       }

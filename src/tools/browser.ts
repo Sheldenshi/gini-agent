@@ -3016,6 +3016,12 @@ export async function browserClose(taskId: string, _args: Record<string, unknown
 // clear retry instruction.
 const MAX_SCREENSHOT_BYTES = 5 * 1024 * 1024;
 
+// Cap on numbered ref badges injected for an annotated browser_vision
+// screenshot. Fifty is plenty for the model to anchor an answer to
+// specific elements; an unbounded overlay on a ref-dense page would bury
+// the very content the screenshot is meant to show.
+const VISION_ANNOTATE_BADGE_CAP = 50;
+
 // Screenshot the current page and ask the configured vision model a question
 // about it. Returns the model's text answer. The agent never sees the
 // screenshot bytes — vision is a side call mediated by the provider layer so
@@ -3032,6 +3038,7 @@ export async function browserVision(
   const question = str(args.question);
   if (!question) return fail("Missing required string argument: question");
   const full = bool(args.full, false);
+  const annotate = bool(args.annotate, false);
   try {
     return await withSession(taskId, async (session) => {
       // Refuse to screenshot a page on a refused origin (loopback
@@ -3078,6 +3085,44 @@ export async function browserVision(
           });
         }
       } catch { /* best-effort blur */ }
+      // When annotating, overlay numbered badges on viewport-visible
+      // stamped elements so the vision model can anchor its answer to
+      // snapshot refs. Badge text is ONLY the ref id ("e12") — never page
+      // text — so the overlay adds no new redaction surface; the
+      // [data-gini-secret] pre-blur above and the post-OCR redaction
+      // below stay untouched, and secret-stamped elements are never
+      // badged at all. See ADR browser-automation-engine.md.
+      if (annotate) {
+        try {
+          if (typeof session.page.evaluate === "function") {
+            await session.page.evaluate((cap: number) => {
+              const stamped = Array.from(document.querySelectorAll("[data-gini-ref]"));
+              let placed = 0;
+              for (const el of stamped) {
+                if (placed >= cap) break;
+                if (el.getAttribute("data-gini-secret") !== null) continue;
+                const rect = el.getBoundingClientRect();
+                if (rect.width <= 0 || rect.height <= 0) continue;
+                if (
+                  rect.bottom <= 0 || rect.right <= 0
+                  || rect.top >= window.innerHeight || rect.left >= window.innerWidth
+                ) {
+                  continue;
+                }
+                const badge = document.createElement("div");
+                badge.setAttribute("data-gini-vision-badge", "true");
+                badge.textContent = el.getAttribute("data-gini-ref") ?? "";
+                badge.style.cssText =
+                  `position:fixed;left:${Math.max(0, rect.left)}px;top:${Math.max(0, rect.top)}px;`
+                  + "z-index:2147483647;background:#1a73e8;color:#fff;"
+                  + "font:10px/1.4 monospace;padding:0 3px;border-radius:3px;pointer-events:none;";
+                document.body.appendChild(badge);
+                placed++;
+              }
+            }, VISION_ANNOTATE_BADGE_CAP);
+          }
+        } catch { /* best-effort overlay — an unannotated screenshot is still useful */ }
+      }
       let buf: Buffer;
       try {
         buf = await session.page.screenshot({ type: "png", fullPage: full });
@@ -3096,6 +3141,19 @@ export async function browserVision(
             });
           }
         } catch { /* best-effort restore */ }
+        // Strip the annotation overlay by its dedicated attribute, even
+        // when the screenshot threw — a surviving badge would leak into
+        // later snapshots and screenshots as a phantom page element.
+        if (annotate) {
+          try {
+            if (typeof session.page.evaluate === "function") {
+              await session.page.evaluate(() => {
+                const badges = document.querySelectorAll("[data-gini-vision-badge]");
+                for (const badge of Array.from(badges)) badge.remove();
+              });
+            }
+          } catch { /* best-effort removal */ }
+        }
       }
       if (buf.length > MAX_SCREENSHOT_BYTES) {
         return fail(
@@ -3110,8 +3168,13 @@ export async function browserVision(
         return fail(`${postShotBlock} (page navigated to a disallowed origin during capture; discarding screenshot)`);
       }
       const imageBase64 = Buffer.from(buf).toString("base64");
+      // With badges in the shot, tell the vision model what they mean so
+      // its answer cites refs the agent can act on directly.
+      const prompt = annotate
+        ? `${question}\n\nThe numbered badges overlaid on the screenshot are element refs (badge "e12" = @e12 in the page snapshot); cite them when referring to specific elements.`
+        : question;
       const result = await generateVisionAnalysis(config, {
-        prompt: question,
+        prompt,
         imageBase64,
         mimeType: "image/png",
         maxTokens: 512

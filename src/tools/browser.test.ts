@@ -2233,6 +2233,205 @@ describe("browserVision", () => {
   });
 });
 
+// browser_vision annotate: numbered ref badges overlaid before the
+// screenshot. The fake page's evaluate(fn, arg) runs the callback locally
+// against a fake DOM installed on globalThis (same pattern as the
+// snapshot-walker tests), so the real injection/removal logic is exercised
+// without Chromium.
+describe("browserVision annotated screenshots", () => {
+  type VisionFakeEl = {
+    _attrs: Record<string, string>;
+    rect: { left: number; top: number; right: number; bottom: number; width: number; height: number };
+    dataset: Record<string, string | undefined>;
+    style: { filter?: string };
+    getAttribute(name: string): string | null;
+    getBoundingClientRect(): VisionFakeEl["rect"];
+  };
+  type FakeBadge = {
+    _attrs: Record<string, string>;
+    textContent: string;
+    style: { cssText: string };
+    setAttribute(name: string, value: string): void;
+    remove(): void;
+  };
+
+  const makeStamped = (
+    ref: string,
+    init?: { secret?: boolean; rect?: Partial<VisionFakeEl["rect"]> }
+  ): VisionFakeEl => ({
+    _attrs: { "data-gini-ref": ref, ...(init?.secret ? { "data-gini-secret": "true" } : {}) },
+    rect: { left: 10, top: 10, right: 110, bottom: 30, width: 100, height: 20, ...init?.rect },
+    dataset: {},
+    style: { filter: "" },
+    getAttribute(name: string) {
+      return Object.prototype.hasOwnProperty.call(this._attrs, name) ? this._attrs[name]! : null;
+    },
+    getBoundingClientRect() {
+      return this.rect;
+    }
+  });
+
+  // Installs fake document/window globals. Returns the LIVE badge list
+  // (appendChild pushes, badge.remove() splices — so length reflects what
+  // is currently in the overlay) and a restore callback for the globals.
+  const installFakeDom = (els: VisionFakeEl[]) => {
+    const badges: FakeBadge[] = [];
+    const originalDocument = (globalThis as Record<string, unknown>).document;
+    const originalWindow = (globalThis as Record<string, unknown>).window;
+    (globalThis as unknown as { document: unknown }).document = {
+      body: { appendChild: (b: FakeBadge) => badges.push(b) },
+      querySelectorAll: (selector: string) => {
+        if (selector === "[data-gini-vision-badge]") return [...badges];
+        const attr = selector.slice(1, -1);
+        return els.filter((el) => Object.prototype.hasOwnProperty.call(el._attrs, attr));
+      },
+      createElement: (_tag: string) => {
+        const badge: FakeBadge = {
+          _attrs: {},
+          textContent: "",
+          style: { cssText: "" },
+          setAttribute(name: string, value: string) {
+            this._attrs[name] = value;
+          },
+          remove() {
+            const i = badges.indexOf(badge);
+            if (i >= 0) badges.splice(i, 1);
+          }
+        };
+        return badge;
+      }
+    };
+    (globalThis as unknown as { window: unknown }).window = { innerWidth: 1280, innerHeight: 800 };
+    const restore = () => {
+      if (originalDocument === undefined) delete (globalThis as Record<string, unknown>).document;
+      else (globalThis as Record<string, unknown>).document = originalDocument;
+      if (originalWindow === undefined) delete (globalThis as Record<string, unknown>).window;
+      else (globalThis as Record<string, unknown>).window = originalWindow;
+    };
+    return { badges, restore };
+  };
+
+  const evalLocally = (<A, R>(fn: (arg: A) => R | Promise<R>, arg?: A): Promise<R> =>
+    Promise.resolve(fn(arg as A))) as unknown as import("playwright-core").Page["evaluate"];
+
+  const config: RuntimeConfig = {
+    instance: "test",
+    port: 7337,
+    token: "test",
+    provider: { name: "echo", model: "gini-echo-v0" },
+    workspaceRoot: "/tmp",
+    stateRoot: "/tmp/gini-vision-test",
+    logRoot: "/tmp/gini-vision-test-logs"
+  };
+
+  afterEach(() => {
+    browserTest.clearFakeSessionsForTest();
+    browserTest.setInFlightDisconnectsForTest(0);
+    clearEchoVisionResponses();
+  });
+
+  test("annotate:true badges viewport-visible stamped elements, skips secret-stamped ones, and strips the overlay after", async () => {
+    const visible = makeStamped("e1");
+    const secret = makeStamped("e2", { secret: true });
+    // Below the 800px-tall fake viewport — must not be badged.
+    const offscreen = makeStamped("e3", { rect: { top: 5000, bottom: 5020 } });
+    const { badges, restore } = installFakeDom([visible, secret, offscreen]);
+    let badgeTextsAtScreenshot: string[] = [];
+    const fakePage = {
+      evaluate: evalLocally,
+      screenshot: async () => {
+        badgeTextsAtScreenshot = badges.map((b) => b.textContent);
+        return Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+      },
+      url: () => "https://example.com/annotated"
+    };
+    browserTest.installFakeSessionWithPageForTest("vision-annotate", fakePage);
+    setEchoVisionResponse({ text: "annotated answer" });
+    try {
+      const raw = await browserVision("vision-annotate", { question: "what?", annotate: true }, config);
+      expect(JSON.parse(raw).success).toBe(true);
+      // Only the viewport-visible, non-secret element was badged.
+      expect(badgeTextsAtScreenshot).toEqual(["e1"]);
+      // The overlay never survives the call.
+      expect(badges.length).toBe(0);
+    } finally {
+      restore();
+    }
+  });
+
+  test("badge injection caps at 50 badges", async () => {
+    const els = Array.from({ length: 60 }, (_, i) => makeStamped(`e${i + 1}`));
+    const { badges, restore } = installFakeDom(els);
+    let badgeCountAtScreenshot = -1;
+    const fakePage = {
+      evaluate: evalLocally,
+      screenshot: async () => {
+        badgeCountAtScreenshot = badges.length;
+        return Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+      },
+      url: () => "https://example.com/dense"
+    };
+    browserTest.installFakeSessionWithPageForTest("vision-cap", fakePage);
+    setEchoVisionResponse({ text: "dense answer" });
+    try {
+      const raw = await browserVision("vision-cap", { question: "what?", annotate: true }, config);
+      expect(JSON.parse(raw).success).toBe(true);
+      // VISION_ANNOTATE_BADGE_CAP keeps a ref-dense page legible.
+      expect(badgeCountAtScreenshot).toBe(50);
+      expect(badges.length).toBe(0);
+    } finally {
+      restore();
+    }
+  });
+
+  test("the overlay is stripped even when the screenshot throws", async () => {
+    const { badges, restore } = installFakeDom([makeStamped("e1")]);
+    const fakePage = {
+      evaluate: evalLocally,
+      screenshot: async () => {
+        // Badges are up at this point; the throw must not strand them.
+        expect(badges.length).toBe(1);
+        throw new Error("capture exploded");
+      },
+      url: () => "https://example.com/boom"
+    };
+    browserTest.installFakeSessionWithPageForTest("vision-strip-on-fail", fakePage);
+    try {
+      const raw = await browserVision("vision-strip-on-fail", { question: "what?", annotate: true }, config);
+      const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+      expect(parsed.success).toBe(false);
+      expect(parsed.error).toContain("capture exploded");
+      expect(badges.length).toBe(0);
+    } finally {
+      restore();
+    }
+  });
+
+  test("the ref-badge mapping sentence reaches the vision prompt only when annotate is set", async () => {
+    // No DOM here: a page without evaluate skips the overlay entirely, and
+    // the unseeded echo provider answers "Vision stub: <prompt>" so the
+    // exact prompt is observable in the answer.
+    const fakePage = {
+      screenshot: async () => Buffer.from([0x89, 0x50, 0x4e, 0x47]),
+      url: () => "https://example.com/prompt"
+    };
+    browserTest.installFakeSessionWithPageForTest("vision-prompt-on", fakePage);
+    const annotatedRaw = await browserVision("vision-prompt-on", { question: "describe the page", annotate: true }, config);
+    const annotated = JSON.parse(annotatedRaw) as { success: boolean; answer?: string };
+    expect(annotated.success).toBe(true);
+    expect(annotated.answer).toContain("describe the page");
+    expect(annotated.answer).toContain("numbered badges");
+    expect(annotated.answer).toContain("@e12");
+
+    browserTest.installFakeSessionWithPageForTest("vision-prompt-off", fakePage);
+    const plainRaw = await browserVision("vision-prompt-off", { question: "describe the page" }, config);
+    const plain = JSON.parse(plainRaw) as { success: boolean; answer?: string };
+    expect(plain.success).toBe(true);
+    expect(plain.answer).toContain("describe the page");
+    expect(plain.answer).not.toContain("badge");
+  });
+});
+
 // Shared helper: build a minimal fake Page that satisfies the surface our
 // tool entry points exercise (evaluate for snapshot, title/url, optional
 // waitForLoadState). Tests planted refs directly via setFakeSessionRefsForTest
