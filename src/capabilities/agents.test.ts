@@ -116,6 +116,25 @@ describe("createAgent", () => {
     expect(created.toolsets).toEqual(["terminal"]);
   });
 
+  test("inherits provider/model from the legacy profile_default id", async () => {
+    const config = buildConfig(workspaceRoot, "create-agent-legacy-default", root);
+    await install(config);
+    await mutateState(config.instance, (state) => {
+      const defaultAgent = state.agents.find((agent) => agent.id === "agent_default");
+      if (!defaultAgent) throw new Error("default agent missing after install");
+      // Pre-rename instances carry the default agent under "profile_default".
+      defaultAgent.id = "profile_default";
+      defaultAgent.providerName = "anthropic";
+      defaultAgent.model = "claude-sonnet-4-6";
+      state.activeAgentId = "profile_default";
+      return defaultAgent;
+    });
+
+    const created = await createAgent(config, { name: "legacy-inherited" });
+    expect(created.providerName).toBe("anthropic");
+    expect(created.model).toBe("claude-sonnet-4-6");
+  });
+
   test("rejects a whitespace-only name", async () => {
     const config = buildConfig(workspaceRoot, "create-agent-blank-name", root);
     await install(config);

@@ -37,7 +37,13 @@ export async function createAgent(config: RuntimeConfig, input: Record<string, u
     //
     // Memory and hindsight content is NOT copied: agents start empty.
     // Only the *config* is inherited from the default agent.
-    const defaultAgent = state.agents.find((agent) => agent.id === "agent_default");
+    // "profile_default" is the legacy pre-rename id for the default agent
+    // — the same pair of ids the boot seeding and the default-model write
+    // target. Without the fallback, agents created on a legacy instance
+    // inherit no provider pair and silently follow config.provider.
+    const defaultAgent =
+      state.agents.find((agent) => agent.id === "agent_default") ??
+      state.agents.find((agent) => agent.id === "profile_default");
     // When the caller doesn't supply toolsets, union the current desired
     // default list into whatever the default agent has on disk. This keeps
     // newly-created sibling agents on an old instance (where
