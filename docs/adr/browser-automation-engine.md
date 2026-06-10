@@ -27,14 +27,14 @@ Findings from source inspection (v0.27.1) and external research:
 
 agent-browser stays in our *development* workflow (driving the Next.js dev server for QA, per `CLAUDE.md`) — that use is interactive, low-trust, and plays to its strengths. This ADR is only about Gini's runtime browser tools.
 
-## Ideas worth porting
+## Ported designs
 
-Verified in agent-browser's source; each stands alone as an improvement to `src/tools/browser.ts` without adopting the engine:
+Verified in agent-browser's source; each stood alone as an improvement to `src/tools/browser.ts` without adopting the engine. All five are implemented there, inside the existing budgets and redaction passes:
 
-1. **Cursor-interactivity augmentation** (`snapshot.rs`): a single injected JS pass that finds elements with `cursor: pointer`/`onclick`/`tabindex` that are *not* native interactive tags or ARIA roles (deduping inherited cursor styles), plus promotion of hidden label-wrapped radio/checkbox inputs that Chrome drops from the AX tree. Catches div-soup clickables a pure accessibility tree misses.
-2. **Stale-ref self-healing** (`element.rs`): cache a node identity per ref; when resolution fails after a DOM re-render, re-query the fresh AX tree by role/name/nth instead of erroring. Refs survive re-renders; the model retries less.
-3. **Snapshot diffing** (`diff.rs`): return a diff against the previous snapshot after an action instead of the full tree — large token savings in multi-step loops, directly relevant to the browser-loop context-overflow incident.
-4. **Annotated screenshots sharing the ref namespace**: numbered labels on the screenshot keyed to the same `@eN` refs, so `browser_vision` answers can point at elements the model can act on.
+1. **Cursor-interactivity augmentation** (`snapshot.rs`): a single injected JS pass that finds elements with `cursor: pointer`/`onclick`/`tabindex` that are *not* native interactive tags or ARIA roles (deduping inherited cursor styles), plus promotion of hidden label-wrapped radio/checkbox inputs that Chrome drops from the AX tree. Catches div-soup clickables a pure accessibility tree misses. Implemented as `[clickable]` snapshot entries under a per-snapshot clickable budget.
+2. **Stale-ref self-healing** (`element.rs`): cache a node identity per ref; when resolution fails after a DOM re-render, re-query by role/name/nth instead of erroring. Refs survive re-renders; the model retries less. Implemented with mis-heal containment the source design lacks: candidates carrying a different ref stamp are rejected, text-matched candidates must themselves qualify as cursor-interactive, the verify-and-restamp runs as one atomic evaluate, and `browser_fill_secrets`/`browser_upload_file` never heal (trust boundary — see [Browser Fill-Secret Tool](browser-fill-secret.md)).
+3. **Snapshot diffing** (`diff.rs`): post-action tools return a line diff against the previous snapshot when the change is small — large token savings in multi-step loops, directly relevant to the browser-loop context-overflow incident. Diffs compare post-redaction text only; explicit `browser_snapshot` always returns the full tree as the recovery path.
+4. **Annotated screenshots sharing the ref namespace**: numbered badges on the `browser_vision` screenshot keyed to the same `@eN` refs, so vision answers can point at elements the model can act on. Badges carry only ref ids, cover only refs the session holds, and skip secret-stamped elements.
 5. **Stable, never-reused tab handles** (`t1`, `t2`, …) instead of positional indices in `browser_tabs`.
 
 ## Revisit triggers
