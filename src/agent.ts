@@ -1420,6 +1420,31 @@ export async function resolveSetupRequest(
     await updateRunFromTask(config, result.task);
     if (result.task.jobId) await finalizeJobRunFromTask(config, result.task);
     await syncSubagentFromTask(config, result.task);
+    try {
+      const emitCtx = resolveEmitContext(config, result.task.id);
+      if (emitCtx) {
+        const toolCallId = approvalToolCallId(result.item.payload);
+        if (toolCallId) {
+          emitToolCallStatus(emitCtx, {
+            callId: toolCallId,
+            status: "denied",
+            errorMessage: result.task.error ?? `Setup cancelled: ${result.item.target}`
+          });
+        }
+        const inFlight = findInFlightAssistantTextForTask(config.instance, result.task.id);
+        if (inFlight) {
+          finalizeAssistantText(emitCtx, inFlight.blockId, inFlight.text);
+        }
+        emitSystemNote(emitCtx, result.task.error ?? `Setup cancelled: ${result.item.target}`);
+        emitPhase(emitCtx, "Failed");
+      }
+    } catch (error) {
+      appendLog(config.instance, "chat.setup_cancel_block.emit_failed", {
+        taskId: result.task.id,
+        setupRequestId: approvalId,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
     await cancelDescendantTasks(config, result.task.id);
   }
 
