@@ -3,11 +3,13 @@ import { mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   __test as browserTest,
+  browserClick,
   browserConsole,
   browserDrag,
   browserHover,
   browserNavigate,
   browserSelectOption,
+  browserSnapshot,
   browserTabs,
   browserUploadFile,
   browserVision,
@@ -1142,6 +1144,353 @@ describe("snapshot walker — cursor-interactive clickables", () => {
       const clickableLines = result.text.split("\n").filter((line) => line.includes(" clickable "));
       expect(clickableLines.length).toBe(75);
       expect(result.text).toContain("[...clickable truncated]");
+    } finally {
+      restore();
+    }
+  });
+});
+
+// Feature coverage for stable refs + post-action snapshot diffing: the
+// walker reuses an element's existing data-gini-ref stamp across
+// snapshots (new ids only for unstamped elements, allocation never
+// reuses a retired id), stamps/numbering reset only on navigation, and
+// action handlers return a line diff against the previous redacted
+// snapshot when the change is small. Explicit browser_snapshot always
+// returns the full tree.
+describe("snapshot stable refs and post-action diffs", () => {
+  type FakeEl = {
+    tagName: string;
+    type?: string;
+    value?: string;
+    _attrs: Record<string, string>;
+    _children: FakeEl[];
+    _textContent: string;
+    _visible: boolean;
+    parentElement: FakeEl | null;
+    getAttribute(name: string): string | null;
+    setAttribute(name: string, value: string): void;
+    removeAttribute(name: string): void;
+    getBoundingClientRect(): { width: number; height: number };
+    get children(): FakeEl[];
+    get textContent(): string;
+    querySelectorAll(selector: string): FakeEl[];
+  };
+  const makeEl = (init: {
+    tagName: string;
+    type?: string;
+    value?: string;
+    visible?: boolean;
+    children?: FakeEl[];
+    textContent?: string;
+    attrs?: Record<string, string>;
+  }): FakeEl => {
+    const visible = init.visible ?? true;
+    const children = init.children ?? [];
+    const el: FakeEl = {
+      tagName: init.tagName,
+      type: init.type,
+      value: init.value,
+      _attrs: { ...(init.attrs ?? {}) },
+      _children: children,
+      _textContent: init.textContent ?? "",
+      _visible: visible,
+      parentElement: null,
+      getAttribute(name: string) {
+        return Object.prototype.hasOwnProperty.call(this._attrs, name) ? this._attrs[name]! : null;
+      },
+      setAttribute(name: string, value: string) {
+        this._attrs[name] = value;
+      },
+      removeAttribute(name: string) {
+        delete this._attrs[name];
+      },
+      getBoundingClientRect() {
+        return this._visible ? { width: 100, height: 20 } : { width: 0, height: 0 };
+      },
+      get children() {
+        return this._children;
+      },
+      get textContent() {
+        return this._textContent;
+      },
+      querySelectorAll(selector: string) {
+        const matches: FakeEl[] = [];
+        const recurse = (node: FakeEl) => {
+          if (selector === "option") {
+            if (node.tagName === "OPTION") matches.push(node);
+          } else if (selector.startsWith("[") && selector.endsWith("]")) {
+            const attr = selector.slice(1, -1);
+            if (Object.prototype.hasOwnProperty.call(node._attrs, attr)) matches.push(node);
+          }
+          for (const child of node._children) recurse(child);
+        };
+        for (const child of this._children) recurse(child);
+        return matches;
+      }
+    };
+    for (const child of children) child.parentElement = el;
+    return el;
+  };
+  const installFakeDom = (body: FakeEl): (() => void) => {
+    const originalDocument = (globalThis as Record<string, unknown>).document;
+    const originalWindow = (globalThis as Record<string, unknown>).window;
+    const originalCSS = (globalThis as Record<string, unknown>).CSS;
+    (globalThis as unknown as { document: unknown }).document = {
+      body,
+      querySelectorAll: (selector: string) => body.querySelectorAll(selector),
+      querySelector: (_sel: string) => null,
+      getElementById: (_id: string) => null
+    };
+    (globalThis as unknown as { window: unknown }).window = {
+      getComputedStyle: (_el: unknown) => ({ display: "block", visibility: "visible", cursor: "auto" })
+    };
+    (globalThis as unknown as { CSS: unknown }).CSS = { escape: (s: string) => s };
+    return () => {
+      if (originalDocument === undefined) {
+        delete (globalThis as Record<string, unknown>).document;
+      } else {
+        (globalThis as Record<string, unknown>).document = originalDocument;
+      }
+      if (originalWindow === undefined) {
+        delete (globalThis as Record<string, unknown>).window;
+      } else {
+        (globalThis as Record<string, unknown>).window = originalWindow;
+      }
+      if (originalCSS === undefined) {
+        delete (globalThis as Record<string, unknown>).CSS;
+      } else {
+        (globalThis as Record<string, unknown>).CSS = originalCSS;
+      }
+    };
+  };
+  // Fake Page whose evaluate(fn, arg) runs fn(arg) locally and whose
+  // locator(sel) returns a stub locator with a click() that invokes the
+  // test-provided mutation — so browserClick can "change the page".
+  const makeFakePage = (state: { url: string; onClick?: () => void }): import("playwright-core").Page =>
+    ({
+      url: () => state.url,
+      title: async () => "Example",
+      waitForLoadState: async () => undefined,
+      evaluate: <A, R>(fn: (arg: A) => R | Promise<R>, arg?: A): Promise<R> => Promise.resolve(fn(arg as A)),
+      locator: (sel: string) => ({
+        __sel: sel,
+        click: async (_opts?: { timeout?: number }) => {
+          state.onClick?.();
+        }
+      })
+    } as unknown as import("playwright-core").Page);
+
+  afterEach(() => {
+    browserTest.clearFakeSessionsForTest();
+    browserTest.setInFlightDisconnectsForTest(0);
+  });
+
+  test("an element keeps its ref across snapshots; new elements allocate new higher ids", async () => {
+    const save = makeEl({ tagName: "BUTTON", textContent: "Save" });
+    const email = makeEl({ tagName: "INPUT", type: "text", value: "", attrs: { placeholder: "Email" } });
+    const body = makeEl({ tagName: "BODY", children: [save, email] });
+    const restore = installFakeDom(body);
+    const page = makeFakePage({ url: "https://example.com/" });
+    try {
+      const first = await browserTest.snapshotForTest(page, false);
+      expect(first.text).toContain('[@e1] button "Save"');
+      expect(first.text).toContain('[@e2] textbox "Email"');
+
+      const del = makeEl({ tagName: "BUTTON", textContent: "Delete" });
+      del.parentElement = body;
+      body._children.push(del);
+
+      const second = await browserTest.snapshotForTest(page, false);
+      expect(second.text).toContain('[@e1] button "Save"');
+      expect(second.text).toContain('[@e2] textbox "Email"');
+      expect(second.text).toContain('[@e3] button "Delete"');
+      expect(second.refs.has("@e1")).toBe(true);
+      expect(second.refs.has("@e3")).toBe(true);
+    } finally {
+      restore();
+    }
+  });
+
+  test("a removed element's id is never reused; navigation clears stamps and restarts at @e1", async () => {
+    const one = makeEl({ tagName: "BUTTON", textContent: "One" });
+    const two = makeEl({ tagName: "BUTTON", textContent: "Two" });
+    const body = makeEl({ tagName: "BODY", children: [one, two] });
+    const restore = installFakeDom(body);
+    const state = { url: "https://a.example/" };
+    const page = makeFakePage(state);
+    browserTest.installFakeSessionWithPageForTest("ref-nav-task", page as Partial<import("playwright-core").Page>);
+    try {
+      const first = await browserTest.snapshotForTest(page, false, "ref-nav-task");
+      expect(first.text).toContain('[@e1] button "One"');
+      expect(first.text).toContain('[@e2] button "Two"');
+
+      // Remove "One" and add "Three": Two keeps @e2, Three gets a fresh
+      // @e3 — the retired @e1 is NOT handed to a different element.
+      body._children.splice(0, 1);
+      const three = makeEl({ tagName: "BUTTON", textContent: "Three" });
+      three.parentElement = body;
+      body._children.push(three);
+      const second = await browserTest.snapshotForTest(page, false, "ref-nav-task");
+      expect(second.navigated).toBe(false);
+      expect(second.text).toContain('[@e2] button "Two"');
+      expect(second.text).toContain('[@e3] button "Three"');
+      expect(second.text).not.toContain("[@e1]");
+
+      // URL change = navigation: stamps cleared, numbering restarts.
+      state.url = "https://b.example/";
+      const third = await browserTest.snapshotForTest(page, false, "ref-nav-task");
+      expect(third.navigated).toBe(true);
+      expect(third.text).toContain('[@e1] button "Two"');
+      expect(third.text).toContain('[@e2] button "Three"');
+    } finally {
+      restore();
+    }
+  });
+
+  // Builds a 20-button page so the diff threshold has room to work with
+  // (the fixed diff header would dwarf a tiny page's full snapshot and
+  // force full mode regardless of the change size).
+  const makeButtonRows = (count: number): FakeEl[] => {
+    const rows: FakeEl[] = [];
+    for (let i = 1; i <= count; i++) {
+      rows.push(makeEl({ tagName: "BUTTON", textContent: `Item${String(i).padStart(2, "0")}` }));
+    }
+    return rows;
+  };
+
+  test("post-action snapshot returns a diff when the change is small", async () => {
+    const body = makeEl({ tagName: "BODY", children: makeButtonRows(20) });
+    const restore = installFakeDom(body);
+    const state: { url: string; onClick?: () => void } = { url: "https://example.com/" };
+    state.onClick = () => {
+      const added = makeEl({ tagName: "BUTTON", textContent: "NewButton" });
+      added.parentElement = body;
+      body._children.push(added);
+    };
+    const page = makeFakePage(state);
+    browserTest.installFakeSessionWithPageForTest("diff-small", page as Partial<import("playwright-core").Page>);
+    try {
+      const baseline = JSON.parse(await browserSnapshot("diff-small", {})) as { success: boolean; snapshot: string };
+      expect(baseline.success).toBe(true);
+      expect(baseline.snapshot).toContain('[@e1] button "Item01"');
+
+      const raw = await browserClick("diff-small", { ref: "@e1" });
+      const parsed = JSON.parse(raw) as { success: boolean; snapshot: string; snapshotMode: string };
+      expect(parsed.success).toBe(true);
+      expect(parsed.snapshotMode).toBe("diff");
+      expect(parsed.snapshot).toContain("[diff vs previous snapshot");
+      // The "+ " marker is followed by the line's own depth indent.
+      expect(parsed.snapshot).toMatch(/\+\s+\[@e21\] button "NewButton"/);
+      // Unchanged lines far from the change are omitted.
+      expect(parsed.snapshot).not.toContain("Item05");
+    } finally {
+      restore();
+    }
+  });
+
+  test("post-action snapshot returns the full tree when the change is large", async () => {
+    const body = makeEl({ tagName: "BODY", children: makeButtonRows(3) });
+    const restore = installFakeDom(body);
+    const state: { url: string; onClick?: () => void } = { url: "https://example.com/" };
+    state.onClick = () => {
+      const fresh: FakeEl[] = [];
+      for (let i = 1; i <= 8; i++) {
+        fresh.push(makeEl({ tagName: "BUTTON", textContent: `Other${i}` }));
+      }
+      for (const el of fresh) el.parentElement = body;
+      body._children.splice(0, body._children.length, ...fresh);
+    };
+    const page = makeFakePage(state);
+    browserTest.installFakeSessionWithPageForTest("diff-large", page as Partial<import("playwright-core").Page>);
+    try {
+      await browserSnapshot("diff-large", {});
+      const raw = await browserClick("diff-large", { ref: "@e1" });
+      const parsed = JSON.parse(raw) as { success: boolean; snapshot: string; snapshotMode: string };
+      expect(parsed.success).toBe(true);
+      expect(parsed.snapshotMode).toBe("full");
+      expect(parsed.snapshot).not.toContain("[diff vs previous snapshot");
+      expect(parsed.snapshot).toContain('button "Other1"');
+    } finally {
+      restore();
+    }
+  });
+
+  test("first snapshot after a navigation is full even from an action handler", async () => {
+    const body = makeEl({ tagName: "BODY", children: makeButtonRows(20) });
+    const restore = installFakeDom(body);
+    const state: { url: string; onClick?: () => void } = { url: "https://example.com/" };
+    state.onClick = () => {
+      state.url = "https://example.com/next";
+    };
+    const page = makeFakePage(state);
+    browserTest.installFakeSessionWithPageForTest("diff-nav", page as Partial<import("playwright-core").Page>);
+    try {
+      await browserSnapshot("diff-nav", {});
+      const raw = await browserClick("diff-nav", { ref: "@e1" });
+      const parsed = JSON.parse(raw) as { success: boolean; snapshot: string; snapshotMode: string };
+      expect(parsed.success).toBe(true);
+      expect(parsed.snapshotMode).toBe("full");
+      expect(parsed.snapshot).not.toContain("[diff vs previous snapshot");
+      expect(parsed.snapshot).toContain('[@e1] button "Item01"');
+    } finally {
+      restore();
+    }
+  });
+
+  test("explicit browser_snapshot always returns the full tree", async () => {
+    const body = makeEl({ tagName: "BODY", children: makeButtonRows(20) });
+    const restore = installFakeDom(body);
+    const page = makeFakePage({ url: "https://example.com/" });
+    browserTest.installFakeSessionWithPageForTest("snap-full", page as Partial<import("playwright-core").Page>);
+    try {
+      await browserSnapshot("snap-full", {});
+      // Mutate the page between snapshots — explicit re-snapshot still
+      // returns every line, never a diff.
+      const added = makeEl({ tagName: "BUTTON", textContent: "NewButton" });
+      added.parentElement = body;
+      body._children.push(added);
+      const raw = await browserSnapshot("snap-full", {});
+      const parsed = JSON.parse(raw) as { success: boolean; snapshot: string; snapshotMode?: string };
+      expect(parsed.success).toBe(true);
+      expect(parsed.snapshotMode).toBeUndefined();
+      expect(parsed.snapshot).not.toContain("[diff vs previous snapshot");
+      expect(parsed.snapshot).toContain('[@e1] button "Item01"');
+      expect(parsed.snapshot).toContain('[@e21] button "NewButton"');
+    } finally {
+      restore();
+    }
+  });
+
+  test("diff text is computed after redaction — registered secret bytes never appear", async () => {
+    const secret = "hunter2-secret-value";
+    // A data-gini-secret-stamped input feeds the live-DOM secret
+    // collector; a plain Notes input receives the secret bytes on click,
+    // simulating a page that copies typed credentials around.
+    const secretInput = makeEl({
+      tagName: "INPUT",
+      type: "text",
+      value: secret,
+      attrs: { "data-gini-secret": "true", placeholder: "Password" }
+    });
+    const notes = makeEl({ tagName: "INPUT", type: "text", value: "", attrs: { placeholder: "Notes" } });
+    const body = makeEl({ tagName: "BODY", children: [...makeButtonRows(20), secretInput, notes] });
+    const restore = installFakeDom(body);
+    const state: { url: string; onClick?: () => void } = { url: "https://example.com/" };
+    state.onClick = () => {
+      notes.value = secret;
+    };
+    const page = makeFakePage(state);
+    browserTest.installFakeSessionWithPageForTest("diff-redact", page as Partial<import("playwright-core").Page>);
+    try {
+      const baseline = JSON.parse(await browserSnapshot("diff-redact", {})) as { snapshot: string };
+      expect(baseline.snapshot).not.toContain(secret);
+
+      const raw = await browserClick("diff-redact", { ref: "@e1" });
+      expect(raw).not.toContain(secret);
+      const parsed = JSON.parse(raw) as { success: boolean; snapshot: string; snapshotMode: string };
+      expect(parsed.success).toBe(true);
+      expect(parsed.snapshotMode).toBe("diff");
+      expect(parsed.snapshot).toMatch(/\+\s+\[@e22\] textbox "Notes" value="\[redacted\]"/);
     } finally {
       restore();
     }

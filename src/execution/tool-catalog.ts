@@ -332,7 +332,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "browser_snapshot",
-      description: "Re-snapshot the current browser page. Default returns interactive elements with @eN refs; entries with role `clickable` are cursor-detected clickables (non-semantic elements styled cursor:pointer or carrying onclick/tabindex). Pass full=true for a richer tree including landmarks and headings.",
+      description: "Re-snapshot the current browser page. Always returns the full tree (action results may return diffs vs the previous snapshot). Default returns interactive elements with @eN refs; entries with role `clickable` are cursor-detected clickables (non-semantic elements styled cursor:pointer or carrying onclick/tabindex). Pass full=true for a richer tree including landmarks and headings.",
       parameters: {
         type: "object",
         properties: {
@@ -349,7 +349,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "browser_click",
-      description: "Click an element on the current page by its @eN ref from the latest snapshot. Returns a fresh snapshot.",
+      description: "Click an element on the current page by its @eN ref from the latest snapshot. Returns a fresh snapshot, possibly as a diff (call browser_snapshot for the full tree).",
       parameters: {
         type: "object",
         properties: {
@@ -367,7 +367,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "browser_type",
-      description: "Clear and type text into an input element identified by its @eN ref. Returns a fresh snapshot.",
+      description: "Clear and type text into an input element identified by its @eN ref. Returns a fresh snapshot, possibly as a diff (call browser_snapshot for the full tree).",
       parameters: {
         type: "object",
         properties: {
@@ -386,7 +386,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "browser_press",
-      description: "Press a keyboard key on the current page (e.g. 'Enter', 'Tab', 'Escape', 'ArrowDown'). Returns a fresh snapshot.",
+      description: "Press a keyboard key on the current page (e.g. 'Enter', 'Tab', 'Escape', 'ArrowDown'). Returns a fresh snapshot, possibly as a diff (call browser_snapshot for the full tree).",
       parameters: {
         type: "object",
         properties: {
@@ -404,7 +404,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "browser_scroll",
-      description: "Scroll the current page up or down by one viewport. Returns a fresh snapshot.",
+      description: "Scroll the current page up or down by one viewport. Returns a fresh snapshot, possibly as a diff (call browser_snapshot for the full tree).",
       parameters: {
         type: "object",
         properties: {
@@ -464,7 +464,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "browser_hover",
-      description: "Hover over an element on the current page by its @eN ref. Useful for revealing tooltips or :hover-only menus. Returns a fresh snapshot.",
+      description: "Hover over an element on the current page by its @eN ref. Useful for revealing tooltips or :hover-only menus. Returns a fresh snapshot, possibly as a diff (call browser_snapshot for the full tree).",
       parameters: {
         type: "object",
         properties: {
@@ -521,7 +521,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "browser_wait_for",
-      description: "Wait for an element (by @eN ref) to reach a state, or for a substring to appear in the page text. Exactly one of `ref` or `text` must be supplied. Returns a fresh snapshot after the wait completes.",
+      description: "Wait for an element (by @eN ref) to reach a state, or for a substring to appear in the page text. Exactly one of `ref` or `text` must be supplied. Returns a fresh snapshot after the wait completes, possibly as a diff (call browser_snapshot for the full tree).",
       parameters: {
         type: "object",
         properties: {

@@ -79,6 +79,21 @@ interface Session {
   // page and stays out of the set) and by browser_tabs action:"new".
   // Pages closed via browser_tabs action:"close" are removed.
   ownedPageIds: Set<Page>;
+  // Monotonic allocator for @eN snapshot refs. Refs are STABLE within a
+  // page lifetime: the walker reuses an element's existing data-gini-ref
+  // stamp and only allocates new ids for unstamped elements, so the
+  // counter never hands a removed element's id to a different element.
+  // Reset to 1 when snapshot() detects a navigation (which also clears
+  // all stamps). See ADR browser-automation-engine.md.
+  nextRefId: number;
+  // Redacted text of the most recent snapshot — the diff base for
+  // post-action snapshots — plus the URL it was taken at. A URL change
+  // between snapshots means navigation: stamps cleared, numbering reset,
+  // diff base dropped. browser_navigate / browser_back / browser_tabs
+  // page swaps clear lastSnapshotUrl explicitly so even a same-URL
+  // navigation (reload) resets refs.
+  lastSnapshotText?: string;
+  lastSnapshotUrl?: string;
 }
 
 // Discriminated union describing the currently-installed shared handle.
@@ -643,7 +658,8 @@ async function getOrCreate(taskId: string): Promise<Session> {
       refs: new Map(),
       lastActivity: Date.now(),
       inFlight: 0,
-      ownedPageIds
+      ownedPageIds,
+      nextRefId: 1
     };
     sessions.set(taskId, session);
     // Attach console capture eagerly so page.goto errors before the
@@ -1176,6 +1192,11 @@ interface SnapshotResult {
   refs: Map<string, Locator>;
   elementCount: number;
   truncated: boolean;
+  // True when this snapshot detected a navigation (URL change since the
+  // session's last snapshot, or an explicit navigate/back/tab swap that
+  // dropped lastSnapshotUrl). Stamps were cleared and numbering reset;
+  // callers must NOT diff this snapshot against the pre-navigation one.
+  navigated: boolean;
 }
 
 // Marker attribute stamped on snapshot-rendered elements so the
@@ -1210,11 +1231,27 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
     throw new Error(`${loopbackBlock} (page settled on disallowed URL after a navigation; agent must not inspect this surface)`);
   }
   const REF_ATTR = REF_ATTR_GLOBAL;
-  // First, clear stale refs from prior snapshots so id allocation stays
-  // stable across calls.
-  await page.evaluate((attr) => {
-    for (const el of document.querySelectorAll(`[${attr}]`)) el.removeAttribute(attr);
-  }, REF_ATTR).catch(() => undefined);
+  // Refs are STABLE within a page lifetime: the walker below reuses an
+  // element's existing data-gini-ref stamp and allocates new ids only
+  // for unstamped elements, so refs the model holds from earlier
+  // snapshots keep resolving and post-action diffs line up. Stamps are
+  // cleared and numbering restarts at @e1 ONLY on navigation — detected
+  // here as a URL change since the session's last snapshot (navigate /
+  // back / tab swaps force it by dropping lastSnapshotUrl). The clear
+  // pass actively strips stamps rather than trusting the new document
+  // to be clean, because a bfcache-restored history entry can resurrect
+  // a stamped DOM. See ADR browser-automation-engine.md.
+  const session = taskId !== undefined ? sessions.get(taskId) : undefined;
+  const currentUrl = typeof page.url === "function" ? page.url() : "";
+  const navigated = session !== undefined && session.lastSnapshotUrl !== currentUrl;
+  if (navigated && session) {
+    await page.evaluate((attr) => {
+      for (const el of document.querySelectorAll(`[${attr}]`)) el.removeAttribute(attr);
+    }, REF_ATTR).catch(() => undefined);
+    session.nextRefId = 1;
+    session.lastSnapshotText = undefined;
+  }
+  const startId = session?.nextRefId ?? 1;
 
   type Raw = {
     ref: string;
@@ -1228,7 +1265,7 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
   };
 
   const raw = await page.evaluate(
-    ({ attr, fullMode, hiddenBudget, clickableBudget }: { attr: string; fullMode: boolean; hiddenBudget: number; clickableBudget: number }) => {
+    ({ attr, fullMode, hiddenBudget, clickableBudget, startId }: { attr: string; fullMode: boolean; hiddenBudget: number; clickableBudget: number; startId: number }) => {
       const INTERACTIVE_TAGS = new Set([
         "A",
         "BUTTON",
@@ -1319,11 +1356,37 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
       };
 
       const out: Raw[] = [];
-      let nextId = 1;
+      // Allocation starts above BOTH the session counter and any id
+      // already stamped in the document. The session counter guards
+      // against reusing a removed element's id for a different element;
+      // the stamp scan guards against collisions when the counter and
+      // the DOM disagree (bfcache restore carrying stamps the counter
+      // never saw, or a unit-test walk with no session).
+      let nextId = startId;
+      for (const el of Array.from(document.querySelectorAll(`[${attr}]`))) {
+        const m = /^e(\d+)$/.exec(el.getAttribute(attr) ?? "");
+        if (m) nextId = Math.max(nextId, Number(m[1]) + 1);
+      }
+      // Reuse an existing stamp (refs are stable within a page lifetime);
+      // only unstamped elements get a freshly-allocated id.
+      const refFor = (el: Element): string => {
+        const existing = el.getAttribute(attr);
+        if (existing) return `@${existing}`;
+        const id = `e${nextId++}`;
+        el.setAttribute(attr, id);
+        return `@${id}`;
+      };
       let hiddenEmitted = 0;
       let hiddenTotal = 0;
       let clickableEmitted = 0;
       let clickableTotal = 0;
+      // Elements already surfaced in THIS walk. The <select> branch
+      // enumerates its <option> children eagerly (they have zero-size
+      // rects, so the bare walk would only see them as hidden); when the
+      // walk then recurses into those same options, this set stops a
+      // second [hidden] row from being emitted for the same element —
+      // with stable stamps the duplicate would even carry the same ref.
+      const emittedThisWalk = new Set<Element>();
       const isFileInput = (el: Element): boolean =>
         el.tagName === "INPUT" && ((el as HTMLInputElement).type?.toLowerCase() ?? "text") === "file";
       // A radio/checkbox that fails isVisible but has an associated visible
@@ -1362,9 +1425,11 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
         // budget regardless of visibility; the `[hidden]` annotation tells
         // the model the input isn't directly clickable.
         const forceEmit = interactive && (isFileInput(el) || (!visible && isHiddenToggleWithVisibleLabel(el)));
-        if (interactive && (visible || forceEmit)) {
-          const ref = `@e${nextId++}`;
-          el.setAttribute(attr, ref.slice(1));
+        if (emittedThisWalk.has(el)) {
+          // Already surfaced (a <select>'s eager option enumeration) —
+          // skip the emission branches, nothing below applies twice.
+        } else if (interactive && (visible || forceEmit)) {
+          const ref = refFor(el);
           let value = "";
           if (el.tagName === "INPUT" || el.tagName === "TEXTAREA") {
             // Suppress sensitive input values so a user-typed
@@ -1421,8 +1486,8 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
             const options = (el as HTMLSelectElement).querySelectorAll("option");
             for (const opt of Array.from(options)) {
               if (opt.disabled || opt.hidden) continue;
-              const optRef = `@e${nextId++}`;
-              opt.setAttribute(attr, optRef.slice(1));
+              emittedThisWalk.add(opt);
+              const optRef = refFor(opt);
               const labelOrText = (opt.label || opt.text || "").trim().slice(0, 120);
               out.push({
                 ref: optRef,
@@ -1444,8 +1509,7 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
           // with thousands of prerendered rows doesn't blow up the snapshot.
           hiddenTotal++;
           if (hiddenEmitted < hiddenBudget) {
-            const ref = `@e${nextId++}`;
-            el.setAttribute(attr, ref.slice(1));
+            const ref = refFor(el);
             out.push({
               ref,
               role: role!,
@@ -1488,8 +1552,7 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
           if (qualifies && name) {
             clickableTotal++;
             if (clickableEmitted < clickableBudget) {
-              const ref = `@e${nextId++}`;
-              el.setAttribute(attr, ref.slice(1));
+              const ref = refFor(el);
               out.push({ ref, role: "clickable", name, value: "", url: "", depth, full: false, hidden: false });
               clickableEmitted++;
             }
@@ -1522,9 +1585,9 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
         for (const child of Array.from(el.children)) walk(child, depth + 1, childUnderCursorClickable);
       };
       walk(document.body, 0, false);
-      return { entries: out, hiddenEmitted, hiddenTotal, hiddenBudget, clickableEmitted, clickableTotal };
+      return { entries: out, hiddenEmitted, hiddenTotal, hiddenBudget, clickableEmitted, clickableTotal, nextId };
     },
-    { attr: REF_ATTR, fullMode: full, hiddenBudget: SNAPSHOT_HIDDEN_BUDGET, clickableBudget: SNAPSHOT_CLICKABLE_BUDGET }
+    { attr: REF_ATTR, fullMode: full, hiddenBudget: SNAPSHOT_HIDDEN_BUDGET, clickableBudget: SNAPSHOT_CLICKABLE_BUDGET, startId }
   );
 
   const refs = new Map<string, Locator>();
@@ -1537,6 +1600,13 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
   const hiddenTotal = (raw as { hiddenTotal: number }).hiddenTotal;
   const clickableEmitted = (raw as { clickableEmitted: number }).clickableEmitted;
   const clickableTotal = (raw as { clickableTotal: number }).clickableTotal;
+  // Persist the advanced allocator so the next snapshot in this session
+  // never reuses an id. Test mocks return minimal walker shapes without
+  // nextId — fall back to the unchanged startId for those.
+  if (session) {
+    const advanced = (raw as { nextId?: number }).nextId;
+    session.nextRefId = typeof advanced === "number" ? advanced : startId;
+  }
   for (const entry of entries) {
     const indent = "  ".repeat(entry.depth);
     let line: string;
@@ -1590,7 +1660,120 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
   if (secretValues.length > 0) {
     text = redactSecretValuesFromString(text, secretValues);
   }
-  return { text, refs, elementCount, truncated };
+  // Store the REDACTED text as the diff base for the next post-action
+  // snapshot — diffing always compares redacted text against redacted
+  // text, so the diff path cannot bypass secret suppression.
+  if (session) {
+    session.lastSnapshotText = text;
+    session.lastSnapshotUrl = currentUrl;
+  }
+  return { text, refs, elementCount, truncated, navigated };
+}
+
+// Post-action snapshots return a line diff instead of the full tree when
+// the diff body is smaller than this fraction of the full text. Above the
+// threshold a diff stops paying for itself (the reader still has to
+// reconstruct most of the page) so we return the full snapshot.
+const SNAPSHOT_DIFF_MAX_RATIO = 0.6;
+// Unchanged lines kept around each +/- run so the model can locate the
+// change inside the tree without the full snapshot.
+const SNAPSHOT_DIFF_CONTEXT_LINES = 1;
+const SNAPSHOT_DIFF_HEADER =
+  "[diff vs previous snapshot — + added, - removed; unchanged omitted. Call browser_snapshot for the full tree.]";
+
+// Line-based diff of two snapshot texts, rendered unified-diff style
+// (header + removed/added lines with SNAPSHOT_DIFF_CONTEXT_LINES of
+// context). Implemented inline as a common-prefix/suffix trim plus an
+// LCS over the changed middle — post-action changes are usually local,
+// so the quadratic LCS only ever sees a small window. No dependency,
+// no regex over page-controlled text. See ADR browser-automation-engine.md.
+function renderSnapshotDiff(prevText: string, currText: string): string {
+  const prev = prevText.split("\n");
+  const curr = currText.split("\n");
+  let start = 0;
+  while (start < prev.length && start < curr.length && prev[start] === curr[start]) start++;
+  let prevEnd = prev.length;
+  let currEnd = curr.length;
+  while (prevEnd > start && currEnd > start && prev[prevEnd - 1] === curr[currEnd - 1]) {
+    prevEnd--;
+    currEnd--;
+  }
+  const a = prev.slice(start, prevEnd);
+  const b = curr.slice(start, currEnd);
+  // LCS table over the trimmed middle; backtrack into an op list.
+  const rows = a.length + 1;
+  const cols = b.length + 1;
+  const table: Uint32Array[] = [];
+  for (let i = 0; i < rows; i++) table.push(new Uint32Array(cols));
+  for (let i = a.length - 1; i >= 0; i--) {
+    for (let j = b.length - 1; j >= 0; j--) {
+      table[i]![j] = a[i] === b[j]
+        ? table[i + 1]![j + 1]! + 1
+        : Math.max(table[i + 1]![j]!, table[i]![j + 1]!);
+    }
+  }
+  const ops: Array<{ kind: "same" | "del" | "add"; line: string }> = [];
+  for (let i = 0; i < start; i++) ops.push({ kind: "same", line: prev[i]! });
+  let ai = 0;
+  let bi = 0;
+  while (ai < a.length && bi < b.length) {
+    if (a[ai] === b[bi]) {
+      ops.push({ kind: "same", line: a[ai]! });
+      ai++;
+      bi++;
+    } else if (table[ai + 1]![bi]! >= table[ai]![bi + 1]!) {
+      ops.push({ kind: "del", line: a[ai]! });
+      ai++;
+    } else {
+      ops.push({ kind: "add", line: b[bi]! });
+      bi++;
+    }
+  }
+  while (ai < a.length) ops.push({ kind: "del", line: a[ai++]! });
+  while (bi < b.length) ops.push({ kind: "add", line: b[bi++]! });
+  for (let i = prevEnd; i < prev.length; i++) ops.push({ kind: "same", line: prev[i]! });
+  // Render only changed lines plus nearby context.
+  const keep = new Array<boolean>(ops.length).fill(false);
+  for (let i = 0; i < ops.length; i++) {
+    if (ops[i]!.kind === "same") continue;
+    const lo = Math.max(0, i - SNAPSHOT_DIFF_CONTEXT_LINES);
+    const hi = Math.min(ops.length - 1, i + SNAPSHOT_DIFF_CONTEXT_LINES);
+    for (let j = lo; j <= hi; j++) keep[j] = true;
+  }
+  const lines: string[] = [SNAPSHOT_DIFF_HEADER];
+  for (let i = 0; i < ops.length; i++) {
+    if (!keep[i]) continue;
+    const op = ops[i]!;
+    lines.push(op.kind === "del" ? `- ${op.line}` : op.kind === "add" ? `+ ${op.line}` : `  ${op.line}`);
+  }
+  return lines.join("\n");
+}
+
+// Shared post-action snapshot: re-snapshot, refresh the session's refs,
+// and return either the full tree or a line diff vs the previous snapshot
+// when the change is small. Used by the action tools (click / type /
+// press / scroll / hover / drag / select_option / wait_for) — NOT by
+// browser_navigate, browser_back, browser_tabs, or explicit
+// browser_snapshot, which always return the full tree. That asymmetry is
+// the model's recovery path: when a diff isn't enough, browser_snapshot
+// gets the whole page. Diffing compares the redacted previous text with
+// the redacted current text (snapshot() redacts before returning and
+// before storing the base), so the diff path cannot leak what redaction
+// suppressed. See ADR browser-automation-engine.md.
+async function snapshotAfterAction(
+  session: Session,
+  taskId: string
+): Promise<{ snapshot: string; snapshotMode: "full" | "diff"; elementCount: number; truncated: boolean }> {
+  const prev = session.lastSnapshotText;
+  const snap = await snapshot(session.page, false, taskId);
+  session.refs = snap.refs;
+  if (!snap.navigated && prev !== undefined) {
+    const diff = renderSnapshotDiff(prev, snap.text);
+    if (diff.length < snap.text.length * SNAPSHOT_DIFF_MAX_RATIO) {
+      return { snapshot: diff, snapshotMode: "diff", elementCount: snap.elementCount, truncated: snap.truncated };
+    }
+  }
+  return { snapshot: snap.text, snapshotMode: "full", elementCount: snap.elementCount, truncated: snap.truncated };
 }
 
 // Build a browser tool response, applying a redaction pass over
@@ -1724,6 +1907,11 @@ export async function browserNavigate(taskId: string, args: Record<string, unkno
         }
         return fail(`${postBlock} (final URL after redirect from ${url})`);
       }
+      // Explicit navigation: even a same-URL goto produced a fresh
+      // document, so drop the snapshot baseline — snapshot() then clears
+      // any stale stamps, restarts ref numbering at @e1, and returns the
+      // full tree (never a diff).
+      session.lastSnapshotUrl = undefined;
       const snap = await snapshot(session.page, false, taskId);
       session.refs = snap.refs;
       return ok({
@@ -1768,14 +1956,11 @@ export async function browserClick(taskId: string, args: Record<string, unknown>
       if (!locator) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
       await locator.click({ timeout: 10_000 });
       await session.page.waitForLoadState("domcontentloaded").catch(() => undefined);
-      const snap = await snapshot(session.page, false, taskId);
-      session.refs = snap.refs;
+      const snapFields = await snapshotAfterAction(session, taskId);
       return ok({
         url: session.page.url(),
         title: await session.page.title(),
-        snapshot: snap.text,
-        elementCount: snap.elementCount,
-        truncated: snap.truncated
+        ...snapFields
       }, taskId);
     });
   } catch (error) {
@@ -1793,13 +1978,10 @@ export async function browserType(taskId: string, args: Record<string, unknown>)
       const locator = session.refs.get(ref);
       if (!locator) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
       await locator.fill(text, { timeout: 10_000 });
-      const snap = await snapshot(session.page, false, taskId);
-      session.refs = snap.refs;
+      const snapFields = await snapshotAfterAction(session, taskId);
       return ok({
         url: session.page.url(),
-        snapshot: snap.text,
-        elementCount: snap.elementCount,
-        truncated: snap.truncated
+        ...snapFields
       }, taskId);
     });
   } catch (error) {
@@ -2092,13 +2274,10 @@ export async function browserPress(taskId: string, args: Record<string, unknown>
     return await withSession(taskId, async (session) => {
       await session.page.keyboard.press(key);
       await session.page.waitForLoadState("domcontentloaded").catch(() => undefined);
-      const snap = await snapshot(session.page, false, taskId);
-      session.refs = snap.refs;
+      const snapFields = await snapshotAfterAction(session, taskId);
       return ok({
         url: session.page.url(),
-        snapshot: snap.text,
-        elementCount: snap.elementCount,
-        truncated: snap.truncated
+        ...snapFields
       }, taskId);
     });
   } catch (error) {
@@ -2115,13 +2294,10 @@ export async function browserScroll(taskId: string, args: Record<string, unknown
     return await withSession(taskId, async (session) => {
       const dy = direction === "down" ? 600 : -600;
       await session.page.evaluate((delta) => window.scrollBy(0, delta), dy);
-      const snap = await snapshot(session.page, false, taskId);
-      session.refs = snap.refs;
+      const snapFields = await snapshotAfterAction(session, taskId);
       return ok({
         url: session.page.url(),
-        snapshot: snap.text,
-        elementCount: snap.elementCount,
-        truncated: snap.truncated
+        ...snapFields
       }, taskId);
     });
   } catch (error) {
@@ -2133,6 +2309,9 @@ export async function browserBack(taskId: string, _args: Record<string, unknown>
   try {
     return await withSession(taskId, async (session) => {
       const response = await session.page.goBack({ waitUntil: "domcontentloaded" });
+      // History navigation, same contract as browser_navigate: drop the
+      // baseline so refs reset and the response carries the full tree.
+      session.lastSnapshotUrl = undefined;
       const snap = await snapshot(session.page, false, taskId);
       session.refs = snap.refs;
       return ok({
@@ -2295,14 +2474,11 @@ export async function browserHover(taskId: string, args: Record<string, unknown>
       const locator = session.refs.get(ref);
       if (!locator) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
       await locator.hover({ timeout: 10_000 });
-      const snap = await snapshot(session.page, false, taskId);
-      session.refs = snap.refs;
+      const snapFields = await snapshotAfterAction(session, taskId);
       return ok({
         url: session.page.url(),
         title: await session.page.title(),
-        snapshot: snap.text,
-        elementCount: snap.elementCount,
-        truncated: snap.truncated
+        ...snapFields
       }, taskId);
     });
   } catch (error) {
@@ -2326,14 +2502,11 @@ export async function browserDrag(taskId: string, args: Record<string, unknown>)
       if (!toLoc) return fail(`Unknown ref ${toRef}. Take a fresh snapshot first.`);
       await fromLoc.dragTo(toLoc, { timeout: 10_000 });
       await session.page.waitForLoadState("domcontentloaded").catch(() => undefined);
-      const snap = await snapshot(session.page, false, taskId);
-      session.refs = snap.refs;
+      const snapFields = await snapshotAfterAction(session, taskId);
       return ok({
         url: session.page.url(),
         title: await session.page.title(),
-        snapshot: snap.text,
-        elementCount: snap.elementCount,
-        truncated: snap.truncated
+        ...snapFields
       }, taskId);
     });
   } catch (error) {
@@ -2411,13 +2584,10 @@ export async function browserSelectOption(taskId: string, args: Record<string, u
         return fail("Missing required argument: provide either 'value' (string) or 'values' (string[]).");
       }
       await locator.selectOption(selection, { timeout: 10_000 });
-      const snap = await snapshot(session.page, false, taskId);
-      session.refs = snap.refs;
+      const snapFields = await snapshotAfterAction(session, taskId);
       return ok({
         url: session.page.url(),
-        snapshot: snap.text,
-        elementCount: snap.elementCount,
-        truncated: snap.truncated,
+        ...snapFields,
         selected: selection
       }, taskId);
     });
@@ -2480,14 +2650,11 @@ export async function browserWaitFor(taskId: string, args: Record<string, unknow
         }
         return fail(message);
       }
-      const snap = await snapshot(session.page, false, taskId);
-      session.refs = snap.refs;
+      const snapFields = await snapshotAfterAction(session, taskId);
       return ok({
         url: session.page.url(),
         title: await session.page.title(),
-        snapshot: snap.text,
-        elementCount: snap.elementCount,
-        truncated: snap.truncated
+        ...snapFields
       }, taskId);
     });
   } catch (error) {
@@ -2543,8 +2710,11 @@ export async function browserTabs(taskId: string, args: Record<string, unknown>)
         // Clear refs BEFORE swapping the page so any concurrent stale ref
         // lookup hitting session.refs while session.page is the new tab
         // fails fast against an empty map rather than silently resolving
-        // against a locator that points at the old page.
+        // against a locator that points at the old page. Dropping the
+        // snapshot baseline marks the page swap as a navigation: refs
+        // renumber from @e1 and the response carries the full tree.
         session.refs = new Map();
+        session.lastSnapshotUrl = undefined;
         session.page = page;
         await page.bringToFront().catch(() => undefined);
         const snap = await snapshot(session.page, false, taskId);
@@ -2563,7 +2733,10 @@ export async function browserTabs(taskId: string, args: Record<string, unknown>)
         }
         const target = session.context.pages()[args.index];
         if (!target) return fail(`No tab at index ${args.index}.`);
+        // Page swap = navigation for ref purposes (the target tab may
+        // carry stamps from an earlier visit — clear and renumber).
         session.refs = new Map();
+        session.lastSnapshotUrl = undefined;
         session.page = target;
         await target.bringToFront().catch(() => undefined);
         const snap = await snapshot(session.page, false, taskId);
@@ -2597,6 +2770,7 @@ export async function browserTabs(taskId: string, args: Record<string, unknown>)
         // left pointing at a closed handle. A freshly-opened fallback page
         // counts as agent-owned (we just created it).
         session.refs = new Map();
+        session.lastSnapshotUrl = undefined;
         const remaining = session.context.pages();
         if (remaining[0]) {
           session.page = remaining[0];
@@ -3021,7 +3195,8 @@ export const __test = {
       refs: new Map(),
       lastActivity: Date.now(),
       inFlight,
-      ownedPageIds: new Set<Page>([fakePage])
+      ownedPageIds: new Set<Page>([fakePage]),
+      nextRefId: 1
     });
   },
   // Install a synthetic session with a caller-provided `page` so tool
@@ -3035,7 +3210,8 @@ export const __test = {
       refs: new Map(),
       lastActivity: Date.now(),
       inFlight: 0,
-      ownedPageIds: new Set<Page>([realPage])
+      ownedPageIds: new Set<Page>([realPage]),
+      nextRefId: 1
     });
   },
   // Install a synthetic session with both a `page` and `context` so tab-
@@ -3053,7 +3229,8 @@ export const __test = {
       refs: new Map(),
       lastActivity: Date.now(),
       inFlight: 0,
-      ownedPageIds: new Set<Page>([realPage])
+      ownedPageIds: new Set<Page>([realPage]),
+      nextRefId: 1
     });
   },
   // Read the currently-installed page on a fake session so tests can
@@ -3111,8 +3288,10 @@ export const __test = {
   // Expose the in-page walker for direct unit testing. Callers supply a
   // fake Page whose `evaluate(fn, arg)` runs `fn(arg)` locally against
   // a pre-populated `globalThis.document` (and friends) — that lets
-  // browser walk semantics be asserted without spawning Chromium.
-  snapshotForTest(page: Page, full: boolean): Promise<SnapshotResult> {
-    return snapshot(page, full);
+  // browser walk semantics be asserted without spawning Chromium. Pass
+  // taskId (with a fake session installed) to exercise the session-scoped
+  // ref-stability / navigation-reset behavior.
+  snapshotForTest(page: Page, full: boolean, taskId?: string): Promise<SnapshotResult> {
+    return snapshot(page, full, taskId);
   }
 };
