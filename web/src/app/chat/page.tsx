@@ -164,8 +164,10 @@ function ChatSurface({
   const sessionsQuery = useChatSessions();
   const { markRead, activityAt } = useChatReadState(sessionsQuery.data);
   // Mark read using the LIST session (it carries `runs`) so the stored
-  // timestamp matches what the sidebar's isUnread compares against; fall back
-  // to the prop session if the list hasn't resolved.
+  // timestamp matches what the sidebar's isUnread compares against. The prop
+  // session (sourced from the unscoped list) covers the gap while the scoped
+  // list resolves — and is the steady state for channels owned by a
+  // non-active agent, which the scoped list never contains.
   const liveSession =
     (sessionsQuery.data ?? []).find((s) => s.id === sessionId) ?? session;
   const liveActivityAt = activityAt(liveSession);
