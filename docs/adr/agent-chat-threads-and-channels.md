@@ -16,11 +16,14 @@ the session list:
   of `chat_blocks` inside the agent's single session, tagged with a
   `thread_id` and rooted at the main-chat block it branched from
   (`parent_block_id`). An agent-routed thread roots at the turn's own
-  `user_text` block (falling back to the most recent main-chat
-  `assistant_text` for turns with no user message, e.g. job/channel
-  turns), so the thread chip renders directly under the message the user
-  sent; a user-started "Reply in thread" roots at the `assistant_text`
-  block the user branched from. There is **no new session per thread** —
+  `user_text` block, so the thread chip renders directly under the message
+  the user sent and the thread reads human → agent. A turn with no human
+  message (an autonomous job/channel fire) does **not** thread — the agent
+  never seeds a thread off its own message; it answers in the channel's
+  main timeline, and threading resumes when the user replies in that
+  channel (that turn has its own `user_text` block). A user-started "Reply
+  in thread" roots at the `assistant_text` block the user branched from.
+  There is **no new session per thread** —
   threads ride the same ordinal stream, SSE, and APNs the ChatBlock
   protocol already provides (see ADR chat-block-protocol.md).
 - **The agent decides routing.** The agent calls a `start_thread`
@@ -211,16 +214,17 @@ mechanisms in priority order:
 `switchTurnToThread()` mints a `thread_id`, resolves the parent as the
 current turn's main-chat `user_text` block
 (`getMainChatUserTextBlockForTask`) so the thread roots at the message
-the user just sent, falling back to the last main-chat `assistant_text`
-block (`getLastMainChatAssistantTextBlock`) for turns with no user
-message (job/channel turns). It then stamps the emit-context so every
-subsequent emit on the turn — sibling tool calls in the same batch and
-all continued text/tools in later iterations — threads automatically.
-Rooting at the user message keeps the thread chip beside the prompt that
-spawned it; rooting at a stale prior-turn assistant block would scatter
-every agent-routed thread onto one ever-older message. If there is no
-block to branch from, the switch is a no-op and the turn stays in the
-main chat.
+the user just sent. It then stamps the emit-context so every subsequent
+emit on the turn — sibling tool calls in the same batch and all continued
+text/tools in later iterations — threads automatically. Rooting at the
+user message keeps the thread chip beside the prompt that spawned it and
+makes the thread read human → agent; rooting at a prior assistant block
+would scatter every agent-routed thread onto one ever-older message and
+make the agent appear to reply to itself. A turn with **no** human
+message — an autonomous job/channel fire — does not thread: the switch is
+a no-op and the turn stays in the channel's main timeline. The agent
+never seeds a thread off its own message; threading requires a human
+message to root at, so a thread always reads as a reply to the user.
 
 The `start_thread`-as-primary choice was forced by behavior, not
 preference (see Resolved Decisions, B). The verified runtime model did
