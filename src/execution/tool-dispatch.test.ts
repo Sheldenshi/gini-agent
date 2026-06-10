@@ -1659,3 +1659,151 @@ describe("capToolResultText", () => {
     expect(out).not.toContain(middle);
   });
 });
+
+describe("ask_user dispatch", () => {
+  test("rejects a missing question with a sync error and mints no card", async () => {
+    const instance = `ask-user-noq-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const taskId = await newTask(config);
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "ask_user",
+      "call_q",
+      JSON.stringify({ options: [{ label: "A" }, { label: "B" }] })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      const parsed = JSON.parse(result.result);
+      expect(parsed.ok).toBe(false);
+      expect(parsed.error).toContain("question");
+    }
+    expect(readState(instance).setupRequests.filter((a) => a.taskId === taskId).length).toBe(0);
+  });
+
+  test("rejects fewer than 2 or more than 6 options with a sync error", async () => {
+    const instance = `ask-user-count-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const taskId = await newTask(config);
+    const one = await dispatchToolCall(
+      config,
+      taskId,
+      "ask_user",
+      "call_one",
+      JSON.stringify({ question: "Pick one?", options: [{ label: "Only" }] })
+    );
+    expect(one.kind).toBe("sync");
+    if (one.kind === "sync") {
+      expect(JSON.parse(one.result).ok).toBe(false);
+    }
+    const seven = await dispatchToolCall(
+      config,
+      taskId,
+      "ask_user",
+      "call_seven",
+      JSON.stringify({
+        question: "Pick one?",
+        options: [1, 2, 3, 4, 5, 6, 7].map((n) => ({ label: `Option ${n}` }))
+      })
+    );
+    expect(seven.kind).toBe("sync");
+    if (seven.kind === "sync") {
+      expect(JSON.parse(seven.result).ok).toBe(false);
+    }
+    expect(readState(instance).setupRequests.filter((a) => a.taskId === taskId).length).toBe(0);
+  });
+
+  test("rejects empty and duplicate option labels with a sync error", async () => {
+    const instance = `ask-user-labels-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const taskId = await newTask(config);
+    const empty = await dispatchToolCall(
+      config,
+      taskId,
+      "ask_user",
+      "call_empty",
+      JSON.stringify({ question: "Pick?", options: [{ label: "  " }, { label: "B" }] })
+    );
+    expect(empty.kind).toBe("sync");
+    if (empty.kind === "sync") {
+      expect(JSON.parse(empty.result).error).toContain("label");
+    }
+    // Duplicate detection runs on TRIMMED labels.
+    const dup = await dispatchToolCall(
+      config,
+      taskId,
+      "ask_user",
+      "call_dup",
+      JSON.stringify({ question: "Pick?", options: [{ label: "Same" }, { label: " Same " }] })
+    );
+    expect(dup.kind).toBe("sync");
+    if (dup.kind === "sync") {
+      expect(JSON.parse(dup.result).error).toContain("Duplicate");
+    }
+    expect(readState(instance).setupRequests.filter((a) => a.taskId === taskId).length).toBe(0);
+  });
+
+  test("valid call mints a pending chat.choice SetupRequest carrying question/options/toolCallId", async () => {
+    const instance = `ask-user-pending-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const taskId = await newTask(config);
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "ask_user",
+      "call_choice",
+      JSON.stringify({
+        question: "How should I search the web?",
+        options: [
+          { label: "Set up Brave + Exa", description: "Best coverage" },
+          { label: "Set up Brave only" },
+          { label: "Neither — use web_fetch", description: "No setup needed" }
+        ]
+      })
+    );
+    expect(result.kind).toBe("pending");
+    if (result.kind === "pending") {
+      const state = readState(instance);
+      const approval = state.setupRequests.find((a) => a.id === result.approvalId);
+      expect(approval).toBeDefined();
+      expect(approval!.action).toBe("chat.choice");
+      expect(approval!.status).toBe("pending");
+      // The question doubles as reason so the setup_requested block summary
+      // (and transcripts) read as the question itself.
+      expect(approval!.reason).toBe("How should I search the web?");
+      expect(approval!.payload.question).toBe("How should I search the web?");
+      expect(approval!.payload.toolCallId).toBe("call_choice");
+      expect(approval!.payload.options).toEqual([
+        { label: "Set up Brave + Exa", description: "Best coverage" },
+        { label: "Set up Brave only" },
+        { label: "Neither — use web_fetch", description: "No setup needed" }
+      ]);
+    }
+  });
+
+  test("surface guard: rejects a telegram-sourced session synchronously", async () => {
+    const instance = `ask-user-tg-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const task = createTask(config.instance, "telegram ask_user test");
+    await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "telegram session");
+      session.source = { kind: "telegram", bridgeId: "b1", chatId: 1, target: "t" };
+      task.chatSessionId = session.id;
+      upsertTask(state, task);
+    });
+    const result = await dispatchToolCall(
+      config,
+      task.id,
+      "ask_user",
+      "call_tg",
+      JSON.stringify({ question: "Pick?", options: [{ label: "A" }, { label: "B" }] })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      const parsed = JSON.parse(result.result);
+      expect(parsed.ok).toBe(false);
+      expect(parsed.error).toContain("regular message");
+    }
+    expect(readState(instance).setupRequests.filter((a) => a.taskId === task.id).length).toBe(0);
+  });
+});

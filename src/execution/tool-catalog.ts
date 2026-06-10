@@ -647,6 +647,42 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     }
   },
   {
+    // User-choice affordance. The agent calls this mid-turn to put a
+    // single-select question card in the web chat; the task pauses on the
+    // resulting chat.choice SetupRequest and resumes with the user's pick.
+    // Always-on (like request_connector): the model needs this path even on
+    // a fresh instance with no toolsets toggled. See
+    // docs/adr/user-choice-prompt.md.
+    toolset: "core",
+    displayLabel: "Ask user",
+    type: "function",
+    function: {
+      name: "ask_user",
+      description: "Ask the user to pick between options when multiple viable paths exist and their preference matters. The user sees a single-select card in chat; the task pauses until they choose, then resumes with their selection. ESPECIALLY use this before requesting connector setup — offer the setup-vs-alternative choices first (e.g. \"Set up Brave + Exa\", \"Set up Brave only\", \"Neither — use web_fetch\") so the user decides whether setup is worth it. Also use it for general mid-task preference or clarification questions (which approach, which account, which format). Single-select only. The card automatically adds an \"Other (type your answer)\" freeform input and a Skip affordance — do NOT include an \"Other\" / \"something else\" / \"skip\" entry in `options`. Do NOT use this for permission confirmations — risk-gated actions already go through the authorization flow.",
+      parameters: {
+        type: "object",
+        properties: {
+          question: { type: "string", description: "The question shown at the top of the card. One clear sentence." },
+          options: {
+            type: "array",
+            minItems: 2,
+            maxItems: 6,
+            description: "2-6 mutually exclusive choices. Keep labels short; put any detail in `description`.",
+            items: {
+              type: "object",
+              properties: {
+                label: { type: "string", description: "Short choice label shown on the radio row (e.g. \"Set up Brave only\")." },
+                description: { type: "string", description: "Optional one-line detail rendered muted under the label." }
+              },
+              required: ["label"]
+            }
+          }
+        },
+        required: ["question", "options"]
+      }
+    }
+  },
+  {
     // Browser-fill-secrets affordance. When the agent's browser tool
     // reaches a login or other input form whose values must come from
     // the user (passwords, OTPs, account ids, MFA codes), the agent
@@ -1980,6 +2016,13 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     // inactive — gating on a legacy toolset would silently disable the
     // onboarding path.
     if (tool.function.name === "request_connector") return true;
+    // ask_user is the in-chat affordance for putting a single-select
+    // question card in front of the user mid-turn. Always-on for the
+    // same reason as request_connector: offering setup-vs-alternative
+    // choices (its primary steer) must work on a fresh instance with
+    // no toolsets toggled, and it's a meta-tool with no side effects
+    // beyond pausing on a user-actor card.
+    if (tool.function.name === "ask_user") return true;
     // browser_fill_secrets is the in-chat affordance for credential
     // entry on the agent's browser tab. Always-on for the same
     // reason as request_connector: a fresh instance with no toolsets
@@ -2335,6 +2378,8 @@ export function chatBlockArgsPreviewFor(
       return truncatePreview(`${previewValue(safe.uploadId)}: ${previewValue(safe.question)}`);
     case "request_connector":
       return truncatePreview(previewValue(safe.provider));
+    case "ask_user":
+      return truncatePreview(previewValue(safe.question));
     case "request_messaging_bridge":
       return truncatePreview(previewValue(safe.kind));
     case "list_messaging_bridges":

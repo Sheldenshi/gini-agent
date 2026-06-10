@@ -110,6 +110,11 @@ const ALWAYS_ON = new Set([
   "skill_run",
   "vision_query",
   "request_connector",
+  // ask_user is the single-select question-card meta-tool (chat.choice
+  // SetupRequest). Always-on like request_connector: its primary steer —
+  // offering setup-vs-alternative choices before connector setup — must
+  // work on a fresh instance with no toolsets toggled.
+  "ask_user",
   // browser_fill_secrets is the meta-tool path for asking the user
   // to type a value into a DOM field on the agent's browser tab. It
   // never types anything itself (it just renders a chat card), so
