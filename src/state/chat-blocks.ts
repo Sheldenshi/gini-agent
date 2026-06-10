@@ -812,6 +812,29 @@ export function getLastMainChatAssistantTextBlock(
   return row ? rowToBlock(row) : undefined;
 }
 
+// Returns the main-chat (un-threaded) user_text block belonging to a task,
+// or undefined when the task has none (job/channel turns have no user
+// message). When the agent routes a turn into a thread, the thread roots at
+// the user message that started the turn so the reply chip renders right
+// where the user asked. Latest-by-ordinal guards against a task ever
+// carrying more than one user_text row.
+export function getMainChatUserTextBlockForTask(
+  instance: Instance,
+  sessionId: string,
+  taskId: string
+): ChatBlock | undefined {
+  const db = getMemoryDb(instance);
+  const row = db
+    .query<ChatBlockRow, [string, string]>(
+      `SELECT * FROM chat_blocks
+       WHERE session_id = ? AND thread_id IS NULL AND kind = 'user_text' AND task_id = ?
+       ORDER BY ordinal DESC
+       LIMIT 1`
+    )
+    .get(sessionId, taskId);
+  return row ? rowToBlock(row) : undefined;
+}
+
 // Returns a single main-chat (un-threaded) block by id, scoped to the
 // session, or undefined when it's absent, belongs to another session, or is
 // itself threaded. The user-initiated "Reply in thread" path validates the

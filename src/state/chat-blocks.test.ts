@@ -26,7 +26,11 @@ import {
   updateToolCallBlock,
   upsertAssistantTextBlock
 } from "./index";
-import { listMainChatBlocks } from "./chat-blocks";
+import {
+  getLastMainChatAssistantTextBlock,
+  getMainChatUserTextBlockForTask,
+  listMainChatBlocks
+} from "./chat-blocks";
 import type { ChatBlock } from "../types";
 
 const ROOT = "/tmp/gini-chat-blocks-test";
@@ -595,6 +599,48 @@ describe("chat-blocks persistence", () => {
     expect(row?.agent_id).toBe("agent_meta");
     expect(row?.task_id).toBe("task_meta");
     expect(row?.run_id).toBe("run_meta");
+  });
+
+  test("getMainChatUserTextBlockForTask returns the task's main-chat user message, ignoring threaded and other-task rows", () => {
+    const instance = "chat-blocks-user-anchor";
+    const sessionId = "chat_anchor";
+    // A user message for the target turn, plus noise: an assistant reply, a
+    // user message from a different task, and a threaded user message.
+    const target = insertChatBlock(instance, {
+      kind: "user_text",
+      sessionId,
+      text: "research this",
+      taskId: "task_target"
+    });
+    insertChatBlock(instance, {
+      kind: "assistant_text",
+      sessionId,
+      text: "an earlier answer",
+      taskId: "task_prior",
+      streaming: false
+    });
+    insertChatBlock(instance, {
+      kind: "user_text",
+      sessionId,
+      text: "different turn",
+      taskId: "task_other"
+    });
+    insertChatBlock(instance, {
+      kind: "user_text",
+      sessionId,
+      text: "threaded reply",
+      taskId: "task_target",
+      threadId: "thread_x",
+      parentBlockId: target.id
+    });
+
+    const found = getMainChatUserTextBlockForTask(instance, sessionId, "task_target");
+    expect(found?.id).toBe(target.id);
+
+    // No user message for the task → undefined, so the caller's `??` chain
+    // falls through to the assistant-block anchor.
+    expect(getMainChatUserTextBlockForTask(instance, sessionId, "task_prior")).toBeUndefined();
+    expect(getLastMainChatAssistantTextBlock(instance, sessionId)?.taskId).toBe("task_prior");
   });
 
   test("system_note round-trips authError metadata; plain notes omit it", () => {

@@ -186,12 +186,16 @@ function ChatSurface({
   // Main chat = blocks with no threadId; thread blocks render in the panel.
   const mainBlocks = useMemo(() => splitBlocks(blocks).main, [blocks]);
 
-  // Map a thread's parent assistant block id → its summary, so the chip
-  // renders directly under the message it branched from.
+  // Map a thread's parent block id → its summary, so the chip renders
+  // directly under the message it branched from. When several threads share
+  // one parent, keep the one with the newest reply so the freshest
+  // conversation is the one surfaced by the single chip.
   const threadByParent = useMemo(() => {
     const map = new Map<string, ThreadSummary>();
     for (const t of threads) {
-      if (t.parentBlockId) map.set(t.parentBlockId, t);
+      if (!t.parentBlockId) continue;
+      const existing = map.get(t.parentBlockId);
+      if (!existing || t.lastReplyAt > existing.lastReplyAt) map.set(t.parentBlockId, t);
     }
     return map;
   }, [threads]);
@@ -359,8 +363,13 @@ function ChatSurface({
                         );
                       }
                       const block = item.block;
+                      // A thread can branch off either the user's message (an
+                      // agent-routed turn) or an assistant reply (the user's
+                      // own "Reply in thread"), so look up a chip for both.
                       const thread =
-                        block.kind === "assistant_text" ? threadByParent.get(block.id) : undefined;
+                        block.kind === "assistant_text" || block.kind === "user_text"
+                          ? threadByParent.get(block.id)
+                          : undefined;
                       // An assistant reply with no thread yet gets the always-
                       // visible "Reply in thread" affordance so the user can
                       // branch a new thread off it (Slack-style).
@@ -390,7 +399,10 @@ function ChatSurface({
                             agent={messageAgent}
                           />
                           {thread ? (
-                            <div className="pl-[46px]">
+                            // Assistant replies sit in a 46px avatar gutter;
+                            // user messages are right-aligned, so align the
+                            // chip to the message it branched from.
+                            <div className={block.kind === "user_text" ? "flex justify-end" : "pl-[46px]"}>
                               <ThreadChip thread={thread} onOpen={() => setOpenThread(thread)} />
                             </div>
                           ) : canStartThread ? (

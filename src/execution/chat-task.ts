@@ -18,6 +18,7 @@ import {
   appendTrace,
   createChatMessage,
   getLastMainChatAssistantTextBlock,
+  getMainChatUserTextBlockForTask,
   isTerminalTaskStatus,
   mutateState,
   now,
@@ -1597,16 +1598,20 @@ async function runLoop(
     Boolean(emitCtx) && !emitCtx?.threadId;
 
   // Mint a thread for this turn and re-point emitCtx at it. Branches off the
-  // most recent main-chat assistant message; when there is none (the very
-  // first turn) we stay in the main chat — there's nothing to branch from —
-  // but the directive is still stripped. Persists the thread fields onto the
-  // Task so an approval-resume (which re-runs resolveEmitContext) keeps
-  // threading from the same parent.
+  // CURRENT turn's user message (the main-chat user_text block carrying this
+  // taskId) so the thread chip renders right where the user asked; turns with
+  // no user message (job/channel turns) fall back to the most recent
+  // main-chat assistant message. When neither exists we stay in the main
+  // chat — there's nothing to branch from — but the directive is still
+  // stripped. Persists the thread fields onto the Task so an approval-resume
+  // (which re-runs resolveEmitContext) keeps threading from the same parent.
   const switchTurnToThread = async (): Promise<"switched" | "already-threaded" | "no-parent"> => {
     if (!emitCtx) return "no-parent";
     if (emitCtx.threadId) return "already-threaded";
-    const parent = getLastMainChatAssistantTextBlock(config.instance, emitCtx.sessionId);
-    if (!parent) return "no-parent"; // First-ever turn — stay in main chat.
+    const parent =
+      getMainChatUserTextBlockForTask(config.instance, emitCtx.sessionId, taskId) ??
+      getLastMainChatAssistantTextBlock(config.instance, emitCtx.sessionId);
+    if (!parent) return "no-parent"; // Nothing to branch from — stay in main chat.
     const threadId = makeId("thread");
     const parentBlockId = parent.id;
     const mainCtx = emitCtx; // Pre-switch (main) context — no threadId.

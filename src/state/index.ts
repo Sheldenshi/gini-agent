@@ -104,6 +104,7 @@ export {
   listChatBlocksAfter,
   listThreadBlocks,
   getLastMainChatAssistantTextBlock,
+  getMainChatUserTextBlockForTask,
   getMainChatBlock,
   summarizeThreads,
   summarizeThreadsForInstance,
