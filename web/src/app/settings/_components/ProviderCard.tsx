@@ -13,6 +13,7 @@ import {
   DialogDescription,
   DialogTitle
 } from "@/components/ui/dialog";
+import { DocReference } from "@/components/DocReference";
 import { providerIcon } from "@/components/provider-logos";
 import { api } from "@/lib/api";
 import { displayProviderName, type ProviderCatalogItem } from "@/lib/providers";
@@ -152,11 +153,25 @@ export function ProviderCard({
           const model = isInstanceProvider
             ? (activeProviderModel ?? row.models[0] ?? "")
             : (row.models[0] ?? "");
+          // Persistent needs-reauth state (issue #233): the runtime recorded a
+          // provider auth failure that nothing has cleared yet. The row swaps
+          // the green "Connected" for an amber "Needs re-authentication" with
+          // the redacted provider error and a CTA routed the same way as the
+          // chat re-auth note (BlockSystemNote): "docs" opens the in-app doc
+          // slide-over, "settings" opens the key-edit dialog that already
+          // lives on this row, "aws" gets text guidance (no key to paste).
+          // The fallbacks mirror BlockSystemNote so a payload missing the
+          // routing fields never renders a broken CTA.
+          const needsReauth = row.authStatus === "needs_reauth";
+          const reauthKind = row.reauth?.reauthKind ?? "settings";
+          const reauthUrl = row.reauth?.reauthUrl ?? "/settings";
 
           return (
             <li
               key={row.id}
-              className="flex items-center gap-4 rounded-2xl border border-border bg-card p-5"
+              className={`flex items-center gap-4 rounded-2xl border p-5 ${
+                needsReauth ? "border-amber-500/30 bg-amber-500/5" : "border-border bg-card"
+              }`}
             >
               <span className="flex size-[42px] items-center justify-center rounded-[11px] bg-muted">
                 <Icon className="size-5 text-foreground" />
@@ -169,18 +184,56 @@ export function ProviderCard({
                   </span>
                 </div>
                 <div className="flex items-center gap-2.5 text-xs text-muted-foreground">
-                  <span className="size-2 rounded-full bg-emerald-400" aria-hidden />
-                  <span>Connected</span>
+                  {needsReauth ? (
+                    <>
+                      <span className="size-2 rounded-full bg-amber-500" aria-hidden />
+                      <span className="font-medium text-amber-600 dark:text-amber-500">
+                        Needs re-authentication
+                      </span>
+                    </>
+                  ) : (
+                    <>
+                      <span className="size-2 rounded-full bg-emerald-400" aria-hidden />
+                      <span>Connected</span>
+                    </>
+                  )}
                   <span className="text-muted-foreground">·</span>
                   <span className="font-mono">{model}</span>
                 </div>
+                {needsReauth && row.reauth?.detail ? (
+                  <p className="text-[11px] italic text-muted-foreground">{row.reauth.detail}</p>
+                ) : null}
+                {needsReauth ? (
+                  reauthKind === "docs" ? (
+                    <DocReference url={reauthUrl}>
+                      <Button size="sm" variant="outline" className="mt-1.5">
+                        How to re-authenticate {displayProviderName(row)}
+                      </Button>
+                    </DocReference>
+                  ) : reauthKind === "aws" ? (
+                    <p className="text-[11px] text-muted-foreground">
+                      Check your AWS credentials (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY or
+                      ~/.aws/credentials), then retry.
+                    </p>
+                  ) : (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="mt-1.5"
+                      onClick={() => setEditingRow(row)}
+                    >
+                      Update {displayProviderName(row)} key
+                    </Button>
+                  )
+                ) : null}
               </div>
               {/*
-                Codex authenticates via codex --login → ~/.codex/auth.json,
+                Codex authenticates via codex login → ~/.codex/auth.json,
                 so there's no key or model to edit from this UI and nothing
                 to "remove" without breaking the user's shell auth. Hide
                 both row-level actions for codex; the Verify flow on the
-                Add Provider page is the only place codex re-auth lives.
+                Add Provider page and the needs-reauth docs CTA above are
+                the only places codex re-auth lives.
               */}
               {row.name === "codex" ? null : (
                 <div className="flex items-center gap-2">
