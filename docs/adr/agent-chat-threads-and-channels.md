@@ -111,7 +111,8 @@ the one resolver for an agent's canonical chat. It runs inside a single
 `ChatBlockBase` gains `threadId?` and `parentBlockId?` (additive, all
 block kinds). A main-chat block leaves both unset; a thread block
 carries `threadId` and the thread's root carries `parentBlockId`
-pointing at the main-chat `assistant_text` it branched from.
+pointing at the main-chat block it branched from — the human `user_text`
+for an agent-started thread, the `assistant_text` for a user-started one.
 
 Schema `MEMORY_SCHEMA_VERSION` 8 → 9 (`src/state/memory-db.ts`):
 
@@ -156,8 +157,12 @@ In `src/state/chat-blocks.ts`, surfaced through the `src/state` barrel:
   are `kind:"agent"` on its own.
 
 `ThreadSummary` (`src/types.ts`) carries `threadId`, `sessionId`,
-optional `agentId` / `parentBlockId` / `rootPreview`, `replyCount`,
-`lastReplyAt`, and optional `lastReplyPreview` / `lastReplyAuthor`.
+optional `agentId` / `parentBlockId` / `rootPreview` / `rootAuthor`,
+`replyCount`, `lastReplyAt`, and optional `lastReplyPreview` /
+`lastReplyAuthor`. `rootAuthor` (`user` / `agent`, from the parent
+block's kind) lets the panel and inbox attribute the root preview
+correctly — "You" for an agent-started thread rooted at the user's
+message, the agent otherwise.
 `lastReplyAt` is the newest **message** block's `createdAt`
 (`user_text` / `assistant_text`), not the newest block of any kind: a run
 appends auxiliary blocks (trailing `phase` "Completed", `tool_call` /
