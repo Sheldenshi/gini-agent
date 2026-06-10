@@ -482,7 +482,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "browser_drag",
-      description: "Drag from one element to another by their @eN refs.",
+      description: "Drag from one element to another by their @eN refs. Returns a fresh snapshot, possibly as a diff (call browser_snapshot for the full tree).",
       parameters: {
         type: "object",
         properties: {
@@ -501,7 +501,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "browser_select_option",
-      description: "Select an option in a <select> element by its @eN ref. Pass `value` for single-select or `values` for multi-select. Exactly one of the two must be provided.",
+      description: "Select an option in a <select> element by its @eN ref. Pass `value` for single-select or `values` for multi-select. Exactly one of the two must be provided. Returns a fresh snapshot, possibly as a diff (call browser_snapshot for the full tree).",
       parameters: {
         type: "object",
         properties: {

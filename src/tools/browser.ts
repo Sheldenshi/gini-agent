@@ -1395,12 +1395,23 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
         if (m) nextId = Math.max(nextId, Number(m[1]) + 1);
       }
       // Reuse an existing stamp (refs are stable within a page lifetime);
-      // only unstamped elements get a freshly-allocated id.
+      // only unstamped elements get a freshly-allocated id. Two stamps are
+      // NOT trusted: a value that doesn't match our e<N> format (the page
+      // set the attribute itself — honoring it would let page content pick
+      // its own ref), and a value already reused this walk (cloneNode
+      // copies attributes, so a cloned subtree carries duplicate stamps;
+      // two elements sharing a ref breaks strict-mode resolution). Both
+      // get restamped with a fresh id.
+      const stampsThisWalk = new Set<string>();
       const refFor = (el: Element): string => {
         const existing = el.getAttribute(attr);
-        if (existing) return `@${existing}`;
+        if (existing && /^e\d+$/.test(existing) && !stampsThisWalk.has(existing)) {
+          stampsThisWalk.add(existing);
+          return `@${existing}`;
+        }
         const id = `e${nextId++}`;
         el.setAttribute(attr, id);
+        stampsThisWalk.add(id);
         return `@${id}`;
       };
       let hiddenEmitted = 0;
@@ -1700,9 +1711,15 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
   }
   // Store the REDACTED text as the diff base for the next post-action
   // snapshot — diffing always compares redacted text against redacted
-  // text, so the diff path cannot bypass secret suppression.
+  // text, so the diff path cannot bypass secret suppression. Only
+  // full=false walks set the base: post-action snapshots are always
+  // full=false, and diffing one against a full=true tree (with its extra
+  // landmark/heading rows) would render every landmark as a spurious
+  // removal. The URL marker updates on EVERY walk regardless — it feeds
+  // the navigation detector above, and skipping it after a full=true
+  // snapshot would make the next walk strip every stamp on the page.
   if (session) {
-    session.lastSnapshotText = text;
+    if (!full) session.lastSnapshotText = text;
     session.lastSnapshotUrl = currentUrl;
   }
   return { text, refs, elementCount, truncated, navigated };
@@ -1724,8 +1741,10 @@ const SNAPSHOT_DIFF_HEADER =
 // context). Implemented inline as a common-prefix/suffix trim plus an
 // LCS over the changed middle — post-action changes are usually local,
 // so the quadratic LCS only ever sees a small window. No dependency,
-// no regex over page-controlled text. See ADR browser-automation-engine.md.
-function renderSnapshotDiff(prevText: string, currText: string): string {
+// no regex over page-controlled text. Returns undefined when the trimmed
+// middle is too large to diff (see the cell cap below); the caller falls
+// back to the full snapshot. See ADR browser-automation-engine.md.
+function renderSnapshotDiff(prevText: string, currText: string): string | undefined {
   const prev = prevText.split("\n");
   const curr = currText.split("\n");
   let start = 0;
@@ -1738,6 +1757,10 @@ function renderSnapshotDiff(prevText: string, currText: string): string {
   }
   const a = prev.slice(start, prevEnd);
   const b = curr.slice(start, currEnd);
+  // A change this widespread won't render as a useful diff anyway, and
+  // the quadratic LCS table below would allocate (and fill) one cell per
+  // line pair — cap the work and let the caller return the full tree.
+  if (a.length * b.length > 1_000_000) return undefined;
   // LCS table over the trimmed middle; backtrack into an op list.
   const rows = a.length + 1;
   const cols = b.length + 1;
@@ -1772,15 +1795,25 @@ function renderSnapshotDiff(prevText: string, currText: string): string {
   for (let i = prevEnd; i < prev.length; i++) ops.push({ kind: "same", line: prev[i]! });
   // Render only changed lines plus nearby context.
   const keep = new Array<boolean>(ops.length).fill(false);
+  let changed = false;
   for (let i = 0; i < ops.length; i++) {
     if (ops[i]!.kind === "same") continue;
+    changed = true;
     const lo = Math.max(0, i - SNAPSHOT_DIFF_CONTEXT_LINES);
     const hi = Math.min(ops.length - 1, i + SNAPSHOT_DIFF_CONTEXT_LINES);
     for (let j = lo; j <= hi; j++) keep[j] = true;
   }
+  // A header with no body reads like an empty page, not an unchanged
+  // one — say so explicitly.
+  if (!changed) return `${SNAPSHOT_DIFF_HEADER}\n(no changes)`;
   const lines: string[] = [SNAPSHOT_DIFF_HEADER];
+  let prevKept = -1;
   for (let i = 0; i < ops.length; i++) {
     if (!keep[i]) continue;
+    // Mark the gap between non-adjacent hunks — without it two distant
+    // changes read as neighboring lines of the tree.
+    if (prevKept !== -1 && i > prevKept + 1) lines.push("  ⋯");
+    prevKept = i;
     const op = ops[i]!;
     lines.push(op.kind === "del" ? `- ${op.line}` : op.kind === "add" ? `+ ${op.line}` : `  ${op.line}`);
   }
@@ -1807,7 +1840,7 @@ async function snapshotAfterAction(
   session.refs = snap.refs;
   if (!snap.navigated && prev !== undefined) {
     const diff = renderSnapshotDiff(prev, snap.text);
-    if (diff.length < snap.text.length * SNAPSHOT_DIFF_MAX_RATIO) {
+    if (diff !== undefined && diff.length < snap.text.length * SNAPSHOT_DIFF_MAX_RATIO) {
       return { snapshot: diff, snapshotMode: "diff", elementCount: snap.elementCount, truncated: snap.truncated };
     }
   }
@@ -1885,6 +1918,7 @@ async function healLostRef(session: Session, target: RefTarget, ref: string): Pr
       // non-ARIA roles) — fall through to the text strategy.
     }
   }
+  let viaText = false;
   if (!candidate) {
     const byText = page.getByText(target.name, { exact: true }).nth(target.nth);
     try {
@@ -1893,6 +1927,36 @@ async function healLostRef(session: Session, target: RefTarget, ref: string): Pr
       return undefined;
     }
     candidate = byText;
+    viaText = true;
+  }
+  // Two guards before the candidate is trusted (mis-heal containment —
+  // see ADR browser-automation-engine.md). First, a candidate already
+  // carrying a different stamp is a live element addressed by some OTHER
+  // ref; restamping it would silently fold two refs onto one node and
+  // the action would land on the wrong element. Second, a text-strategy
+  // candidate must itself qualify as cursor-interactive the way the
+  // walker's synthetic "clickable" entries do — getByText also matches
+  // same-text bystanders (headings, plain spans) the walker never
+  // emitted. Both cases bail to the standard Unknown-ref failure.
+  try {
+    const verdict = await candidate.evaluate(
+      (el: Element, arg: { attr: string; id: string }) => {
+        const stamp = el.getAttribute(arg.attr);
+        const tabindexAttr = el.getAttribute("tabindex");
+        return {
+          foreignStamp: stamp !== null && stamp !== arg.id,
+          cursorInteractive:
+            window.getComputedStyle(el as HTMLElement).cursor === "pointer" ||
+            el.getAttribute("onclick") !== null ||
+            (tabindexAttr !== null && Number.parseInt(tabindexAttr, 10) >= 0),
+        };
+      },
+      { attr: REF_ATTR_GLOBAL, id: ref.slice(1) }
+    );
+    if (verdict.foreignStamp) return undefined;
+    if (viaText && !verdict.cursorInteractive) return undefined;
+  } catch {
+    return undefined;
   }
   // Restamp with the SAME id so the ref stays stable for future actions
   // and snapshots. Best-effort: acting on the candidate locator is
@@ -2784,9 +2848,19 @@ export async function browserWaitFor(taskId: string, args: Record<string, unknow
             // would invert the wait's meaning — so those keep the raw
             // stamped locator.
             const resolved = await resolveRefForAction(session, ref);
-            if (!resolved) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
-            healedRef = resolved.healed;
-            await resolved.locator.waitFor({ state: waitState, timeout: timeoutMs });
+            if (resolved) {
+              healedRef = resolved.healed;
+              await resolved.locator.waitFor({ state: waitState, timeout: timeoutMs });
+            } else {
+              // Resolution failing right now is not "unknown ref" for the
+              // presence states — waiting for an element that isn't there
+              // YET is exactly what this tool is for. Fall back to polling
+              // the stamped locator so a node that (re)appears with its
+              // stamp intact satisfies the wait.
+              const target = session.refs.get(ref);
+              if (!target) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
+              await target.locator.waitFor({ state: waitState, timeout: timeoutMs });
+            }
           } else {
             const target = session.refs.get(ref);
             if (!target) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
@@ -3095,11 +3169,19 @@ export async function browserVision(
       if (annotate) {
         try {
           if (typeof session.page.evaluate === "function") {
-            await session.page.evaluate((cap: number) => {
+            // Only refs the session actually holds get a badge — a stamp
+            // alone isn't enough (the walker stamps elements the char
+            // budget then drops, and a page could plant the attribute
+            // itself); a badge citing a ref the agent can't act on would
+            // send it chasing Unknown-ref failures.
+            const knownIds = Array.from(session.refs.keys()).map((r) => r.slice(1));
+            await session.page.evaluate((arg: { cap: number; ids: string[] }) => {
+              const known = new Set(arg.ids);
               const stamped = Array.from(document.querySelectorAll("[data-gini-ref]"));
               let placed = 0;
               for (const el of stamped) {
-                if (placed >= cap) break;
+                if (placed >= arg.cap) break;
+                if (!known.has(el.getAttribute("data-gini-ref") ?? "")) continue;
                 if (el.getAttribute("data-gini-secret") !== null) continue;
                 const rect = el.getBoundingClientRect();
                 if (rect.width <= 0 || rect.height <= 0) continue;
@@ -3112,14 +3194,19 @@ export async function browserVision(
                 const badge = document.createElement("div");
                 badge.setAttribute("data-gini-vision-badge", "true");
                 badge.textContent = el.getAttribute("data-gini-ref") ?? "";
+                // Document-absolute placement (viewport rect + scroll
+                // offset) rather than position:fixed, so badges land on
+                // their elements in fullPage captures too — fixed boxes
+                // would all pile up in the scrolled-to viewport.
                 badge.style.cssText =
-                  `position:fixed;left:${Math.max(0, rect.left)}px;top:${Math.max(0, rect.top)}px;`
+                  `position:absolute;left:${Math.max(0, rect.left + window.scrollX)}px;`
+                  + `top:${Math.max(0, rect.top + window.scrollY)}px;`
                   + "z-index:2147483647;background:#1a73e8;color:#fff;"
                   + "font:10px/1.4 monospace;padding:0 3px;border-radius:3px;pointer-events:none;";
-                document.body.appendChild(badge);
+                document.documentElement.appendChild(badge);
                 placed++;
               }
-            }, VISION_ANNOTATE_BADGE_CAP);
+            }, { cap: VISION_ANNOTATE_BADGE_CAP, ids: knownIds });
           }
         } catch { /* best-effort overlay — an unannotated screenshot is still useful */ }
       }
@@ -3591,5 +3678,11 @@ export const __test = {
   // ref-stability / navigation-reset behavior.
   snapshotForTest(page: Page, full: boolean, taskId?: string): Promise<SnapshotResult> {
     return snapshot(page, full, taskId);
+  },
+  // Direct access to the diff renderer so its formatting rules — the
+  // "(no changes)" body, hunk separators, the LCS cell cap — can be
+  // asserted without driving a full page walk.
+  renderSnapshotDiffForTest(prevText: string, currText: string): string | undefined {
+    return renderSnapshotDiff(prevText, currText);
   }
 };

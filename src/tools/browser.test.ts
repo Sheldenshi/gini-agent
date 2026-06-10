@@ -692,6 +692,158 @@ describe("snapshot walker — <select> option surfacing", () => {
   });
 });
 
+// Shared fake-DOM scaffolding for the snapshot-walker suites below. Each
+// test plants its own document.body, calls __test.snapshotForTest with a
+// fake page that runs the evaluate-callback locally, and restores globals
+// on exit. The element model is the superset every suite needs:
+// per-element computed cursor, parentElement wiring (makeWalkerEl links
+// children to their parent), <select>/<option> fields, and a
+// document.querySelector that resolves `label[for="..."]` over the
+// planted body tree.
+type WalkerFakeEl = {
+  tagName: string;
+  type?: string;
+  value?: string;
+  disabled?: boolean;
+  hidden?: boolean;
+  label?: string;
+  text?: string;
+  _attrs: Record<string, string>;
+  _children: WalkerFakeEl[];
+  _textContent: string;
+  _visible: boolean;
+  _cursor: string;
+  parentElement: WalkerFakeEl | null;
+  getAttribute(name: string): string | null;
+  setAttribute(name: string, value: string): void;
+  removeAttribute(name: string): void;
+  getBoundingClientRect(): { width: number; height: number };
+  get children(): WalkerFakeEl[];
+  get textContent(): string;
+  querySelectorAll(selector: string): WalkerFakeEl[];
+};
+const makeWalkerEl = (init: {
+  tagName: string;
+  type?: string;
+  value?: string;
+  disabled?: boolean;
+  hidden?: boolean;
+  label?: string;
+  text?: string;
+  visible?: boolean;
+  cursor?: string;
+  children?: WalkerFakeEl[];
+  textContent?: string;
+  attrs?: Record<string, string>;
+}): WalkerFakeEl => {
+  const visible = init.visible ?? true;
+  const children = init.children ?? [];
+  const el: WalkerFakeEl = {
+    tagName: init.tagName,
+    type: init.type,
+    value: init.value,
+    disabled: init.disabled,
+    hidden: init.hidden,
+    label: init.label,
+    text: init.text,
+    _attrs: { ...(init.attrs ?? {}) },
+    _children: children,
+    _textContent: init.textContent ?? "",
+    _visible: visible,
+    _cursor: init.cursor ?? "auto",
+    parentElement: null,
+    getAttribute(name: string) {
+      return Object.prototype.hasOwnProperty.call(this._attrs, name) ? this._attrs[name]! : null;
+    },
+    setAttribute(name: string, value: string) {
+      this._attrs[name] = value;
+    },
+    removeAttribute(name: string) {
+      delete this._attrs[name];
+    },
+    getBoundingClientRect() {
+      return this._visible ? { width: 100, height: 20 } : { width: 0, height: 0 };
+    },
+    get children() {
+      return this._children;
+    },
+    get textContent() {
+      return this._textContent;
+    },
+    querySelectorAll(selector: string) {
+      const matches: WalkerFakeEl[] = [];
+      const recurse = (node: WalkerFakeEl) => {
+        if (selector === "option") {
+          if (node.tagName === "OPTION") matches.push(node);
+        } else if (selector.startsWith("[") && selector.endsWith("]")) {
+          const attr = selector.slice(1, -1);
+          if (Object.prototype.hasOwnProperty.call(node._attrs, attr)) matches.push(node);
+        }
+        for (const child of node._children) recurse(child);
+      };
+      for (const child of this._children) recurse(child);
+      return matches;
+    }
+  };
+  for (const child of children) child.parentElement = el;
+  return el;
+};
+// Installs the fake DOM globals the walker reads from inside the
+// page.evaluate callback (which runs locally under the fake page). The
+// returned `restore` function puts the originals back.
+const installWalkerDom = (body: WalkerFakeEl): (() => void) => {
+  const originalDocument = (globalThis as Record<string, unknown>).document;
+  const originalWindow = (globalThis as Record<string, unknown>).window;
+  const originalCSS = (globalThis as Record<string, unknown>).CSS;
+  const findByLabelFor = (target: string): WalkerFakeEl | null => {
+    let found: WalkerFakeEl | null = null;
+    const recurse = (node: WalkerFakeEl) => {
+      if (found) return;
+      if (node.tagName === "LABEL" && node.getAttribute("for") === target) {
+        found = node;
+        return;
+      }
+      for (const child of node._children) recurse(child);
+    };
+    recurse(body);
+    return found;
+  };
+  (globalThis as unknown as { document: unknown }).document = {
+    body,
+    querySelectorAll: (selector: string) => body.querySelectorAll(selector),
+    querySelector: (sel: string) => {
+      const m = /^label\[for="(.+)"\]$/.exec(sel);
+      return m ? findByLabelFor(m[1]!) : null;
+    },
+    getElementById: (_id: string) => null
+  };
+  (globalThis as unknown as { window: unknown }).window = {
+    getComputedStyle: (el: unknown) => ({
+      display: "block",
+      visibility: "visible",
+      cursor: (el as WalkerFakeEl)._cursor ?? "auto"
+    })
+  };
+  (globalThis as unknown as { CSS: unknown }).CSS = { escape: (s: string) => s };
+  return () => {
+    if (originalDocument === undefined) {
+      delete (globalThis as Record<string, unknown>).document;
+    } else {
+      (globalThis as Record<string, unknown>).document = originalDocument;
+    }
+    if (originalWindow === undefined) {
+      delete (globalThis as Record<string, unknown>).window;
+    } else {
+      (globalThis as Record<string, unknown>).window = originalWindow;
+    }
+    if (originalCSS === undefined) {
+      delete (globalThis as Record<string, unknown>).CSS;
+    } else {
+      (globalThis as Record<string, unknown>).CSS = originalCSS;
+    }
+  };
+};
+
 // Tests for hidden-element surfacing in the snapshot walker. The walker
 // must emit invisible interactive elements (with a [hidden] marker) so
 // wait_for state:"hidden"/"attached"/"detached" can target them, AND must
@@ -699,114 +851,9 @@ describe("snapshot walker — <select> option surfacing", () => {
 // inputs behind styled-button uploaders are still drivable via
 // browser_upload_file.
 describe("snapshot walker — hidden interactive elements", () => {
-  // Shared fake-DOM scaffolding. Each test plants its own document.body,
-  // calls __test.snapshotForTest with a fake page that runs the
-  // evaluate-callback locally, and restores globals on exit.
-  type FakeEl = {
-    tagName: string;
-    type?: string;
-    value?: string;
-    disabled?: boolean;
-    hidden?: boolean;
-    label?: string;
-    text?: string;
-    _attrs: Record<string, string>;
-    _children: FakeEl[];
-    _textContent: string;
-    _visible: boolean;
-    getAttribute(name: string): string | null;
-    setAttribute(name: string, value: string): void;
-    removeAttribute(name: string): void;
-    getBoundingClientRect(): { width: number; height: number };
-    get children(): FakeEl[];
-    get textContent(): string;
-    querySelectorAll(selector: string): FakeEl[];
-  };
-  const makeEl = (init: Partial<FakeEl> & { tagName: string; visible?: boolean; children?: FakeEl[]; textContent?: string; attrs?: Record<string, string> }): FakeEl => {
-    const visible = init.visible ?? true;
-    const children = init.children ?? [];
-    const el: FakeEl = {
-      tagName: init.tagName,
-      type: init.type,
-      value: init.value,
-      disabled: init.disabled,
-      hidden: init.hidden,
-      label: init.label,
-      text: init.text,
-      _attrs: { ...(init.attrs ?? {}) },
-      _children: children,
-      _textContent: init.textContent ?? "",
-      _visible: visible,
-      getAttribute(name: string) {
-        return Object.prototype.hasOwnProperty.call(this._attrs, name) ? this._attrs[name]! : null;
-      },
-      setAttribute(name: string, value: string) {
-        this._attrs[name] = value;
-      },
-      removeAttribute(name: string) {
-        delete this._attrs[name];
-      },
-      getBoundingClientRect() {
-        return this._visible ? { width: 100, height: 20 } : { width: 0, height: 0 };
-      },
-      get children() {
-        return this._children;
-      },
-      get textContent() {
-        return this._textContent;
-      },
-      querySelectorAll(selector: string) {
-        const matches: FakeEl[] = [];
-        const recurse = (node: FakeEl) => {
-          if (selector === "option") {
-            if (node.tagName === "OPTION") matches.push(node);
-          } else if (selector.startsWith("[") && selector.endsWith("]")) {
-            const attr = selector.slice(1, -1);
-            if (Object.prototype.hasOwnProperty.call(node._attrs, attr)) matches.push(node);
-          }
-          for (const child of node._children) recurse(child);
-        };
-        for (const child of this._children) recurse(child);
-        return matches;
-      }
-    };
-    return el;
-  };
-  // Installs the fake DOM globals the walker reads from inside the
-  // page.evaluate callback (which runs locally under the fake page). The
-  // returned `restore` function puts the originals back.
-  const installFakeDom = (body: FakeEl): (() => void) => {
-    const originalDocument = (globalThis as Record<string, unknown>).document;
-    const originalWindow = (globalThis as Record<string, unknown>).window;
-    const originalCSS = (globalThis as Record<string, unknown>).CSS;
-    (globalThis as unknown as { document: unknown }).document = {
-      body,
-      querySelectorAll: (selector: string) => body.querySelectorAll(selector),
-      querySelector: (_sel: string) => null,
-      getElementById: (_id: string) => null
-    };
-    (globalThis as unknown as { window: unknown }).window = {
-      getComputedStyle: (_el: unknown) => ({ display: "block", visibility: "visible" })
-    };
-    (globalThis as unknown as { CSS: unknown }).CSS = { escape: (s: string) => s };
-    return () => {
-      if (originalDocument === undefined) {
-        delete (globalThis as Record<string, unknown>).document;
-      } else {
-        (globalThis as Record<string, unknown>).document = originalDocument;
-      }
-      if (originalWindow === undefined) {
-        delete (globalThis as Record<string, unknown>).window;
-      } else {
-        (globalThis as Record<string, unknown>).window = originalWindow;
-      }
-      if (originalCSS === undefined) {
-        delete (globalThis as Record<string, unknown>).CSS;
-      } else {
-        (globalThis as Record<string, unknown>).CSS = originalCSS;
-      }
-    };
-  };
+  type FakeEl = WalkerFakeEl;
+  const makeEl = makeWalkerEl;
+  const installFakeDom = installWalkerDom;
 
   // Fake Page whose page.evaluate(fn, arg) runs fn(arg) locally; the
   // locator factory returns a synthetic locator stub keyed by selector so
@@ -901,138 +948,9 @@ describe("snapshot walker — hidden interactive elements", () => {
 // force-emitted with [hidden] like file inputs. See ADR
 // browser-automation-engine.md.
 describe("snapshot walker — cursor-interactive clickables", () => {
-  // Fake-DOM scaffolding like the hidden-elements suite above, extended
-  // with: per-element computed cursor, parentElement wiring (makeEl links
-  // children to their parent), and a document.querySelector that resolves
-  // `label[for="..."]` over the planted body tree.
-  type FakeEl = {
-    tagName: string;
-    type?: string;
-    value?: string;
-    _attrs: Record<string, string>;
-    _children: FakeEl[];
-    _textContent: string;
-    _visible: boolean;
-    _cursor: string;
-    parentElement: FakeEl | null;
-    getAttribute(name: string): string | null;
-    setAttribute(name: string, value: string): void;
-    removeAttribute(name: string): void;
-    getBoundingClientRect(): { width: number; height: number };
-    get children(): FakeEl[];
-    get textContent(): string;
-    querySelectorAll(selector: string): FakeEl[];
-  };
-  const makeEl = (init: {
-    tagName: string;
-    type?: string;
-    value?: string;
-    visible?: boolean;
-    cursor?: string;
-    children?: FakeEl[];
-    textContent?: string;
-    attrs?: Record<string, string>;
-  }): FakeEl => {
-    const visible = init.visible ?? true;
-    const children = init.children ?? [];
-    const el: FakeEl = {
-      tagName: init.tagName,
-      type: init.type,
-      value: init.value,
-      _attrs: { ...(init.attrs ?? {}) },
-      _children: children,
-      _textContent: init.textContent ?? "",
-      _visible: visible,
-      _cursor: init.cursor ?? "auto",
-      parentElement: null,
-      getAttribute(name: string) {
-        return Object.prototype.hasOwnProperty.call(this._attrs, name) ? this._attrs[name]! : null;
-      },
-      setAttribute(name: string, value: string) {
-        this._attrs[name] = value;
-      },
-      removeAttribute(name: string) {
-        delete this._attrs[name];
-      },
-      getBoundingClientRect() {
-        return this._visible ? { width: 100, height: 20 } : { width: 0, height: 0 };
-      },
-      get children() {
-        return this._children;
-      },
-      get textContent() {
-        return this._textContent;
-      },
-      querySelectorAll(selector: string) {
-        const matches: FakeEl[] = [];
-        const recurse = (node: FakeEl) => {
-          if (selector === "option") {
-            if (node.tagName === "OPTION") matches.push(node);
-          } else if (selector.startsWith("[") && selector.endsWith("]")) {
-            const attr = selector.slice(1, -1);
-            if (Object.prototype.hasOwnProperty.call(node._attrs, attr)) matches.push(node);
-          }
-          for (const child of node._children) recurse(child);
-        };
-        for (const child of this._children) recurse(child);
-        return matches;
-      }
-    };
-    for (const child of children) child.parentElement = el;
-    return el;
-  };
-  const installFakeDom = (body: FakeEl): (() => void) => {
-    const originalDocument = (globalThis as Record<string, unknown>).document;
-    const originalWindow = (globalThis as Record<string, unknown>).window;
-    const originalCSS = (globalThis as Record<string, unknown>).CSS;
-    const findByLabelFor = (target: string): FakeEl | null => {
-      let found: FakeEl | null = null;
-      const recurse = (node: FakeEl) => {
-        if (found) return;
-        if (node.tagName === "LABEL" && node.getAttribute("for") === target) {
-          found = node;
-          return;
-        }
-        for (const child of node._children) recurse(child);
-      };
-      recurse(body);
-      return found;
-    };
-    (globalThis as unknown as { document: unknown }).document = {
-      body,
-      querySelectorAll: (selector: string) => body.querySelectorAll(selector),
-      querySelector: (sel: string) => {
-        const m = /^label\[for="(.+)"\]$/.exec(sel);
-        return m ? findByLabelFor(m[1]!) : null;
-      },
-      getElementById: (_id: string) => null
-    };
-    (globalThis as unknown as { window: unknown }).window = {
-      getComputedStyle: (el: unknown) => ({
-        display: "block",
-        visibility: "visible",
-        cursor: (el as FakeEl)._cursor ?? "auto"
-      })
-    };
-    (globalThis as unknown as { CSS: unknown }).CSS = { escape: (s: string) => s };
-    return () => {
-      if (originalDocument === undefined) {
-        delete (globalThis as Record<string, unknown>).document;
-      } else {
-        (globalThis as Record<string, unknown>).document = originalDocument;
-      }
-      if (originalWindow === undefined) {
-        delete (globalThis as Record<string, unknown>).window;
-      } else {
-        (globalThis as Record<string, unknown>).window = originalWindow;
-      }
-      if (originalCSS === undefined) {
-        delete (globalThis as Record<string, unknown>).CSS;
-      } else {
-        (globalThis as Record<string, unknown>).CSS = originalCSS;
-      }
-    };
-  };
+  type FakeEl = WalkerFakeEl;
+  const makeEl = makeWalkerEl;
+  const installFakeDom = installWalkerDom;
   const makeFakePage = (): import("playwright-core").Page =>
     ({
       evaluate: <A, R>(fn: (arg: A) => R | Promise<R>, arg?: A): Promise<R> => Promise.resolve(fn(arg as A)),
@@ -1159,111 +1077,9 @@ describe("snapshot walker — cursor-interactive clickables", () => {
 // snapshot when the change is small. Explicit browser_snapshot always
 // returns the full tree.
 describe("snapshot stable refs and post-action diffs", () => {
-  type FakeEl = {
-    tagName: string;
-    type?: string;
-    value?: string;
-    _attrs: Record<string, string>;
-    _children: FakeEl[];
-    _textContent: string;
-    _visible: boolean;
-    parentElement: FakeEl | null;
-    getAttribute(name: string): string | null;
-    setAttribute(name: string, value: string): void;
-    removeAttribute(name: string): void;
-    getBoundingClientRect(): { width: number; height: number };
-    get children(): FakeEl[];
-    get textContent(): string;
-    querySelectorAll(selector: string): FakeEl[];
-  };
-  const makeEl = (init: {
-    tagName: string;
-    type?: string;
-    value?: string;
-    visible?: boolean;
-    children?: FakeEl[];
-    textContent?: string;
-    attrs?: Record<string, string>;
-  }): FakeEl => {
-    const visible = init.visible ?? true;
-    const children = init.children ?? [];
-    const el: FakeEl = {
-      tagName: init.tagName,
-      type: init.type,
-      value: init.value,
-      _attrs: { ...(init.attrs ?? {}) },
-      _children: children,
-      _textContent: init.textContent ?? "",
-      _visible: visible,
-      parentElement: null,
-      getAttribute(name: string) {
-        return Object.prototype.hasOwnProperty.call(this._attrs, name) ? this._attrs[name]! : null;
-      },
-      setAttribute(name: string, value: string) {
-        this._attrs[name] = value;
-      },
-      removeAttribute(name: string) {
-        delete this._attrs[name];
-      },
-      getBoundingClientRect() {
-        return this._visible ? { width: 100, height: 20 } : { width: 0, height: 0 };
-      },
-      get children() {
-        return this._children;
-      },
-      get textContent() {
-        return this._textContent;
-      },
-      querySelectorAll(selector: string) {
-        const matches: FakeEl[] = [];
-        const recurse = (node: FakeEl) => {
-          if (selector === "option") {
-            if (node.tagName === "OPTION") matches.push(node);
-          } else if (selector.startsWith("[") && selector.endsWith("]")) {
-            const attr = selector.slice(1, -1);
-            if (Object.prototype.hasOwnProperty.call(node._attrs, attr)) matches.push(node);
-          }
-          for (const child of node._children) recurse(child);
-        };
-        for (const child of this._children) recurse(child);
-        return matches;
-      }
-    };
-    for (const child of children) child.parentElement = el;
-    return el;
-  };
-  const installFakeDom = (body: FakeEl): (() => void) => {
-    const originalDocument = (globalThis as Record<string, unknown>).document;
-    const originalWindow = (globalThis as Record<string, unknown>).window;
-    const originalCSS = (globalThis as Record<string, unknown>).CSS;
-    (globalThis as unknown as { document: unknown }).document = {
-      body,
-      querySelectorAll: (selector: string) => body.querySelectorAll(selector),
-      querySelector: (_sel: string) => null,
-      getElementById: (_id: string) => null
-    };
-    (globalThis as unknown as { window: unknown }).window = {
-      getComputedStyle: (_el: unknown) => ({ display: "block", visibility: "visible", cursor: "auto" })
-    };
-    (globalThis as unknown as { CSS: unknown }).CSS = { escape: (s: string) => s };
-    return () => {
-      if (originalDocument === undefined) {
-        delete (globalThis as Record<string, unknown>).document;
-      } else {
-        (globalThis as Record<string, unknown>).document = originalDocument;
-      }
-      if (originalWindow === undefined) {
-        delete (globalThis as Record<string, unknown>).window;
-      } else {
-        (globalThis as Record<string, unknown>).window = originalWindow;
-      }
-      if (originalCSS === undefined) {
-        delete (globalThis as Record<string, unknown>).CSS;
-      } else {
-        (globalThis as Record<string, unknown>).CSS = originalCSS;
-      }
-    };
-  };
+  type FakeEl = WalkerFakeEl;
+  const makeEl = makeWalkerEl;
+  const installFakeDom = installWalkerDom;
   // Fake Page whose evaluate(fn, arg) runs fn(arg) locally and whose
   // locator(sel) returns a stub locator with a click() that invokes the
   // test-provided mutation — so browserClick can "change the page".
@@ -1343,6 +1159,43 @@ describe("snapshot stable refs and post-action diffs", () => {
       expect(third.navigated).toBe(true);
       expect(third.text).toContain('[@e1] button "Two"');
       expect(third.text).toContain('[@e2] button "Three"');
+    } finally {
+      restore();
+    }
+  });
+
+  test("a duplicate (cloned) stamp is restamped with a fresh id", async () => {
+    // cloneNode copies attributes, so a cloned subtree carries the same
+    // stamp as its source; two elements sharing a ref would break
+    // strict-mode resolution. Only the first holder keeps the id.
+    const orig = makeEl({ tagName: "BUTTON", textContent: "Card", attrs: { "data-gini-ref": "e1" } });
+    const clone = makeEl({ tagName: "BUTTON", textContent: "Card", attrs: { "data-gini-ref": "e1" } });
+    const body = makeEl({ tagName: "BODY", children: [orig, clone] });
+    const restore = installFakeDom(body);
+    const page = makeFakePage({ url: "https://example.com/" });
+    try {
+      const result = await browserTest.snapshotForTest(page, false);
+      expect(result.text).toContain('[@e1] button "Card"');
+      expect(result.text).toContain('[@e2] button "Card"');
+      expect(orig._attrs["data-gini-ref"]).toBe("e1");
+      expect(clone._attrs["data-gini-ref"]).toBe("e2");
+    } finally {
+      restore();
+    }
+  });
+
+  test("a stamp that doesn't match the e<N> format is never honored", async () => {
+    // Only the walker writes well-formed stamps; any other value means
+    // the page set the attribute itself, and honoring it would let page
+    // content pick its own ref. It gets overwritten with a fresh id.
+    const bogus = makeEl({ tagName: "BUTTON", textContent: "Planted", attrs: { "data-gini-ref": "javascript:alert(1)" } });
+    const body = makeEl({ tagName: "BODY", children: [bogus] });
+    const restore = installFakeDom(body);
+    const page = makeFakePage({ url: "https://example.com/" });
+    try {
+      const result = await browserTest.snapshotForTest(page, false);
+      expect(result.text).toContain('[@e1] button "Planted"');
+      expect(bogus._attrs["data-gini-ref"]).toBe("e1");
     } finally {
       restore();
     }
@@ -1496,6 +1349,65 @@ describe("snapshot stable refs and post-action diffs", () => {
       restore();
     }
   });
+
+  test("a full=true snapshot does not poison the post-action diff base", async () => {
+    // full=true trees carry landmark/heading rows that full=false trees
+    // (and every post-action snapshot) lack; diffing against one would
+    // render each landmark as a spurious removal.
+    const heading = makeEl({ tagName: "H1", textContent: "Dashboard" });
+    const body = makeEl({ tagName: "BODY", children: [heading, ...makeButtonRows(20)] });
+    const restore = installFakeDom(body);
+    const state: { url: string; onClick?: () => void } = { url: "https://example.com/" };
+    state.onClick = () => {
+      const added = makeEl({ tagName: "BUTTON", textContent: "NewButton" });
+      added.parentElement = body;
+      body._children.push(added);
+    };
+    const page = makeFakePage(state);
+    browserTest.installFakeSessionWithPageForTest("diff-fullbase", page as Partial<import("playwright-core").Page>);
+    try {
+      await browserSnapshot("diff-fullbase", {});
+      const full = JSON.parse(await browserSnapshot("diff-fullbase", { full: true })) as { snapshot: string };
+      expect(full.snapshot).toContain('heading "Dashboard"');
+
+      const raw = await browserClick("diff-fullbase", { ref: "@e1" });
+      const parsed = JSON.parse(raw) as { success: boolean; snapshot: string; snapshotMode: string };
+      expect(parsed.success).toBe(true);
+      expect(parsed.snapshotMode).toBe("diff");
+      expect(parsed.snapshot).toMatch(/\+\s+\[@e21\] button "NewButton"/);
+      expect(parsed.snapshot).not.toContain('- heading "Dashboard"');
+    } finally {
+      restore();
+    }
+  });
+});
+
+describe("renderSnapshotDiff formatting", () => {
+  test("identical snapshots render an explicit '(no changes)' body", () => {
+    const text = 'button "Save"\nbutton "Cancel"';
+    const diff = browserTest.renderSnapshotDiffForTest(text, text);
+    expect(diff).toBeDefined();
+    expect(diff!).toContain("[diff vs previous snapshot");
+    expect(diff!).toContain("(no changes)");
+  });
+
+  test("non-contiguous hunks are separated by a gap marker", () => {
+    const prevLines = Array.from({ length: 12 }, (_, i) => `line${i}`);
+    const currLines = [...prevLines];
+    currLines[1] = "changedA";
+    currLines[10] = "changedB";
+    const diff = browserTest.renderSnapshotDiffForTest(prevLines.join("\n"), currLines.join("\n"));
+    expect(diff!).toContain("+ changedA");
+    expect(diff!).toContain("+ changedB");
+    // Without the marker, two distant changes read as neighboring lines.
+    expect(diff!).toContain("⋯");
+  });
+
+  test("an over-budget changed middle bails out instead of running the quadratic LCS", () => {
+    const a = Array.from({ length: 1100 }, (_, i) => `a${i}`).join("\n");
+    const b = Array.from({ length: 1100 }, (_, i) => `b${i}`).join("\n");
+    expect(browserTest.renderSnapshotDiffForTest(a, b)).toBeUndefined();
+  });
 });
 
 // Stale-ref self-healing: when an SPA re-render destroys the stamped
@@ -1557,12 +1469,30 @@ describe("stale-ref self-healing", () => {
   }
 
   // A healing candidate that exists (count 1) and records the action +
-  // restamp landing on it.
-  function makeCandidate() {
+  // restamp landing on it. Its evaluate runs the supplied closure against
+  // a fake element (with a getComputedStyle window shim), so the real
+  // verdict checks — foreign stamp, cursor interactivity — are exercised.
+  function makeCandidate(init?: {
+    stamp?: string;
+    cursor?: string;
+    onclick?: boolean;
+    tabindex?: string;
+  }) {
     const record = {
       clicks: [] as Array<{ timeout?: number } | undefined>,
       waits: [] as Array<{ state?: string; timeout?: number } | undefined>,
       restamps: [] as Array<{ attr: string; id: string }>
+    };
+    const attrs = new Map<string, string>();
+    if (init?.stamp !== undefined) attrs.set("data-gini-ref", init.stamp);
+    if (init?.onclick) attrs.set("onclick", "void 0");
+    if (init?.tabindex !== undefined) attrs.set("tabindex", init.tabindex);
+    const el = {
+      getAttribute: (name: string) => attrs.get(name) ?? null,
+      setAttribute: (name: string, value: string) => {
+        attrs.set(name, value);
+        record.restamps.push({ attr: name, id: value });
+      }
     };
     const candidate = {
       count: async () => 1,
@@ -1572,8 +1502,16 @@ describe("stale-ref self-healing", () => {
       waitFor: async (o?: { state?: string; timeout?: number }) => {
         record.waits.push(o);
       },
-      evaluate: async (_fn: unknown, arg: { attr: string; id: string }) => {
-        record.restamps.push(arg);
+      evaluate: async (fn: (el: unknown, arg: unknown) => unknown, arg: unknown) => {
+        const g = globalThis as Record<string, unknown>;
+        const originalWindow = g.window;
+        g.window = { getComputedStyle: () => ({ cursor: init?.cursor ?? "auto" }) };
+        try {
+          return fn(el, arg);
+        } finally {
+          if (originalWindow === undefined) delete g.window;
+          else g.window = originalWindow;
+        }
       }
     };
     return { candidate, record };
@@ -1649,7 +1587,7 @@ describe("stale-ref self-healing", () => {
   });
 
   test("role clickable heals via exact-text matching, not getByRole", async () => {
-    const { candidate, record } = makeCandidate();
+    const { candidate, record } = makeCandidate({ cursor: "pointer" });
     const { page, calls } = makeHealPage({ textCandidate: candidate });
     browserTest.installFakeSessionWithPageForTest("heal-clickable", page);
     const refs = new Map<string, unknown>();
@@ -1668,6 +1606,56 @@ describe("stale-ref self-healing", () => {
     expect(record.clicks.length).toBe(1);
   });
 
+  test("a candidate carrying a different stamp is never healed onto", async () => {
+    // The re-query landed on a live element already addressed by another
+    // ref; restamping it would fold two refs onto one node.
+    const { candidate, record } = makeCandidate({ stamp: "e9" });
+    const { page } = makeHealPage({ roleCandidate: candidate });
+    browserTest.installFakeSessionWithPageForTest("heal-foreign", page);
+    const refs = new Map<string, unknown>();
+    refs.set("@e5", { locator: { count: async () => 0 }, role: "button", name: "Submit", nth: 0 });
+    browserTest.setFakeSessionRefsForTest("heal-foreign", refs);
+
+    const raw = await browserClick("heal-foreign", { ref: "@e5" });
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toContain("Unknown ref @e5");
+    expect(record.clicks.length).toBe(0);
+    expect(record.restamps.length).toBe(0);
+  });
+
+  test("a same-text bystander that is not cursor-interactive is never healed onto", async () => {
+    // getByText also matches headings/spans containing the text; only an
+    // element that would itself qualify as a walker clickable is trusted.
+    const { candidate, record } = makeCandidate({ cursor: "auto" });
+    const { page, calls } = makeHealPage({ textCandidate: candidate });
+    browserTest.installFakeSessionWithPageForTest("heal-bystander", page);
+    const refs = new Map<string, unknown>();
+    refs.set("@e3", { locator: { count: async () => 0 }, role: "clickable", name: "Open card", nth: 0 });
+    browserTest.setFakeSessionRefsForTest("heal-bystander", refs);
+
+    const raw = await browserClick("heal-bystander", { ref: "@e3" });
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toContain("Unknown ref @e3");
+    expect(calls.getByText.length).toBe(1);
+    expect(record.clicks.length).toBe(0);
+    expect(record.restamps.length).toBe(0);
+  });
+
+  test("an own-onclick text candidate qualifies without cursor:pointer", async () => {
+    const { candidate, record } = makeCandidate({ onclick: true });
+    const { page } = makeHealPage({ textCandidate: candidate });
+    browserTest.installFakeSessionWithPageForTest("heal-onclick", page);
+    const refs = new Map<string, unknown>();
+    refs.set("@e3", { locator: { count: async () => 0 }, role: "clickable", name: "Open card", nth: 0 });
+    browserTest.setFakeSessionRefsForTest("heal-onclick", refs);
+
+    const raw = await browserClick("heal-onclick", { ref: "@e3" });
+    expect(JSON.parse(raw).success).toBe(true);
+    expect(record.clicks.length).toBe(1);
+  });
+
   test("wait_for state visible self-heals and flags healedRef", async () => {
     const { candidate, record } = makeCandidate();
     const { page, calls } = makeHealPage({ roleCandidate: candidate });
@@ -1683,6 +1671,32 @@ describe("stale-ref self-healing", () => {
     expect(calls.getByRole.length).toBe(1);
     expect(record.waits.length).toBe(1);
     expect(record.waits[0]!.state).toBe("visible");
+  });
+
+  test("wait_for visible polls the stamped locator when resolution and healing both miss", async () => {
+    // The element isn't there YET — waiting for it to appear is the
+    // tool's whole contract, so a failed heal must not fail the call.
+    const waits: Array<{ state?: string; timeout?: number } | undefined> = [];
+    const stamped = {
+      count: async () => 0,
+      waitFor: async (o?: { state?: string; timeout?: number }) => {
+        waits.push(o);
+      }
+    };
+    const { page, calls } = makeHealPage({});
+    browserTest.installFakeSessionWithPageForTest("heal-wait-poll", page);
+    const refs = new Map<string, unknown>();
+    refs.set("@e4", { locator: stamped, role: "status", name: "Saved", nth: 0 });
+    browserTest.setFakeSessionRefsForTest("heal-wait-poll", refs);
+
+    const raw = await browserWaitFor("heal-wait-poll", { ref: "@e4", state: "visible" });
+    const parsed = JSON.parse(raw) as { success: boolean; healedRef?: boolean };
+    expect(parsed.success).toBe(true);
+    expect(parsed.healedRef).toBeUndefined();
+    // Heal was attempted (role re-query ran) before falling back.
+    expect(calls.getByRole.length).toBe(1);
+    expect(waits.length).toBe(1);
+    expect(waits[0]!.state).toBe("visible");
   });
 
   test("wait_for state hidden never heals — the raw stamped locator does the waiting", async () => {
@@ -2274,12 +2288,12 @@ describe("browserVision annotated screenshots", () => {
   // Installs fake document/window globals. Returns the LIVE badge list
   // (appendChild pushes, badge.remove() splices — so length reflects what
   // is currently in the overlay) and a restore callback for the globals.
-  const installFakeDom = (els: VisionFakeEl[]) => {
+  const installFakeDom = (els: VisionFakeEl[], scroll?: { x: number; y: number }) => {
     const badges: FakeBadge[] = [];
     const originalDocument = (globalThis as Record<string, unknown>).document;
     const originalWindow = (globalThis as Record<string, unknown>).window;
     (globalThis as unknown as { document: unknown }).document = {
-      body: { appendChild: (b: FakeBadge) => badges.push(b) },
+      documentElement: { appendChild: (b: FakeBadge) => badges.push(b) },
       querySelectorAll: (selector: string) => {
         if (selector === "[data-gini-vision-badge]") return [...badges];
         const attr = selector.slice(1, -1);
@@ -2301,7 +2315,12 @@ describe("browserVision annotated screenshots", () => {
         return badge;
       }
     };
-    (globalThis as unknown as { window: unknown }).window = { innerWidth: 1280, innerHeight: 800 };
+    (globalThis as unknown as { window: unknown }).window = {
+      innerWidth: 1280,
+      innerHeight: 800,
+      scrollX: scroll?.x ?? 0,
+      scrollY: scroll?.y ?? 0
+    };
     const restore = () => {
       if (originalDocument === undefined) delete (globalThis as Record<string, unknown>).document;
       else (globalThis as Record<string, unknown>).document = originalDocument;
@@ -2313,6 +2332,14 @@ describe("browserVision annotated screenshots", () => {
 
   const evalLocally = (<A, R>(fn: (arg: A) => R | Promise<R>, arg?: A): Promise<R> =>
     Promise.resolve(fn(arg as A))) as unknown as import("playwright-core").Page["evaluate"];
+
+  // Badges are filtered to refs the session holds, so each test registers
+  // the ids it expects badged (values are irrelevant — only keys are read).
+  const setSessionRefIds = (taskId: string, ids: string[]) => {
+    const refs = new Map<string, unknown>();
+    for (const id of ids) refs.set(`@${id}`, {});
+    browserTest.setFakeSessionRefsForTest(taskId, refs);
+  };
 
   const config: RuntimeConfig = {
     instance: "test",
@@ -2346,6 +2373,7 @@ describe("browserVision annotated screenshots", () => {
       url: () => "https://example.com/annotated"
     };
     browserTest.installFakeSessionWithPageForTest("vision-annotate", fakePage);
+    setSessionRefIds("vision-annotate", ["e1", "e2", "e3"]);
     setEchoVisionResponse({ text: "annotated answer" });
     try {
       const raw = await browserVision("vision-annotate", { question: "what?", annotate: true }, config);
@@ -2372,6 +2400,7 @@ describe("browserVision annotated screenshots", () => {
       url: () => "https://example.com/dense"
     };
     browserTest.installFakeSessionWithPageForTest("vision-cap", fakePage);
+    setSessionRefIds("vision-cap", els.map((el) => el._attrs["data-gini-ref"]!));
     setEchoVisionResponse({ text: "dense answer" });
     try {
       const raw = await browserVision("vision-cap", { question: "what?", annotate: true }, config);
@@ -2379,6 +2408,59 @@ describe("browserVision annotated screenshots", () => {
       // VISION_ANNOTATE_BADGE_CAP keeps a ref-dense page legible.
       expect(badgeCountAtScreenshot).toBe(50);
       expect(badges.length).toBe(0);
+    } finally {
+      restore();
+    }
+  });
+
+  test("badges are document-absolute: viewport rect plus scroll offset", async () => {
+    const { badges, restore } = installFakeDom([makeStamped("e1")], { x: 5, y: 1000 });
+    let cssAtScreenshot = "";
+    const fakePage = {
+      evaluate: evalLocally,
+      screenshot: async () => {
+        cssAtScreenshot = badges[0]?.style.cssText ?? "";
+        return Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+      },
+      url: () => "https://example.com/scrolled"
+    };
+    browserTest.installFakeSessionWithPageForTest("vision-scrolled", fakePage);
+    setSessionRefIds("vision-scrolled", ["e1"]);
+    setEchoVisionResponse({ text: "scrolled answer" });
+    try {
+      const raw = await browserVision("vision-scrolled", { question: "what?", annotate: true }, config);
+      expect(JSON.parse(raw).success).toBe(true);
+      // position:fixed would pin the badge to the viewport and miss its
+      // element in a fullPage capture; document coordinates compose.
+      expect(cssAtScreenshot).toContain("position:absolute");
+      expect(cssAtScreenshot).toContain("left:15px");
+      expect(cssAtScreenshot).toContain("top:1010px");
+    } finally {
+      restore();
+    }
+  });
+
+  test("stamped elements whose ref the session does not hold get no badge", async () => {
+    // e2 carries a stamp (char-budget drop, or page-planted attribute)
+    // but the session never mapped it — badging it would cite a ref the
+    // agent cannot act on.
+    const { badges, restore } = installFakeDom([makeStamped("e1"), makeStamped("e2")]);
+    let badgeTextsAtScreenshot: string[] = [];
+    const fakePage = {
+      evaluate: evalLocally,
+      screenshot: async () => {
+        badgeTextsAtScreenshot = badges.map((b) => b.textContent);
+        return Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+      },
+      url: () => "https://example.com/unmapped"
+    };
+    browserTest.installFakeSessionWithPageForTest("vision-unmapped", fakePage);
+    setSessionRefIds("vision-unmapped", ["e1"]);
+    setEchoVisionResponse({ text: "unmapped answer" });
+    try {
+      const raw = await browserVision("vision-unmapped", { question: "what?", annotate: true }, config);
+      expect(JSON.parse(raw).success).toBe(true);
+      expect(badgeTextsAtScreenshot).toEqual(["e1"]);
     } finally {
       restore();
     }
@@ -2396,6 +2478,7 @@ describe("browserVision annotated screenshots", () => {
       url: () => "https://example.com/boom"
     };
     browserTest.installFakeSessionWithPageForTest("vision-strip-on-fail", fakePage);
+    setSessionRefIds("vision-strip-on-fail", ["e1"]);
     try {
       const raw = await browserVision("vision-strip-on-fail", { question: "what?", annotate: true }, config);
       const parsed = JSON.parse(raw) as { success: boolean; error?: string };
