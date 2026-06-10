@@ -103,7 +103,6 @@ export {
   listChatBlocks,
   listChatBlocksAfter,
   listThreadBlocks,
-  getLastMainChatAssistantTextBlock,
   getMainChatUserTextBlockForTask,
   getMainChatBlock,
   summarizeThreads,

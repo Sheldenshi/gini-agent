@@ -26,11 +26,7 @@ import {
   updateToolCallBlock,
   upsertAssistantTextBlock
 } from "./index";
-import {
-  getLastMainChatAssistantTextBlock,
-  getMainChatUserTextBlockForTask,
-  listMainChatBlocks
-} from "./chat-blocks";
+import { getMainChatUserTextBlockForTask, listMainChatBlocks } from "./chat-blocks";
 import type { ChatBlock } from "../types";
 
 const ROOT = "/tmp/gini-chat-blocks-test";
@@ -637,10 +633,9 @@ describe("chat-blocks persistence", () => {
     const found = getMainChatUserTextBlockForTask(instance, sessionId, "task_target");
     expect(found?.id).toBe(target.id);
 
-    // No user message for the task → undefined, so the caller's `??` chain
-    // falls through to the assistant-block anchor.
+    // No user message for the task → undefined, so an agent turn for that
+    // task does not thread (it stays in the channel/main timeline).
     expect(getMainChatUserTextBlockForTask(instance, sessionId, "task_prior")).toBeUndefined();
-    expect(getLastMainChatAssistantTextBlock(instance, sessionId)?.taskId).toBe("task_prior");
   });
 
   test("system_note round-trips authError metadata; plain notes omit it", () => {

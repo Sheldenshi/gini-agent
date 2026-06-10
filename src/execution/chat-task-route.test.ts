@@ -394,11 +394,12 @@ describe("chat-task route directive", () => {
     expect(finished.parentBlockId).toBe(userBlock);
   });
 
-  test("a turn with no user message (job/channel) falls back to the prior assistant anchor", async () => {
-    const config = buildConfig(workspaceRoot, "chat-route-jobfallback");
+  test("a turn with no user message (job/channel) does not thread, even if the model calls start_thread", async () => {
+    const config = buildConfig(workspaceRoot, "chat-route-jobnothread");
     const provider = normalizeProvider(config.provider);
-    // A prior main-chat assistant block exists from a real turn.
-    const { sessionId, parentBlockId: priorAssistant } = await seedFirstTurn(config, provider);
+    // A prior main-chat assistant block exists from a real turn — the agent
+    // must NOT seed a thread off it.
+    const { sessionId } = await seedFirstTurn(config, provider);
 
     // Run a task directly (like a scheduled job) so NO user_text block is
     // created for it; the model routes to a thread via start_thread.
@@ -412,7 +413,7 @@ describe("chat-task route directive", () => {
     });
     setEchoToolCallingResponse({
       provider,
-      text: "Job output in a thread.",
+      text: "Job output stays in the channel.",
       toolCalls: [],
       finishReason: "stop"
     });
@@ -425,13 +426,14 @@ describe("chat-task route directive", () => {
     const finished = await runChatTask(config, task.id);
 
     expect(finished.status).toBe("completed");
-    // No user message for the task → anchor falls back to the prior assistant.
-    expect(finished.threadId).toBeDefined();
-    expect(finished.parentBlockId).toBe(priorAssistant);
+    // No human message to branch from → the agent never seeds a thread off
+    // its own message; the turn stays in the channel's main timeline.
+    expect(finished.threadId).toBeUndefined();
+    expect(finished.parentBlockId).toBeUndefined();
     const blocks = listChatBlocks(config.instance, sessionId)
       .filter((b) => b.kind === "assistant_text" && b.taskId === task.id);
     expect(blocks.length).toBe(1);
-    expect(blocks[0]!.parentBlockId).toBe(priorAssistant);
+    expect(blocks[0]!.threadId).toBeUndefined();
   });
 
   test("a task pre-seeded with task.threadId threads its whole response with no directive", async () => {
