@@ -1835,6 +1835,10 @@ async function runLoop(
       });
     }
 
+    // Captured before the call so the success-triggered clear below can
+    // prove its evidence predates any failure recorded while this call was
+    // in flight (long streams authenticate at start and survive an expiry).
+    const callStartedAt = now();
     let result: Awaited<ReturnType<typeof generateToolCallingResponse>>;
     try {
       result = await generateToolCallingResponse(
@@ -1864,9 +1868,12 @@ async function runLoop(
     // A successful call proves this provider's credential works — drop any
     // persistent needs-reauth record for it (issue #233). The helper checks
     // lock-free first, so the common healthy path writes no state.
+    // `evidenceFrom` keeps a record written by a concurrent task while this
+    // call was in flight: that failure is newer evidence than this success.
     await clearProviderAuthFailureIfPresent(config.instance, result.provider.name, {
       reason: "provider call succeeded",
-      taskId
+      taskId,
+      evidenceFrom: callStartedAt
     });
 
     // First successful provider call in this runLoop entry: commit the
@@ -2494,6 +2501,9 @@ async function runLoop(
     { role: "user", content: summaryInstruction }
   ];
   try {
+    // Same evidence-recency capture as the main loop call: the clear below
+    // must not erase a failure recorded while this call was in flight.
+    const summaryCallStartedAt = now();
     let summaryResult: Awaited<ReturnType<typeof generateToolCallingResponse>>;
     try {
       summaryResult = await generateToolCallingResponse(
@@ -2519,7 +2529,8 @@ async function runLoop(
     // #233). Lock-free check first — no state write on the healthy path.
     await clearProviderAuthFailureIfPresent(config.instance, summaryResult.provider.name, {
       reason: "provider call succeeded",
-      taskId
+      taskId,
+      evidenceFrom: summaryCallStartedAt
     });
     const finalText = summaryResult.text || "(no content)";
     const exhausted = await mutateState(config.instance, (state) => {

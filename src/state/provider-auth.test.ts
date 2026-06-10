@@ -110,6 +110,57 @@ describe("provider-auth state", () => {
     );
   });
 
+  test("evidenceFrom keeps a record newer than the success's call start and clears an older one", async () => {
+    const instance = "pauth-evidence";
+    await mutateState(instance, (state) => {
+      recordProviderAuthFailure(state, { provider: "codex", detail: "token expired" });
+    });
+    const recordedAt = readState(instance).providerAuthFailures!.codex!.at;
+
+    // Evidence gathered BEFORE the failure was recorded (a long stream that
+    // authenticated at start, then outlived the token): the record survives
+    // and no provider.auth.cleared row is emitted.
+    const before = new Date(Date.parse(recordedAt) - 1000).toISOString();
+    expect(
+      await clearProviderAuthFailureIfPresent(instance, "codex", {
+        reason: "provider call succeeded",
+        evidenceFrom: before
+      })
+    ).toBe(false);
+    let state = readState(instance);
+    expect(state.providerAuthFailures?.codex).toBeDefined();
+    expect(state.audit.filter((a) => a.action === "provider.auth.cleared")).toHaveLength(0);
+
+    // Evidence from a call that started AFTER the failure: the success
+    // post-dates the record, so the clear proceeds.
+    const after = new Date(Date.parse(recordedAt) + 1000).toISOString();
+    expect(
+      await clearProviderAuthFailureIfPresent(instance, "codex", {
+        reason: "provider call succeeded",
+        evidenceFrom: after
+      })
+    ).toBe(true);
+    state = readState(instance);
+    expect(state.providerAuthFailures?.codex).toBeUndefined();
+    expect(state.audit.filter((a) => a.action === "provider.auth.cleared")).toHaveLength(1);
+  });
+
+  test("a millisecond tie between evidenceFrom and the record keeps the record", async () => {
+    const instance = "pauth-evidence-tie";
+    await mutateState(instance, (state) => {
+      recordProviderAuthFailure(state, { provider: "openai", detail: "401 unauthorized" });
+    });
+    const recordedAt = readState(instance).providerAuthFailures!.openai!.at;
+    const kept = await mutateState(instance, (state) =>
+      clearProviderAuthFailure(state, "openai", {
+        reason: "provider call succeeded",
+        evidenceFrom: recordedAt
+      })
+    );
+    expect(kept).toBe(false);
+    expect(readState(instance).providerAuthFailures?.openai).toBeDefined();
+  });
+
   test("getProviderAuthFailure reads the record and tolerates the field being absent", async () => {
     const instance = "pauth-get";
     let state = readState(instance);
