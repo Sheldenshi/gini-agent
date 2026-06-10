@@ -16,6 +16,7 @@ import {
   uploadUrl,
   type ApiError
 } from "./api";
+import { GATEWAY_RESTARTING_MESSAGE, GATEWAY_UNREACHABLE_CODE } from "./gateway-codes";
 
 const realFetch = globalThis.fetch;
 
@@ -104,20 +105,23 @@ describe("api — gateway error envelopes", () => {
 
 describe("api — gateway-down shapes", () => {
   test("the BFF's 503 gateway_unreachable envelope is tagged unreachable", async () => {
-    stubFetch(JSON.stringify({ error: "Gini is restarting — reconnecting.", code: "gateway_unreachable" }), {
+    // Built from the SAME constants the BFF envelope uses (gateway-codes.ts),
+    // so a drift in either side breaks this test instead of silently
+    // regressing the client's unreachable detection.
+    stubFetch(JSON.stringify({ error: GATEWAY_RESTARTING_MESSAGE, code: GATEWAY_UNREACHABLE_CODE }), {
       status: 503
     });
     const error = await captureApiError(api("/status"));
     expect(error.unreachable).toBe(true);
     expect(error.status).toBe(503);
-    expect(error.message).toBe("Gini is restarting — reconnecting.");
+    expect(error.message).toBe(GATEWAY_RESTARTING_MESSAGE);
   });
 
   test("a 5xx with an EMPTY body is treated as unreachable with a friendly message", async () => {
     stubFetch("", { status: 500 });
     const error = await captureApiError(api("/status"));
     expect(error.unreachable).toBe(true);
-    expect(error.message).toBe("Gini is restarting — reconnecting.");
+    expect(error.message).toBe(GATEWAY_RESTARTING_MESSAGE);
   });
 
   test("a 5xx with a non-JSON body (proxy error page) is treated as unreachable", async () => {

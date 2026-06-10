@@ -204,6 +204,15 @@ export async function watchdog(ctx: CliContext, deps: WatchdogDeps = {}): Promis
     }
   };
 
+  // One queued report per web outage episode, not per tick. The loop probes
+  // every 10s, the pending/ queue never collides filenames, and nothing
+  // prunes it — so an unguarded per-tick write during a sustained web-only
+  // outage floods the queue (and the boot-time listPendingReports parse)
+  // with thousands of identical reports. Set on a successful write, cleared
+  // when the web probe passes again, so a recovery + fresh outage still
+  // queues a new report.
+  let webOutageReported = false;
+
   // One probe tick. Runs under try/finally so process.exitCode = 0 always
   // executes even if a probe, kickstart, or log call throws — the watchdog
   // must read as a clean probe regardless.
@@ -241,13 +250,17 @@ export async function watchdog(ctx: CliContext, deps: WatchdogDeps = {}): Promis
       // false-positive issue. We still kickstart web below regardless.
       const shouldReportWebCrash = webPort !== null && webProbeFailed && runtimeOk;
 
+      // A healthy web probe ends the outage episode — the next failure is a
+      // new episode and may queue a new report.
+      if (webOk) webOutageReported = false;
+
       // Web dead/hung -> build a crash report from the web log tails, queue it into
       // pending/, then kickstart the web service. The web has no in-process crash
       // handler (decision: web crash coverage is the watchdog), so this is the only
       // place a web outage gets captured. The queued report is offered to the user
       // on the next restart and filed only on consent — nothing is filed here.
       if (!webOk) {
-        if (shouldReportWebCrash) {
+        if (shouldReportWebCrash && !webOutageReported) {
           try {
             const logTail = [
               ...readWebLogTail(instance, "web-launchd.err.log"),
@@ -268,6 +281,7 @@ export async function watchdog(ctx: CliContext, deps: WatchdogDeps = {}): Promis
               secretsEnvBody
             });
             writeCrashReportFile(report);
+            webOutageReported = true;
             actions.push("report:web");
           } catch {
             // Building/writing the report must never stop us from reviving web.

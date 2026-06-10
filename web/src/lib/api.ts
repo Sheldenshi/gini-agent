@@ -1,13 +1,10 @@
+import { GATEWAY_RESTARTING_MESSAGE, GATEWAY_UNREACHABLE_CODE } from "./gateway-codes";
+
 // Error thrown by api(). `status` is the HTTP status when the BFF/gateway
 // produced a response; `unreachable` marks the transient gateway-down shape
 // (the BFF's 503 gateway_unreachable envelope) so callers can render a
 // "reconnecting" treatment instead of a hard failure.
 export type ApiError = Error & { status?: number; unreachable?: boolean };
-
-// Mirrors GATEWAY_UNREACHABLE_CODE in web/src/lib/runtime.ts. Not imported:
-// runtime.ts is server-only (node:fs et al.) and must not enter the client
-// bundle.
-const GATEWAY_UNREACHABLE_CODE = "gateway_unreachable";
 
 function apiError(message: string, status: number, unreachable: boolean): ApiError {
   const error = new Error(message) as ApiError;
@@ -45,7 +42,7 @@ export async function api<T = unknown>(path: string, init: RequestInit = {}): Pr
     // an unparseable 5xx body is treated the same (a proxy hop dropped the
     // connection mid-response) so the UI never hard-errors on a restart blip.
     const unreachable = value?.code === GATEWAY_UNREACHABLE_CODE || (value === null && response.status >= 500);
-    const fallback = unreachable ? "Gini is restarting — reconnecting." : `HTTP ${response.status}`;
+    const fallback = unreachable ? GATEWAY_RESTARTING_MESSAGE : `HTTP ${response.status}`;
     throw apiError(value?.error ?? value?.message ?? fallback, response.status, unreachable);
   }
   if (value === null && text.trim().length > 0) {

@@ -528,6 +528,31 @@ describe("watchdog", () => {
     }
   });
 
+  test("loop: a sustained web outage queues ONE report per episode, not one per tick", async () => {
+    writePorts();
+    // Four ticks: down, down (same episode), recovered, down (new episode).
+    const webResults = [false, false, true, false];
+    let probes = 0;
+    await watchdog(ctxFor([]), {
+      probeRuntime: async () => true,
+      probeWeb: async () => {
+        const result = webResults[probes] ?? true;
+        probes += 1;
+        return result;
+      },
+      kickstartImpl: () => okLaunchctl,
+      isLoadedImpl: () => true,
+      supervisorImpl: () => "launchd",
+      maxTicks: 4,
+      sleep: async () => {}
+    });
+    expect(probes).toBe(4);
+    // Tick 1 reports, tick 2 is the same episode (suppressed), tick 3 clears
+    // the episode, tick 4 is a fresh outage and reports again.
+    expect(listPendingReports().length).toBe(2);
+    expect(process.exitCode).toBe(0);
+  });
+
   test("--once forces a single tick even when deps.maxTicks asks for more (and never sleeps)", async () => {
     writePorts();
     let probes = 0;

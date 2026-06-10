@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { GATEWAY_RESTARTING_MESSAGE, GATEWAY_UNREACHABLE_CODE } from "./gateway-codes";
 import { parseTrustedOriginUrls } from "./trusted-origins";
 
 // Headers we forward verbatim from the browser to the runtime. Last-Event-ID
@@ -117,18 +118,13 @@ export interface ProxyOptions {
   signal?: AbortSignal;
 }
 
-// Machine-readable marker for "the gateway itself is down", as opposed to a
-// gateway-produced error. The web client keys its transient "reconnecting"
-// treatment on this code, so it must stay in sync with api.ts.
-export const GATEWAY_UNREACHABLE_CODE = "gateway_unreachable";
-
 // A gateway restart is routine (auto-update, watchdog kickstart), so the BFF
 // answers for it with a retryable 503 + JSON body instead of letting the
 // fetch rejection escape the route handler — which Next.js would turn into a
 // bare empty-body 500 that crashes response.json() in every client.
 export function gatewayUnreachableResponse(): Response {
   return Response.json(
-    { error: "Gini is restarting — reconnecting.", code: GATEWAY_UNREACHABLE_CODE },
+    { error: GATEWAY_RESTARTING_MESSAGE, code: GATEWAY_UNREACHABLE_CODE },
     { status: 503, headers: { "retry-after": "2" } }
   );
 }

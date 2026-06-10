@@ -13,8 +13,8 @@
 //   - `<prefix>.<instance>.gateway`  — the Bun runtime (src/server.ts)
 //   - `<prefix>.<instance>.web`      — Next.js dev server, gated on the
 //                                      gateway's /api/healthz coming up
-//   - `<prefix>.<instance>.watchdog` — periodic health probe (StartInterval)
-//                                      that revives a dead/hung gateway/web
+//   - `<prefix>.<instance>.watchdog` — long-lived health-probe loop that
+//                                      revives a dead/hung gateway/web
 //
 // Scope notes:
 //   - macOS only in v1. Linux systemd --user parity is a follow-up.
@@ -117,7 +117,7 @@ export interface LaunchSpec {
 export interface LaunchSpecPair {
   gateway: LaunchSpec;
   web: LaunchSpec;
-  // The periodic health watchdog (StartInterval one-shot). Carries no
+  // The health watchdog (a long-lived KeepAlive probe loop). Carries no
   // provider secrets — it only probes localhost health endpoints and shells
   // out to launchctl.
   watchdog: LaunchSpec;
@@ -341,9 +341,10 @@ export function resolveLaunchSpecPair(options: ResolveLaunchOptions): LaunchSpec
     environment: webEnv
   };
 
-  // Watchdog plist: a periodic one-shot (StartInterval, see generatePlist)
-  // that runs `gini watchdog --instance <name>`, probes the gateway +
-  // web health endpoints, and kickstarts whichever is dead/hung. It needs
+  // Watchdog plist: a long-lived KeepAlive job (see generatePlist) that
+  // runs `gini watchdog --instance <name>` — an in-process probe loop over
+  // the gateway + web health endpoints that kickstarts whichever is
+  // dead/hung. It needs
   // NO provider secrets (it only hits localhost health endpoints and shells
   // out to launchctl), so the env is the base PATH/HOME/LANG plus the
   // launchd marker and GINI_INSTANCE — same minimal surface as the web env
@@ -677,10 +678,10 @@ export interface PlistStampInput {
   programArguments: string[];
   workingDirectory: string;
   processType: string;
-  // The scheduling shape. Periodic (watchdog) carries startIntervalSeconds and
-  // a true keepAlive=false; long-lived (gateway/web) carries keepAlive=true and
-  // a throttleIntervalSeconds. We record both numbers explicitly so a change to
-  // either interval re-stamps.
+  // The scheduling shape. A periodic kind would carry startIntervalSeconds
+  // and keepAlive=false; the long-lived kinds (gateway/web/watchdog — all
+  // three today) carry keepAlive=true and a throttleIntervalSeconds. We
+  // record both numbers explicitly so a change to either interval re-stamps.
   keepAlive: boolean;
   throttleIntervalSeconds: number | null;
   startIntervalSeconds: number | null;
@@ -780,8 +781,8 @@ export interface PlistOptions {
   throttleIntervalSeconds?: number;
   // When set, emit a periodic one-shot plist instead of a long-lived one:
   // `StartInterval` (launchd relaunches every N seconds) + `RunAtLoad`, and
-  // NO `KeepAlive`. Used for the watchdog. When omitted, the plist is a
-  // KeepAlive long-lived job (gateway/web).
+  // NO `KeepAlive`. No current kind uses this; when omitted, the plist is a
+  // KeepAlive long-lived job (all three kinds today).
   startIntervalSeconds?: number;
 }
 
@@ -927,7 +928,7 @@ export interface WritePlistOptions {
   stderrPath: string;
   throttleIntervalSeconds?: number;
   // Forwarded to generatePlist: when set, writes a periodic (StartInterval,
-  // no KeepAlive) plist instead of a long-lived one. Set for the watchdog.
+  // no KeepAlive) plist instead of a long-lived one. No current kind sets it.
   startIntervalSeconds?: number;
 }
 

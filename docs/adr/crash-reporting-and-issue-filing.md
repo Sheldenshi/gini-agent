@@ -165,9 +165,11 @@ distinct crash for one-click filing.
 - A crash loop produces at most one ask per fingerprint per day even though
   KeepAlive respawns the process each time, because `lastAskedAt` is persisted
   to disk and stamped before the ask.
-- Web outages are captured through the watchdog's ~30s tick rather than
-  instantly, and a web report is a synthesized error rather than a real JS
-  stack. An in-process web crash handler remains a possible follow-up.
+- Web outages are captured through the watchdog's 10s probe-loop tick
+  (`WATCHDOG_TICK_INTERVAL_MS`, see
+  [Always-Up Supervision](always-up-supervision.md)) rather than instantly,
+  and a web report is a synthesized error rather than a real JS stack. An
+  in-process web crash handler remains a possible follow-up.
 
 ## Acceptance Checks
 
