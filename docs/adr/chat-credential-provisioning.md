@@ -135,7 +135,10 @@ and its secure card — so provisioning becomes "the agent asks via
   model's prose. Because the row is claimed at completion, a completed
   `connector.request` is terminal: the card renders the resolved connect outcome
   (a persisted `ok:false` failure resumes the agent to re-request; otherwise
-  "Connected") rather than offering a resubmit that would be Gone.
+  "Connected") rather than offering a resubmit that would be Gone. If the user
+  cancels before completion, the row remains cancelled but the paused chat loop
+  receives a cancellation tool result, so the agent can continue without the
+  connector or ask for the specific input it still needs.
 
 - The needs-setup system block tells the agent exactly how to request each
   missing credential: a registered provider id, or the templateless
