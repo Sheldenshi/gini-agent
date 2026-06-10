@@ -56,12 +56,15 @@ interface PersistedGate {
   // only once a status poll reports a different pid — proof the response came
   // from the restarted gateway, not the old process winding down.
   beforePid?: number;
-  // The web-server pid when the update started (from the local __healthz
-  // route). The gateway and web server restart independently, so a status
-  // poll can reach the NEW gateway through the still-alive OLD web server;
-  // the restarting phase additionally requires __healthz to report a
-  // different pid before reloading onto the web port.
-  beforeWebPid?: number;
+  // The web-server tree identity when the update started: the __healthz
+  // route's `ppid` (the next CLI supervising the worker). The gateway and web
+  // server restart independently, so a status poll can reach the NEW gateway
+  // through the still-alive OLD web server; the restarting phase additionally
+  // requires __healthz to report a different ppid before reloading onto the
+  // web port. The worker pid is no proof: the next CLI respawns the worker —
+  // new pid, same tree — on any next.config.* change, which an update's
+  // checkout can trigger while the OLD tree is still serving.
+  beforeWebPpid?: number;
   // Whether the POST scheduled a runtime restart. When false the servers stay
   // up, so the gate may reload as soon as the new revision is reported.
   restartExpected?: boolean;
@@ -88,7 +91,7 @@ function readPersistedGate(): PersistedGate | null {
       targetSha: typeof parsed.targetSha === "string" ? parsed.targetSha : undefined,
       beforeSha: typeof parsed.beforeSha === "string" ? parsed.beforeSha : undefined,
       beforePid: typeof parsed.beforePid === "number" ? parsed.beforePid : undefined,
-      beforeWebPid: typeof parsed.beforeWebPid === "number" ? parsed.beforeWebPid : undefined,
+      beforeWebPpid: typeof parsed.beforeWebPpid === "number" ? parsed.beforeWebPpid : undefined,
       restartExpected: typeof parsed.restartExpected === "boolean" ? parsed.restartExpected : undefined,
       verified: parsed.verified === true ? true : undefined
     };
@@ -107,8 +110,8 @@ function writePersistedGate(value: PersistedGate | null): void {
   }
 }
 
-// Hold the "complete" confirmation on screen this long before reloading onto the
-// freshly built assets.
+// Hold the "complete" confirmation on screen this long before the final
+// pre-reload probe and the reload onto the freshly built assets.
 const COMPLETE_RELOAD_DELAY_MS = 1_500;
 // Generous ceiling for each waiting phase (git + bun install in both roots,
 // then the restart). If a phase never reports back within this, the gate
@@ -122,7 +125,7 @@ export function UpdateGateProvider({ children }: { children: ReactNode }) {
   const [targetSha, setTargetSha] = useState<string | null>(null);
   const [beforeSha, setBeforeSha] = useState<string | null>(null);
   const [beforePid, setBeforePid] = useState<number | null>(null);
-  const [beforeWebPid, setBeforeWebPid] = useState<number | null>(null);
+  const [beforeWebPpid, setBeforeWebPpid] = useState<number | null>(null);
   const [restartExpected, setRestartExpected] = useState(true);
   // When the gate entered "restarting" — see the pid-less fallbacks below.
   const [restartingSince, setRestartingSince] = useState<number | null>(null);
@@ -140,14 +143,18 @@ export function UpdateGateProvider({ children }: { children: ReactNode }) {
   // either order, so /status (proxied to the gateway) can't vouch for the web
   // server it transited: a poll can reach the NEW gateway through the
   // still-alive OLD web server. Poll the web-local __healthz route alongside
-  // status while waiting so the web process proves its own identity.
+  // status while waiting so the web server proves its own identity. `ppid` —
+  // not the worker pid — is that identity: see the route. retry: false keeps
+  // the cadence on the refetch interval while the server is down instead of
+  // stretching each cycle through exponential retry backoff.
   const healthz = useQuery({
     queryKey: ["web", "healthz"],
-    queryFn: () => api<{ pid?: number }>("/__healthz"),
+    queryFn: () => api<{ ppid?: number }>("/__healthz"),
     enabled: waiting,
-    refetchInterval: 1_500
+    refetchInterval: 1_500,
+    retry: false
   });
-  const healthzPid = typeof healthz.data?.pid === "number" ? healthz.data.pid : null;
+  const healthzPpid = typeof healthz.data?.ppid === "number" ? healthz.data.ppid : null;
 
   const versionCheck = useQuery({
     queryKey: ["version", "check"],
@@ -163,7 +170,7 @@ export function UpdateGateProvider({ children }: { children: ReactNode }) {
     setTargetSha(null);
     setBeforeSha(null);
     setBeforePid(null);
-    setBeforeWebPid(null);
+    setBeforeWebPpid(null);
     setRestartExpected(true);
     setRestartingSince(null);
     writePersistedGate(null);
@@ -190,7 +197,7 @@ export function UpdateGateProvider({ children }: { children: ReactNode }) {
         targetSha: result.afterSha,
         beforeSha: beforeSha ?? undefined,
         beforePid: beforePid ?? undefined,
-        beforeWebPid: beforeWebPid ?? undefined,
+        beforeWebPpid: beforeWebPpid ?? undefined,
         restartExpected: expectRestart
       });
     },
@@ -223,21 +230,23 @@ export function UpdateGateProvider({ children }: { children: ReactNode }) {
       beforeSha: statusSha ?? undefined,
       beforePid: statusPid ?? undefined
     });
-    // Capture the web server's identity once, in parallel with the POST. The
-    // POST takes seconds (git + install), so this settles long before any
-    // restart; if it fails, the web leg degrades to its time-based fallback.
-    setBeforeWebPid(null);
-    api<{ pid?: number }>("/__healthz")
-      .then((h) => setBeforeWebPid(typeof h.pid === "number" ? h.pid : null))
+    // Capture the web server's tree identity (ppid) once, in parallel with
+    // the POST. The POST takes seconds (git + install), so this settles long
+    // before any restart; if it fails, the web leg degrades to its time-based
+    // fallback.
+    setBeforeWebPpid(null);
+    api<{ ppid?: number }>("/__healthz")
+      .then((h) => setBeforeWebPpid(typeof h.ppid === "number" ? h.ppid : null))
       .catch(() => {});
     mutate();
   }, [phase, statusSha, statusPid, mutate]);
 
   // Resume an in-flight gate after a restart-triggered reload. Only a
-  // verified complete (written after reachability was proven) may resume
-  // straight into the reload; a persisted complete without the marker — one
-  // written before the stack proved it restarted — re-enters "restarting" and
-  // proves reachability first.
+  // verified complete (written after reachability was proven) may resume into
+  // "complete" — and even then the pre-reload probe re-checks the web server
+  // before reloading. A persisted complete without the marker — one written
+  // before the stack proved it restarted — re-enters "restarting" and proves
+  // reachability first.
   useEffect(() => {
     const persisted = readPersistedGate();
     if (!persisted) return;
@@ -248,7 +257,7 @@ export function UpdateGateProvider({ children }: { children: ReactNode }) {
     setTargetSha(persisted.targetSha ?? null);
     setBeforeSha(persisted.beforeSha ?? null);
     setBeforePid(persisted.beforePid ?? null);
-    setBeforeWebPid(persisted.beforeWebPid ?? null);
+    setBeforeWebPpid(persisted.beforeWebPpid ?? null);
     setRestartExpected(persisted.restartExpected ?? true);
     setPhase(persisted.phase === "complete" ? "restarting" : persisted.phase);
   }, []);
@@ -273,7 +282,7 @@ export function UpdateGateProvider({ children }: { children: ReactNode }) {
       writePersistedGate({
         phase: "restarting",
         beforePid: beforePid ?? undefined,
-        beforeWebPid: beforeWebPid ?? undefined
+        beforeWebPpid: beforeWebPpid ?? undefined
       });
     } else {
       // No restart scheduled → the servers never go down, so this complete
@@ -281,7 +290,7 @@ export function UpdateGateProvider({ children }: { children: ReactNode }) {
       setPhase("complete");
       writePersistedGate({ phase: "complete", verified: true });
     }
-  }, [phase, targetSha, beforeSha, statusSha, isPending, restartExpected, beforePid, beforeWebPid]);
+  }, [phase, targetSha, beforeSha, statusSha, isPending, restartExpected, beforePid, beforeWebPpid]);
 
   // Wall-clock the moment the gate began waiting on the restart; consumed only
   // by the pid-less fallbacks in the completion detector below.
@@ -298,17 +307,19 @@ export function UpdateGateProvider({ children }: { children: ReactNode }) {
   //   - Gateway leg: /status reports a pid different from beforePid. Cached
   //     query data still carries the old pid, so a differing pid is
   //     intrinsically a fresh post-restart response.
-  //   - Web leg: the local __healthz route reports a pid different from
-  //     beforeWebPid — proof the web process itself was replaced (next-dev
-  //     module re-evals keep the same pid; a kickstart doesn't).
-  // Each leg falls back when its starting pid is unknown (a gate persisted by
-  // an older page, or the probe failing/omitting pid): the first poll on that
-  // query that succeeds after entering this phase — reachability without
-  // identity, with a residual race against the dying old stack that's
-  // acceptable for the degraded path. dataUpdatedAt only advances on success
-  // and each query retains its last data, so a satisfied leg stays satisfied
-  // while the other catches up. While the servers are down the polls just
-  // reject; react-query keeps refetching on the interval.
+  //   - Web leg: the local __healthz route reports a ppid different from
+  //     beforeWebPpid — proof the web server TREE was replaced. The worker
+  //     pid would lie here: the next CLI respawns its worker (new pid, same
+  //     still-old tree) when an update's checkout touches next.config.*, but
+  //     the supervising ppid only changes on a kickstart / stop+start.
+  // Each leg falls back when its starting identity is unknown (a gate
+  // persisted by an older page, or the probe failing/omitting the field): the
+  // first poll on that query that succeeds after entering this phase —
+  // reachability without identity, with a residual race against the dying old
+  // stack that's acceptable for the degraded path. dataUpdatedAt only
+  // advances on success and each query retains its last data, so a satisfied
+  // leg stays satisfied while the other catches up. While the servers are
+  // down the polls just reject; react-query keeps refetching on the interval.
   const statusUpdatedAt = status.dataUpdatedAt;
   const healthzUpdatedAt = healthz.dataUpdatedAt;
   useEffect(() => {
@@ -318,25 +329,52 @@ export function UpdateGateProvider({ children }: { children: ReactNode }) {
         ? statusPid != null && statusPid !== beforePid
         : restartingSince != null && statusUpdatedAt > restartingSince;
     const webRestarted =
-      beforeWebPid != null
-        ? healthzPid != null && healthzPid !== beforeWebPid
+      beforeWebPpid != null
+        ? healthzPpid != null && healthzPpid !== beforeWebPpid
         : restartingSince != null && healthzUpdatedAt > restartingSince;
     if (gatewayRestarted && webRestarted) {
       setPhase("complete");
       writePersistedGate({ phase: "complete", verified: true });
     }
-  }, [phase, beforePid, statusPid, beforeWebPid, healthzPid, restartingSince, statusUpdatedAt, healthzUpdatedAt]);
+  }, [phase, beforePid, statusPid, beforeWebPpid, healthzPpid, restartingSince, statusUpdatedAt, healthzUpdatedAt]);
 
-  // Once complete, reload onto the fresh assets. Clear the persisted gate first
-  // so the reloaded page comes up clean.
+  // Once complete, reload onto the fresh assets — after one last __healthz
+  // probe. The identity proofs above are point-in-time: the web server can
+  // still go down between the proving poll and this reload (a crash, or a
+  // worker respawn mid-flight), and reloading into that window strands the
+  // browser on a connection error with the gate gone. So probe once right
+  // before reloading — no retries, short timeout, the reload is the
+  // time-sensitive part — and on failure drop back to "restarting", where the
+  // phase-entry effect re-arms restartingSince and the detectors take over
+  // again. A resumed verified-complete gate passes through here too, so its
+  // pre-reload proof never predates the reload that resumed it. Clear the
+  // persisted gate only on the success path so the reloaded page comes up
+  // clean.
   useEffect(() => {
     if (phase !== "complete") return;
+    let cancelled = false;
     const timer = setTimeout(() => {
-      writePersistedGate(null);
-      window.location.reload();
+      api("/__healthz", { signal: AbortSignal.timeout(5_000) })
+        .then(() => {
+          if (cancelled) return;
+          writePersistedGate(null);
+          window.location.reload();
+        })
+        .catch(() => {
+          if (cancelled) return;
+          setPhase("restarting");
+          writePersistedGate({
+            phase: "restarting",
+            beforePid: beforePid ?? undefined,
+            beforeWebPpid: beforeWebPpid ?? undefined
+          });
+        });
     }, COMPLETE_RELOAD_DELAY_MS);
-    return () => clearTimeout(timer);
-  }, [phase]);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [phase, beforePid, beforeWebPpid]);
 
   // Safety net spanning the waiting phases: release if the update never
   // reports back (a hung POST, a failed restart, or a reload that lost the
