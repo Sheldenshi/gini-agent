@@ -6,6 +6,7 @@ import {
   browserClick,
   browserConsole,
   browserDrag,
+  browserFillByLocator,
   browserHover,
   browserNavigate,
   browserSelectOption,
@@ -1493,6 +1494,294 @@ describe("snapshot stable refs and post-action diffs", () => {
       expect(parsed.snapshot).toMatch(/\+\s+\[@e22\] textbox "Notes" value="\[redacted\]"/);
     } finally {
       restore();
+    }
+  });
+});
+
+// Stale-ref self-healing: when an SPA re-render destroys the stamped
+// [data-gini-ref] node, action tools re-query by the role/name/nth
+// recorded at snapshot time, restamp the survivor with the SAME id, and
+// flag healedRef in the result. fill_secrets and upload stay fail-loud
+// on the exact stamped element (trust boundary — see ADR
+// browser-fill-secret.md).
+describe("stale-ref self-healing", () => {
+  afterEach(() => {
+    browserTest.clearFakeSessionsForTest();
+    browserTest.setInFlightDisconnectsForTest(0);
+  });
+
+  // Fake page for healing tests. The walker evaluate returns an empty
+  // page (post-action snapshot content isn't under test here);
+  // getByRole/getByText record their arguments and hand back the
+  // supplied candidate (default: a candidate matching nothing).
+  function makeHealPage(opts: {
+    roleCandidate?: Record<string, unknown>;
+    textCandidate?: Record<string, unknown>;
+  }) {
+    const calls = {
+      getByRole: [] as Array<{ role: string; options?: Record<string, unknown>; nth?: number }>,
+      getByText: [] as Array<{ text: string; options?: Record<string, unknown>; nth?: number }>,
+      locator: [] as string[]
+    };
+    const page = {
+      url: () => "https://example.com/app",
+      title: async () => "App",
+      waitForLoadState: async () => undefined,
+      evaluate: async () => ({ entries: [], hiddenEmitted: 0, hiddenTotal: 0, hiddenBudget: 0 }),
+      locator: (sel: string) => {
+        calls.locator.push(sel);
+        return { __sel: sel };
+      },
+      getByRole: (role: string, options?: Record<string, unknown>) => {
+        const entry = { role, options, nth: undefined as number | undefined };
+        calls.getByRole.push(entry);
+        return {
+          nth: (n: number) => {
+            entry.nth = n;
+            return opts.roleCandidate ?? { count: async () => 0 };
+          }
+        };
+      },
+      getByText: (text: string, options?: Record<string, unknown>) => {
+        const entry = { text, options, nth: undefined as number | undefined };
+        calls.getByText.push(entry);
+        return {
+          nth: (n: number) => {
+            entry.nth = n;
+            return opts.textCandidate ?? { count: async () => 0 };
+          }
+        };
+      }
+    };
+    return { page: page as unknown as Partial<import("playwright-core").Page>, calls };
+  }
+
+  // A healing candidate that exists (count 1) and records the action +
+  // restamp landing on it.
+  function makeCandidate() {
+    const record = {
+      clicks: [] as Array<{ timeout?: number } | undefined>,
+      waits: [] as Array<{ state?: string; timeout?: number } | undefined>,
+      restamps: [] as Array<{ attr: string; id: string }>
+    };
+    const candidate = {
+      count: async () => 1,
+      click: async (o?: { timeout?: number }) => {
+        record.clicks.push(o);
+      },
+      waitFor: async (o?: { state?: string; timeout?: number }) => {
+        record.waits.push(o);
+      },
+      evaluate: async (_fn: unknown, arg: { attr: string; id: string }) => {
+        record.restamps.push(arg);
+      }
+    };
+    return { candidate, record };
+  }
+
+  test("click self-heals a lost stamp via role/name/nth, restamps the survivor, and flags healedRef", async () => {
+    const { candidate, record } = makeCandidate();
+    const { page, calls } = makeHealPage({ roleCandidate: candidate });
+    browserTest.installFakeSessionWithPageForTest("heal-click", page);
+    const refs = new Map<string, unknown>();
+    // Stamped locator matches nothing — the node was re-rendered away.
+    refs.set("@e5", { locator: { count: async () => 0 }, role: "button", name: "Submit", nth: 1 });
+    browserTest.setFakeSessionRefsForTest("heal-click", refs);
+
+    const raw = await browserClick("heal-click", { ref: "@e5" });
+    const parsed = JSON.parse(raw) as { success: boolean; healedRef?: boolean };
+    expect(parsed.success).toBe(true);
+    expect(parsed.healedRef).toBe(true);
+    // Re-query used the recorded role/name/nth, never the text fallback.
+    expect(calls.getByRole.length).toBe(1);
+    expect(calls.getByRole[0]!.role).toBe("button");
+    expect(calls.getByRole[0]!.options).toEqual({ name: "Submit", exact: true });
+    expect(calls.getByRole[0]!.nth).toBe(1);
+    expect(calls.getByText.length).toBe(0);
+    // The click landed on the healed candidate with the standard timeout.
+    expect(record.clicks.length).toBe(1);
+    expect(record.clicks[0]!.timeout).toBe(10_000);
+    // The survivor was restamped with the SAME id, and the fast-path
+    // locator was rebuilt against the stamped selector.
+    expect(record.restamps).toEqual([{ attr: "data-gini-ref", id: "e5" }]);
+    expect(calls.locator).toContain('[data-gini-ref="e5"]');
+  });
+
+  test("a live stamp resolves on the fast path without any re-query or healedRef flag", async () => {
+    const clicks: Array<{ timeout?: number } | undefined> = [];
+    const stamped = {
+      count: async () => 1,
+      click: async (o?: { timeout?: number }) => {
+        clicks.push(o);
+      }
+    };
+    const { page, calls } = makeHealPage({});
+    browserTest.installFakeSessionWithPageForTest("heal-fast", page);
+    const refs = new Map<string, unknown>();
+    refs.set("@e5", { locator: stamped, role: "button", name: "Submit", nth: 0 });
+    browserTest.setFakeSessionRefsForTest("heal-fast", refs);
+
+    const raw = await browserClick("heal-fast", { ref: "@e5" });
+    const parsed = JSON.parse(raw) as { success: boolean; healedRef?: boolean };
+    expect(parsed.success).toBe(true);
+    expect(parsed.healedRef).toBeUndefined();
+    expect(clicks.length).toBe(1);
+    expect(calls.getByRole.length).toBe(0);
+    expect(calls.getByText.length).toBe(0);
+  });
+
+  test("no healing candidate yields the standard Unknown ref error", async () => {
+    // Default candidates count 0: the role re-query finds nothing, and a
+    // supported role with no match fails rather than guessing by text.
+    const { page, calls } = makeHealPage({});
+    browserTest.installFakeSessionWithPageForTest("heal-miss", page);
+    const refs = new Map<string, unknown>();
+    refs.set("@e7", { locator: { count: async () => 0 }, role: "button", name: "Gone", nth: 0 });
+    browserTest.setFakeSessionRefsForTest("heal-miss", refs);
+
+    const raw = await browserClick("heal-miss", { ref: "@e7" });
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toContain("Unknown ref @e7");
+    expect(parsed.error).toContain("fresh snapshot");
+    expect(calls.getByRole.length).toBe(1);
+    expect(calls.getByText.length).toBe(0);
+  });
+
+  test("role clickable heals via exact-text matching, not getByRole", async () => {
+    const { candidate, record } = makeCandidate();
+    const { page, calls } = makeHealPage({ textCandidate: candidate });
+    browserTest.installFakeSessionWithPageForTest("heal-clickable", page);
+    const refs = new Map<string, unknown>();
+    refs.set("@e3", { locator: { count: async () => 0 }, role: "clickable", name: "Open card", nth: 2 });
+    browserTest.setFakeSessionRefsForTest("heal-clickable", refs);
+
+    const raw = await browserClick("heal-clickable", { ref: "@e3" });
+    const parsed = JSON.parse(raw) as { success: boolean; healedRef?: boolean };
+    expect(parsed.success).toBe(true);
+    expect(parsed.healedRef).toBe(true);
+    expect(calls.getByRole.length).toBe(0);
+    expect(calls.getByText.length).toBe(1);
+    expect(calls.getByText[0]!.text).toBe("Open card");
+    expect(calls.getByText[0]!.options).toEqual({ exact: true });
+    expect(calls.getByText[0]!.nth).toBe(2);
+    expect(record.clicks.length).toBe(1);
+  });
+
+  test("wait_for state visible self-heals and flags healedRef", async () => {
+    const { candidate, record } = makeCandidate();
+    const { page, calls } = makeHealPage({ roleCandidate: candidate });
+    browserTest.installFakeSessionWithPageForTest("heal-wait", page);
+    const refs = new Map<string, unknown>();
+    refs.set("@e4", { locator: { count: async () => 0 }, role: "status", name: "Saved", nth: 0 });
+    browserTest.setFakeSessionRefsForTest("heal-wait", refs);
+
+    const raw = await browserWaitFor("heal-wait", { ref: "@e4", state: "visible" });
+    const parsed = JSON.parse(raw) as { success: boolean; healedRef?: boolean };
+    expect(parsed.success).toBe(true);
+    expect(parsed.healedRef).toBe(true);
+    expect(calls.getByRole.length).toBe(1);
+    expect(record.waits.length).toBe(1);
+    expect(record.waits[0]!.state).toBe("visible");
+  });
+
+  test("wait_for state hidden never heals — the raw stamped locator does the waiting", async () => {
+    // A lost stamp often IS the disappearance being awaited; healing onto
+    // a re-rendered replacement would invert the wait's meaning.
+    let countCalls = 0;
+    const waits: Array<{ state?: string; timeout?: number } | undefined> = [];
+    const stamped = {
+      count: async () => {
+        countCalls += 1;
+        return 0;
+      },
+      waitFor: async (o?: { state?: string; timeout?: number }) => {
+        waits.push(o);
+      }
+    };
+    const { page, calls } = makeHealPage({});
+    browserTest.installFakeSessionWithPageForTest("heal-wait-hidden", page);
+    const refs = new Map<string, unknown>();
+    refs.set("@e4", { locator: stamped, role: "status", name: "Saved", nth: 0 });
+    browserTest.setFakeSessionRefsForTest("heal-wait-hidden", refs);
+
+    const raw = await browserWaitFor("heal-wait-hidden", { ref: "@e4", state: "hidden" });
+    const parsed = JSON.parse(raw) as { success: boolean; healedRef?: boolean };
+    expect(parsed.success).toBe(true);
+    expect(parsed.healedRef).toBeUndefined();
+    expect(waits.length).toBe(1);
+    expect(waits[0]!.state).toBe("hidden");
+    // No liveness probe, no re-query: the stamped locator was used as-is.
+    expect(countCalls).toBe(0);
+    expect(calls.getByRole.length).toBe(0);
+    expect(calls.getByText.length).toBe(0);
+  });
+
+  test("fill_secrets never self-heals: a lost stamp fails loudly via the literal stamped selector", async () => {
+    const { page, calls } = makeHealPage({});
+    // The stamped node is gone, so the literal-selector fill times out
+    // the way playwright would.
+    (page as { locator?: unknown }).locator = (sel: string) => {
+      calls.locator.push(sel);
+      return {
+        fill: async () => {
+          throw new Error("Timeout 10000ms exceeded.");
+        }
+      };
+    };
+    browserTest.installFakeSessionWithPageForTest("heal-fill", page);
+    // Healing metadata exists for the ref — and must NOT be consulted.
+    const refs = new Map<string, unknown>();
+    refs.set("@e5", { locator: { count: async () => 0 }, role: "textbox", name: "Password", nth: 0 });
+    browserTest.setFakeSessionRefsForTest("heal-fill", refs);
+
+    const result = await browserFillByLocator("heal-fill", { locator: "@e5", value: "sekrit-value-1234" });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.code).toBe("fill-error");
+    // Resolution went through the literal stamped selector only — no
+    // role/name re-query ever ran (trust boundary; see ADR
+    // browser-fill-secret.md).
+    expect(calls.locator).toEqual(['[data-gini-ref="e5"]']);
+    expect(calls.getByRole.length).toBe(0);
+    expect(calls.getByText.length).toBe(0);
+  });
+
+  test("upload never self-heals: acts only on the stamped element and fails loudly when detached", async () => {
+    const HEAL_ROOT = "/tmp/gini-browser-heal-upload-tests";
+    rmSync(HEAL_ROOT, { recursive: true, force: true });
+    mkdirSync(HEAL_ROOT, { recursive: true });
+    writeFileSync(join(HEAL_ROOT, "doc.txt"), "data\n");
+    try {
+      const { page, calls } = makeHealPage({});
+      browserTest.installFakeSessionWithPageForTest("heal-upload", page);
+      let setInputCalls = 0;
+      const refs = new Map<string, unknown>();
+      refs.set("@e2", {
+        locator: {
+          count: async () => 0,
+          setInputFiles: async () => {
+            setInputCalls += 1;
+            throw new Error("Element is not attached to the DOM");
+          }
+        },
+        role: "file",
+        name: "Resume",
+        nth: 0
+      });
+      browserTest.setFakeSessionRefsForTest("heal-upload", refs);
+
+      const raw = await browserUploadFile("heal-upload", { ref: "@e2", path: "doc.txt" }, HEAL_ROOT);
+      const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+      expect(parsed.success).toBe(false);
+      expect(parsed.error).toContain("not attached");
+      // The detached stamped element was the ONLY thing touched — no
+      // role/name re-query (trust boundary; see ADR
+      // browser-fill-secret.md).
+      expect(setInputCalls).toBe(1);
+      expect(calls.getByRole.length).toBe(0);
+      expect(calls.getByText.length).toBe(0);
+    } finally {
+      rmSync(HEAL_ROOT, { recursive: true, force: true });
     }
   });
 });
