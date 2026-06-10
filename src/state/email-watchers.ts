@@ -83,7 +83,8 @@ function buildWatch(watcher: EmailWatcherRecord): Record<string, unknown> {
     watcherId: watcher.id,
     query: watcher.query,
     ...(watcher.accountEmail ? { account: watcher.accountEmail } : {}),
-    ...(watcher.sender ? { sender: watcher.sender } : {})
+    ...(watcher.sender ? { sender: watcher.sender } : {}),
+    ...(watcher.objective ? { objective: watcher.objective } : {})
   };
 }
 
@@ -133,10 +134,30 @@ export interface AddEmailWatcherInput {
   // The account to watch. v1 watches the single signed-in gws identity;
   // recorded for the multi-account future.
   account?: string;
+  // The user's standing goal for this watch (validated: trimmed, capped).
+  objective?: string;
   // Owning agent for the watcher + its dedicated chat session. Threaded by
   // internal callers (the email_watch tool) so the woken turns attribute to
   // the originating agent; the HTTP path leaves it to the active agent.
   agentId?: string;
+}
+
+// Cap on a watcher objective (chars, after trim) — long enough for standing
+// instructions, short enough to ride every matched tick's context.
+const OBJECTIVE_MAX_CHARS = 2000;
+
+// Validate + normalize a watcher objective: trim, reject empty, cap length.
+// The single deep-validation point for every channel (tool, HTTP, CLI) — all
+// of them route through addEmailWatcher / setEmailWatcherObjective. Throws
+// with the "Invalid input:" prefix the gateway maps to a 400.
+export function validateObjective(value: unknown): string {
+  if (typeof value !== "string") throw new Error("Invalid input: objective must be a string.");
+  const trimmed = value.trim();
+  if (trimmed.length === 0) throw new Error("Invalid input: objective must not be empty.");
+  if (trimmed.length > OBJECTIVE_MAX_CHARS) {
+    throw new Error(`Invalid input: objective must be at most ${OBJECTIVE_MAX_CHARS} characters (got ${trimmed.length}).`);
+  }
+  return trimmed;
 }
 
 // Build the Gmail query for a watcher: a raw query wins; otherwise
@@ -164,16 +185,18 @@ export async function addEmailWatcher(
   input: AddEmailWatcherInput
 ): Promise<EmailWatcherRecord> {
   const query = buildWatcherQuery(input);
+  // Persist the explicitly watched sender only when it actually drove the
+  // query (a raw `query` wins and makes this a raw-query watch — no single
+  // sender, so the automated-sender heuristic stays on).
+  const sender = input.query ? undefined : input.sender;
+  // Validate BEFORE provisioning so a rejected input can't leave an orphan
+  // shared job/session behind.
+  const objective = input.objective !== undefined ? validateObjective(input.objective) : undefined;
 
   // Ensure the shared job + session before creating the record, so the new
   // watcher points at them and the rebuild below has a job to update.
   const owningAgentId = input.agentId ?? readState(config.instance).activeAgentId;
   const shared = await ensureSharedJobAndSession(config, owningAgentId);
-
-  // Persist the explicitly watched sender only when it actually drove the
-  // query (a raw `query` wins and makes this a raw-query watch — no single
-  // sender, so the automated-sender heuristic stays on).
-  const sender = input.query ? undefined : input.sender;
 
   const watcher = await mutateState(config.instance, (state) =>
     createEmailWatcher(state, {
@@ -182,6 +205,7 @@ export async function addEmailWatcher(
       accountEmail: input.account,
       query,
       ...(sender ? { sender } : {}),
+      ...(objective ? { objective } : {}),
       chatSessionId: shared.chatSessionId,
       jobId: shared.jobId,
       enabled: true,
@@ -393,7 +417,7 @@ export function getEmailWatcher(config: RuntimeConfig, watcherId: string): Email
 export async function updateEmailWatcher(
   config: RuntimeConfig,
   watcherId: string,
-  patch: Partial<Pick<EmailWatcherRecord, "query" | "labelIds" | "enabled" | "status" | "lastError" | "lastPolledAt" | "accountEmail" | "credentialName" | "jobId">>
+  patch: Partial<Pick<EmailWatcherRecord, "query" | "labelIds" | "enabled" | "status" | "lastError" | "lastPolledAt" | "accountEmail" | "credentialName" | "jobId" | "objective">>
 ): Promise<EmailWatcherRecord | undefined> {
   return mutateState(config.instance, (state) => {
     const item = state.emailWatchers.find((candidate) => candidate.id === watcherId);
@@ -431,6 +455,23 @@ export async function removeEmailWatcher(config: RuntimeConfig, watcherId: strin
   });
   await rebuildSharedJobWatches(config, removed.agentId);
   return removed;
+}
+
+// Update a watcher's standing objective (validated: trimmed, capped), then
+// rebuild the shared job's watch list so the new objective rides the hook
+// config into the detection script on the next tick. Used when the user
+// changes the goal mid-conversation. Returns the updated record (or undefined
+// when the watcher vanished mid-flight).
+export async function setEmailWatcherObjective(
+  config: RuntimeConfig,
+  watcherId: string,
+  objective: string
+): Promise<EmailWatcherRecord | undefined> {
+  const validated = validateObjective(objective);
+  const updated = await updateEmailWatcher(config, watcherId, { objective: validated });
+  if (!updated) return undefined;
+  await rebuildSharedJobWatches(config, updated.agentId);
+  return getEmailWatcher(config, watcherId) ?? updated;
 }
 
 // Enable / disable a watcher, then rebuild the shared job's watch list so a

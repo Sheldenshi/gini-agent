@@ -1305,6 +1305,14 @@ export interface EmailWatcherRecord {
   // always dropped. Raw-query watches have no single sender and keep the
   // heuristic.
   sender?: string;
+  // The user's standing instructions for this watch ("get a refund or a
+  // replacement", "keep responding until resolved"), distilled from the goal
+  // the user stated at setup (revisable via update). Injected by the
+  // detection script as a TRUSTED context item on ticks where this watch
+  // matches, so the drafting turn knows what the reply should achieve.
+  // Validated at write time (trimmed, capped); never sourced from email
+  // content.
+  objective?: string;
   // Optional Gmail label ids to scope the query. Unused in v1.
   labelIds?: string[];
   // Dedicated chat session the woken turn posts its proposed reply into.

@@ -1329,7 +1329,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   },
   {
     // Email watcher management (ADR email-watch.md). One tool with an
-    // `action` enum (add | list | remove) keeps the catalog surface
+    // `action` enum keeps the catalog surface
     // minimal — the same pattern create/list/delete_job follow, collapsed
     // into a single tool because the watch surface is narrow. Low-risk /
     // no approval: this only writes a config record (an EmailWatcherRecord)
@@ -1342,19 +1342,20 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "email_watch",
-      description: "Manage email watchers. Use `action: \"add\"` to start watching for emails (optionally from a specific sender) and have a proposed reply drafted in a dedicated chat thread when one arrives — fire this when the user says things like 'watch my email for messages from alice@x.com and draft replies' or 'keep an eye on emails from my boss'. The watcher polls the signed-in Google account roughly once a minute; on each new matching email it wakes a turn that reads the message and posts a PROPOSED reply for review (it never sends without explicit approval). Provide `sender` to scope to one address (builds the query `from:<sender>`), or `query` for a raw Gmail search query. Use `action: \"list\"` to show existing watchers, `action: \"remove\"` with an `id` to stop one, and `action: \"disable\"` / `action: \"enable\"` with an `id` to pause/resume a watcher without deleting it. Watching requires the user to be signed in to Google via the `gws` CLI; if they aren't, the watcher is created but stays in `needs_auth` until they sign in.",
+      description: "Manage email watchers. Use `action: \"add\"` to start watching for emails (optionally from a specific sender) and have a proposed reply drafted in a dedicated chat thread when one arrives — fire this when the user says things like 'watch my email for messages from alice@x.com and draft replies' or 'keep an eye on emails from my boss'. The watcher polls the signed-in Google account roughly once a minute; on each new matching email it wakes a turn that reads the message and posts a PROPOSED reply for review (it never sends without explicit approval). Provide `sender` to scope to one address (builds the query `from:<sender>`), or `query` for a raw Gmail search query. When the user states a GOAL for the watch ('get a refund or a replacement', 'keep responding until it's resolved'), DISTILL it into `objective` at creation — it is injected into every drafting turn for that watch so replies advance it; when the user changes the goal later, use `action: \"update\"` with the watcher `id` and the new `objective`. Use `action: \"list\"` to show existing watchers, `action: \"remove\"` with an `id` to stop one, and `action: \"disable\"` / `action: \"enable\"` with an `id` to pause/resume a watcher without deleting it. Watching requires the user to be signed in to Google via the `gws` CLI; if they aren't, the watcher is created but stays in `needs_auth` until they sign in.",
       parameters: {
         type: "object",
         properties: {
           action: {
             type: "string",
-            enum: ["add", "list", "remove", "disable", "enable"],
-            description: "What to do: 'add' a new watcher, 'list' existing watchers, 'remove' a watcher by id, or 'disable'/'enable' a watcher by id (pause/resume without deleting)."
+            enum: ["add", "list", "remove", "disable", "enable", "update"],
+            description: "What to do: 'add' a new watcher, 'list' existing watchers, 'remove' a watcher by id, 'disable'/'enable' a watcher by id (pause/resume without deleting), or 'update' a watcher's objective by id."
           },
           sender: { type: "string", description: "For action='add': the email address to watch for (e.g. 'alice@example.com'). Builds the Gmail query `from:<sender>`. Omit to watch the whole inbox (or provide `query` instead)." },
           query: { type: "string", description: "For action='add': a raw Gmail search query (e.g. 'from:boss@x.com subject:urgent is:unread'). Takes precedence over `sender` when both are given." },
+          objective: { type: "string", description: "For action='add'/'update': the user's standing goal for this watch, distilled from what they said (e.g. 'get a refund or a replacement', 'keep responding until the issue is resolved'). Injected into every drafting turn for the watch so proposed replies advance it. Max 2000 characters." },
           account: { type: "string", description: "For action='add': the account email to watch. v1 watches the single signed-in gws identity; recorded for the multi-account future." },
-          id: { type: "string", description: "For action='remove'/'disable'/'enable': the watcher id (from action='list')." }
+          id: { type: "string", description: "For action='remove'/'disable'/'enable'/'update': the watcher id (from action='list')." }
         },
         required: ["action"]
       }

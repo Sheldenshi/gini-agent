@@ -20,7 +20,9 @@ import {
   removeEmailWatcher,
   renameChatSession,
   setEmailWatcherEnabled,
-  updateEmailWatcher
+  setEmailWatcherObjective,
+  updateEmailWatcher,
+  validateObjective
 } from ".";
 
 const ROOT = mkdtempSync(join(tmpdir(), "gini-email-watchers-test-"));
@@ -108,6 +110,49 @@ describe("watcher CRUD", () => {
   test("remove on a missing watcher throws", async () => {
     const config = buildConfig("ew-remove-missing");
     await expect(removeEmailWatcher(config, "nope")).rejects.toThrow("Email watcher not found");
+  });
+});
+
+describe("watcher objective", () => {
+  test("validateObjective trims, rejects empty, caps at 2000 chars", () => {
+    expect(validateObjective("  get a refund  ")).toBe("get a refund");
+    expect(() => validateObjective("   ")).toThrow("Invalid input: objective must not be empty");
+    expect(() => validateObjective(42)).toThrow("Invalid input: objective must be a string");
+    expect(() => validateObjective("x".repeat(2001))).toThrow("Invalid input: objective must be at most 2000 characters");
+    expect(validateObjective("x".repeat(2000))).toBe("x".repeat(2000));
+  });
+
+  test("add stores the validated objective and the watch list carries it", async () => {
+    const config = buildConfig("ew-objective-add");
+    const watcher = await addEmailWatcher(config, { sender: "alice@x.com", objective: " Get a refund or a replacement " });
+    expect(watcher.objective).toBe("Get a refund or a replacement");
+    const job = readState(config.instance).jobs.find(
+      (j) => (j.preRunHook?.config as { skill?: string })?.skill === "gmail-watch"
+    );
+    const watches = (job?.preRunHook?.config as { watches?: { objective?: string }[] }).watches ?? [];
+    expect(watches[0]?.objective).toBe("Get a refund or a replacement");
+  });
+
+  test("a rejected objective on the FIRST add leaves no orphan shared job", async () => {
+    const config = buildConfig("ew-objective-reject");
+    await expect(addEmailWatcher(config, { sender: "a@x.com", objective: "  " })).rejects.toThrow("Invalid input");
+    const state = readState(config.instance);
+    expect(state.emailWatchers).toHaveLength(0);
+    expect(state.jobs.filter((j) => (j.preRunHook?.config as { skill?: string })?.skill === "gmail-watch")).toHaveLength(0);
+  });
+
+  test("setEmailWatcherObjective revises the goal and pushes it into the watch list", async () => {
+    const config = buildConfig("ew-objective-update");
+    const watcher = await addEmailWatcher(config, { sender: "bob@x.com", objective: "Get a refund" });
+    const updated = await setEmailWatcherObjective(config, watcher.id, " Accept a replacement instead ");
+    expect(updated?.objective).toBe("Accept a replacement instead");
+    const job = readState(config.instance).jobs.find(
+      (j) => (j.preRunHook?.config as { skill?: string })?.skill === "gmail-watch"
+    );
+    const watches = (job?.preRunHook?.config as { watches?: { objective?: string }[] }).watches ?? [];
+    expect(watches[0]?.objective).toBe("Accept a replacement instead");
+    // A missing watcher returns undefined.
+    expect(await setEmailWatcherObjective(config, "nope", "x")).toBeUndefined();
   });
 });
 

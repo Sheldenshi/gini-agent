@@ -77,6 +77,11 @@ interface DetectArgs {
   // bypasses the automated-sender heuristic (the user asked for it by name);
   // self is still always dropped.
   sender?: string;
+  // The user's standing instructions for this watch. Validated config from
+  // the trusted tool/API channel (same trust level as the job prompt) —
+  // emitted as ONE TRUSTED item on ticks where this watch matches, NEVER
+  // inside the untrusted fence, and never sourced from email content.
+  objective?: string;
   state?: DetectState | null;
 }
 
@@ -90,6 +95,7 @@ interface Watch {
   query: string;
   account?: string;
   sender?: string;
+  objective?: string;
 }
 
 // The shared job's multi-watch input: the list of enabled watches + the opaque
@@ -352,6 +358,16 @@ export function buildMatchItem(meta: EmailMetadata): ResultItem {
   return { text: `New email from ${from} — ${payload}`, untrusted: true };
 }
 
+// The user's standing objective for a watch, as ONE TRUSTED item
+// (untrusted:false — the runner renders it unfenced). The objective is
+// validated config from the trusted tool/API channel, the same trust level as
+// the job prompt; it must NEVER ride inside the untrusted fence, and untrusted
+// email content never flows into it. Emitted only on ticks where the watch
+// actually matched, so the drafting turn knows what its replies should achieve.
+export function buildObjectiveItem(label: string, objective: string): ResultItem {
+  return { text: `Objective for this watch (${label}): ${objective}`, untrusted: false };
+}
+
 // ── Self-email resolution (ported verbatim) ──────────────────────────────────
 
 async function resolveSelfEmail(gwsSpawn: GwsSpawn): Promise<string | undefined> {
@@ -519,6 +535,12 @@ export async function detect(
     }
   }
 
+  // A matched tick carries the watch's standing objective as ONE trusted item
+  // alongside the untrusted matches (never on a no-match tick).
+  if (collected > 0 && args.objective) {
+    items.push(buildObjectiveItem(args.sender ?? args.query, args.objective));
+  }
+
   const newCursor = lastConsumedInternalDate > 0 ? String(lastConsumedInternalDate) : cursorIn;
 
   // Recompute the boundary `seen` set: the ids sharing the new cursor's exact
@@ -670,7 +692,11 @@ export async function runWatches(args: DetectArgsMulti, gwsSpawn: GwsSpawn): Pro
     // others — that watch is marked error and the rest still run.
     let result: DetectResult;
     try {
-      result = await run({ query: watch.query, account: watch.account, sender: watch.sender, state: stateIn }, gwsSpawn, selfEmail);
+      result = await run(
+        { query: watch.query, account: watch.account, sender: watch.sender, objective: watch.objective, state: stateIn },
+        gwsSpawn,
+        selfEmail
+      );
     } catch (error) {
       byWatcherOut[watch.watcherId] = {
         ...stateIn,

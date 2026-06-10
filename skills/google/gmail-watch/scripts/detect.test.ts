@@ -130,8 +130,10 @@ function itemPayload(text: string): Record<string, unknown> {
   return JSON.parse(json) as Record<string, unknown>;
 }
 
-function draftedIds(items: { text: string }[] | undefined): string[] {
-  return (items ?? []).map((i) => itemPayload(i.text).id as string);
+// Drafted = untrusted match items only (trusted objective/notice items carry
+// no JSON payload).
+function draftedIds(items: { text: string; untrusted: boolean }[] | undefined): string[] {
+  return (items ?? []).filter((i) => i.untrusted).map((i) => itemPayload(i.text).id as string);
 }
 
 describe("parse + safety helpers", () => {
@@ -304,6 +306,38 @@ describe("detect — regimes", () => {
     // The watched automated address fires; self is still dropped.
     expect(r.kind).toBe("context");
     expect(draftedIds(r.items)).toEqual(["u1"]);
+  });
+
+  test("a matched tick appends ONE trusted objective item; a no-match tick emits none", async () => {
+    const spawn = stubSpawn(["o1"], {
+      o1: { id: "o1", internalDate: "3000", from: "Alice <alice@x.com>", subject: "offer" }
+    });
+    const r = await detect(
+      {
+        query: "from:alice@x.com",
+        sender: "alice@x.com",
+        objective: "Get a refund or a replacement",
+        state: { cursor: "1000", seen: [] }
+      },
+      spawn,
+      "me@example.com"
+    );
+    expect(r.kind).toBe("context");
+    expect(matchCount(r.items)).toBe(1);
+    // Exactly one TRUSTED item: the objective, labeled by the watched sender,
+    // outside the untrusted fence (the runner renders trusted items unfenced).
+    const trusted = r.items!.filter((i) => !i.untrusted);
+    expect(trusted).toHaveLength(1);
+    expect(trusted[0]!.text).toBe("Objective for this watch (alice@x.com): Get a refund or a replacement");
+
+    // Nothing new on the next tick => shortCircuit, no objective item.
+    const quiet = await detect(
+      { query: "from:alice@x.com", sender: "alice@x.com", objective: "Get a refund or a replacement", state: r.state },
+      stubSpawn([], {}),
+      "me@example.com"
+    );
+    expect(quiet.kind).toBe("shortCircuit");
+    expect(quiet.items).toBeUndefined();
   });
 
   test("bounds the query with after:<epochSec> once a cursor exists, but not on seeding", async () => {
@@ -760,20 +794,23 @@ describe("runWatches — multi-watch (one shared job)", () => {
     expect(r.state.byWatcher["w-bulk"]!.cursor).toBe(String(20_000_000 + 59 * 1000));
   });
 
-  test("a watch entry's sender rides through to the heuristic bypass", async () => {
+  test("a watch entry's sender + objective ride through to the bypass and the trusted item", async () => {
     const spawn = multiSpawn(
       { "from:noreply@ups.com": ["p1"] },
       { p1: { id: "p1", internalDate: "4000", from: "UPS <noreply@ups.com>", subject: "shipped" } }
     );
     const r = await runWatches(
       {
-        watches: [{ watcherId: "w-ups", query: "from:noreply@ups.com", sender: "noreply@ups.com" }],
+        watches: [{ watcherId: "w-ups", query: "from:noreply@ups.com", sender: "noreply@ups.com", objective: "Track the package until delivered" }],
         state: { byWatcher: { "w-ups": { cursor: "1000", seen: [] } } }
       },
       spawn
     );
     expect(r.kind).toBe("context");
     expect(draftedIds(r.items)).toEqual(["p1"]);
+    const trusted = r.items!.filter((i) => !i.untrusted);
+    expect(trusted).toHaveLength(1);
+    expect(trusted[0]!.text).toBe("Objective for this watch (noreply@ups.com): Track the package until delivered");
   });
 
   test("no watches yields a silent shortCircuit with empty byWatcher", async () => {

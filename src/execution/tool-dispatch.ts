@@ -26,7 +26,7 @@ import {
   now,
   readState
 } from "../state";
-import { addEmailWatcher, listEmailWatchers, removeEmailWatcher, setEmailWatcherEnabled } from "../state/email-watchers";
+import { addEmailWatcher, listEmailWatchers, removeEmailWatcher, setEmailWatcherEnabled, setEmailWatcherObjective } from "../state/email-watchers";
 import { ApprovalRaceLostError, ApprovedActionFailedError, TaskAlreadyTerminalError, cancelTask, findTask, resolveAuthorization, runTerminalCommand } from "../agent";
 import { walkFiles, simpleDiff } from "../tools/file";
 import { codeExecutionCommand } from "../tools/code";
@@ -1932,6 +1932,8 @@ async function emailWatchTool(
     const summary = watchers.map((w) => ({
       id: w.id,
       query: w.query,
+      sender: w.sender,
+      objective: w.objective,
       accountEmail: w.accountEmail,
       enabled: w.enabled,
       status: w.status,
@@ -1968,8 +1970,25 @@ async function emailWatchTool(
       : `Disabled email watcher ${updated.id} (query: ${updated.query}); polling paused.`;
   }
 
+  if (action === "update") {
+    // Revise a watcher's standing objective (the user changed the goal
+    // mid-conversation). Deep validation (trim, cap, empty) lives in the
+    // shared state helper so the tool, HTTP, and CLI channels enforce the
+    // same contract.
+    const id = requireString(args, "id");
+    const objective = requireString(args, "objective");
+    const updated = await setEmailWatcherObjective(config, id, objective);
+    if (!updated) throw new Error(`Email watcher not found: ${id}`);
+    appendTrace(config.instance, taskId, {
+      type: "tool",
+      message: "Updated email watcher objective",
+      data: { watcherId: updated.id }
+    });
+    return `Updated objective for email watcher ${updated.id}: ${updated.objective}`;
+  }
+
   if (action !== "add") {
-    throw new Error(`Invalid input: action must be one of "add" | "list" | "remove" | "disable" | "enable" (got ${action}).`);
+    throw new Error(`Invalid input: action must be one of "add" | "list" | "remove" | "disable" | "enable" | "update" (got ${action}).`);
   }
 
   // action === "add". Build the Gmail query: a raw `query` wins; otherwise
@@ -1995,10 +2014,19 @@ async function emailWatchTool(
     }
     account = args.account;
   }
+  // Deep objective validation (trim, cap, empty) lives in addEmailWatcher so
+  // every channel enforces the same contract; this is the type gate only.
+  let objective: string | undefined;
+  if (args.objective !== undefined && args.objective !== null) {
+    if (typeof args.objective !== "string" || args.objective.length === 0) {
+      throw new Error("Invalid input: objective must be a non-empty string.");
+    }
+    objective = args.objective;
+  }
   // Inherit the originating task's agent so the watcher + its dedicated chat
   // session (and the future woken turns) attribute to the right agent.
   const owningAgentId = readState(config.instance).tasks.find((t) => t.id === taskId)?.agentId;
-  const watcher = await addEmailWatcher(config, { sender, query: rawQuery, account, agentId: owningAgentId });
+  const watcher = await addEmailWatcher(config, { sender, query: rawQuery, account, objective, agentId: owningAgentId });
 
   appendTrace(config.instance, taskId, {
     type: "tool",
