@@ -21,6 +21,7 @@ import {
   readPlistStamp,
   resolveLaunchSpec,
   serviceTarget,
+  supervisedServices,
   supervisor,
   writePlist,
   type LaunchSpec,
@@ -799,14 +800,18 @@ describe("generatePlist", () => {
   });
 });
 
-describe("generatePlist (watchdog kind: periodic StartInterval)", () => {
+describe("generatePlist (scheduling shapes)", () => {
   const baseSpec = {
     programArguments: ["/opt/bun/bin/bun", "run", "gini", "watchdog", "--instance", "main"],
     workingDirectory: "/Users/test/.gini/runtime",
     environment: { PATH: "/usr/bin", GINI_INSTANCE: "main", HOME: "/Users/test", LANG: "en_US.UTF-8" }
   };
 
-  test("emits StartInterval + RunAtLoad and NO KeepAlive for the watchdog", () => {
+  test("an explicit startIntervalSeconds emits the periodic shape: StartInterval + RunAtLoad, no KeepAlive", () => {
+    // No current kind uses this shape (the watchdog is a long-lived loop —
+    // launchd's spawn deferral gapped StartInterval ticks during the very
+    // outages the watchdog covers), but the periodic machinery stays for
+    // future short-lived jobs where KeepAlive would respawn in a tight loop.
     const xml = generatePlist({
       instance: "main",
       kind: "watchdog",
@@ -817,16 +822,14 @@ describe("generatePlist (watchdog kind: periodic StartInterval)", () => {
     });
     expect(xml).toMatch(/<key>StartInterval<\/key>\s*<integer>30<\/integer>/);
     expect(xml).toMatch(/<key>RunAtLoad<\/key>\s*<true\/>/);
-    // The watchdog is a periodic one-shot that always exits 0 — KeepAlive
-    // would respawn it in a tight loop the instant it finishes.
     expect(xml).not.toContain("<key>KeepAlive</key>");
     // ThrottleInterval is a KeepAlive-job knob; the periodic plist drops it.
     expect(xml).not.toContain("<key>ThrottleInterval</key>");
     expect(xml).toContain(`<string>${LABEL_PREFIX}.main.watchdog</string>`);
   });
 
-  test("gateway and web still carry KeepAlive <true/> (StartInterval is watchdog-only)", () => {
-    for (const kind of ["gateway", "web"] as const) {
+  test("all three kinds default to the long-lived shape: KeepAlive <true/>, no StartInterval", () => {
+    for (const kind of ["gateway", "web", "watchdog"] as const) {
       const xml = generatePlist({
         instance: "main",
         kind,
@@ -835,8 +838,25 @@ describe("generatePlist (watchdog kind: periodic StartInterval)", () => {
         stderrPath: "/tmp/err.log"
       });
       expect(xml).toMatch(/<key>KeepAlive<\/key>\s*<true\/>/);
+      expect(xml).toMatch(/<key>ThrottleInterval<\/key>\s*<integer>10<\/integer>/);
       expect(xml).not.toContain("<key>StartInterval</key>");
     }
+  });
+
+  test("the supervisedServices watchdog descriptor carries no startIntervalSeconds (long-lived KeepAlive loop)", () => {
+    const services = supervisedServices({
+      instance: "main",
+      homeOverride: "/Users/test",
+      bunPathOverride: "/opt/bun/bin/bun",
+      projectRootOverride: "/repo/gini",
+      cwdOverride: "/tmp/neutral",
+      readSecretsFile: () => null
+    });
+    const watchdogSvc = services.find((svc) => svc.kind === "watchdog");
+    expect(watchdogSvc).toBeDefined();
+    // The probe cadence lives in the watchdog's own loop, not in launchd
+    // scheduling — its plist must be the KeepAlive long-lived shape.
+    expect(watchdogSvc!.startIntervalSeconds).toBeUndefined();
   });
 });
 
@@ -923,7 +943,7 @@ describe("computePlistStamp / readPlistStamp", () => {
       gatewayStamp(gatewaySpec({ workingDirectory: "/somewhere/else" }))
     ).not.toBe(base);
     // The KeepAlive-vs-periodic scheduling shape re-stamps: same spec but
-    // computed as the periodic (watchdog) shape.
+    // computed as the periodic shape.
     const periodic = computePlistStamp(
       plistStampInput({
         kind: "gateway",

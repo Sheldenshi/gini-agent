@@ -1,7 +1,16 @@
-// `gini watchdog --instance <name>` — periodic health probe (the launchd
-// watchdog job's StartInterval one-shot).
+// `gini watchdog --instance <name>` — the supervision safety net. A
+// long-lived probe LOOP under a launchd KeepAlive job (see
+// src/cli/autostart.ts watchdog plist); `--once` runs a single tick for
+// manual/diagnostic use.
 //
-// Runs every ~30s under launchd (see src/cli/autostart.ts watchdog plist).
+// It used to be a StartInterval one-shot (launchd respawned it every 30s).
+// That made the safety net subject to the exact failure it guards against:
+// on macOS 26 launchd defers pended spawns, so during a gateway
+// respawn-deferral window the watchdog's own ticks were deferred alongside it
+// (observed tick gaps of 50-99s against the 30s interval, while the gateway
+// sat dead). A long-lived loop only asks launchd to spawn once —
+// the steady-state cadence is our own timer, immune to spawn deferral.
+//
 // Each tick:
 //   1. Probe the gateway runtime at /api/status (any HTTP response means the
 //      runtime is alive — /api/status returns 401 without auth, which still
@@ -17,15 +26,17 @@
 //      service. The report is offered to the user on the next restart and filed
 //      only on consent — the watchdog never files anything itself.
 //
-// Always exits 0: it's a periodic probe, and a non-zero exit muddies launchd's
-// StartInterval bookkeeping. Every external dependency (fetch, the launchctl
-// kickstart runner, the clock) is injectable so tests never bind real ports or
-// call real launchctl.
+// A tick never throws and the loop never exits on its own; exitCode stays 0 so
+// a `--once` run (or a killed loop) reads as a clean probe to launchd. Every
+// external dependency (fetch, the launchctl kickstart runner, the clock, the
+// inter-tick sleep) is injectable so tests never bind real ports, call real
+// launchctl, or sleep real time.
 
 import { existsSync, readFileSync } from "node:fs";
 import { arch, platform } from "node:os";
 import { join } from "node:path";
 import type { CliContext } from "../context";
+import { hasFlag } from "../args";
 import { logDir, runtimePortPath, webPortPath } from "../../paths";
 import { isLoaded, kickstart, supervisor, type LaunchctlResult, type PlistKind } from "../../integrations/launchd";
 import { isSupervisedWebChild } from "../../runtime/health-probe";
@@ -42,6 +53,10 @@ import {
 // but never responds must not stall the whole tick — 2s is generous for a
 // localhost health endpoint while keeping the watchdog snappy.
 const PROBE_TIMEOUT_MS = 2000;
+// Steady-state pause between probe ticks. 10s bounds dead-gateway detection
+// latency (tick + 2s probe timeout keeps revival well under 30s) without
+// spinning the CPU on localhost probes.
+export const WATCHDOG_TICK_INTERVAL_MS = 10_000;
 // How many trailing lines of each web log to carry into the crash report.
 // Bounded so a long log doesn't bloat the report.
 const WEB_LOG_TAIL_LINES = 50;
@@ -67,6 +82,18 @@ export interface WatchdogDeps {
   // the queued report so the restart-ask can gate on supervision later.
   supervisorImpl?: () => "launchd" | null;
   clock?: () => Date;
+  // Loop controls. `maxTicks` bounds the loop for tests (and is forced to 1 by
+  // `--once`); `sleep`/`intervalMs` make the inter-tick pause virtual in tests.
+  maxTicks?: number;
+  intervalMs?: number;
+  sleep?: (ms: number) => Promise<void>;
+}
+
+// Default inter-tick sleep. Real time; tests inject a virtual clock.
+function defaultSleep(ms: number): Promise<void> {
+  const { promise, resolve } = Promise.withResolvers<void>();
+  setTimeout(resolve, ms);
+  return promise;
 }
 
 // Read a recorded port file. Returns null when absent or unparseable — a
@@ -136,10 +163,13 @@ export async function watchdog(ctx: CliContext, deps: WatchdogDeps = {}): Promis
     deps.reenableImpl ?? (async (inst: string, kind: PlistKind) => (await enable({ instance: inst, kinds: [kind] })).ok);
   const supervisorImpl = deps.supervisorImpl ?? supervisor;
   const clock = deps.clock ?? (() => new Date());
+  const sleep = deps.sleep ?? defaultSleep;
+  const intervalMs = deps.intervalMs ?? WATCHDOG_TICK_INTERVAL_MS;
+  const maxTicks = hasFlag(ctx.cliArgs, "--once") ? 1 : deps.maxTicks ?? Number.POSITIVE_INFINITY;
 
   // A kickstart shellout (or an injected one) that throws must not flip the
-  // tick to a non-zero exit. Swallow it here — launchd will retry on the next
-  // StartInterval, and the tick's job is to be a clean periodic probe.
+  // tick to a non-zero exit. Swallow it here — the next tick retries, and the
+  // tick's job is to be a clean periodic probe.
   const safeKickstart = (kind: PlistKind): void => {
     try {
       kickstartImpl(instance, kind);
@@ -174,96 +204,108 @@ export async function watchdog(ctx: CliContext, deps: WatchdogDeps = {}): Promis
     }
   };
 
-  // The whole tick runs under try/finally so process.exitCode = 0 always
-  // executes even if a probe, kickstart, or log call throws — a periodic
-  // launchd probe must report success regardless.
-  try {
-    const runtimePort = readPort(runtimePortPath(instance));
-    const webPort = readPort(webPortPath(instance));
+  // One probe tick. Runs under try/finally so process.exitCode = 0 always
+  // executes even if a probe, kickstart, or log call throws — the watchdog
+  // must read as a clean probe regardless.
+  const tick = async (): Promise<void> => {
+    try {
+      const runtimePort = readPort(runtimePortPath(instance));
+      const webPort = readPort(webPortPath(instance));
 
-    // A missing port file means the service never recorded a port (not booted /
-    // stopped). We can't health-probe it, so treat it as down — kickstart will
-    // (re)launch it if it's enabled, and is a graceful no-op otherwise.
-    const runtimeOk = runtimePort !== null ? await probeRuntime(runtimePort) : false;
-    // Track whether the web probe actually RAN and FAILED, separate from a
-    // missing port. A missing port is a boot race (or a stopped service), not a
-    // crash — we still kickstart, but we must not file an issue for it.
-    const webProbeFailed = webPort !== null ? !(await probeWeb(instance, webPort)) : false;
-    const webOk = webPort !== null && !webProbeFailed;
+      // A missing port file means the service never recorded a port (not booted /
+      // stopped). We can't health-probe it, so treat it as down — kickstart will
+      // (re)launch it if it's enabled, and is a graceful no-op otherwise.
+      const runtimeOk = runtimePort !== null ? await probeRuntime(runtimePort) : false;
+      // Track whether the web probe actually RAN and FAILED, separate from a
+      // missing port. A missing port is a boot race (or a stopped service), not a
+      // crash — we still kickstart, but we must not file an issue for it.
+      const webProbeFailed = webPort !== null ? !(await probeWeb(instance, webPort)) : false;
+      const webOk = webPort !== null && !webProbeFailed;
 
-    const actions: string[] = [];
+      const actions: string[] = [];
 
-    // Runtime dead/hung -> kickstart the gateway. KeepAlive should already
-    // respawn it, but macOS 26 frequently defers that; the explicit kick forces
-    // a stop+start. No crash report here: an in-process uncaughtException already
-    // queues a report via the runtime crash handler, and a hung-but-not-crashed
-    // runtime has no error to attribute.
-    if (!runtimeOk) {
-      actions.push(await reviveService("gateway"));
-    }
-
-    // A web crash report is only warranted for a GENUINE web-specific failure:
-    // the web port was recorded (so it had booted), the probe actually failed,
-    // AND the runtime is healthy. A missing port is a boot race; a failed probe
-    // while the runtime is also down is just the symptom of a runtime outage
-    // (the BFF can't reach a dead gateway). Filing in either case produces a
-    // false-positive issue. We still kickstart web below regardless.
-    const shouldReportWebCrash = webPort !== null && webProbeFailed && runtimeOk;
-
-    // Web dead/hung -> build a crash report from the web log tails, queue it into
-    // pending/, then kickstart the web service. The web has no in-process crash
-    // handler (decision: web crash coverage is the watchdog), so this is the only
-    // place a web outage gets captured. The queued report is offered to the user
-    // on the next restart and filed only on consent — nothing is filed here.
-    if (!webOk) {
-      if (shouldReportWebCrash) {
-        try {
-          const logTail = [
-            ...readWebLogTail(instance, "web-launchd.err.log"),
-            ...readWebLogTail(instance, "web.log")
-          ];
-          const { secretsEnvBody } = readRedactionLiterals();
-          const report = buildCrashReport({
-            instance,
-            supervisor: supervisorImpl(),
-            // No JS Error object for a web outage — synthesize one so the report's
-            // fingerprint/dedup still works. The message is stable so recurrences
-            // collapse to a single issue.
-            error: new Error("web service health probe failed (dead or hung)"),
-            source: "web",
-            logTail,
-            sysInfo: { platform: platform(), arch: arch(), nodeVersion: process.version },
-            clock,
-            secretsEnvBody
-          });
-          writeCrashReportFile(report);
-          actions.push("report:web");
-        } catch {
-          // Building/writing the report must never stop us from reviving web.
-        }
+      // Runtime dead/hung -> kickstart the gateway. KeepAlive should already
+      // respawn it, but macOS 26 frequently defers that; the explicit kick forces
+      // a stop+start. No crash report here: an in-process uncaughtException already
+      // queues a report via the runtime crash handler, and a hung-but-not-crashed
+      // runtime has no error to attribute.
+      if (!runtimeOk) {
+        actions.push(await reviveService("gateway"));
       }
-      actions.push(await reviveService("web"));
-    }
 
-    // Best-effort log line; a logging failure must not flip the tick's exit.
-    try {
-      appendLog(instance, "watchdog.tick", { webOk, runtimeOk, webProbeFailed, shouldReportWebCrash, actions });
-    } catch {
-      // Logging is observability, not control flow — swallow.
+      // A web crash report is only warranted for a GENUINE web-specific failure:
+      // the web port was recorded (so it had booted), the probe actually failed,
+      // AND the runtime is healthy. A missing port is a boot race; a failed probe
+      // while the runtime is also down is just the symptom of a runtime outage
+      // (the BFF can't reach a dead gateway). Filing in either case produces a
+      // false-positive issue. We still kickstart web below regardless.
+      const shouldReportWebCrash = webPort !== null && webProbeFailed && runtimeOk;
+
+      // Web dead/hung -> build a crash report from the web log tails, queue it into
+      // pending/, then kickstart the web service. The web has no in-process crash
+      // handler (decision: web crash coverage is the watchdog), so this is the only
+      // place a web outage gets captured. The queued report is offered to the user
+      // on the next restart and filed only on consent — nothing is filed here.
+      if (!webOk) {
+        if (shouldReportWebCrash) {
+          try {
+            const logTail = [
+              ...readWebLogTail(instance, "web-launchd.err.log"),
+              ...readWebLogTail(instance, "web.log")
+            ];
+            const { secretsEnvBody } = readRedactionLiterals();
+            const report = buildCrashReport({
+              instance,
+              supervisor: supervisorImpl(),
+              // No JS Error object for a web outage — synthesize one so the report's
+              // fingerprint/dedup still works. The message is stable so recurrences
+              // collapse to a single issue.
+              error: new Error("web service health probe failed (dead or hung)"),
+              source: "web",
+              logTail,
+              sysInfo: { platform: platform(), arch: arch(), nodeVersion: process.version },
+              clock,
+              secretsEnvBody
+            });
+            writeCrashReportFile(report);
+            actions.push("report:web");
+          } catch {
+            // Building/writing the report must never stop us from reviving web.
+          }
+        }
+        actions.push(await reviveService("web"));
+      }
+
+      // Best-effort log line; a logging failure must not flip the tick's exit.
+      try {
+        appendLog(instance, "watchdog.tick", { webOk, runtimeOk, webProbeFailed, shouldReportWebCrash, actions });
+      } catch {
+        // Logging is observability, not control flow — swallow.
+      }
+    } catch (err) {
+      // A thrown/rejected probe (probeRuntime/probeWeb) or any other tick failure
+      // must NOT reject out of the loop — the CLI top-level would then exit(1)
+      // and take the whole safety net down with it. Swallow it (logged
+      // best-effort) and let the next tick retry.
+      try {
+        appendLog(instance, "watchdog.error", { error: String(err) });
+      } catch {
+        // Logging is observability, not control flow — swallow.
+      }
+    } finally {
+      // The watchdog always reads as a clean probe — recovery actions are
+      // recorded in the tick log, not signaled via exit code.
+      process.exitCode = 0;
     }
-  } catch (err) {
-    // A thrown/rejected probe (probeRuntime/probeWeb) or any other tick failure
-    // must NOT reject out of watchdog — the CLI top-level would then exit(1),
-    // muddying launchd's StartInterval bookkeeping. Swallow it (logged
-    // best-effort) and let the finally below resolve the tick with exitCode 0.
-    try {
-      appendLog(instance, "watchdog.error", { error: String(err) });
-    } catch {
-      // Logging is observability, not control flow — swallow.
-    }
-  } finally {
-    // Periodic probe: always succeed so launchd's StartInterval bookkeeping
-    // stays clean. Recovery actions are recorded above, not signaled via exit.
-    process.exitCode = 0;
+  };
+
+  // The probe loop. Ticks immediately on start (launchd just spawned us — the
+  // first health answer should not wait an interval), then paces itself with
+  // its own timer. KeepAlive only has to spawn this process once, so launchd's
+  // spawn-deferral can't gap the cadence the way StartInterval respawns could.
+  for (let ranTicks = 1; ; ranTicks += 1) {
+    await tick();
+    if (ranTicks >= maxTicks) break;
+    await sleep(intervalMs);
   }
 }

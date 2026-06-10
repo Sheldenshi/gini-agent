@@ -256,8 +256,8 @@ function usage(): Record<string, unknown> {
     ],
     notes: [
       "macOS only in v1 (Linux systemd --user is a follow-up).",
-      "Three services per instance: <prefix>.<instance>.gateway (Bun runtime), <prefix>.<instance>.web (Next.js), and <prefix>.<instance>.watchdog (periodic health probe that revives a dead/hung gateway or web).",
-      "The watchdog runs every 30s (StartInterval, not KeepAlive): it probes the gateway /api/status and web /api/runtime/__healthz, kickstarts whichever is down, and files a deduped crash report when web is down.",
+      "Three services per instance: <prefix>.<instance>.gateway (Bun runtime), <prefix>.<instance>.web (Next.js), and <prefix>.<instance>.watchdog (long-lived health-probe loop that revives a dead/hung gateway or web).",
+      "The watchdog is a long-lived KeepAlive loop probing every 10s: it checks the gateway /api/status and web /api/runtime/__healthz, kickstarts whichever is down, and queues a deduped crash report when web is down. (It was a 30s StartInterval one-shot, but launchd's spawn deferral gapped its ticks during the very outages it covers.)",
       "`gini stop` runs `launchctl bootout` to unload the service (KeepAlive is `true` — launchd always respawns on exit, so a clean exit alone won't keep it down). The web service is torn down the same way.",
       "macOS 26 (Tahoe): launchd often defers auto-respawn after SIGKILL indefinitely (`pended nondemand spawn = inefficient`). Use `gini autostart kick` to force a respawn when this happens; RunAtLoad still fires at login.",
       "Secrets in ~/.gini/secrets.env are merged into the gateway plist's EnvironmentVariables only (the web plist is the BFF and never talks to providers directly). If you change a key (e.g. `gini provider set`), re-run `autostart enable` to refresh the plist for future respawns.",
@@ -473,8 +473,8 @@ export async function enable(options: EnableOptions): Promise<EnableResult> {
       spec: svc.spec,
       stdoutPath,
       stderrPath,
-      // Only the watchdog descriptor carries this; gateway/web leave it
-      // undefined and get the KeepAlive long-lived plist shape.
+      // No current descriptor sets this (all three kinds are KeepAlive
+      // long-lived jobs); the plumbing stays for a future periodic kind.
       ...(svc.startIntervalSeconds !== undefined ? { startIntervalSeconds: svc.startIntervalSeconds } : {})
     });
     const wasLoaded = deps.isLoaded(instance, svc.kind);
@@ -825,9 +825,9 @@ function status(instance: string): StatusResult {
     pid: gateway.pid,
     lastExitStatus: gateway.lastExitStatus,
     limitations: [
-      "macOS 26+: launchd auto-respawn after SIGKILL is unreliable. The watchdog kickstarts a dead/hung service every ~30s; `gini autostart kick` forces it on demand.",
+      "macOS 26+: launchd auto-respawn after SIGKILL is unreliable. The watchdog's 10s probe loop kickstarts a dead/hung service; `gini autostart kick` forces it on demand.",
       "macOS only in v1.",
-      "Three services per instance: <prefix>.<instance>.gateway, <prefix>.<instance>.web, and <prefix>.<instance>.watchdog (periodic health probe that revives a wedged-but-alive or cleanly-exited gateway/web). `gini status` aggregates web/runtime health."
+      "Three services per instance: <prefix>.<instance>.gateway, <prefix>.<instance>.web, and <prefix>.<instance>.watchdog (long-lived health-probe loop that revives a wedged-but-alive or cleanly-exited gateway/web). `gini status` aggregates web/runtime health."
     ]
   };
 }

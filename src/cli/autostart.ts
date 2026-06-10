@@ -382,19 +382,15 @@ export interface SupervisedService {
   // stdout tees.
   stdoutLogFilename: string;
   stderrLogFilename: string;
-  // Set only for the watchdog kind: the periodic one-shot interval (seconds)
-  // that drives the plist's StartInterval. gateway/web leave this undefined
-  // (they are KeepAlive long-lived jobs, not periodic).
+  // Reserved for a periodic one-shot kind: the interval (seconds) that drives
+  // the plist's StartInterval. All three current kinds leave this undefined
+  // (they are KeepAlive long-lived jobs) — the watchdog used to be a
+  // StartInterval one-shot, but launchd's spawn deferral on macOS 26 gapped
+  // its ticks in exactly the outage windows it exists to cover,
+  // so it now runs its own probe loop in one long-lived process.
   startIntervalSeconds?: number;
   resolution: "installed" | "source";
 }
-
-// How often the watchdog launchd job re-runs `gini watchdog`. A periodic
-// one-shot (StartInterval), NOT a KeepAlive long-lived job: launchd relaunches
-// it every N seconds. 30s bounds detection latency for a dead/hung web or
-// runtime without spinning the CPU. Overlaps benignly with the gateway/web
-// ThrottleInterval — a kickstart against an already-running job is a no-op.
-export const WATCHDOG_START_INTERVAL_SECONDS = 30;
 
 export interface SupervisedServicesOptions extends ResolveLaunchOptions {
   // Narrow to a subset of kinds. Defaults to all three
@@ -434,7 +430,6 @@ export function supervisedServices(options: SupervisedServicesOptions): Supervis
     spec: specForKind[kind],
     stdoutLogFilename: stdoutForKind[kind],
     stderrLogFilename: stderrForKind[kind],
-    ...(kind === "watchdog" ? { startIntervalSeconds: WATCHDOG_START_INTERVAL_SECONDS } : {}),
     resolution: pair.resolution
   }));
 }
@@ -866,12 +861,16 @@ export function generatePlist(options: PlistOptions): string {
   // crash respawn.
   //
   // Scheduling block differs by job shape:
-  //   - Long-lived (gateway/web): KeepAlive:true + ThrottleInterval. launchd
-  //     always respawns on exit; bootout is the stop.
-  //   - Periodic (watchdog): StartInterval + RunAtLoad and NO KeepAlive. The
-  //     watchdog is a short-lived probe that always exits 0 — KeepAlive would
-  //     respawn it in a tight loop the instant it finishes. StartInterval is
-  //     the right primitive: launchd reruns it every N seconds.
+  //   - Long-lived (gateway/web/watchdog): KeepAlive:true + ThrottleInterval.
+  //     launchd always respawns on exit; bootout is the stop. The watchdog is
+  //     long-lived too — its probe cadence is an in-process loop, NOT launchd
+  //     StartInterval respawns, because launchd's spawn deferral (macOS 26)
+  //     gapped StartInterval ticks during the very gateway outages the
+  //     watchdog exists to cover.
+  //   - Periodic (startIntervalSeconds set): StartInterval + RunAtLoad and NO
+  //     KeepAlive — for a short-lived job that exits after each run, where
+  //     KeepAlive would respawn it in a tight loop. No current kind uses this
+  //     shape; the machinery stays for future periodic jobs.
   const scheduling = periodic
     ? `    <key>RunAtLoad</key>
     <true/>
