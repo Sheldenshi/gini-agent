@@ -117,7 +117,7 @@ export default function SetupPage() {
         body: JSON.stringify({ provider: "codex" })
       });
       if (!result.ok) {
-        setError(result.error ?? "Codex credentials not found. Run `codex --login` and retry.");
+        setError(result.error ?? "Codex credentials not found. Run `codex login` and retry.");
         return;
       }
       router.replace("/");
@@ -183,10 +183,10 @@ export default function SetupPage() {
 
             <TabsContent value="codex" className="space-y-3 pt-4">
               <p className="text-sm">
-                Codex uses your existing <code className="rounded bg-muted px-1 py-0.5 text-xs">codex --login</code>{" "}
+                Codex uses your existing <code className="rounded bg-muted px-1 py-0.5 text-xs">codex login</code>{" "}
                 auth (no API key needed). Run this in your terminal first:
               </p>
-              <pre className="rounded-md bg-muted p-3 font-mono text-xs">codex --login</pre>
+              <pre className="rounded-md bg-muted p-3 font-mono text-xs">codex login</pre>
               <p className="text-xs text-muted-foreground">
                 Then click Refresh to detect ~/.codex/auth.json and continue.
               </p>

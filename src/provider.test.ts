@@ -2650,6 +2650,101 @@ describe("provider", () => {
     }
   });
 
+  // ----- Local codex credential failures -----
+  // Steady-state local credential failures (auth.json missing — the
+  // post-`codex logout` state — wrong-shape file, or persistently
+  // unreadable file) must surface as ProviderAuthError("codex") so failTask
+  // renders the named re-auth CTA instead of a raw muted note (issue #233).
+  // Anthropic and bedrock already throw typed for missing local credentials;
+  // these pin codex parity.
+
+  test("codex: missing auth.json surfaces as ProviderAuthError without hitting the network", async () => {
+    const root = "/tmp/gini-provider-codex-missing-auth";
+    rmSync(root, { recursive: true, force: true });
+    mkdirSync(root, { recursive: true });
+    // Point CODEX_AUTH_JSON at a path that exists as a directory but holds
+    // no auth.json — the exact state `codex logout` leaves behind.
+    const restoreEnv = setEnv("CODEX_AUTH_JSON", `${root}/auth.json`);
+    const fetchStub = installFetch(() => anthropicJson({}));
+    try {
+      const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
+      const err = await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "hi" }],
+        []
+      ).catch((e) => e);
+      expect(err).toBeInstanceOf(ProviderAuthError);
+      expect((err as ProviderAuthError).provider).toBe("codex");
+      expect((err as Error).message).toMatch(/No Codex credentials found/);
+      expect((err as Error).message).toContain("codex login");
+      // Steady-state absence is not retryable: no request goes out.
+      expect(fetchStub.calls.length).toBe(0);
+      expect(providerReauth("codex").kind).toBe("docs");
+    } finally {
+      fetchStub.restore();
+      restoreEnv();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("codex: auth.json without OPENAI_API_KEY or tokens.access_token surfaces as ProviderAuthError", async () => {
+    const { authPath, restore } = installCodexAuth("codex-wrong-shape-auth");
+    writeFileSync(authPath, JSON.stringify({ auth_mode: "chatgpt", tokens: { refresh_token: "r" } }));
+    const fetchStub = installFetch(() => anthropicJson({}));
+    try {
+      const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
+      const err = await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "hi" }],
+        []
+      ).catch((e) => e);
+      expect(err).toBeInstanceOf(ProviderAuthError);
+      expect((err as ProviderAuthError).provider).toBe("codex");
+      expect((err as Error).message).toMatch(/does not contain OPENAI_API_KEY or tokens\.access_token/);
+      expect(fetchStub.calls.length).toBe(0);
+    } finally {
+      fetchStub.restore();
+      restore();
+    }
+  });
+
+  test("codex: persistently corrupt auth.json fails typed after exactly one retry", async () => {
+    // Attempt 1 reads the corrupt file → CodexAuthRaceError → one 50ms wait
+    // → attempt 2 reads the SAME corrupt file. At that point the failure is
+    // no longer a mid-write race, so the second race error is converted to
+    // ProviderAuthError("codex") for the re-auth CTA. Contrast with the
+    // mid-rewrite test above, where the file turns valid before attempt 2
+    // and the call succeeds — that recovery path must keep working.
+    const { authPath, restore } = installCodexAuth("codex-corrupt-auth-typed");
+    writeFileSync(authPath, "{ not valid json");
+    const fetchStub = installFetch(() => anthropicJson({}));
+    const originalSetTimeout = globalThis.setTimeout;
+    const delays: number[] = [];
+    globalThis.setTimeout = ((handler: TimerHandler, ms?: number, ...rest: unknown[]) => {
+      if (typeof ms === "number") delays.push(ms);
+      return originalSetTimeout(handler as () => void, ms, ...rest);
+    }) as unknown as typeof globalThis.setTimeout;
+    try {
+      const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
+      const err = await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "hi" }],
+        []
+      ).catch((e) => e);
+      expect(err).toBeInstanceOf(ProviderAuthError);
+      expect((err as ProviderAuthError).provider).toBe("codex");
+      expect((err as Error).message).toMatch(/Could not read Codex credentials/);
+      // Exactly one 50ms retry wait was scheduled, and the bearer read
+      // failed both times before any request went out.
+      expect(delays.filter((ms) => ms === 50).length).toBe(1);
+      expect(fetchStub.calls.length).toBe(0);
+    } finally {
+      globalThis.setTimeout = originalSetTimeout;
+      fetchStub.restore();
+      restore();
+    }
+  });
+
   test("codex generateTaskSummary retries through callOpenAIResponses on session-expired", async () => {
     // generateTaskSummary lands in callOpenAIResponses for codex, which
     // also wraps in withCodexSessionRetry. Pin the contract so a

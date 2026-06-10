@@ -1526,13 +1526,13 @@ export function planMigration(source: OpenclawDiscovery): MigrationPlan {
       // Codex uses an OAuth file (~/.codex/auth.json), not a bearer env
       // var — that file is shared with openclaw verbatim, so the
       // migration is a no-op once the operator has logged in via
-      // `codex --login`. Writing a CODEX_API_KEY would be unread by the
+      // `codex login`. Writing a CODEX_API_KEY would be unread by the
       // runtime and leak the openclaw access token under a misleading
       // name. Surface this explicitly so the operator knows what to do.
       if (giniProvider === "codex") {
         unsupported.push({
           kind: "provider:codex",
-          detail: "Gini's codex provider reads OAuth from ~/.codex/auth.json (shared with openclaw); run `codex --login` if you haven't already. No secret was migrated."
+          detail: "Gini's codex provider reads OAuth from ~/.codex/auth.json (shared with openclaw); run `codex login` if you haven't already. No secret was migrated."
         });
         continue;
       }
