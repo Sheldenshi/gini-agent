@@ -34,7 +34,7 @@ import { launchPersistentChrome } from "./chrome-discovery";
 import { generateVisionAnalysis } from "../provider";
 import { assertInsideWorkspace, readState } from "../state";
 import { sanitizeUrlForAuditTarget } from "../execution/browser-fill-secrets-types";
-import type { BrowserConnectionRecord, Instance, RuntimeConfig } from "../types";
+import type { BrowserConnectionRecord, BrowserDomainPolicy, Instance, RuntimeConfig } from "../types";
 
 // Per-instance Chrome profile directory. The agent persists ALL sign-ins
 // and cookies here; the directory survives Connect/Disconnect cycles and
@@ -1176,10 +1176,66 @@ export function safetyCheck(rawUrl: string, options: { allowLoopback?: boolean }
   return undefined;
 }
 
+// Per-agent browsing boundary on top of the SSRF gate above. Returns a
+// "Blocked:" reason when the URL's host is denied by (or, in allow-only
+// mode, absent from) the agent's BrowserDomainPolicy; undefined when no
+// policy applies or the host passes. Matching is exact host or subdomain
+// suffix (`example.com` matches `sub.example.com`), case-insensitive, no
+// wildcards. Deny is checked first so an entry on both lists stays
+// blocked. Unparseable URLs pass — safetyCheck already refuses them with
+// its own message. The reason can name the host (unlike the registered-
+// secret gate, nothing here is sensitive) so the model can route around
+// the boundary instead of retrying. See ADR browser-domain-policy.md.
+export function domainPolicyBlockReason(rawUrl: string, policy: BrowserDomainPolicy | undefined): string | undefined {
+  if (!policy) return undefined;
+  const deny = Array.isArray(policy.deny) ? policy.deny : [];
+  const allow = Array.isArray(policy.allow) ? policy.allow : [];
+  if (deny.length === 0 && allow.length === 0) return undefined;
+  let hostname: string;
+  try {
+    hostname = new URL(rawUrl).hostname;
+  } catch {
+    return undefined;
+  }
+  // Same host normalization as safetyCheck: strip IPv6 brackets and the
+  // trailing root dot, lowercase.
+  const host = hostname.replace(/^\[|\]$/g, "").replace(/\.$/, "").toLowerCase();
+  const matches = (entry: string): boolean => {
+    const domain = entry.replace(/\.$/, "").toLowerCase();
+    return domain.length > 0 && (host === domain || host.endsWith(`.${domain}`));
+  };
+  if (deny.some(matches)) {
+    return `Blocked: ${host} is denied by the agent's browser domain policy.`;
+  }
+  if (allow.length > 0 && !allow.some(matches)) {
+    return `Blocked: ${host} is not in the agent's allowed browsing domains (agent domain policy is allow-only).`;
+  }
+  return undefined;
+}
+
+// Resolve the task's owning agent's BrowserDomainPolicy through the same
+// state channel activeBrowserRecord uses. Returns undefined — no policy,
+// nothing blocked — when no runtime instance is registered (tests / direct
+// tool callers), the task has no agentId (system-driven flows), or the
+// state read fails; the always-on SSRF gate still applies in every one of
+// those cases.
+function agentDomainPolicyForTask(taskId: string | undefined): BrowserDomainPolicy | undefined {
+  if (!runtimeInstance || !taskId) return undefined;
+  try {
+    const state = readState(runtimeInstance);
+    const agentId = state.tasks.find((task) => task.id === taskId)?.agentId;
+    if (!agentId) return undefined;
+    return state.agents.find((agent) => agent.id === agentId)?.browserDomainPolicy;
+  } catch {
+    return undefined;
+  }
+}
+
 // Shared origin boundary check for any tool that reads or executes against
 // the live page. Returns the safetyCheck reason — covering EVERY origin
 // safetyCheck refuses (loopback control-plane, cloud metadata, link-local)
-// — when the page's current URL is disallowed, otherwise undefined; bounces
+// — or the agent domain-policy reason when the page's current URL is
+// disallowed, otherwise undefined; bounces
 // the page to about:blank (best-effort) on a block. browser_navigate blocks
 // these targets up front, but a page can still settle on one afterward via
 // JS navigation, meta-refresh, a link click, or a CDP-attached tab already
@@ -1190,11 +1246,11 @@ export function safetyCheck(rawUrl: string, options: { allowLoopback?: boolean }
 // Test mocks pass minimal page stubs (often only `evaluate`). Guarding
 // url()/goto() behind typeof keeps those mocks from having to grow a
 // surface just to clear this check.
-async function disallowedOriginReason(page: Page): Promise<string | undefined> {
+async function disallowedOriginReason(page: Page, taskId?: string): Promise<string | undefined> {
   if (typeof page.url !== "function") return undefined;
   const currentUrl = page.url();
   if (!currentUrl || currentUrl === "about:blank") return undefined;
-  const blocked = safetyCheck(currentUrl);
+  const blocked = safetyCheck(currentUrl) ?? domainPolicyBlockReason(currentUrl, agentDomainPolicyForTask(taskId));
   if (!blocked) return undefined;
   if (typeof page.goto === "function") {
     try {
@@ -1270,7 +1326,7 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
   // (only evaluate is mocked, since the walker only needs DOM
   // access). Guard the url()/goto() calls behind typeof checks so
   // existing unit tests don't have to grow the mock surface.
-  const loopbackBlock = await disallowedOriginReason(page);
+  const loopbackBlock = await disallowedOriginReason(page, taskId);
   if (loopbackBlock) {
     throw new Error(`${loopbackBlock} (page settled on disallowed URL after a navigation; agent must not inspect this surface)`);
   }
@@ -2068,7 +2124,7 @@ function str(value: unknown): string | undefined {
 export async function browserNavigate(taskId: string, args: Record<string, unknown>): Promise<string> {
   const url = str(args.url);
   if (!url) return fail("Missing required string argument: url");
-  const blocked = safetyCheck(url);
+  const blocked = safetyCheck(url) ?? domainPolicyBlockReason(url, agentDomainPolicyForTask(taskId));
   if (blocked) return fail(blocked);
   try {
     return await withSession(taskId, async (session) => {
@@ -2125,7 +2181,9 @@ export async function browserNavigate(taskId: string, args: Record<string, unkno
       // a prior cleanup landed us there. Skip the post-nav block
       // for it; the snapshot() boundary check already special-
       // cases it the same way.
-      const postBlock = finalUrl === "about:blank" ? undefined : safetyCheck(finalUrl);
+      const postBlock = finalUrl === "about:blank"
+        ? undefined
+        : safetyCheck(finalUrl) ?? domainPolicyBlockReason(finalUrl, agentDomainPolicyForTask(taskId));
       if (postBlock) {
         try {
           await session.page.goto("about:blank", { waitUntil: "domcontentloaded" });
@@ -2592,7 +2650,7 @@ export async function browserConsole(taskId: string, args: Record<string, unknow
       // on a now-refused page so it can't surface on a later call.
       const preUrl = typeof session.page.url === "function" ? session.page.url() : "";
       if (preUrl && preUrl !== "about:blank") {
-        const preBlock = safetyCheck(preUrl);
+        const preBlock = safetyCheck(preUrl) ?? domainPolicyBlockReason(preUrl, agentDomainPolicyForTask(taskId));
         if (preBlock) {
           if (typeof session.page.goto === "function") {
             try {
@@ -2664,7 +2722,7 @@ export async function browserConsole(taskId: string, args: Record<string, unknow
       // messages (console output the page emitted): the write is already
       // blocked, but returning — or later resurfacing — that state would still
       // leak it, so drop the captured logs too.
-      const postEvalBlock = await disallowedOriginReason(session.page);
+      const postEvalBlock = await disallowedOriginReason(session.page, taskId);
       if (postEvalBlock) {
         consoleLogs.delete(taskId);
         return fail(`${postEvalBlock} (refusing to return console state from a disallowed origin)`);
@@ -2990,7 +3048,7 @@ export async function browserTabs(taskId: string, args: Record<string, unknown>)
         }
         const url = str(args.url);
         if (url) {
-          const blocked = safetyCheck(url);
+          const blocked = safetyCheck(url) ?? domainPolicyBlockReason(url, agentDomainPolicyForTask(taskId));
           if (blocked) return fail(blocked);
         }
         const page = await session.context.newPage();
@@ -3149,7 +3207,7 @@ export async function browserVision(
       // rendered pixels to the vision provider, so an unguarded screenshot of
       // a loopback page would exfiltrate control-plane state as an image —
       // the same surface browser_console and snapshot() already gate.
-      const visionBlock = await disallowedOriginReason(session.page);
+      const visionBlock = await disallowedOriginReason(session.page, taskId);
       if (visionBlock) {
         return fail(`${visionBlock} (refusing to screenshot a disallowed origin)`);
       }
@@ -3282,7 +3340,7 @@ export async function browserVision(
       // Re-check after the capture: if the page navigated to a refused origin
       // while the screenshot was in flight, discard the buffer rather than
       // sending its pixels to the vision provider.
-      const postShotBlock = await disallowedOriginReason(session.page);
+      const postShotBlock = await disallowedOriginReason(session.page, taskId);
       if (postShotBlock) {
         return fail(`${postShotBlock} (page navigated to a disallowed origin during capture; discarding screenshot)`);
       }
@@ -3702,8 +3760,8 @@ export const __test = {
   },
   // Expose the server-side loopback boundary check for direct unit
   // testing — snapshot() and browser_console both gate on it.
-  disallowedOriginReasonForTest(page: Page): Promise<string | undefined> {
-    return disallowedOriginReason(page);
+  disallowedOriginReasonForTest(page: Page, taskId?: string): Promise<string | undefined> {
+    return disallowedOriginReason(page, taskId);
   },
   // Seed / read the per-task console-log buffer so tests can assert that a
   // blocked browser_console call drops captured control-plane output.

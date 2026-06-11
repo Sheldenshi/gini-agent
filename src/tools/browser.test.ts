@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
@@ -19,6 +19,7 @@ import {
   closeAll,
   currentDisconnectGeneration,
   disconnectSharedBrowser,
+  domainPolicyBlockReason,
   hostnameIsLoopback,
   redactSecretValuesFromString,
   safetyCheck,
@@ -29,7 +30,7 @@ import { dispatchToolCall } from "../execution/tool-dispatch";
 import { resolveSetupRequest } from "../agent";
 import { completeBrowserConnectSetup } from "../capabilities/browser-connect";
 import { clearEchoVisionResponses, setEchoVisionResponse } from "../provider";
-import { createTask, mutateState, readState, upsertTask } from "../state";
+import { createAgentRecord, createTask, mutateState, readState, upsertTask } from "../state";
 import type { RuntimeConfig } from "../types";
 
 // Direct unit coverage for the URL safety guard. We exercise the function
@@ -236,6 +237,166 @@ describe("browser safetyCheck registered-secret URL gate", () => {
     const parsed = JSON.parse(raw) as { success: boolean; error?: string };
     expect(parsed.success).toBe(false);
     expect(raw).not.toContain(secret);
+  });
+});
+
+// Matching semantics for the per-agent browsing boundary. Pure-function
+// coverage; enforcement plumbing is covered in the describe below. See
+// ADR browser-domain-policy.md.
+describe("browser domainPolicyBlockReason", () => {
+  test("no policy or empty lists allow everything", () => {
+    expect(domainPolicyBlockReason("https://example.com/", undefined)).toBeUndefined();
+    expect(domainPolicyBlockReason("https://example.com/", {})).toBeUndefined();
+    expect(domainPolicyBlockReason("https://example.com/", { deny: [], allow: [] })).toBeUndefined();
+  });
+
+  test("deny matches the exact host and subdomains, case-insensitively", () => {
+    const policy = { deny: ["Tracker.Evil"] };
+    for (const url of [
+      "https://tracker.evil/",
+      "https://TRACKER.EVIL/path",
+      "https://sub.tracker.evil/",
+      "https://deep.sub.tracker.evil/"
+    ]) {
+      const result = domainPolicyBlockReason(url, policy);
+      expect(result).toBeDefined();
+      expect(result).toContain("domain policy");
+    }
+  });
+
+  test("deny is suffix-on-domain-boundary, not substring", () => {
+    const policy = { deny: ["example.com"] };
+    // notexample.com merely ends with the same bytes — no dot boundary.
+    expect(domainPolicyBlockReason("https://notexample.com/", policy)).toBeUndefined();
+    expect(domainPolicyBlockReason("https://example.com.attacker.net/", policy)).toBeUndefined();
+  });
+
+  test("non-empty allow switches to allow-only mode", () => {
+    const policy = { allow: ["example.com"] };
+    expect(domainPolicyBlockReason("https://example.com/", policy)).toBeUndefined();
+    expect(domainPolicyBlockReason("https://docs.example.com/", policy)).toBeUndefined();
+    const blocked = domainPolicyBlockReason("https://other.test/", policy);
+    expect(blocked).toBeDefined();
+    expect(blocked).toContain("other.test");
+    expect(blocked).toContain("allow-only");
+  });
+
+  test("deny beats allow when a host matches both lists", () => {
+    const policy = { deny: ["bad.example.com"], allow: ["example.com"] };
+    expect(domainPolicyBlockReason("https://example.com/", policy)).toBeUndefined();
+    const blocked = domainPolicyBlockReason("https://bad.example.com/", policy);
+    expect(blocked).toBeDefined();
+    expect(blocked).toContain("denied");
+  });
+
+  test("unparseable URLs pass through (safetyCheck owns that refusal)", () => {
+    expect(domainPolicyBlockReason("not a url", { deny: ["example.com"] })).toBeUndefined();
+  });
+});
+
+// Enforcement plumbing: the policy is read from the task's owning agent's
+// AgentRecord.browserDomainPolicy in state, checked at navigate pre-flight
+// and at the live-page origin boundary (post-redirect re-validation).
+describe("browser domain policy enforcement", () => {
+  const ROOT = "/tmp/gini-browser-domain-policy-tests";
+  const instance = `browser-domain-policy-${process.pid}`;
+
+  // Seed an agent carrying the policy and a task owned by it, register the
+  // instance with the browser layer, and hand back the task id.
+  async function seedPolicyTask(policy: { deny?: string[]; allow?: string[] }): Promise<string> {
+    process.env["GINI_STATE_ROOT"] = ROOT;
+    rmSync(`${ROOT}/instances/${instance}`, { recursive: true, force: true });
+    setBrowserInstance(instance);
+    return mutateState(instance, (state) => {
+      const agent = createAgentRecord(state, {
+        name: "policy-agent",
+        toolsets: [],
+        messagingTargets: [],
+        browserDomainPolicy: policy
+      });
+      const task = createTask(state.instance, "domain policy test", undefined, undefined, undefined, undefined, agent.id);
+      upsertTask(state, task);
+      return task.id;
+    });
+  }
+
+  // seedPolicyTask repoints GINI_STATE_ROOT for the duration of this
+  // describe; capture the incoming value at test time (other describes set
+  // it during collection) and restore it so later tests in this file read
+  // their own roots.
+  let priorStateRoot: string | undefined;
+  beforeAll(() => {
+    priorStateRoot = process.env["GINI_STATE_ROOT"];
+  });
+
+  afterEach(() => {
+    setBrowserInstance("default");
+  });
+
+  afterAll(() => {
+    if (priorStateRoot === undefined) delete process.env["GINI_STATE_ROOT"];
+    else process.env["GINI_STATE_ROOT"] = priorStateRoot;
+    rmSync(ROOT, { recursive: true, force: true });
+  });
+
+  test("browser_navigate fails pre-flight on a denied domain, naming it", async () => {
+    const taskId = await seedPolicyTask({ deny: ["tracker.evil"] });
+    const raw = await browserNavigate(taskId, { url: "https://sub.tracker.evil/pixel" });
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toContain("sub.tracker.evil");
+    expect(parsed.error).toContain("domain policy");
+  });
+
+  test("allow cannot override the SSRF gate (loopback stays blocked)", async () => {
+    const taskId = await seedPolicyTask({ allow: ["localhost"] });
+    const raw = await browserNavigate(taskId, { url: "http://localhost:3082/api/state" });
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toContain("loopback");
+  });
+
+  test("post-redirect re-validation bounces a page parked on a denied domain", async () => {
+    const taskId = await seedPolicyTask({ deny: ["tracker.evil"] });
+    const gotos: string[] = [];
+    const fakePage = {
+      url: () => "https://tracker.evil/landing",
+      goto: async (url: string) => {
+        gotos.push(url);
+        return null;
+      }
+    } as unknown as Parameters<typeof browserTest.disallowedOriginReasonForTest>[0];
+    const reason = await browserTest.disallowedOriginReasonForTest(fakePage, taskId);
+    expect(reason).toBeDefined();
+    expect(reason).toContain("tracker.evil");
+    expect(reason).toContain("domain policy");
+    expect(gotos).toEqual(["about:blank"]);
+  });
+
+  test("a page on a non-denied domain passes the origin boundary", async () => {
+    const taskId = await seedPolicyTask({ deny: ["tracker.evil"] });
+    const fakePage = {
+      url: () => "https://example.com/",
+      goto: async () => null
+    } as unknown as Parameters<typeof browserTest.disallowedOriginReasonForTest>[0];
+    expect(await browserTest.disallowedOriginReasonForTest(fakePage, taskId)).toBeUndefined();
+  });
+
+  test("tasks with no owning agent have no domain policy", async () => {
+    await seedPolicyTask({ deny: ["tracker.evil"] });
+    // A second task in the same state with NO agentId: the deny list above
+    // belongs to a different agent and must not bleed onto it.
+    const orphanTaskId = await mutateState(instance, (state) => {
+      const task = createTask(state.instance, "no agent", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+    setBrowserInstance(instance);
+    const fakePage = {
+      url: () => "https://tracker.evil/landing",
+      goto: async () => null
+    } as unknown as Parameters<typeof browserTest.disallowedOriginReasonForTest>[0];
+    expect(await browserTest.disallowedOriginReasonForTest(fakePage, orphanTaskId)).toBeUndefined();
   });
 });
 

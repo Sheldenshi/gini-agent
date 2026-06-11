@@ -9,6 +9,7 @@ Each file in this directory captures one architecture decision: the context, the
 - [Browser Fill-Secret Tool](browser-fill-secret.md)
 - [Browser Stealth Identity](browser-stealth-identity.md)
 - [Browser Automation Engine — In-Process playwright-core, Not agent-browser](browser-automation-engine.md)
+- [Per-Agent Browser Domain Policy](browser-domain-policy.md)
 - [Instances And Control Surface](instances-and-control-surface.md)
 - [Agent Loop With Native Tool Calling](agent-loop-tool-calling.md)
 - [Deferred Tools (Load-On-Demand Catalog)](deferred-tools.md)

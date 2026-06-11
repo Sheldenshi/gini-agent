@@ -1226,6 +1226,20 @@ export interface ModelCatalogEntry {
   routes: ModelRoute[];
 }
 
+// User-managed browsing boundary for one agent's browser tools. Entries
+// are bare domains (no scheme, no wildcards); a URL's host matches an
+// entry when it equals the entry or is a subdomain of it, case-insensitive
+// (`example.com` matches `sub.example.com`). `deny` always blocks first; a
+// non-empty `allow` additionally switches the agent to allow-only browsing.
+// Enforced in src/tools/browser.ts at navigate pre-flight AND at the
+// post-redirect / live-page origin boundary. The SSRF/loopback gate runs
+// first and cannot be overridden by `allow`. See ADR
+// browser-domain-policy.md.
+export interface BrowserDomainPolicy {
+  deny?: string[];
+  allow?: string[];
+}
+
 export interface AgentRecord {
   id: string;
   instance: Instance;
@@ -1235,6 +1249,10 @@ export interface AgentRecord {
   model?: string;
   toolsets: string[];
   messagingTargets: string[];
+  // Optional browsing domain policy. Absent ⇒ no domain restrictions
+  // beyond the always-on SSRF gate. User-managed by editing the agent
+  // record (no CLI/UI surface yet — see ADR browser-domain-policy.md).
+  browserDomainPolicy?: BrowserDomainPolicy;
   createdAt: string;
   updatedAt: string;
 }
