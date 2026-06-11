@@ -36,7 +36,8 @@ import {
   insertMemoryUnit,
   mutateState,
   now,
-  readState
+  readState,
+  recordProviderAuthFailure
 } from "../state";
 import { echoEmbed } from "../embeddings";
 import { resolveDefaultPriorContextTokenBudget } from "../provider-capabilities";
@@ -718,6 +719,130 @@ describe("chat-task loop", () => {
     expect((warning?.data as Record<string, unknown> | undefined)?.iterations).toBe(3);
 
     rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("a successful provider call clears the persistent needs-reauth record", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-reauth-clear");
+    const provider = normalizeProvider(config.provider);
+
+    // A prior turn recorded an echo auth failure (issue #233).
+    await mutateState(config.instance, (state) => {
+      recordProviderAuthFailure(state, { provider: "echo", detail: "token expired", taskId: "task_prior" });
+    });
+    expect(readState(config.instance).providerAuthFailures?.echo).toBeDefined();
+
+    setEchoToolCallingResponse({ provider, text: "All good again.", toolCalls: [], finishReason: "stop" });
+    const task = await submitTask(config, "say hi", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id);
+    expect(finished.status).toBe("completed");
+
+    // The successful call dropped the record and audited the clear.
+    const state = readState(config.instance);
+    expect(state.providerAuthFailures?.echo).toBeUndefined();
+    const cleared = state.audit.find((a) => a.action === "provider.auth.cleared" && a.target === "echo");
+    expect(cleared).toBeDefined();
+    expect(cleared?.evidence).toMatchObject({ provider: "echo", reason: "provider call succeeded" });
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("a healthy turn with no needs-reauth record writes no clear audit (no state churn)", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-reauth-nochurn");
+    const provider = normalizeProvider(config.provider);
+
+    setEchoToolCallingResponse({ provider, text: "Nothing to clear.", toolCalls: [], finishReason: "stop" });
+    const task = await submitTask(config, "say hi", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id);
+    expect(finished.status).toBe("completed");
+
+    // The clear seam fires only when a record exists — a healthy instance
+    // sees neither a record nor a provider.auth.cleared audit row.
+    const state = readState(config.instance);
+    expect(state.providerAuthFailures?.echo).toBeUndefined();
+    expect(state.audit.some((a) => a.action === "provider.auth.cleared")).toBe(false);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("an auth failure on the iteration-cap summary call persists the needs-reauth record", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    writeFileSync(join(workspaceRoot, "hello0.md"), "Hello (0)");
+    writeFileSync(join(workspaceRoot, "hello1.md"), "Hello (1)");
+    // The summary-failure path settles the task itself (it does not route
+    // through failTask), so it must write the persistent record on its own.
+    // Drive it with a REAL provider transport (openai + stubbed fetch): two
+    // streamed tool-call turns reach the cap, then the tool-less summary call
+    // gets a 401 whose body names a key fragment that must be redacted.
+    const config = buildConfig(workspaceRoot, "chat-task-reauth-summary", {
+      provider: { name: "openai", model: "gpt-test" },
+      agent: { maxIterations: 2 }
+    });
+
+    const prevKey = process.env.OPENAI_API_KEY;
+    const prevEmbed = process.env.GINI_EMBEDDING_PROVIDER;
+    const originalFetch = globalThis.fetch;
+    process.env.OPENAI_API_KEY = "sk-test-summary";
+    // Pin embeddings to the in-process echo provider so memory recall never
+    // routes through the stubbed fetch.
+    process.env.GINI_EMBEDDING_PROVIDER = "echo";
+
+    const sseToolCall = (i: number): Response => {
+      const events = [
+        { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: `call_s${i}`, type: "function", function: { name: "file_read", arguments: "" } }] } }] },
+        { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: JSON.stringify({ path: `hello${i}.md` }) } }] } }] },
+        { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] }
+      ];
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const enc = new TextEncoder();
+          for (const e of events) controller.enqueue(enc.encode(`data: ${JSON.stringify(e)}\n\n`));
+          controller.enqueue(enc.encode("data: [DONE]\n\n"));
+          controller.close();
+        }
+      });
+      return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
+    };
+    let calls = 0;
+    globalThis.fetch = ((() => {
+      calls += 1;
+      if (calls <= 2) return Promise.resolve(sseToolCall(calls - 1));
+      // The tool-less summary call is non-streaming; reject it like a dead
+      // credential would.
+      return Promise.resolve(new Response(
+        JSON.stringify({ error: { message: "Incorrect API key provided: sk-livefail123456" } }),
+        { status: 401, headers: { "content-type": "application/json" } }
+      ));
+    }) as unknown) as typeof fetch;
+
+    try {
+      const task = await submitTask(config, "loop forever", { mode: "chat" });
+      const finished = await waitForTerminal(config, task.id, 10000);
+
+      expect(finished.status).toBe("failed");
+      expect(finished.authErrorProvider).toBe("openai");
+      expect(finished.error).toBe("Incorrect API key provided: sk-***");
+
+      const state = readState(config.instance);
+      expect(state.providerAuthFailures?.openai).toMatchObject({
+        provider: "openai",
+        detail: "Incorrect API key provided: sk-***",
+        taskId: task.id
+      });
+      // The raw key fragment never lands in state.json.
+      expect(JSON.stringify(state.providerAuthFailures)).not.toContain("sk-livefail123456");
+      expect(
+        state.audit.find((a) => a.action === "provider.auth.needs_reauth" && a.target === "openai")
+      ).toBeDefined();
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (prevKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = prevKey;
+      if (prevEmbed === undefined) delete process.env.GINI_EMBEDDING_PROVIDER;
+      else process.env.GINI_EMBEDDING_PROVIDER = prevEmbed;
+      rmSync(workspaceRoot, { recursive: true, force: true });
+    }
   });
 
   // Loop-breaker (identical-repeat). A model that emits the IDENTICAL tool

@@ -9,10 +9,13 @@
 // warning and passes every other error through.
 //
 // LEAK SAFETY: mock.module is process-wide in `bun test` and can outlive the file
-// that set it, so every override SPREADS the real module and changes only the
-// exports this file needs; the canonical real namespaces are captured for both
-// spreading and the afterAll revert. None of these specifiers is the SUBJECT of
-// another rendering test, so the spread keeps any residual override harmless.
+// that set it, so the third-party overrides SPREAD the real module and revert in
+// afterAll. The local component stubs (RuntimeStreamBridge, ConnectionBanner,
+// UpdateGate) are NOT reverted on purpose — importing the real modules for a
+// spread would register them (plus their query/stream deps) against the 100%
+// coverage gate without covering them. Their own test files render the real
+// components, which is safe because the suite runs with --isolate (fresh module
+// registry per file — the structural backstop for all module mocks here).
 
 import { afterAll, beforeAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { render, screen } from "@testing-library/react";
@@ -40,6 +43,11 @@ beforeAll(async () => {
   mock.module("sonner", () => ({ ...realSonner, Toaster: () => <div data-testid="toaster-stub" /> }));
   mock.module("./RuntimeStreamBridge", () => ({
     RuntimeStreamBridge: () => <div data-testid="stream-bridge-stub" />
+  }));
+  // Same rationale: the real ConnectionBanner (and its useRuntimeStream dep)
+  // is covered by its own test file; the stub keeps this one's imports lean.
+  mock.module("./ConnectionBanner", () => ({
+    ConnectionBanner: () => <div data-testid="connection-banner-stub" />
   }));
   // Same rationale as RuntimeStreamBridge: don't pull the real UpdateGate src
   // (and its query/mutation deps) into the coverage gate. The stub renders its
@@ -71,16 +79,18 @@ describe("Providers", () => {
     pathname = "/chat";
     render(<Providers>{CHILD}</Providers>);
     expect(screen.queryByTestId("stream-bridge-stub")).not.toBeNull();
+    expect(screen.queryByTestId("connection-banner-stub")).not.toBeNull();
     expect(screen.queryByTestId("update-gate-stub")).not.toBeNull();
     expect(screen.queryByTestId("child")).not.toBeNull();
     expect(screen.queryByTestId("toaster-stub")).not.toBeNull();
     expect(screen.queryByTestId("theme-provider")).not.toBeNull();
   });
 
-  test("/pair: skips the RuntimeStreamBridge and update gate but still renders children", () => {
+  test("/pair: skips the RuntimeStreamBridge, banner, and update gate but still renders children", () => {
     pathname = "/pair";
     render(<Providers>{CHILD}</Providers>);
     expect(screen.queryByTestId("stream-bridge-stub")).toBeNull();
+    expect(screen.queryByTestId("connection-banner-stub")).toBeNull();
     expect(screen.queryByTestId("update-gate-stub")).toBeNull();
     expect(screen.queryByTestId("child")).not.toBeNull();
   });

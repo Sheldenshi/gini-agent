@@ -551,6 +551,45 @@ export interface SystemNoteBlock extends ChatBlockBase {
   authError?: SystemNoteAuthError;
 }
 
+// Persistent per-provider auth-failure record (issue #233). Written when a
+// ProviderAuthError fails a task (failTask records for any task mode,
+// including legacy imperative dispatch); cleared only at the seams that
+// prove the credential works again: a successful provider call in the
+// chat-task loop (main loop and the iteration-cap summary call), a
+// provider-config write or successful setup Verify through the setup API,
+// and provider removal. Successful provider calls outside the chat-task
+// loop do not clear. Only FAILURES are stored — a provider with no record is OK.
+// Lives on `RuntimeState.providerAuthFailures`, keyed by provider name, so
+// persistent surfaces (Settings → Providers, /api/providers/catalog) can
+// report "needs re-authentication" instead of presence-only "Connected".
+// See ADR provider-reauth-guidance.md.
+export interface ProviderAuthFailureRecord {
+  // Provider whose credential failed (e.g. "codex").
+  provider: ProviderName;
+  // The provider's error message, redacted via redactSecrets by the writer —
+  // some providers echo a partial key in their auth error.
+  detail: string;
+  // ISO timestamp when the failure was recorded.
+  at: string;
+  // Task whose provider call observed the failure, for the audit trail.
+  taskId?: string;
+}
+
+// Per-provider auth status surfaced on the /api/providers/catalog payload.
+// "ok" means no failure record exists; "needs_reauth" means a provider call
+// failed on a credential error and nothing has cleared it since.
+export type ProviderAuthStatus = "ok" | "needs_reauth";
+
+// Re-auth payload accompanying `authStatus: "needs_reauth"` on the catalog.
+// `reauthKind`/`reauthUrl` mirror SystemNoteAuthError so the Settings card and
+// the chat note render the same CTA (derived via providerReauth at read time).
+export interface ProviderReauthInfo {
+  detail: string;
+  at: string;
+  reauthKind: "docs" | "settings" | "aws";
+  reauthUrl: string;
+}
+
 export type ChatBlock =
   | UserTextBlock
   | AssistantTextBlock
@@ -647,6 +686,11 @@ export interface RuntimeState {
   // full block is re-emitted to bound the delta-reconstruction depth.
   // Optional so legacy state files don't need a schema migration.
   identitySnapshots?: Record<string, IdentitySnapshotRecord>;
+  // Per-provider needs-reauth records (issue #233). Absence of a key means
+  // that provider's credential is OK as far as the runtime knows. Optional
+  // so legacy state files don't need a schema migration; the helpers in
+  // src/state/provider-auth.ts treat undefined as empty.
+  providerAuthFailures?: Partial<Record<ProviderName, ProviderAuthFailureRecord>>;
 }
 
 // Captured agent-runtime identity surfaced into the system prompt so

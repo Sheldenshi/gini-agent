@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { GATEWAY_RESTARTING_MESSAGE, GATEWAY_UNREACHABLE_CODE } from "./gateway-codes";
 import { parseTrustedOriginUrls } from "./trusted-origins";
 
 // Headers we forward verbatim from the browser to the runtime. Last-Event-ID
@@ -28,6 +29,17 @@ interface FileCache {
 }
 const fileCacheTtlMs = 2000;
 const fileCache: Map<string, FileCache> = new Map();
+
+/** Test-only seam: lets tests expire/inspect cache entries instead of
+ * sleeping out the real TTL. */
+export const __fileCacheTestHooks = {
+  clear(): void {
+    fileCache.clear();
+  },
+  entry(path: string): FileCache | undefined {
+    return fileCache.get(path);
+  }
+};
 
 function readFileWithMtimeCache(path: string): string | null {
   const now = Date.now();
@@ -106,6 +118,46 @@ export interface ProxyOptions {
   signal?: AbortSignal;
 }
 
+// A gateway restart is routine (auto-update, watchdog kickstart), so the BFF
+// answers for it with a retryable 503 + JSON body instead of letting the
+// fetch rejection escape the route handler — which Next.js would turn into a
+// bare empty-body 500 that crashes response.json() in every client.
+export function gatewayUnreachableResponse(): Response {
+  return Response.json(
+    { error: GATEWAY_RESTARTING_MESSAGE, code: GATEWAY_UNREACHABLE_CODE },
+    { status: 503, headers: { "retry-after": "2" } }
+  );
+}
+
+// Server-side trail for the unreachable path. Catching the upstream
+// rejection means Next.js no longer dumps a stack trace per failed proxy
+// request — but those traces were the only record of WHICH address the BFF
+// dialed and WHY it failed, the load-bearing datum when the cause is a
+// persistent misconfig (stale port file, wrong instance) rather than a
+// restart blip. Log one line with target + cause, deduplicated so a normal
+// restart window (dozens of polls against the same dead port) emits one
+// entry instead of a storm; a changed message (different port, different
+// errno) logs immediately.
+const UNREACHABLE_LOG_INTERVAL_MS = 10_000;
+let lastUnreachableLog = { message: "", at: 0 };
+
+function logGatewayUnreachable(target: string, err: unknown): void {
+  const cause =
+    err instanceof Error ? String((err.cause as Error | undefined)?.message ?? err.cause ?? err.message) : String(err);
+  const message = `[bff] gateway unreachable: ${target} (${cause})`;
+  const now = Date.now();
+  if (message === lastUnreachableLog.message && now - lastUnreachableLog.at < UNREACHABLE_LOG_INTERVAL_MS) return;
+  lastUnreachableLog = { message, at: now };
+  console.error(message);
+}
+
+/** Test-only seam: reset the dedup latch between cases. */
+export const __unreachableLogTestHooks = {
+  reset(): void {
+    lastUnreachableLog = { message: "", at: 0 };
+  }
+};
+
 // Forward a small allowlist of response headers from the upstream runtime.
 // The QR endpoints (and any future bearer-gated response that needs
 // browser-caching control) set `Cache-Control: no-store`; without this
@@ -178,7 +230,16 @@ export async function proxyRequest(
     if (body.byteLength > 0) init.body = body;
   }
   const fetcher = options.fetcher ?? fetch;
-  const upstream = await fetcher(target, init);
+  let upstream: Response;
+  try {
+    upstream = await fetcher(target, init);
+  } catch (err) {
+    // The client went away (navigation/unmount) — let the platform handle the
+    // aborted request rather than fabricating a response for nobody.
+    if (signal?.aborted) throw err;
+    logGatewayUnreachable(target, err);
+    return gatewayUnreachableResponse();
+  }
   const isStream = upstream.headers.get("content-type")?.includes("text/event-stream");
   if (isStream) {
     // Return the upstream body directly without materializing — preserves chunking
@@ -384,20 +445,6 @@ export function guardCsrf(request: Request, _pathSegments: string[]): Response |
   }
 
   return null;
-}
-
-export async function runtimeFetch(path: string, init: RequestInit = {}): Promise<Response> {
-  const headers = new Headers(init.headers);
-  headers.set("authorization", `Bearer ${runtimeToken()}`);
-  if (!headers.has("content-type") && init.body) headers.set("content-type", "application/json");
-  return fetch(`${runtimeUrl()}${path}`, { ...init, headers });
-}
-
-export async function runtimeJson<T = unknown>(path: string, init: RequestInit = {}): Promise<T> {
-  const response = await runtimeFetch(path, init);
-  const value = (await response.json()) as { error?: string };
-  if (!response.ok) throw new Error(value.error ?? `HTTP ${response.status}`);
-  return value as T;
 }
 
 export function pickForwardHeaders(headers: Headers): Headers {

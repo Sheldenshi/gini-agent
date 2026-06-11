@@ -13,8 +13,8 @@
 //   - `<prefix>.<instance>.gateway`  — the Bun runtime (src/server.ts)
 //   - `<prefix>.<instance>.web`      — Next.js dev server, gated on the
 //                                      gateway's /api/healthz coming up
-//   - `<prefix>.<instance>.watchdog` — periodic health probe (StartInterval)
-//                                      that revives a dead/hung gateway/web
+//   - `<prefix>.<instance>.watchdog` — long-lived health-probe loop that
+//                                      revives a dead/hung gateway/web
 //
 // Scope notes:
 //   - macOS only in v1. Linux systemd --user parity is a follow-up.
@@ -117,7 +117,7 @@ export interface LaunchSpec {
 export interface LaunchSpecPair {
   gateway: LaunchSpec;
   web: LaunchSpec;
-  // The periodic health watchdog (StartInterval one-shot). Carries no
+  // The health watchdog (a long-lived KeepAlive probe loop). Carries no
   // provider secrets — it only probes localhost health endpoints and shells
   // out to launchctl.
   watchdog: LaunchSpec;
@@ -341,9 +341,10 @@ export function resolveLaunchSpecPair(options: ResolveLaunchOptions): LaunchSpec
     environment: webEnv
   };
 
-  // Watchdog plist: a periodic one-shot (StartInterval, see generatePlist)
-  // that runs `gini watchdog --instance <name>`, probes the gateway +
-  // web health endpoints, and kickstarts whichever is dead/hung. It needs
+  // Watchdog plist: a long-lived KeepAlive job (see generatePlist) that
+  // runs `gini watchdog --instance <name>` — an in-process probe loop over
+  // the gateway + web health endpoints that kickstarts whichever is
+  // dead/hung. It needs
   // NO provider secrets (it only hits localhost health endpoints and shells
   // out to launchctl), so the env is the base PATH/HOME/LANG plus the
   // launchd marker and GINI_INSTANCE — same minimal surface as the web env
@@ -382,19 +383,15 @@ export interface SupervisedService {
   // stdout tees.
   stdoutLogFilename: string;
   stderrLogFilename: string;
-  // Set only for the watchdog kind: the periodic one-shot interval (seconds)
-  // that drives the plist's StartInterval. gateway/web leave this undefined
-  // (they are KeepAlive long-lived jobs, not periodic).
+  // Reserved for a periodic one-shot kind: the interval (seconds) that drives
+  // the plist's StartInterval. All three current kinds leave this undefined
+  // (they are KeepAlive long-lived jobs) — the watchdog used to be a
+  // StartInterval one-shot, but launchd's spawn deferral on macOS 26 gapped
+  // its ticks in exactly the outage windows it exists to cover,
+  // so it now runs its own probe loop in one long-lived process.
   startIntervalSeconds?: number;
   resolution: "installed" | "source";
 }
-
-// How often the watchdog launchd job re-runs `gini watchdog`. A periodic
-// one-shot (StartInterval), NOT a KeepAlive long-lived job: launchd relaunches
-// it every N seconds. 30s bounds detection latency for a dead/hung web or
-// runtime without spinning the CPU. Overlaps benignly with the gateway/web
-// ThrottleInterval — a kickstart against an already-running job is a no-op.
-export const WATCHDOG_START_INTERVAL_SECONDS = 30;
 
 export interface SupervisedServicesOptions extends ResolveLaunchOptions {
   // Narrow to a subset of kinds. Defaults to all three
@@ -434,7 +431,6 @@ export function supervisedServices(options: SupervisedServicesOptions): Supervis
     spec: specForKind[kind],
     stdoutLogFilename: stdoutForKind[kind],
     stderrLogFilename: stderrForKind[kind],
-    ...(kind === "watchdog" ? { startIntervalSeconds: WATCHDOG_START_INTERVAL_SECONDS } : {}),
     resolution: pair.resolution
   }));
 }
@@ -682,10 +678,10 @@ export interface PlistStampInput {
   programArguments: string[];
   workingDirectory: string;
   processType: string;
-  // The scheduling shape. Periodic (watchdog) carries startIntervalSeconds and
-  // a true keepAlive=false; long-lived (gateway/web) carries keepAlive=true and
-  // a throttleIntervalSeconds. We record both numbers explicitly so a change to
-  // either interval re-stamps.
+  // The scheduling shape. A periodic kind would carry startIntervalSeconds
+  // and keepAlive=false; the long-lived kinds (gateway/web/watchdog — all
+  // three today) carry keepAlive=true and a throttleIntervalSeconds. We
+  // record both numbers explicitly so a change to either interval re-stamps.
   keepAlive: boolean;
   throttleIntervalSeconds: number | null;
   startIntervalSeconds: number | null;
@@ -785,8 +781,8 @@ export interface PlistOptions {
   throttleIntervalSeconds?: number;
   // When set, emit a periodic one-shot plist instead of a long-lived one:
   // `StartInterval` (launchd relaunches every N seconds) + `RunAtLoad`, and
-  // NO `KeepAlive`. Used for the watchdog. When omitted, the plist is a
-  // KeepAlive long-lived job (gateway/web).
+  // NO `KeepAlive`. No current kind uses this; when omitted, the plist is a
+  // KeepAlive long-lived job (all three kinds today).
   startIntervalSeconds?: number;
 }
 
@@ -866,12 +862,16 @@ export function generatePlist(options: PlistOptions): string {
   // crash respawn.
   //
   // Scheduling block differs by job shape:
-  //   - Long-lived (gateway/web): KeepAlive:true + ThrottleInterval. launchd
-  //     always respawns on exit; bootout is the stop.
-  //   - Periodic (watchdog): StartInterval + RunAtLoad and NO KeepAlive. The
-  //     watchdog is a short-lived probe that always exits 0 — KeepAlive would
-  //     respawn it in a tight loop the instant it finishes. StartInterval is
-  //     the right primitive: launchd reruns it every N seconds.
+  //   - Long-lived (gateway/web/watchdog): KeepAlive:true + ThrottleInterval.
+  //     launchd always respawns on exit; bootout is the stop. The watchdog is
+  //     long-lived too — its probe cadence is an in-process loop, NOT launchd
+  //     StartInterval respawns, because launchd's spawn deferral (macOS 26)
+  //     gapped StartInterval ticks during the very gateway outages the
+  //     watchdog exists to cover.
+  //   - Periodic (startIntervalSeconds set): StartInterval + RunAtLoad and NO
+  //     KeepAlive — for a short-lived job that exits after each run, where
+  //     KeepAlive would respawn it in a tight loop. No current kind uses this
+  //     shape; the machinery stays for future periodic jobs.
   const scheduling = periodic
     ? `    <key>RunAtLoad</key>
     <true/>
@@ -928,7 +928,7 @@ export interface WritePlistOptions {
   stderrPath: string;
   throttleIntervalSeconds?: number;
   // Forwarded to generatePlist: when set, writes a periodic (StartInterval,
-  // no KeepAlive) plist instead of a long-lived one. Set for the watchdog.
+  // no KeepAlive) plist instead of a long-lived one. No current kind sets it.
   startIntervalSeconds?: number;
 }
 

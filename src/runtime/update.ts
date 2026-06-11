@@ -151,9 +151,15 @@ export function scheduleRuntimeRestart(instance: Instance, options: ScheduleRest
   // already run `git reset --hard` + `bun install` synchronously by the
   // time we get here, so the working tree is the fresh code with no
   // install/respawn race. We:
-  //   1. Spawn a detached, unref'd `gini autostart kick --kind web` so the
-  //      web service re-execs with any new web/ deps. It must survive our
-  //      own exit, so it's detached and we self-SIGTERM after.
+  //   1. Spawn detached, unref'd `gini autostart kick` children for the web
+  //      service (re-execs with any new web/ deps) AND the watchdog. The
+  //      watchdog is a long-lived KeepAlive loop, so nothing else replaces
+  //      its process on a code-only update — neither KeepAlive (it never
+  //      exits) nor the plist-stamp reconcile (the template is unchanged);
+  //      without the kick it would run the old code until logout. Both
+  //      children must survive our own exit, so they're detached and we
+  //      self-SIGTERM after. The gateway is NOT kicked — a kickstart -k
+  //      would force-kill it mid-drain; its restart is the self-SIGTERM.
   //   2. Self-SIGTERM. The server's SIGTERM handler drains and exits 0;
   //      KeepAlive:true respawns the gateway with the fresh code.
   // This keeps the gateway under launchd supervision (no detached
@@ -161,17 +167,19 @@ export function scheduleRuntimeRestart(instance: Instance, options: ScheduleRest
   // it outside KeepAlive).
   if (supervisor() === "launchd") {
     try {
-      const child = spawnFn(process.execPath, [
-        "run", "gini", "autostart", "kick",
-        "--instance", instance,
-        "--kind", "web"
-      ], {
-        cwd: root,
-        detached: true,
-        stdio: ["ignore", outFd, errFd],
-        env: { ...process.env, GINI_INSTANCE: instance }
-      });
-      if (typeof child.unref === "function") child.unref();
+      for (const kind of ["web", "watchdog"] as const) {
+        const child = spawnFn(process.execPath, [
+          "run", "gini", "autostart", "kick",
+          "--instance", instance,
+          "--kind", kind
+        ], {
+          cwd: root,
+          detached: true,
+          stdio: ["ignore", outFd, errFd],
+          env: { ...process.env, GINI_INSTANCE: instance }
+        });
+        if (typeof child.unref === "function") child.unref();
+      }
     } catch (error) {
       try {
         appendFileSync(logFile, `[${new Date().toISOString()}] kick spawn failed: ${error instanceof Error ? error.message : String(error)}\n`);

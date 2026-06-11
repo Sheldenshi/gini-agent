@@ -26,7 +26,7 @@ import { displayProviderName, type ProviderCatalogItem } from "@/lib/providers";
 const SELECTABLE_PROVIDERS = ["codex", "openai", "anthropic", "bedrock", "openrouter", "deepseek", "azure", "local"] as const;
 
 const PROVIDER_VISUAL: Record<string, { icon: React.ComponentType<{ className?: string }>; description: string }> = {
-  codex: { icon: TerminalIcon, description: "OAuth via codex --login" },
+  codex: { icon: TerminalIcon, description: "OAuth via codex login" },
   openai: { icon: OpenAILogo, description: "GPT-5.4, GPT-5.4 mini, …" },
   anthropic: { icon: AnthropicLogo, description: "Claude (first-party API key)" },
   bedrock: { icon: BedrockLogo, description: "Claude, Nova, Llama… on AWS" },
@@ -260,10 +260,10 @@ export default function AddProviderPage() {
                 <p className="text-sm text-foreground">
                   Run this in your terminal, then click Verify Codex auth:
                 </p>
-                <pre className="rounded-md bg-muted px-4 py-3 font-mono text-xs text-foreground">codex --login</pre>
+                <pre className="rounded-md bg-muted px-4 py-3 font-mono text-xs text-foreground">codex login</pre>
                 <p className="text-xs text-muted-foreground">
                   Gini reads <code className="rounded bg-muted px-1 py-0.5 font-mono text-[11px]">~/.codex/auth.json</code> on
-                  every request, so a future <code className="rounded bg-muted px-1 py-0.5 font-mono text-[11px]">codex --login</code> refresh is picked up automatically.
+                  every request, so a future <code className="rounded bg-muted px-1 py-0.5 font-mono text-[11px]">codex login</code> refresh is picked up automatically.
                 </p>
               </div>
             ) : isBedrock ? (

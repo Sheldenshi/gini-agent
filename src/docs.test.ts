@@ -19,7 +19,7 @@ describe("readDocSection", () => {
     // Starts with the section heading itself (the panel header shows the H1).
     expect(result.markdown.startsWith("## Re-authentication")).toBe(true);
     // Includes the numbered steps.
-    expect(result.markdown).toContain("Type `/logout` and press Enter");
+    expect(result.markdown).toContain("Run `codex logout` to clear the expired credential");
     // Includes the nested ### sub-section.
     expect(result.markdown).toContain("### If you authenticate with `OPENAI_API_KEY` instead");
     // Excludes the intro paragraph above the section.

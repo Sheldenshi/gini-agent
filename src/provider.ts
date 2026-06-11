@@ -7,7 +7,7 @@ import { readState } from "./state";
 import { appendTrace } from "./state/trace";
 import { bedrockSupportsStreamingWithTools, bedrockSupportsToolUse, resolveProviderModality } from "./provider-capabilities";
 import { resolveAwsCredentials, signAwsRequest } from "./aws-sigv4";
-import type { CostRecord, ProviderCatalogItem, ProviderConfig, ProviderName, ProviderResult, RuntimeConfig, SystemNoteAuthError } from "./types";
+import type { CostRecord, ProviderAuthFailureRecord, ProviderAuthStatus, ProviderCatalogItem, ProviderConfig, ProviderName, ProviderReauthInfo, ProviderResult, RuntimeConfig, SystemNoteAuthError } from "./types";
 
 const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
 const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
@@ -210,6 +210,30 @@ export function providerCatalogWithStatus(
     ...item,
     configured: isProviderConfigured(item.name, activeProviderName, activeApiKeyEnv, activeBaseUrl)
   }));
+}
+
+// Catalog enrichment with the persistent per-provider auth status (issue
+// #233). `authStatus: "needs_reauth"` plus a `reauth` payload (redacted
+// detail, failure timestamp, and the same reauthKind/reauthUrl routing the
+// chat note carries — derived via providerReauth at read time) when a
+// needs-reauth record exists for the provider; `authStatus: "ok"` otherwise.
+// Layered on top of providerCatalogWithStatus by the /api/providers/catalog
+// handler — the records live in runtime state, which the pure catalog
+// builders deliberately don't read.
+export function withProviderAuthStatus<T extends { name: ProviderCatalogItem["name"] }>(
+  items: T[],
+  providerAuthFailures: Partial<Record<ProviderName, ProviderAuthFailureRecord>> | undefined
+): Array<T & { authStatus: ProviderAuthStatus; reauth?: ProviderReauthInfo }> {
+  return items.map((item) => {
+    const record = providerAuthFailures?.[item.name as ProviderName];
+    if (!record) return { ...item, authStatus: "ok" as const };
+    const target = providerReauth(record.provider);
+    return {
+      ...item,
+      authStatus: "needs_reauth" as const,
+      reauth: { detail: record.detail, at: record.at, reauthKind: target.kind, reauthUrl: target.url }
+    };
+  });
 }
 
 export function providerCatalog(): ProviderCatalogItem[] {
@@ -743,40 +767,59 @@ export async function generateToolCallingResponse(
     return result;
   }
 
-  // Codex/responses API. Route to the native function-calling responses
-  // path whenever tools are present OR the message history already
-  // contains tool-calling traffic (assistant tool_calls / tool results).
-  // The latter matters for the graceful-exhaustion summary call: it
-  // passes `tools: []` but needs the prior tool transcript preserved so
-  // the model can summarize what it learned. Falling back to the text-
-  // only `/responses` path here would strip that transcript.
-  if (provider.name === "codex") {
-    if (tools.length > 0 || messagesContainToolTraffic(messages)) {
-      return callToolCallingResponses(provider, messages, tools, onDelta);
+  const dispatch = async (): Promise<ToolCallingResult> => {
+    // Codex/responses API. Route to the native function-calling responses
+    // path whenever tools are present OR the message history already
+    // contains tool-calling traffic (assistant tool_calls / tool results).
+    // The latter matters for the graceful-exhaustion summary call: it
+    // passes `tools: []` but needs the prior tool transcript preserved so
+    // the model can summarize what it learned. Falling back to the text-
+    // only `/responses` path here would strip that transcript.
+    if (provider.name === "codex") {
+      if (tools.length > 0 || messagesContainToolTraffic(messages)) {
+        return callToolCallingResponses(provider, messages, tools, onDelta);
+      }
+      const systemContext = stitchSystemFromMessages(messages);
+      const userInput = lastUserText || "";
+      const text = await callOpenAIResponses(provider, userInput, systemContext, onDelta);
+      return {
+        provider: text.provider,
+        text: text.text,
+        toolCalls: [],
+        finishReason: "stop",
+        responseId: text.responseId,
+        usage: text.usage,
+        cost: text.cost
+      };
     }
-    const systemContext = stitchSystemFromMessages(messages);
-    const userInput = lastUserText || "";
-    const text = await callOpenAIResponses(provider, userInput, systemContext, onDelta);
-    return {
-      provider: text.provider,
-      text: text.text,
-      toolCalls: [],
-      finishReason: "stop",
-      responseId: text.responseId,
-      usage: text.usage,
-      cost: text.cost
-    };
-  }
 
-  if (provider.name === "anthropic") {
-    return callAnthropicMessages(provider, messages, tools, onDelta);
-  }
+    if (provider.name === "anthropic") {
+      return callAnthropicMessages(provider, messages, tools, onDelta);
+    }
 
-  if (provider.name === "bedrock") {
-    return callBedrockConverse(provider, messages, tools, onDelta);
-  }
+    if (provider.name === "bedrock") {
+      return callBedrockConverse(provider, messages, tools, onDelta);
+    }
 
-  return callToolCallingChatCompletions(provider, messages, tools, onDelta);
+    return callToolCallingChatCompletions(provider, messages, tools, onDelta);
+  };
+  try {
+    return await dispatch();
+  } catch (error) {
+    // Pin auth attribution to the provider resolved at THIS call's entry.
+    // The chat-task wraps tag with the loop's effective-context snapshot,
+    // but an instance-sourced call late-binds config.provider above — a
+    // provider switch landing mid-turn (Settings POST or the agent's own
+    // set_provider) would otherwise let an untyped 401 from the OLD
+    // provider be recorded under the NEW provider's needs-reauth key.
+    // Typed errors (anthropic/bedrock/codex local throws, codex session
+    // errors) already carry the correct hard-coded name and pass through.
+    const message = error instanceof Error ? error.message : String(error);
+    if (!(error instanceof ProviderAuthError) && isAuthExpiredError(message)) {
+      throw new ProviderAuthError(provider.name, message);
+    }
+    throw error;
+  }
 }
 
 // True when the message array carries assistant `tool_calls` entries or
@@ -2701,46 +2744,62 @@ export async function generateTaskSummary(
   const systemContext = recalledBlock.length > 0
     ? `${stablePrefix}\n\n${recalledBlock}`
     : stablePrefix;
-  if (provider.name === "anthropic" || provider.name === "bedrock") {
-    const result = provider.name === "bedrock"
-      ? await callBedrockConverse(
-          provider,
-          [
-            { role: "system", content: systemContext },
-            { role: "user", content: input }
-          ],
-          [],
-          onDelta
-        )
-      : await callAnthropicMessages(
-          provider,
-          [
-            { role: "system", content: systemContext },
-            { role: "user", content: input }
-          ],
-          [],
-          onDelta
-        );
-    return {
-      provider: result.provider,
-      text: result.text || "The model returned no text output.",
-      responseId: result.responseId,
-      usage: result.usage,
-      cost: result.cost
-    };
+  const dispatch = async (): Promise<ProviderResult> => {
+    if (provider.name === "anthropic" || provider.name === "bedrock") {
+      const result = provider.name === "bedrock"
+        ? await callBedrockConverse(
+            provider,
+            [
+              { role: "system", content: systemContext },
+              { role: "user", content: input }
+            ],
+            [],
+            onDelta
+          )
+        : await callAnthropicMessages(
+            provider,
+            [
+              { role: "system", content: systemContext },
+              { role: "user", content: input }
+            ],
+            [],
+            onDelta
+          );
+      return {
+        provider: result.provider,
+        text: result.text || "The model returned no text output.",
+        responseId: result.responseId,
+        usage: result.usage,
+        cost: result.cost
+      };
+    }
+    if (
+      provider.name === "openrouter" ||
+      provider.name === "local" ||
+      provider.name === "deepseek" ||
+      // Azure OpenAI exposes deployment-scoped chat/completions, not the flat
+      // /responses surface this path uses for standard OpenAI — route it through
+      // the chat-completions builder so the URL + api-key header come out right.
+      provider.name === "azure"
+    ) {
+      return callChatCompletions(provider, input, systemContext);
+    }
+    return callOpenAIResponses(provider, input, systemContext, onDelta);
+  };
+  try {
+    return await dispatch();
+  } catch (error) {
+    // Same resolved-provider auth tagging as generateToolCallingResponse:
+    // this is the imperative path's model call (runTask → failTask), and
+    // failTask records the needs-reauth state only for typed errors — an
+    // untyped 401 here would leave sessionless tasks invisible to the
+    // amber Settings row (issue #233).
+    const message = error instanceof Error ? error.message : String(error);
+    if (!(error instanceof ProviderAuthError) && isAuthExpiredError(message)) {
+      throw new ProviderAuthError(provider.name, message);
+    }
+    throw error;
   }
-  if (
-    provider.name === "openrouter" ||
-    provider.name === "local" ||
-    provider.name === "deepseek" ||
-    // Azure OpenAI exposes deployment-scoped chat/completions, not the flat
-    // /responses surface this path uses for standard OpenAI — route it through
-    // the chat-completions builder so the URL + api-key header come out right.
-    provider.name === "azure"
-  ) {
-    return callChatCompletions(provider, input, systemContext);
-  }
-  return callOpenAIResponses(provider, input, systemContext, onDelta);
 }
 
 // Best-effort active-agent resolution for the legacy single-shot path.
@@ -3457,7 +3516,16 @@ function readOpenAIBearer(provider: ProviderConfig): string {
   const envName = provider.apiKeyEnv ?? "OPENAI_API_KEY";
   const apiKey = process.env[envName];
   if (!apiKey) {
-    throw new Error(`${providerDisplayLabel(provider.name)} provider is configured but ${envName} is not set.`);
+    // Typed so failTask records the needs-reauth state and renders the named
+    // re-auth CTA for a key unset mid-turn (mirrors readAnthropicKey and
+    // bedrock) — the message itself never matches the chat-task classifier
+    // ("is not set" carries no auth verb, and `_` is a word char so the env
+    // var name hides the api-key noun), so an untyped throw here would leave
+    // the whole OpenAI-compatible family invisible to the amber Settings row.
+    throw new ProviderAuthError(
+      provider.name,
+      `${providerDisplayLabel(provider.name)} provider is configured but ${envName} is not set.`
+    );
   }
   return apiKey;
 }
@@ -3495,7 +3563,12 @@ function readCodexBearer(provider: ProviderConfig): string {
     if (credentials.transient) {
       throw new CodexAuthRaceError(credentials.message);
     }
-    throw new Error(credentials.message);
+    // Steady-state credential absence (file missing — the post-`codex logout`
+    // state — or a file without OPENAI_API_KEY / tokens.access_token) is
+    // typed so failTask names the codex credential and emits the re-auth CTA
+    // note directly — typed errors bypass the chat-task message classifier
+    // (mirrors anthropic/bedrock; issue #233).
+    throw new ProviderAuthError("codex", credentials.message);
   }
   return credentials.bearer;
 }
@@ -3577,8 +3650,9 @@ function extractStreamErrorMessage(payload: Record<string, unknown>): string | u
 // reader observing the file between the truncate and the flush can
 // see an empty or partial JSON document. An immediate retry would race
 // that writer; a small wait lets the rewrite settle so the second
-// attempt reads a complete file.
-const CODEX_RETRY_REWRITE_DELAY_MS = 50;
+// attempt reads a complete file. Exported so other auth.json readers
+// (the codex connector probe) can wait out the same window.
+export const CODEX_RETRY_REWRITE_DELAY_MS = 50;
 
 // Single-retry wrapper for codex /responses calls. The codex CLI rotates
 // access tokens out-of-band; a request in flight at the moment of
@@ -3606,7 +3680,21 @@ async function withCodexSessionRetry<T>(make: () => Promise<T>): Promise<T> {
       throw err;
     }
     await new Promise<void>((resolve) => setTimeout(resolve, CODEX_RETRY_REWRITE_DELAY_MS));
-    return await make();
+    try {
+      return await make();
+    } catch (retryErr) {
+      // A second consecutive auth.json read failure is no longer a mid-write
+      // race — the file is persistently unreadable or corrupt, which is a
+      // credential problem the user must fix. Surface it typed so failTask
+      // renders the codex re-auth CTA directly (issue #233); typed errors
+      // bypass the chat-task message classifier. A second
+      // CodexSessionExpiredError stays untouched: its backend message
+      // already matches isAuthExpiredError downstream.
+      if (retryErr instanceof CodexAuthRaceError) {
+        throw new ProviderAuthError("codex", retryErr.message);
+      }
+      throw retryErr;
+    }
   }
 }
 
@@ -3627,7 +3715,7 @@ function readCodexCredentials(provider: ProviderConfig): {
     return {
       ok: false,
       authPath,
-      message: `No Codex credentials found at ${authPath}. Run codex --login or set CODEX_AUTH_JSON.`
+      message: `No Codex credentials found at ${authPath}. Run codex login or set CODEX_AUTH_JSON.`
     };
   }
 
@@ -3682,6 +3770,63 @@ function readCodexCredentials(provider: ProviderConfig): {
 export function hasUsableCodexCredentials(provider?: ProviderConfig): boolean {
   const probe = provider ?? { name: "codex" as const, model: DEFAULT_CODEX_MODEL };
   return readCodexCredentials(probe).ok;
+}
+
+// Bearer-free view of the codex credential state for health probes (the codex
+// connector module). Routes through the same readCodexCredentials resolution
+// the provider uses — CODEX_AUTH_JSON honored as a filesystem path, default
+// ~/.codex/auth.json otherwise — and additionally decodes the JWT `exp` claim
+// off an OAuth access token so a probe can call out an already-expired token
+// WITHOUT a network round-trip. Deliberately never exposes the bearer itself.
+export interface CodexCredentialProbe {
+  ok: boolean;
+  authPath: string;
+  credentialType?: "api_key" | "access_token";
+  message: string;
+  // Unix epoch seconds from the access token's JWT `exp` claim. Undefined for
+  // api_key-shaped credentials (no expiry to read) and for tokens that don't
+  // parse as a JWT — an unparseable token is UNKNOWN, not unhealthy.
+  accessTokenExp?: number;
+  // True when the failure is plausibly a mid-rewrite read of auth.json
+  // (readFileSync threw, or JSON.parse failed) — the same retryable race
+  // window readCodexCredentials flags. Probes should retry once after
+  // CODEX_RETRY_REWRITE_DELAY_MS instead of reporting unhealthy.
+  transient?: boolean;
+}
+
+export function probeCodexCredentials(provider?: ProviderConfig): CodexCredentialProbe {
+  const probe = provider ?? { name: "codex" as const, model: DEFAULT_CODEX_MODEL };
+  const credentials = readCodexCredentials(probe);
+  return {
+    ok: credentials.ok,
+    authPath: credentials.authPath,
+    ...(credentials.credentialType ? { credentialType: credentials.credentialType } : {}),
+    message: credentials.message,
+    ...(credentials.transient ? { transient: true } : {}),
+    ...(credentials.credentialType === "access_token" && credentials.bearer
+      ? (() => {
+          const exp = decodeJwtExp(credentials.bearer);
+          return exp === undefined ? {} : { accessTokenExp: exp };
+        })()
+      : {})
+  };
+}
+
+// Local, network-free read of a JWT's `exp` claim: split on ".", base64url-
+// decode the payload segment, read a finite numeric `exp`. Any deviation from
+// that shape (wrong segment count, bad base64, bad JSON, missing/non-numeric
+// exp) returns undefined — callers must treat that as "expiry unknown", never
+// as "expired".
+function decodeJwtExp(token: string): number | undefined {
+  const segments = token.split(".");
+  if (segments.length !== 3) return undefined;
+  try {
+    const payload = JSON.parse(Buffer.from(segments[1]!, "base64url").toString("utf8")) as unknown;
+    if (!isRecord(payload)) return undefined;
+    return typeof payload.exp === "number" && Number.isFinite(payload.exp) ? payload.exp : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function codexAuthPath(provider: ProviderConfig): string {

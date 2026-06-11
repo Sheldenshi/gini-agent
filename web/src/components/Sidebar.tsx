@@ -24,13 +24,13 @@ import { useMemo, useState, useSyncExternalStore } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { api } from "@/lib/api";
-import { useInvalidate, useStatus, useThreadsInbox } from "@/lib/queries";
+import { useAllChatSessions, useInvalidate, useStatus, useThreadsInbox } from "@/lib/queries";
 import { useChatReadState, useThreadReadState } from "@/lib/use-chat-read-state";
 import { AgentAvatar } from "@/components/chat/AgentAvatar";
 import { CreateAgentDialog } from "@/components/CreateAgentDialog";
 import { TunnelMenu } from "@/components/tunnel/TunnelMenu";
 import { useUpdateGate } from "@/components/UpdateGate";
-import type { AgentRow, ChatSession } from "@/lib/view-types";
+import type { AgentRow } from "@/lib/view-types";
 import type { JobRecord } from "@runtime/types";
 
 function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
@@ -60,11 +60,7 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
     queryFn: () => api<JobRecord[]>("/jobs"),
     refetchInterval: 3000
   });
-  const allSessions = useQuery({
-    queryKey: ["chat", "all"],
-    queryFn: () => api<ChatSession[]>("/chat"),
-    refetchInterval: 3000
-  });
+  const allSessions = useAllChatSessions();
 
   // A job is recurring when it isn't a one-shot reminder and carries an active
   // schedule (cron or interval). Stable-sorted by createdAt (then name) so the

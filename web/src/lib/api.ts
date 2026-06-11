@@ -1,25 +1,55 @@
+import { GATEWAY_RESTARTING_MESSAGE, GATEWAY_UNREACHABLE_CODE } from "./gateway-codes";
+
+// Error thrown by api(). `status` is the HTTP status when the BFF/gateway
+// produced a response; `unreachable` marks the transient gateway-down shape
+// (the BFF's 503 gateway_unreachable envelope) so callers can render a
+// "reconnecting" treatment instead of a hard failure.
+export type ApiError = Error & { status?: number; unreachable?: boolean };
+
+function apiError(message: string, status: number, unreachable: boolean): ApiError {
+  const error = new Error(message) as ApiError;
+  error.status = status;
+  if (unreachable) error.unreachable = true;
+  return error;
+}
+
 export async function api<T = unknown>(path: string, init: RequestInit = {}): Promise<T> {
   const response = await fetch(`/api/runtime${path}`, {
     ...init,
     headers: { "content-type": "application/json", ...(init.headers ?? {}) }
   });
-  // Two error-body shapes flow through the gateway:
-  //   - Generic 4xx/5xx: { error: "..." } (set by json(..., status) calls).
-  //   - Fill-secret / connector routes: { ok: false, message: "..." }
-  //     (the runtime emits a runtime-action result envelope).
-  // Read both so non-2xx fill_secret responses surface the
-  // actionable message instead of falling back to "HTTP 400".
-  const value = (await response.json()) as { error?: string; message?: string; ok?: boolean };
+  // Parse from text, not response.json(): a gateway restart used to surface
+  // here as response.json() throwing a raw SyntaxError ("Unexpected end of
+  // JSON input") on an empty 500 body. Reading text first keeps
+  // every non-JSON body (empty, truncated, HTML error page) on the tagged
+  // ApiError path instead.
+  const text = await response.text();
+  type ErrorEnvelope = { error?: string; message?: string; ok?: boolean; code?: string };
+  let value: ErrorEnvelope | null = null;
+  try {
+    value = text ? (JSON.parse(text) as ErrorEnvelope) : null;
+  } catch {
+    value = null;
+  }
   if (!response.ok) {
-    // Tag the gateway's HTTP status so callers can distinguish a structured
-    // error response (the gateway replied non-2xx) from a transport failure
-    // (fetch rejecting, or response.json() throwing on a truncated body when
-    // the gateway drops the connection — neither of which reaches here).
-    const error = new Error(value.error ?? value.message ?? `HTTP ${response.status}`) as Error & {
-      status?: number;
-    };
-    error.status = response.status;
-    throw error;
+    // Two error-body shapes flow through the gateway:
+    //   - Generic 4xx/5xx: { error: "..." } (set by json(..., status) calls).
+    //   - Fill-secret / connector routes: { ok: false, message: "..." }
+    //     (the runtime emits a runtime-action result envelope).
+    // Read both so non-2xx fill_secret responses surface the
+    // actionable message instead of falling back to "HTTP 400".
+    // The BFF answers for a down gateway with 503 + code "gateway_unreachable";
+    // an unparseable 5xx body is treated the same (a proxy hop dropped the
+    // connection mid-response) so the UI never hard-errors on a restart blip.
+    const unreachable = value?.code === GATEWAY_UNREACHABLE_CODE || (value === null && response.status >= 500);
+    const fallback = unreachable ? GATEWAY_RESTARTING_MESSAGE : `HTTP ${response.status}`;
+    throw apiError(value?.error ?? value?.message ?? fallback, response.status, unreachable);
+  }
+  if (value === null && text.trim().length > 0) {
+    // A 2xx body that isn't JSON means the response was corrupted in flight
+    // (truncated stream, proxy interference). Surface a tagged transport
+    // error rather than the old raw SyntaxError.
+    throw apiError("Gini returned an unreadable response — retrying may help.", response.status, false);
   }
   return value as T;
 }

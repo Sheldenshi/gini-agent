@@ -11,9 +11,10 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { getSetupStatus, removeSetupProvider, setSetupProvider } from "./setup-api";
+import { mutateState, readState, recordProviderAuthFailure } from "../state";
 import { writeKeyToSecretsEnv } from "../state/secrets-env";
 import { loadConfig } from "../paths";
-import type { RuntimeConfig } from "../types";
+import type { ProviderName, RuntimeConfig } from "../types";
 
 function tag(): string {
   return `${process.pid}-${Math.floor(Math.random() * 1_000_000)}`;
@@ -385,19 +386,19 @@ describe("setup-api", () => {
     }
   });
 
-  test("remove rejects codex, local, and unknown providers", () => {
-    expect(removeSetupProvider(config, "codex")).toMatchObject({ ok: false, error: expect.stringContaining("codex CLI") });
-    expect(removeSetupProvider(config, "local")).toMatchObject({ ok: false });
-    expect(removeSetupProvider(config, "mistral")).toMatchObject({ ok: false });
-    expect(removeSetupProvider(config, "mistral").error).toContain("Cannot remove provider 'mistral'");
+  test("remove rejects codex, local, and unknown providers", async () => {
+    expect(await removeSetupProvider(config, "codex")).toMatchObject({ ok: false, error: expect.stringContaining("codex CLI") });
+    expect(await removeSetupProvider(config, "local")).toMatchObject({ ok: false });
+    expect(await removeSetupProvider(config, "mistral")).toMatchObject({ ok: false });
+    expect((await removeSetupProvider(config, "mistral")).error).toContain("Cannot remove provider 'mistral'");
   });
 
-  test("remove scrubs the key and falls back to echo when the removed provider was active", () => {
+  test("remove scrubs the key and falls back to echo when the removed provider was active", async () => {
     const prevKey = process.env.OPENAI_API_KEY;
     process.env.OPENAI_API_KEY = "sk-active";
     config.provider = { name: "openai", model: "gpt-5.4-mini", apiKeyEnv: "OPENAI_API_KEY" };
     try {
-      const result = removeSetupProvider(config, "openai");
+      const result = await removeSetupProvider(config, "openai");
       expect(result.ok).toBe(true);
       expect(result.switched).toBe(true);
       expect(config.provider.name).toBe("echo");
@@ -408,7 +409,7 @@ describe("setup-api", () => {
     }
   });
 
-  test("remove switches the active provider to codex when codex auth is available", () => {
+  test("remove switches the active provider to codex when codex auth is available", async () => {
     const prevKey = process.env.OPENAI_API_KEY;
     const authPath = join(s.stateRoot, "codex-auth.json");
     mkdirSync(s.stateRoot, { recursive: true });
@@ -417,7 +418,7 @@ describe("setup-api", () => {
     process.env.OPENAI_API_KEY = "sk-active";
     config.provider = { name: "openai", model: "gpt-5.4-mini", apiKeyEnv: "OPENAI_API_KEY" };
     try {
-      const result = removeSetupProvider(config, "openai");
+      const result = await removeSetupProvider(config, "openai");
       expect(result.ok).toBe(true);
       expect(result.switched).toBe(true);
       expect(config.provider.name).toBe("codex");
@@ -427,12 +428,12 @@ describe("setup-api", () => {
     }
   });
 
-  test("remove scrubs the key without switching when the provider was not active", () => {
+  test("remove scrubs the key without switching when the provider was not active", async () => {
     const prevKey = process.env.OPENAI_API_KEY;
     process.env.OPENAI_API_KEY = "sk-inactive";
     // config.provider stays at the codex default — removing openai must not switch it.
     try {
-      const result = removeSetupProvider(config, "openai");
+      const result = await removeSetupProvider(config, "openai");
       expect(result.ok).toBe(true);
       expect(result.switched).toBe(false);
       expect(config.provider.name).toBe("codex");
@@ -464,7 +465,7 @@ describe("setup-api", () => {
       const before = readFileSync(join(s.home, ".gini", "secrets.env"), "utf8");
       expect(before).toContain("BEDROCK_BEARER_TOKEN=");
 
-      const result = removeSetupProvider(config, "anthropic");
+      const result = await removeSetupProvider(config, "anthropic");
       expect(result.ok).toBe(true);
       expect(result.switched).toBe(true);
       // The live token must be gone from BOTH stores — the canonical-only
@@ -638,7 +639,7 @@ describe("setup-api", () => {
     writeKeyToSecretsEnv("MY_AZURE_KEY", "az-secret");
     process.env.MY_AZURE_KEY = "az-secret";
     try {
-      const result = removeSetupProvider(config, "azure");
+      const result = await removeSetupProvider(config, "azure");
       expect(result.ok).toBe(true);
       // The secret must be gone from BOTH stores, under the custom env var.
       expect(process.env.MY_AZURE_KEY).toBeUndefined();
@@ -705,5 +706,193 @@ describe("setup-api", () => {
     expect(lines.length).toBe(1);
     expect(lines[0]).toContain("sk-second");
     expect(process.env.OPENAI_API_KEY).toBe("sk-second");
+  });
+
+  // Persistent needs-reauth clearing (issue #233): a successful config write
+  // through this API is the user re-establishing the credential, so the
+  // per-provider failure record must drop. A FAILED write must leave it.
+  async function seedAuthFailure(provider: ProviderName): Promise<void> {
+    await mutateState(config.instance, (state) => {
+      recordProviderAuthFailure(state, { provider, detail: "token expired", taskId: "task_seed" });
+    });
+    expect(readState(config.instance).providerAuthFailures?.[provider]).toBeDefined();
+  }
+
+  test("POST setup/provider clears the needs-reauth record for the rotated env-keyed provider", async () => {
+    await seedAuthFailure("openai");
+    const result = await setSetupProvider(config, { provider: "openai", apiKey: "sk-rotated" });
+    expect(result.ok).toBe(true);
+    const state = readState(config.instance);
+    expect(state.providerAuthFailures?.openai).toBeUndefined();
+    const cleared = state.audit.find((a) => a.action === "provider.auth.cleared" && a.target === "openai");
+    expect(cleared?.evidence).toMatchObject({ reason: "provider configuration updated" });
+  });
+
+  test("a keyless model-only edit of an env-keyed provider leaves the needs-reauth record", async () => {
+    // The Edit dialog leaves the key field blank to keep the saved key, so a
+    // model-only save submits no apiKey; the dead key in process.env passes
+    // the env-already-set gate. The write must succeed WITHOUT clearing —
+    // editing the model proves nothing about the credential.
+    await seedAuthFailure("openai");
+    process.env.OPENAI_API_KEY = "sk-dead";
+    const result = await setSetupProvider(config, { provider: "openai", model: "gpt-5.4-mini" });
+    expect(result.ok).toBe(true);
+    const state = readState(config.instance);
+    expect(state.providerAuthFailures?.openai).toBeDefined();
+    expect(state.audit.some((a) => a.action === "provider.auth.cleared" && a.target === "openai")).toBe(false);
+  });
+
+  test("a keyless baseUrl-only edit of an env-keyed provider leaves the needs-reauth record", async () => {
+    await seedAuthFailure("openai");
+    process.env.OPENAI_API_KEY = "sk-dead";
+    const result = await setSetupProvider(config, { provider: "openai", baseUrl: "https://proxy.example.com/v1" });
+    expect(result.ok).toBe(true);
+    const state = readState(config.instance);
+    expect(state.providerAuthFailures?.openai).toBeDefined();
+    expect(state.audit.some((a) => a.action === "provider.auth.cleared" && a.target === "openai")).toBe(false);
+  });
+
+  test("POST bedrock clears the needs-reauth record on a successful config write", async () => {
+    // Bedrock has no key form — re-saving the provider with working AWS
+    // credentials IS the recovery seam for that provider class.
+    await seedAuthFailure("bedrock");
+    const prevAk = process.env.AWS_ACCESS_KEY_ID;
+    const prevSk = process.env.AWS_SECRET_ACCESS_KEY;
+    process.env.AWS_ACCESS_KEY_ID = "AKIAIOSFODNN7EXAMPLE";
+    process.env.AWS_SECRET_ACCESS_KEY = "secret";
+    try {
+      const result = await setSetupProvider(config, { provider: "bedrock", model: "us.amazon.nova-pro-v1:0", awsRegion: "us-west-2" });
+      expect(result.ok).toBe(true);
+      const state = readState(config.instance);
+      expect(state.providerAuthFailures?.bedrock).toBeUndefined();
+      const cleared = state.audit.find((a) => a.action === "provider.auth.cleared" && a.target === "bedrock");
+      expect(cleared?.evidence).toMatchObject({ reason: "provider configuration updated" });
+    } finally {
+      if (prevAk === undefined) delete process.env.AWS_ACCESS_KEY_ID; else process.env.AWS_ACCESS_KEY_ID = prevAk;
+      if (prevSk === undefined) delete process.env.AWS_SECRET_ACCESS_KEY; else process.env.AWS_SECRET_ACCESS_KEY = prevSk;
+    }
+  });
+
+  test("POST codex (the setup Verify seam) clears the codex record once credentials are present", async () => {
+    await seedAuthFailure("codex");
+    const authPath = join(s.stateRoot, "codex-auth.json");
+    mkdirSync(s.stateRoot, { recursive: true });
+    writeFileSync(authPath, JSON.stringify({ auth_mode: "chatgpt", tokens: { access_token: "fresh", refresh_token: "r" } }));
+    process.env.CODEX_AUTH_JSON = authPath;
+    const result = await setSetupProvider(config, { provider: "codex" });
+    expect(result.ok).toBe(true);
+    expect(readState(config.instance).providerAuthFailures?.codex).toBeUndefined();
+  });
+
+  test("codex Verify fails on a provably-expired JWT and leaves the needs-reauth record", async () => {
+    // The runtime decodes the OAuth JWT exp locally; Verify must not bless
+    // the very credential the connector probe reports as expired.
+    await seedAuthFailure("codex");
+    const enc = (obj: unknown) => Buffer.from(JSON.stringify(obj)).toString("base64url");
+    const pastExp = Math.floor(Date.now() / 1000) - 60;
+    const expiredJwt = `${enc({ alg: "none" })}.${enc({ exp: pastExp })}.sig`;
+    const authPath = join(s.stateRoot, "codex-auth-expired.json");
+    mkdirSync(s.stateRoot, { recursive: true });
+    writeFileSync(authPath, JSON.stringify({ auth_mode: "chatgpt", tokens: { access_token: expiredJwt, refresh_token: "r" } }));
+    process.env.CODEX_AUTH_JSON = authPath;
+    const result = await setSetupProvider(config, { provider: "codex" });
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("Codex access token expired at");
+    expect(result.error).toContain("codex login");
+    expect(readState(config.instance).providerAuthFailures?.codex).toBeDefined();
+  });
+
+  test("codex Verify passes on a future-exp JWT and clears the needs-reauth record", async () => {
+    await seedAuthFailure("codex");
+    const enc = (obj: unknown) => Buffer.from(JSON.stringify(obj)).toString("base64url");
+    const futureExp = Math.floor(Date.now() / 1000) + 3600;
+    const freshJwt = `${enc({ alg: "none" })}.${enc({ exp: futureExp })}.sig`;
+    const authPath = join(s.stateRoot, "codex-auth-fresh.json");
+    mkdirSync(s.stateRoot, { recursive: true });
+    writeFileSync(authPath, JSON.stringify({ auth_mode: "chatgpt", tokens: { access_token: freshJwt, refresh_token: "r" } }));
+    process.env.CODEX_AUTH_JSON = authPath;
+    const result = await setSetupProvider(config, { provider: "codex" });
+    expect(result.ok).toBe(true);
+    expect(readState(config.instance).providerAuthFailures?.codex).toBeUndefined();
+  });
+
+  test("codex Verify preserves a same-provider apiKeyEnv and baseUrl across the write", async () => {
+    // Verify probes THROUGH the custom apiKeyEnv resolution; the persisted
+    // config must keep pointing at the credential source it just validated.
+    await seedAuthFailure("codex");
+    const authPath = join(s.stateRoot, "codex-auth-custom.json");
+    mkdirSync(s.stateRoot, { recursive: true });
+    writeFileSync(authPath, JSON.stringify({ auth_mode: "chatgpt", tokens: { access_token: "fresh", refresh_token: "r" } }));
+    const prevCustom = process.env.MY_CODEX_AUTH_SETUP;
+    process.env.MY_CODEX_AUTH_SETUP = authPath;
+    // No CODEX_AUTH_JSON fallback: the custom env is the only working source.
+    delete process.env.CODEX_AUTH_JSON;
+    config.provider = {
+      name: "codex",
+      model: "gpt-5.5",
+      baseUrl: "http://127.0.0.1:9999/custom",
+      apiKeyEnv: "MY_CODEX_AUTH_SETUP"
+    };
+    try {
+      const result = await setSetupProvider(config, { provider: "codex" });
+      expect(result.ok).toBe(true);
+      expect(config.provider.apiKeyEnv).toBe("MY_CODEX_AUTH_SETUP");
+      expect(config.provider.baseUrl).toBe("http://127.0.0.1:9999/custom");
+      expect(readState(config.instance).providerAuthFailures?.codex).toBeUndefined();
+    } finally {
+      if (prevCustom === undefined) delete process.env.MY_CODEX_AUTH_SETUP;
+      else process.env.MY_CODEX_AUTH_SETUP = prevCustom;
+    }
+  });
+
+  test("codex Verify recovers from a torn auth.json read via the single retry", async () => {
+    // A read landing inside the codex CLI's non-atomic rewrite produces a
+    // transient parse failure; Verify retries once after the rewrite-settle
+    // delay (same contract as the connector probe), so a fully-authenticated
+    // user racing the rewrite doesn't get a false "not found".
+    await seedAuthFailure("codex");
+    const authPath = join(s.stateRoot, "codex-auth-torn.json");
+    mkdirSync(s.stateRoot, { recursive: true });
+    writeFileSync(authPath, "{ torn mid-write");
+    process.env.CODEX_AUTH_JSON = authPath;
+    // Repair lands on the task queue immediately — well inside the 50ms
+    // retry delay — simulating the CLI finishing its rewrite.
+    setTimeout(() => {
+      writeFileSync(authPath, JSON.stringify({ auth_mode: "chatgpt", tokens: { access_token: "fresh", refresh_token: "r" } }));
+    }, 0);
+    const result = await setSetupProvider(config, { provider: "codex" });
+    expect(result.ok).toBe(true);
+    expect(readState(config.instance).providerAuthFailures?.codex).toBeUndefined();
+  });
+
+  test("codex Verify fails after the retry when auth.json stays unreadable", async () => {
+    await seedAuthFailure("codex");
+    const authPath = join(s.stateRoot, "codex-auth-stays-torn.json");
+    mkdirSync(s.stateRoot, { recursive: true });
+    writeFileSync(authPath, "{ torn mid-write");
+    process.env.CODEX_AUTH_JSON = authPath;
+    const result = await setSetupProvider(config, { provider: "codex" });
+    expect(result.ok).toBe(false);
+    expect(readState(config.instance).providerAuthFailures?.codex).toBeDefined();
+  });
+
+  test("a FAILED setup/provider write leaves the needs-reauth record in place", async () => {
+    await seedAuthFailure("codex");
+    // CODEX_AUTH_JSON still points at the scrubbed nonexistent path from
+    // beforeEach, so the presence gate rejects the Verify.
+    const result = await setSetupProvider(config, { provider: "codex" });
+    expect(result.ok).toBe(false);
+    expect(readState(config.instance).providerAuthFailures?.codex).toBeDefined();
+  });
+
+  test("removing a provider clears its needs-reauth record", async () => {
+    await seedAuthFailure("openai");
+    process.env.OPENAI_API_KEY = "sk-doomed";
+    const result = await removeSetupProvider(config, "openai");
+    expect(result.ok).toBe(true);
+    const state = readState(config.instance);
+    expect(state.providerAuthFailures?.openai).toBeUndefined();
+    const cleared = state.audit.find((a) => a.action === "provider.auth.cleared" && a.target === "openai");
+    expect(cleared?.evidence).toMatchObject({ reason: "provider removed" });
   });
 });

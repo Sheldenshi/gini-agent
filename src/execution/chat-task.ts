@@ -16,6 +16,7 @@ import {
   appendLog,
   appendTaskPartial,
   appendTrace,
+  clearProviderAuthFailureIfPresent,
   createChatMessage,
   findInFlightAssistantTextForTask,
   getMainChatUserTextBlockForTask,
@@ -23,7 +24,8 @@ import {
   mutateState,
   now,
   readState,
-  readTrace
+  readTrace,
+  recordProviderAuthFailure
 } from "../state";
 import { id as makeId } from "../state/ids";
 import { readGoogleAccounts } from "../state/google-accounts";
@@ -2256,6 +2258,12 @@ async function runLoop(
     // After MAX_CONTEXT_OVERFLOW_ATTEMPTS total attempts the task exits
     // gracefully with a partial result — the transcript provably cannot
     // reach the model, so failing the whole task would discard real work.
+    //
+    // `callStartedAt` is captured before the first attempt so the
+    // success-triggered clear below can prove its evidence predates any
+    // failure recorded while this call was in flight (long streams
+    // authenticate at start and survive an expiry).
+    const callStartedAt = now();
     let result: Awaited<ReturnType<typeof generateToolCallingResponse>> | undefined;
     for (let attempt = 1; result === undefined; attempt++) {
       try {
@@ -2353,6 +2361,17 @@ async function runLoop(
         promptTokenEstimateGap = Math.max(0, observedPromptTokens - estimatedPromptTokens);
       }
     }
+
+    // A successful call proves this provider's credential works — drop any
+    // persistent needs-reauth record for it (issue #233). The helper checks
+    // lock-free first, so the common healthy path writes no state.
+    // `evidenceFrom` keeps a record written by a concurrent task while this
+    // call was in flight: that failure is newer evidence than this success.
+    await clearProviderAuthFailureIfPresent(config.instance, result.provider.name, {
+      reason: "provider call succeeded",
+      taskId,
+      evidenceFrom: callStartedAt
+    });
 
     // First successful provider call in this runLoop entry: commit the
     // deferred identity snapshot. We only persist once per fresh
@@ -2998,6 +3017,9 @@ async function runLoop(
     { role: "user", content: summaryInstruction }
   ];
   try {
+    // Same evidence-recency capture as the main loop call: the clear below
+    // must not erase a failure recorded while this call was in flight.
+    const summaryCallStartedAt = now();
     let summaryResult: Awaited<ReturnType<typeof generateToolCallingResponse>>;
     try {
       summaryResult = await generateToolCallingResponse(
@@ -3018,6 +3040,14 @@ async function runLoop(
       throw error;
     }
     accumulatedCost = addCost(accumulatedCost, summaryResult.cost);
+    // Same clear seam as the main loop: a successful summary call proves the
+    // credential works, so drop any persistent needs-reauth record (issue
+    // #233). Lock-free check first — no state write on the healthy path.
+    await clearProviderAuthFailureIfPresent(config.instance, summaryResult.provider.name, {
+      reason: "provider call succeeded",
+      taskId,
+      evidenceFrom: summaryCallStartedAt
+    });
     const finalText = summaryResult.text || "(no content)";
     const exhausted = await mutateState(config.instance, (state) => {
       const item = findTask(state, taskId);
@@ -3091,6 +3121,17 @@ async function runLoop(
     const authProvider = error instanceof ProviderAuthError ? error.provider : undefined;
     const message = authProvider ? redactSecrets(rawMessage) : rawMessage;
     const exhausted = await mutateState(config.instance, (state) => {
+      // Mirror failTask: persist the needs-reauth record BEFORE the terminal
+      // guard — credential state is independent of task lifecycle, and a
+      // concurrent cancel that flipped the task terminal first must not drop
+      // the record (issue #233). recordProviderAuthFailure dedups its own
+      // transition audit. (If findTask throws on a removed row, the whole
+      // mutation is discarded — writeState only runs when the callback
+      // returns — which matches the pre-existing removed-task behavior.)
+      // `message` is already redacted.
+      if (authProvider) {
+        recordProviderAuthFailure(state, { provider: authProvider, detail: message, taskId });
+      }
       const item = findTask(state, taskId);
       // Respect a prior terminal status.
       if (isTerminalTaskStatus(item.status)) return item;
@@ -3101,7 +3142,9 @@ async function runLoop(
         : stoppedOnStall
           ? "Chat task stopped: tool loop made no progress."
           : `Chat task exceeded ${cap} model iterations.`;
-      if (authProvider) item.authErrorProvider = authProvider;
+      if (authProvider) {
+        item.authErrorProvider = authProvider;
+      }
       // Preserve the accumulated cost from the loop so the audit row
       // reflects all model calls leading up to the failed summary turn.
       item.cost = accumulatedCost;

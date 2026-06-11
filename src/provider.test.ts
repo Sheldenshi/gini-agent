@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import {
   clearEchoAuxTextResponses,
   clearEchoToolCallingResponses,
@@ -208,10 +209,8 @@ describe("provider", () => {
   });
 
   test("detects Codex auth.json without exposing token values", () => {
-    const root = "/tmp/gini-provider-codex-test";
+    const root = mkdtempSync(join(tmpdir(), "gini-provider-codex-test-"));
     const authPath = `${root}/auth.json`;
-    rmSync(root, { recursive: true, force: true });
-    mkdirSync(root, { recursive: true });
     writeFileSync(authPath, JSON.stringify({
       auth_mode: "chatgpt",
       tokens: {
@@ -228,6 +227,7 @@ describe("provider", () => {
     expect(JSON.stringify(health)).not.toContain("secret-refresh-token");
     if (original === undefined) delete process.env.CODEX_AUTH_JSON;
     else process.env.CODEX_AUTH_JSON = original;
+    rmSync(root, { recursive: true, force: true });
   });
 
   test("codex tool-calling parses function_call SSE events from /responses", async () => {
@@ -2655,6 +2655,99 @@ describe("provider", () => {
     }
   });
 
+  // ----- Local codex credential failures -----
+  // Steady-state local credential failures (auth.json missing — the
+  // post-`codex logout` state — wrong-shape file, or persistently
+  // unreadable file) must surface as ProviderAuthError("codex") so failTask
+  // renders the named re-auth CTA instead of a raw muted note (issue #233).
+  // Anthropic and bedrock already throw typed for missing local credentials;
+  // these pin codex parity.
+
+  test("codex: missing auth.json surfaces as ProviderAuthError without hitting the network", async () => {
+    const root = mkdtempSync(join(tmpdir(), "gini-provider-codex-missing-auth-"));
+    // Point CODEX_AUTH_JSON at a path that exists as a directory but holds
+    // no auth.json — the exact state `codex logout` leaves behind.
+    const restoreEnv = setEnv("CODEX_AUTH_JSON", `${root}/auth.json`);
+    const fetchStub = installFetch(() => anthropicJson({}));
+    try {
+      const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
+      const err = await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "hi" }],
+        []
+      ).catch((e) => e);
+      expect(err).toBeInstanceOf(ProviderAuthError);
+      expect((err as ProviderAuthError).provider).toBe("codex");
+      expect((err as Error).message).toMatch(/No Codex credentials found/);
+      expect((err as Error).message).toContain("codex login");
+      // Steady-state absence is not retryable: no request goes out.
+      expect(fetchStub.calls.length).toBe(0);
+      expect(providerReauth("codex").kind).toBe("docs");
+    } finally {
+      fetchStub.restore();
+      restoreEnv();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("codex: auth.json without OPENAI_API_KEY or tokens.access_token surfaces as ProviderAuthError", async () => {
+    const { authPath, restore } = installCodexAuth("codex-wrong-shape-auth");
+    writeFileSync(authPath, JSON.stringify({ auth_mode: "chatgpt", tokens: { refresh_token: "r" } }));
+    const fetchStub = installFetch(() => anthropicJson({}));
+    try {
+      const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
+      const err = await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "hi" }],
+        []
+      ).catch((e) => e);
+      expect(err).toBeInstanceOf(ProviderAuthError);
+      expect((err as ProviderAuthError).provider).toBe("codex");
+      expect((err as Error).message).toMatch(/does not contain OPENAI_API_KEY or tokens\.access_token/);
+      expect(fetchStub.calls.length).toBe(0);
+    } finally {
+      fetchStub.restore();
+      restore();
+    }
+  });
+
+  test("codex: persistently corrupt auth.json fails typed after exactly one retry", async () => {
+    // Attempt 1 reads the corrupt file → CodexAuthRaceError → one 50ms wait
+    // → attempt 2 reads the SAME corrupt file. At that point the failure is
+    // no longer a mid-write race, so the second race error is converted to
+    // ProviderAuthError("codex") for the re-auth CTA. Contrast with the
+    // mid-rewrite test above, where the file turns valid before attempt 2
+    // and the call succeeds — that recovery path must keep working.
+    const { authPath, restore } = installCodexAuth("codex-corrupt-auth-typed");
+    writeFileSync(authPath, "{ not valid json");
+    const fetchStub = installFetch(() => anthropicJson({}));
+    const originalSetTimeout = globalThis.setTimeout;
+    const delays: number[] = [];
+    globalThis.setTimeout = ((handler: TimerHandler, ms?: number, ...rest: unknown[]) => {
+      if (typeof ms === "number") delays.push(ms);
+      return originalSetTimeout(handler as () => void, ms, ...rest);
+    }) as unknown as typeof globalThis.setTimeout;
+    try {
+      const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
+      const err = await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "hi" }],
+        []
+      ).catch((e) => e);
+      expect(err).toBeInstanceOf(ProviderAuthError);
+      expect((err as ProviderAuthError).provider).toBe("codex");
+      expect((err as Error).message).toMatch(/Could not read Codex credentials/);
+      // Exactly one 50ms retry wait was scheduled, and the bearer read
+      // failed both times before any request went out.
+      expect(delays.filter((ms) => ms === 50).length).toBe(1);
+      expect(fetchStub.calls.length).toBe(0);
+    } finally {
+      globalThis.setTimeout = originalSetTimeout;
+      fetchStub.restore();
+      restore();
+    }
+  });
+
   test("codex generateTaskSummary retries through callOpenAIResponses on session-expired", async () => {
     // generateTaskSummary lands in callOpenAIResponses for codex, which
     // also wraps in withCodexSessionRetry. Pin the contract so a
@@ -3393,10 +3486,12 @@ describe("provider", () => {
 // that exercise the codex /responses path need this so readCodexBearer
 // resolves a non-empty access token without real OAuth state on disk.
 function installCodexAuth(suffix: string): { authPath: string; restore: () => void } {
-  const root = `/tmp/gini-provider-codex-${suffix}`;
+  // mkdtemp (unique per call) rather than a fixed suffix-derived path: this
+  // machine routinely runs the suite from several worktrees at once, and a
+  // shared /tmp path lets one run's cleanup delete another run's auth.json
+  // mid-test (CLAUDE.md fast-test rules: unique temp dirs).
+  const root = mkdtempSync(join(tmpdir(), `gini-provider-codex-${suffix}-`));
   const authPath = `${root}/auth.json`;
-  rmSync(root, { recursive: true, force: true });
-  mkdirSync(root, { recursive: true });
   writeFileSync(authPath, JSON.stringify({
     auth_mode: "chatgpt",
     tokens: {
@@ -3511,6 +3606,78 @@ describe("auth-error classification", () => {
     ];
     for (const message of negatives) {
       expect(isContextOverflowError(message)).toBe(false);
+    }
+  });
+
+  test("auth failures are attributed to the provider resolved at call entry, not the post-switch one", async () => {
+    // A Settings POST or the agent's own set_provider can swap
+    // config.provider while a call is in flight. The 401 belongs to the
+    // provider that SERVED the call — the needs-reauth record keys off this
+    // name, so a stale attribution would flag the wrong provider (issue #233).
+    const restoreEnv = setEnv("OPENAI_API_KEY", "sk-dead");
+    const cfg = config(normalizeProvider({ name: "openai", model: "gpt-test" }));
+    const fetchStub = installFetch(() => {
+      // The switch lands mid-call, before the 401 resolves.
+      cfg.provider = normalizeProvider({ name: "openrouter", model: "or-test" });
+      return new Response(
+        JSON.stringify({ error: { message: "Incorrect API key provided" } }),
+        { status: 401, headers: { "content-type": "application/json" } }
+      );
+    });
+    try {
+      const err = await generateToolCallingResponse(cfg, [{ role: "user", content: "hi" }], []).catch((e) => e);
+      expect(err).toBeInstanceOf(ProviderAuthError);
+      expect((err as ProviderAuthError).provider).toBe("openai");
+      expect((err as Error).message).toContain("Incorrect API key provided");
+    } finally {
+      fetchStub.restore();
+      restoreEnv();
+    }
+  });
+
+  test("generateTaskSummary surfaces a backend 401 as a typed ProviderAuthError", async () => {
+    // The imperative path's model call: failTask records the needs-reauth
+    // state only for typed errors, so an untyped 401 here would leave
+    // sessionless tasks invisible to the amber Settings row.
+    const restoreEnv = setEnv("OPENROUTER_API_KEY", "sk-or-dead");
+    const fetchStub = installFetch(() =>
+      new Response(
+        JSON.stringify({ error: { message: "invalid api key" } }),
+        { status: 401, headers: { "content-type": "application/json" } }
+      )
+    );
+    try {
+      const err = await generateTaskSummary(
+        config(normalizeProvider({ name: "openrouter", model: "or-test" })),
+        "summarize this"
+      ).catch((e) => e);
+      expect(err).toBeInstanceOf(ProviderAuthError);
+      expect((err as ProviderAuthError).provider).toBe("openrouter");
+    } finally {
+      fetchStub.restore();
+      restoreEnv();
+    }
+  });
+
+  test("openai: a missing API key env var surfaces as a typed ProviderAuthError, not a generic failure", async () => {
+    // Mirrors the anthropic/bedrock pins: the missing-env message never
+    // matches isAuthExpiredError, so only a typed throw reaches the
+    // needs-reauth record and the amber Settings row.
+    const restoreEnv = setEnv("OPENAI_API_KEY", undefined);
+    const fetchStub = installFetch(() => anthropicJson({}));
+    try {
+      const err = await generateToolCallingResponse(
+        config(normalizeProvider({ name: "openai", model: "gpt-test" })),
+        [{ role: "user", content: "hi" }],
+        []
+      ).catch((e) => e);
+      expect(err).toBeInstanceOf(ProviderAuthError);
+      expect((err as ProviderAuthError).provider).toBe("openai");
+      expect((err as Error).message).toContain("OPENAI_API_KEY is not set");
+      expect(fetchStub.calls.length).toBe(0);
+    } finally {
+      fetchStub.restore();
+      restoreEnv();
     }
   });
 

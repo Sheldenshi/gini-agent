@@ -34,12 +34,12 @@ Pinning `default` to fixed memorable ports lets `gini start` produce a stable UR
   `ai.lilaclabs.gini.<instance>.gateway` (Bun runtime, runs
   `src/server.ts` directly), `ai.lilaclabs.gini.<instance>.web`
   (Next.js dev server, gated on the gateway becoming healthy via a
-  shell shim), and `ai.lilaclabs.gini.<instance>.watchdog` (a periodic
-  health probe). The gateway and web are supervised with `KeepAlive`
-  set to `true` (launchd always respawns on *any* exit, including a
-  clean `exit 0` from an auto-update self-restart), so `gini stop`
-  unloads them via `launchctl bootout` rather than relying on a clean
-  exit. The watchdog covers the gaps KeepAlive can't — a
+  shell shim), and `ai.lilaclabs.gini.<instance>.watchdog` (a
+  long-lived health-probe loop). All three are supervised with
+  `KeepAlive` set to `true` (launchd always respawns on *any* exit,
+  including a clean `exit 0` from an auto-update self-restart), so
+  `gini stop` unloads them via `launchctl bootout` rather than relying
+  on a clean exit. The watchdog covers the gaps KeepAlive can't — a
   wedged-but-alive process, a launchd-deferred respawn, and a deregistered
   core service it re-bootstraps via `autostart enable`. Provider
   secrets from `~/.gini/secrets.env` are merged into the gateway plist's

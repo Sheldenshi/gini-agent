@@ -1,7 +1,7 @@
 // Tests for `gini watchdog`. Every external dependency is injected — no real
-// fetch, no real launchctl. Port files + the report/log dirs live under a
-// unique GINI_STATE_ROOT in /tmp. The watchdog always exits 0
-// (process.exitCode === 0) regardless of which services were down.
+// fetch, no real launchctl, no real sleeps. Port files + the report/log dirs
+// live under a unique GINI_STATE_ROOT in /tmp. The watchdog always keeps
+// process.exitCode === 0 regardless of which services were down.
 //
 // Coverage:
 //   - all healthy -> no kickstart, no report queued, exit 0
@@ -10,11 +10,16 @@
 //   - missing port files -> treated as down (kickstart fired), no report, exit 0
 //   - a deregistered core service -> re-bootstrap (enable) instead of kickstart,
 //     only under launchd; a failed/throwing re-enable is swallowed, exit 0
+//   - loop mode: ticks are paced by the injectable sleep, recover mid-loop,
+//     and `--once` forces a single tick
+//
+// Single-tick tests run via `--once` so the loop (the launchd default) never
+// spins; loop tests bound it with deps.maxTicks.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { watchdog } from "./watchdog";
+import { watchdog, WATCHDOG_TICK_INTERVAL_MS } from "./watchdog";
 import type { CliContext } from "../context";
 import type { LaunchctlResult, PlistKind } from "../../integrations/launchd";
 import { runtimePortPath, webPortPath } from "../../paths";
@@ -26,14 +31,14 @@ function tag(): string {
 
 const INSTANCE = "watchdog-test";
 
-function ctxFor(): CliContext {
+function ctxFor(extraArgs: string[] = ["--once"]): CliContext {
   return {
     config: { instance: INSTANCE } as CliContext["config"],
-    cliArgs: ["watchdog"],
+    cliArgs: ["watchdog", ...extraArgs],
     command: "watchdog",
     ephemeralSmoke: false,
     explicitInstance: true,
-    rawArgs: ["watchdog", "--instance", INSTANCE],
+    rawArgs: ["watchdog", "--instance", INSTANCE, ...extraArgs],
     web: { webPort: 0, webPortPinned: false, noWeb: true, runtimePortPinned: false }
   };
 }
@@ -322,6 +327,283 @@ describe("watchdog", () => {
     });
     expect(kicks.length).toBe(0);
     expect(reenables.length).toBe(0);
+    expect(process.exitCode).toBe(0);
+  });
+
+  test("loop: runs maxTicks ticks, sleeping the tick interval BETWEEN ticks (not after the last)", async () => {
+    writePorts();
+    let probes = 0;
+    const sleeps: number[] = [];
+    await watchdog(ctxFor([]), {
+      probeRuntime: async () => {
+        probes += 1;
+        return true;
+      },
+      probeWeb: async () => true,
+      kickstartImpl: () => okLaunchctl,
+      isLoadedImpl: () => true,
+      supervisorImpl: () => "launchd",
+      maxTicks: 3,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      }
+    });
+    expect(probes).toBe(3);
+    // Two pauses for three ticks, each at the default cadence.
+    expect(sleeps).toEqual([WATCHDOG_TICK_INTERVAL_MS, WATCHDOG_TICK_INTERVAL_MS]);
+    expect(process.exitCode).toBe(0);
+  });
+
+  test("loop: a gateway that dies mid-loop is kickstarted on the tick that sees it, and the loop keeps going", async () => {
+    writePorts();
+    const results = [true, false, true];
+    let probes = 0;
+    const kicks: PlistKind[] = [];
+    await watchdog(ctxFor([]), {
+      probeRuntime: async () => {
+        const result = results[probes] ?? true;
+        probes += 1;
+        return result;
+      },
+      probeWeb: async () => true,
+      kickstartImpl: (_instance, kind) => {
+        kicks.push(kind);
+        return okLaunchctl;
+      },
+      isLoadedImpl: () => true,
+      supervisorImpl: () => "launchd",
+      maxTicks: 3,
+      intervalMs: 7,
+      sleep: async () => {}
+    });
+    expect(probes).toBe(3);
+    // Exactly one revive: the dead tick kicked the gateway, the healthy
+    // ticks before and after did nothing.
+    expect(kicks).toEqual(["gateway"]);
+    expect(process.exitCode).toBe(0);
+  });
+
+  test("loop: a custom intervalMs reaches the sleep", async () => {
+    writePorts();
+    const sleeps: number[] = [];
+    await watchdog(ctxFor([]), {
+      probeRuntime: async () => true,
+      probeWeb: async () => true,
+      kickstartImpl: () => okLaunchctl,
+      isLoadedImpl: () => true,
+      supervisorImpl: () => "launchd",
+      maxTicks: 2,
+      intervalMs: 5,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      }
+    });
+    expect(sleeps).toEqual([5]);
+  });
+
+  test("default runtime probe: a live local HTTP server counts as alive", async () => {
+    const server = Bun.serve({ port: 0, fetch: () => new Response("{}", { status: 401 }) });
+    try {
+      writeFileSync(runtimePortPath(INSTANCE), `${server.port}\n`);
+      writeFileSync(webPortPath(INSTANCE), "7777\n");
+      const kicks: PlistKind[] = [];
+      await watchdog(ctxFor(), {
+        // No probeRuntime injected — the real localhost fetch runs.
+        probeWeb: async () => true,
+        kickstartImpl: (_instance, kind) => {
+          kicks.push(kind);
+          return okLaunchctl;
+        },
+        isLoadedImpl: () => true,
+        supervisorImpl: () => "launchd"
+      });
+      expect(kicks.length).toBe(0);
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  test("default runtime probe: a refused connection counts as dead", async () => {
+    // Claim an ephemeral port, then free it so the probe is refused.
+    const server = Bun.serve({ port: 0, fetch: () => new Response("ok") });
+    const freedPort = server.port;
+    server.stop(true);
+    writeFileSync(runtimePortPath(INSTANCE), `${freedPort}\n`);
+    writeFileSync(webPortPath(INSTANCE), "7777\n");
+    const kicks: PlistKind[] = [];
+    await watchdog(ctxFor(), {
+      probeWeb: async () => true,
+      kickstartImpl: (_instance, kind) => {
+        kicks.push(kind);
+        return okLaunchctl;
+      },
+      isLoadedImpl: () => true,
+      supervisorImpl: () => "launchd"
+    });
+    expect(kicks).toEqual(["gateway"]);
+  });
+
+  test("default sleep paces the loop when none is injected", async () => {
+    writePorts();
+    let probes = 0;
+    await watchdog(ctxFor([]), {
+      probeRuntime: async () => {
+        probes += 1;
+        return true;
+      },
+      probeWeb: async () => true,
+      kickstartImpl: () => okLaunchctl,
+      isLoadedImpl: () => true,
+      supervisorImpl: () => "launchd",
+      maxTicks: 2,
+      intervalMs: 1
+    });
+    expect(probes).toBe(2);
+  });
+
+  test("an unreadable port file (directory) is treated as down", async () => {
+    mkdirSync(runtimePortPath(INSTANCE), { recursive: true });
+    writeFileSync(webPortPath(INSTANCE), "7777\n");
+    const kicks: PlistKind[] = [];
+    await watchdog(ctxFor(), {
+      probeRuntime: async () => true,
+      probeWeb: async () => true,
+      kickstartImpl: (_instance, kind) => {
+        kicks.push(kind);
+        return okLaunchctl;
+      },
+      isLoadedImpl: () => true,
+      supervisorImpl: () => "launchd"
+    });
+    expect(kicks).toEqual(["gateway"]);
+  });
+
+  test("web crash report carries the web.log tail and scrubs secrets.env values", async () => {
+    writePorts();
+    // Point HOME at the scratch root so secretsEnvPath() resolves inside it.
+    const prevHome = process.env.HOME;
+    process.env.HOME = stateRoot;
+    try {
+      mkdirSync(join(stateRoot, ".gini"), { recursive: true });
+      writeFileSync(join(stateRoot, ".gini", "secrets.env"), "OPENAI_API_KEY=sk-super-secret-value\n");
+      const logs = join(stateRoot, "instances", INSTANCE, "logs");
+      mkdirSync(join(logs, "web-launchd.err.log"), { recursive: true }); // unreadable (directory) — must not block the report
+      writeFileSync(join(logs, "web.log"), "boot ok\ntoken sk-super-secret-value leaked\n");
+      await watchdog(ctxFor(), {
+        probeRuntime: async () => true,
+        probeWeb: async () => false,
+        kickstartImpl: () => okLaunchctl,
+        isLoadedImpl: () => true,
+        supervisorImpl: () => "launchd"
+      });
+      const pending = listPendingReports();
+      expect(pending.length).toBe(1);
+      const serialized = JSON.stringify(pending[0]!.report);
+      expect(serialized).toContain("boot ok");
+      // The secrets.env literal must never survive into the queued report.
+      expect(serialized).not.toContain("sk-super-secret-value");
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+    }
+  });
+
+  test("an unreadable secrets.env (directory) still queues the report", async () => {
+    writePorts();
+    const prevHome = process.env.HOME;
+    process.env.HOME = stateRoot;
+    try {
+      mkdirSync(join(stateRoot, ".gini", "secrets.env"), { recursive: true });
+      await watchdog(ctxFor(), {
+        probeRuntime: async () => true,
+        probeWeb: async () => false,
+        kickstartImpl: () => okLaunchctl,
+        isLoadedImpl: () => true,
+        supervisorImpl: () => "launchd"
+      });
+      expect(listPendingReports().length).toBe(1);
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+    }
+  });
+
+  test("loop: a sustained web outage queues ONE report per episode, not one per tick", async () => {
+    writePorts();
+    // Four ticks: down, down (same episode), recovered, down (new episode).
+    const webResults = [false, false, true, false];
+    let probes = 0;
+    await watchdog(ctxFor([]), {
+      probeRuntime: async () => true,
+      probeWeb: async () => {
+        const result = webResults[probes] ?? true;
+        probes += 1;
+        return result;
+      },
+      kickstartImpl: () => okLaunchctl,
+      isLoadedImpl: () => true,
+      supervisorImpl: () => "launchd",
+      maxTicks: 4,
+      sleep: async () => {}
+    });
+    expect(probes).toBe(4);
+    // Tick 1 reports, tick 2 is the same episode (suppressed), tick 3 clears
+    // the episode, tick 4 is a fresh outage and reports again.
+    expect(listPendingReports().length).toBe(2);
+    expect(process.exitCode).toBe(0);
+  });
+
+  test("--help prints usage and returns without probing or looping", async () => {
+    // The default mode loops forever, so help MUST short-circuit before the
+    // loop — falling through would hang the terminal and kickstart services.
+    writePorts();
+    let probes = 0;
+    const realLog = console.log;
+    const logged: string[] = [];
+    console.log = ((...args: unknown[]) => {
+      logged.push(args.map(String).join(" "));
+    }) as typeof console.log;
+    try {
+      for (const helpArg of ["--help", "-h", "help"]) {
+        await watchdog(ctxFor([helpArg]), {
+          probeRuntime: async () => {
+            probes += 1;
+            return true;
+          },
+          probeWeb: async () => true,
+          kickstartImpl: () => okLaunchctl,
+          isLoadedImpl: () => true,
+          supervisorImpl: () => "launchd",
+          sleep: async () => {
+            throw new Error("help must not enter the loop");
+          }
+        });
+      }
+    } finally {
+      console.log = realLog;
+    }
+    expect(probes).toBe(0);
+    expect(logged.join("\n")).toContain("--once");
+  });
+
+  test("--once forces a single tick even when deps.maxTicks asks for more (and never sleeps)", async () => {
+    writePorts();
+    let probes = 0;
+    await watchdog(ctxFor(["--once"]), {
+      probeRuntime: async () => {
+        probes += 1;
+        return true;
+      },
+      probeWeb: async () => true,
+      kickstartImpl: () => okLaunchctl,
+      isLoadedImpl: () => true,
+      supervisorImpl: () => "launchd",
+      maxTicks: 5,
+      sleep: async () => {
+        throw new Error("--once must not sleep");
+      }
+    });
+    expect(probes).toBe(1);
     expect(process.exitCode).toBe(0);
   });
 });

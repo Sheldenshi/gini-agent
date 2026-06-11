@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { setDefaultModel } from "./default-model";
 import { install } from "./index";
 import { loadConfig } from "../paths";
-import { mutateState, readState } from "../state";
+import { mutateState, readState, recordProviderAuthFailure } from "../state";
 import type { RuntimeConfig } from "../types";
 
 function tag(): string {
@@ -192,5 +192,37 @@ describe("setDefaultModel", () => {
     });
     expect(result.ok).toBe(false);
     expect(process.env.OPENAI_API_KEY).toBeUndefined();
+  });
+
+  test("a model-only pick does not clear the provider's needs-reauth record", async () => {
+    // The dead key sits in process.env, so the keyless selection save passes
+    // setSetupProvider's env-already-set gate without touching the credential.
+    process.env.OPENAI_API_KEY = "sk-dead";
+    await setDefaultModel(config, { provider: "openai", model: "gpt-5.4" });
+    await mutateState(config.instance, (state) => {
+      recordProviderAuthFailure(state, { provider: "openai", detail: "token expired", taskId: "task_seed" });
+    });
+
+    const result = await setDefaultModel(config, { provider: "openai", model: "gpt-5.4-mini" });
+    expect(result.ok).toBe(true);
+    // A selection-only save proves nothing about the credential: the record
+    // (and the amber Settings row it drives) must survive, and no clear may
+    // be audited — otherwise the row flips back to a stale "Connected".
+    const state = readState(config.instance);
+    expect(state.providerAuthFailures?.openai).toBeDefined();
+    expect(state.audit.some((a) => a.action === "provider.auth.cleared" && a.target === "openai")).toBe(false);
+  });
+
+  test("a codex default-model pick does not clear codex's needs-reauth record", async () => {
+    // The codex branch gates on credential PRESENCE only, so a dead token
+    // still passes; the selection must not masquerade as a Verify.
+    await mutateState(config.instance, (state) => {
+      recordProviderAuthFailure(state, { provider: "codex", detail: "token expired", taskId: "task_seed" });
+    });
+    const result = await setDefaultModel(config, { provider: "codex", model: "gpt-5.5" });
+    expect(result.ok).toBe(true);
+    const state = readState(config.instance);
+    expect(state.providerAuthFailures?.codex).toBeDefined();
+    expect(state.audit.some((a) => a.action === "provider.auth.cleared" && a.target === "codex")).toBe(false);
   });
 });

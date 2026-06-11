@@ -6,7 +6,7 @@ import { useMutation } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { PageHeader, EmptyState } from "@/components/PageHeader";
 import { api } from "@/lib/api";
-import { useChatSessions, useInvalidate, useStatus, useTask, useTasks } from "@/lib/queries";
+import { useAllChatSessions, useInvalidate, useStatus, useTask, useTasks } from "@/lib/queries";
 import type { Task, TraceRecord } from "@runtime/types";
 import type { ChatSession } from "@/lib/view-types";
 import { TaskList, type TaskFilter } from "./_components/TaskList";
@@ -108,8 +108,9 @@ function TaskDetailContainer({
   // Resolve task -> chat session via the field stamped at task creation
   // (and backfilled by normalizeState for legacy state files). Reading
   // task.chatSessionId directly avoids fetching the unscoped chatMessages
-  // list from /state for the join.
-  const chats = useChatSessions();
+  // list from /state for the join. The unscoped session list keeps the
+  // lookup working for deep-linked tasks owned by a non-active agent.
+  const chats = useAllChatSessions();
   const linkedSession = useMemo<ChatSession | null>(() => {
     const sessionId = data.task.chatSessionId;
     if (!sessionId) return null;

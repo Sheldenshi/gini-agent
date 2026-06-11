@@ -76,7 +76,7 @@ import { cancelSubagent, listSubagents, spawnSubagent } from "./capabilities/sub
 import { addMcpServer, checkMcpServer, invokeMcpTool, removeMcpServer } from "./integrations/mcp";
 import { addMessagingBridge, allowChat, checkMessagingBridge, denyChat, disableMessagingBridge, listAllowedChats, listMessagingMessages, receiveMessagingInput, rejectPendingChat, removeMessagingBridge, sendMessagingOutput } from "./integrations/messaging";
 import { inspectImportSource } from "./integrations/importers";
-import { providerCatalogWithStatus } from "./provider";
+import { providerCatalogWithStatus, withProviderAuthStatus } from "./provider";
 import { buildModelCatalog } from "./model-routes";
 import { setDefaultModel } from "./runtime/default-model";
 import { createAgent, deleteAgent, listAgents, renameAgent, setAgentProvider, useAgent } from "./capabilities/agents";
@@ -1740,7 +1740,13 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       const chatId = parseChatIdStrict(payload.chatId);
       return json(await rejectPendingChat(config, params[0], chatId));
     }],
-    ["GET", /^\/api\/providers\/catalog$/, () => json(providerCatalogWithStatus(config.provider?.name, config.provider?.apiKeyEnv, config.provider?.baseUrl))],
+    // Catalog rows carry the persistent per-provider auth status (issue #233)
+    // so Settings can render "Needs re-authentication" instead of presence-only
+    // "Connected" when a provider call failed on a dead credential.
+    ["GET", /^\/api\/providers\/catalog$/, () => json(withProviderAuthStatus(
+      providerCatalogWithStatus(config.provider?.name, config.provider?.apiKeyEnv, config.provider?.baseUrl),
+      readState(config.instance).providerAuthFailures
+    ))],
     // Model-first view of the same catalog: canonical models with the routes
     // (configured providers) that serve them. Drives the model picker in the
     // web Settings page and chat Settings tab (ADR model-first-selection.md).
@@ -1768,7 +1774,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["POST", /^\/api\/setup\/provider\/remove$/, async (request) => {
       const payload = await body(request);
       const providerName = typeof payload.provider === "string" ? payload.provider : "";
-      const result = removeSetupProvider(config, providerName);
+      const result = await removeSetupProvider(config, providerName);
       return json(result, result.ok ? 200 : 400);
     }],
     ["GET", /^\/api\/agents$/, () => json(listAgents(config))],
