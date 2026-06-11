@@ -52,7 +52,8 @@ import {
   compactionMiddleSpan,
   elideOldToolResultsToBudget,
   IN_TURN_COMPACTION_NOTE_PREFIX,
-  nextNavWithoutAction,
+  initialNavStallState,
+  nextNavStallState,
   promptTokensFromUsage,
   renderMessagesForCompaction
 } from "./chat-task";
@@ -849,6 +850,123 @@ describe("chat-task loop", () => {
         /repeating the same tool call\(s\) with identical arguments \(loop-breaker\)/.test(t.message)
     );
     expect(breaker).toBeDefined();
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // Navigation loop-breaker MUST NOT false-positive on legitimate sequential
+  // research. A model that navigates across many DISTINCT URLs (each blocked
+  // here by the loopback SSRF gate, so no Chromium launches) is making progress,
+  // not looping — the per-URL recent-window guard must let it run to the
+  // iteration cap rather than tripping the navigation loop-breaker. (Loopback
+  // URLs all yield the same generic block message, so distinct ports differ
+  // only in arguments — exactly the trace signature the false-positive showed:
+  // climbing nav count with identicalRunLength 1.)
+  test("does NOT trip the navigation loop-breaker on distinct-URL research", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-nav-distinct");
+    config.agent = { maxIterations: 9 };
+    const provider = normalizeProvider(config.provider);
+
+    // Nine navigations to nine DISTINCT loopback URLs. Each is SSRF-blocked
+    // pre-flight (deterministic, no browser), but the nav guard counts the
+    // call regardless of result — and since every URL is new, the count never
+    // climbs. The loop exhausts the iteration cap instead.
+    for (let i = 1; i <= 9; i++) {
+      setEchoToolCallingResponse({
+        provider,
+        text: "",
+        toolCalls: [
+          {
+            id: `call_nav_${i}`,
+            type: "function",
+            function: { name: "browser_navigate", arguments: JSON.stringify({ url: `http://127.0.0.1:${i}/` }) }
+          }
+        ],
+        finishReason: "tool_calls"
+      });
+    }
+    // Tool-less summary turn the cap-exhaustion exit consumes.
+    setEchoToolCallingResponse({
+      provider,
+      text: "I checked nine different pages but ran out of steps before finishing.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "research across pages", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id, 10000);
+
+    expect(finished.status).toBe("completed");
+    // Reached the iteration cap — NOT the loop-breaker.
+    expect(finished.currentStep).toBe("Completed (iteration cap reached: 9)");
+
+    const { readTrace } = await import("../state");
+    const traces = readTrace(config.instance, task.id);
+    // No navigation loop-breaker warning fired.
+    const navBreaker = traces.find(
+      (t) => t.type === "warning" && /navigations to recently-visited URLs.*loop-breaker/.test(t.message)
+    );
+    expect(navBreaker).toBeUndefined();
+    // The cap warning is what stopped us.
+    const capWarning = traces.find((t) => t.type === "warning" && /Iteration cap \(9\)/.test(t.message));
+    expect(capWarning).toBeDefined();
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // The navigation loop-breaker's protection MUST NOT regress: a model that
+  // oscillates between a small set of URLs (the degenerate reload/ping-pong
+  // pattern behind the original context-overflow incident) still trips it at
+  // the existing threshold. Oscillating between TWO URLs keeps the exact-match
+  // and action-only guards from firing (arguments alternate every turn), so
+  // only the navigation guard can catch it — isolating the guard under test.
+  test("STILL trips the navigation loop-breaker on oscillating-URL reload loops", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-nav-oscillate");
+    const provider = normalizeProvider(config.provider);
+
+    // Two distinct first-visits seed the recent-URL window (count stays 0),
+    // then alternating between them is a repeat every turn so the count climbs
+    // to MAX_NAVIGATION_WITHOUT_ACTION (8): 2 seed + 8 repeats = 10 navigations.
+    const urls = ["http://127.0.0.1:1/", "http://127.0.0.1:2/"];
+    for (let i = 0; i < 10; i++) {
+      setEchoToolCallingResponse({
+        provider,
+        text: "",
+        toolCalls: [
+          {
+            id: `call_osc_${i}`,
+            type: "function",
+            function: { name: "browser_navigate", arguments: JSON.stringify({ url: urls[i % 2] }) }
+          }
+        ],
+        finishReason: "tool_calls"
+      });
+    }
+    // Tool-less summary turn the loop-breaker exit consumes.
+    setEchoToolCallingResponse({
+      provider,
+      text: "I kept bouncing between the same two pages without getting anywhere.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "open these pages", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id, 10000);
+
+    expect(finished.status).toBe("completed");
+    expect(finished.currentStep).toBe("Completed (stopped: tool loop made no progress)");
+
+    const { readTrace } = await import("../state");
+    const traces = readTrace(config.instance, task.id);
+    const navBreaker = traces.find(
+      (t) => t.type === "warning" && /navigations to recently-visited URLs.*loop-breaker/.test(t.message)
+    );
+    expect(navBreaker).toBeDefined();
+    // Stopped well before the 90-cap: 10 navigation turns + 1 summary turn.
+    const calls = getEchoToolCallingCalls();
+    expect(calls.length).toBe(11);
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
@@ -3933,44 +4051,134 @@ describe("chat-task loop", () => {
   });
 });
 
-// Navigation-without-action counter (loop-breaker guard 3). Driving the real
+// Navigation-without-progress counter (loop-breaker guard 3). Driving the real
 // browser tool through the loop would launch Chromium — heavy and flaky in a
 // unit test — so the counter step is a pure helper tested directly. The model's
-// emitted tool names per iteration are all the input it needs.
-describe("nextNavWithoutAction", () => {
-  test("navigation tools increment, page-actions reset, neutral tools are unchanged", () => {
-    // A run of navigations climbs.
-    expect(nextNavWithoutAction(0, ["browser_navigate"])).toBe(1);
-    expect(nextNavWithoutAction(1, ["browser_navigate"])).toBe(2);
-    expect(nextNavWithoutAction(2, ["browser_back"])).toBe(3);
-    // A page-action resets to zero.
-    expect(nextNavWithoutAction(7, ["browser_click"])).toBe(0);
-    expect(nextNavWithoutAction(3, ["browser_type"])).toBe(0);
-    expect(nextNavWithoutAction(3, ["browser_fill_form"])).toBe(0);
-    // Neutral tools (snapshot, scroll, time, etc.) leave the count alone.
-    expect(nextNavWithoutAction(4, ["browser_snapshot"])).toBe(4);
-    expect(nextNavWithoutAction(4, ["get_current_time"])).toBe(4);
-    expect(nextNavWithoutAction(0, [])).toBe(0);
+// emitted (tool name, navigation URL) pairs per iteration are all it needs.
+describe("nextNavStallState", () => {
+  // Convenience: thread a sequence of single-call iterations through the state
+  // and return the running count after each one.
+  function counts(steps: { name: string; url?: string }[]): number[] {
+    let state = initialNavStallState();
+    const out: number[] = [];
+    for (const s of steps) {
+      state = nextNavStallState(state, [s]);
+      out.push(state.count);
+    }
+    return out;
+  }
+
+  test("repeated navigation to the SAME url climbs; page-actions reset", () => {
+    expect(
+      counts([
+        { name: "browser_navigate", url: "https://a.com" }, // 0: first visit is progress
+        { name: "browser_navigate", url: "https://a.com" }, // 1: repeat
+        { name: "browser_navigate", url: "https://a.com" }, // 2: repeat
+        { name: "browser_click" }, // 0: page-action resets
+        { name: "browser_navigate", url: "https://a.com" } // 0: still in window but reset wins on the click line; new line is a repeat
+      ])
+    ).toEqual([0, 1, 2, 0, 1]);
+  });
+
+  test("navigating to a NEW url is progress and resets the count", () => {
+    // Reload the same page twice (climb), then move to a fresh URL (reset).
+    expect(
+      counts([
+        { name: "browser_navigate", url: "https://a.com" }, // 0
+        { name: "browser_navigate", url: "https://a.com" }, // 1
+        { name: "browser_navigate", url: "https://b.com" }, // 0: new URL
+        { name: "browser_navigate", url: "https://c.com" } // 0: new URL
+      ])
+    ).toEqual([0, 1, 0, 0]);
+  });
+
+  test("a browser_console data extraction resets the count (the research pattern)", () => {
+    // navigate -> console-extract -> navigate across DISTINCT pages never climbs:
+    // a fresh URL is already progress, and the console reset reinforces it.
+    expect(
+      counts([
+        { name: "browser_navigate", url: "https://a.com" }, // 0
+        { name: "browser_console" }, // 0: progress
+        { name: "browser_navigate", url: "https://b.com" }, // 0: new URL
+        { name: "browser_console" }, // 0
+        { name: "browser_navigate", url: "https://c.com" } // 0: new URL
+      ])
+    ).toEqual([0, 0, 0, 0, 0]);
+    // A console extraction resets even a climbing reload count (the model pulled
+    // data off the page — genuine progress), though the URL stays in the window.
+    expect(
+      counts([
+        { name: "browser_navigate", url: "https://a.com" }, // 0
+        { name: "browser_navigate", url: "https://a.com" }, // 1: repeat
+        { name: "browser_navigate", url: "https://a.com" }, // 2: repeat
+        { name: "browser_console" }, // 0: progress resets
+        { name: "browser_navigate", url: "https://a.com" } // 1: still in window, repeat again
+      ])
+    ).toEqual([0, 1, 2, 0, 1]);
+  });
+
+  test("browser_snapshot is NEUTRAL — re-snapshotting the same page does NOT reset", () => {
+    // The degenerate overflow incident: navigate then re-snapshot the same URL
+    // repeatedly. Snapshot must not reset the stall, so the reload count climbs.
+    expect(
+      counts([
+        { name: "browser_navigate", url: "https://a.com" }, // 0
+        { name: "browser_snapshot" }, // 0 (neutral, count unchanged)
+        { name: "browser_navigate", url: "https://a.com" }, // 1: repeat URL
+        { name: "browser_snapshot" }, // 1 (neutral)
+        { name: "browser_navigate", url: "https://a.com" } // 2: repeat URL
+      ])
+    ).toEqual([0, 0, 1, 1, 2]);
   });
 
   test("multiple tools in one iteration apply in order (last write wins on reset)", () => {
-    // navigate then click in the same turn nets a reset.
-    expect(nextNavWithoutAction(5, ["browser_navigate", "browser_click"])).toBe(0);
-    // click then navigate ends incremented from zero.
-    expect(nextNavWithoutAction(5, ["browser_click", "browser_navigate"])).toBe(1);
-    // two navigations in one turn climb by two.
-    expect(nextNavWithoutAction(2, ["browser_navigate", "browser_navigate"])).toBe(4);
+    // navigate (repeat) then click in the same turn nets a reset.
+    let s = nextNavStallState({ count: 4, recentUrls: ["https://a.com"] }, [
+      { name: "browser_navigate", url: "https://a.com" },
+      { name: "browser_click" }
+    ]);
+    expect(s.count).toBe(0);
+    // click then navigate-to-known ends at 1 (reset, then a repeat).
+    s = nextNavStallState({ count: 4, recentUrls: ["https://a.com"] }, [
+      { name: "browser_click" },
+      { name: "browser_navigate", url: "https://a.com" }
+    ]);
+    expect(s.count).toBe(1);
   });
 
   test("oscillation between two URLs climbs to the threshold (the case guard 2 misses)", () => {
-    // Alternating navigate targets keep the ACTION signature flipping, so the
-    // action-only guard resets every turn — but the navigation counter climbs
-    // monotonically because no page-action ever intervenes.
-    let count = 0;
+    // Alternating navigate targets keep the ACTION signature flipping so the
+    // action-only guard resets every turn — but both URLs stay in the recent
+    // window, so each navigation is a repeat and the stall climbs monotonically.
+    let state = initialNavStallState();
+    // Seed both URLs into the window first (two distinct first-visits).
+    state = nextNavStallState(state, [{ name: "browser_navigate", url: "https://a.com" }]);
+    state = nextNavStallState(state, [{ name: "browser_navigate", url: "https://b.com" }]);
     for (let i = 0; i < 8; i++) {
-      count = nextNavWithoutAction(count, ["browser_navigate"]);
+      const url = i % 2 === 0 ? "https://a.com" : "https://b.com";
+      state = nextNavStallState(state, [{ name: "browser_navigate", url }]);
     }
-    expect(count).toBe(8);
+    expect(state.count).toBeGreaterThanOrEqual(8);
+  });
+
+  test("a long run of DISTINCT urls never trips (the legitimate-research case)", () => {
+    let state = initialNavStallState();
+    for (let i = 0; i < 12; i++) {
+      state = nextNavStallState(state, [{ name: "browser_navigate", url: `https://site.com/page-${i}` }]);
+    }
+    expect(state.count).toBe(0);
+  });
+
+  test("repeated browser_back oscillation climbs (back has no url of its own)", () => {
+    let state = initialNavStallState();
+    const out: number[] = [];
+    for (let i = 0; i < 10; i++) {
+      state = nextNavStallState(state, [{ name: "browser_back" }]);
+      out.push(state.count);
+    }
+    // First back is the first visit of the back-sentinel (0), then it repeats.
+    expect(out[0]).toBe(0);
+    expect(out[8]).toBeGreaterThanOrEqual(8);
   });
 });
 
