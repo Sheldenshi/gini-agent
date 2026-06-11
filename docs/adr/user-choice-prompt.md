@@ -52,10 +52,14 @@ task.
 
 The tool description steers the model to call `ask_user` when multiple viable
 paths exist and the user's preference matters — especially BEFORE requesting
-connector setup, offering setup-vs-alternative choices (e.g. "Set up Brave +
-Exa" / "Set up Brave only" / "Neither — use web_fetch"), and for general
-mid-task preference or clarification questions. It is NOT for permission
-confirmations: risk-gated actions stay on the authorization flow.
+connector setup, offering setup-vs-alternative choices (e.g. for missing web
+search: connect a provider / fetch likely sites with `web_fetch` / browse with
+the browser), and for general mid-task preference or clarification questions.
+Every offered option must be a capability-backed action the agent can actually
+take or a setup it can request; "answer from general knowledge" is not offered
+as an option for research or current-information tasks — the user can type
+that under Other if they want it. It is NOT for permission confirmations:
+risk-gated actions stay on the authorization flow.
 
 ## Surfaces
 
