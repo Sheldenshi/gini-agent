@@ -28,8 +28,10 @@ The three layers a fan-out job runs through:
    **parentless constrained subagent** ([Subagent Delegation](subagent-delegation.md))
    running in its route's session, under the owning agent, with the route's
    systemPrompt and toolset/skill whitelist. It reads its bucket and acts
-   (drafts, flags, asks for input). Continuity across ticks is free: the channel
-   holds the negotiation history, the hook state holds the per-route cursor.
+   (drafts, flags, asks for input). Continuity across ticks: the channel holds the
+   negotiation history, the hook state holds the per-route cursor — so a follow-up
+   user message in the channel, and the next tick's worker, both see the prior
+   draft.
 
 **Tiered dumb/smart dispatch.** A route worker may be a plain concern worker
 (the dumb path: act on this bucket) OR an intelligent router that itself
@@ -119,6 +121,24 @@ subagents — rather than adding a new one.
   parent, and the spawn-depth cap is gated on `parentTaskId` so a parentless spawn
   no-ops it. One mechanism serves both a plain concern worker and an intelligent
   router that delegates further. (See [Subagent Delegation](subagent-delegation.md).)
+- **The worker's turn persists to its channel's history.** A session-bound fan-out
+  worker is spawned via `spawnSubagent` and its run carries no `conversationId`, so
+  the legacy chat-finalize paths (`syncChatTaskResult`, `finalizeJobRunFromTask`)
+  that normally write a turn's transcript + a durable assistant chatMessage do not
+  fire for it. The chat task resolves its transcript session from `task.chatSessionId`
+  (the same key the block-emit path uses, so blocks and transcript land in the same
+  channel) and persists the final turn-ending text as a durable assistant chatMessage
+  for the session-bound-subagent case (a completed worker with a `subagentId`, no
+  `jobId`, and non-empty non-sentinel text), guarded against double-writing an
+  existing assistant row. Without this, the channel would replay empty history and a
+  follow-up user message would not see the worker's prior draft.
+- **`[SILENT]` is suppressed at the chat-BLOCK layer.** A worker (like any
+  scheduled-job turn) with nothing to report answers with exactly `[SILENT]` to
+  suppress delivery. The legacy message layer already drops that `ChatMessageRecord`;
+  because the UI renders chat BLOCKS, the in-flight `assistant_text` block is also
+  retracted when the final text is exactly `[SILENT]` (trailing whitespace tolerated,
+  never content that merely contains the token), so the channel never shows a literal
+  `[SILENT]` row, and the durable-message persistence above skips it identically.
 
 ## Trust Boundary
 
