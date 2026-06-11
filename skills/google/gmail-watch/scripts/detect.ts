@@ -633,13 +633,16 @@ async function fetchInternalDate(gwsSpawn: GwsSpawn, id: string): Promise<number
 // moves FORWARD (to newer mail): you can never reach an older, un-listed tail by
 // advancing it, so a path that needs the tail is wrong.
 //
-//  1. SEEDING (no cursor): BASELINE only. Take the newest listed id (Gmail lists
-//     newest-first => window.ids[0]), fetch ITS internalDate, set the cursor
-//     there, record that id plus any sibling sharing its exact epoch second
-//     (Gmail's `after:` is inclusive of the boundary second) in `seen`, and emit
-//     NO item. Pre-existing mail older than the baseline is excluded by `after:`
-//     forever — the correct behavior (never draft a backlog), regardless of
-//     inbox size.
+//  1. SEEDING (no cursor): BASELINE + draft the single newest pending inbound.
+//     Take the newest listed id (Gmail lists newest-first => window.ids[0]), set
+//     the cursor at its internalDate, and record that id plus any sibling sharing
+//     its exact epoch second (Gmail's `after:` is inclusive of the boundary
+//     second) in `seen`. If the newest passes the SAME drop filter as steady
+//     state (non-self, non-automated unless explicitly watched), draft THAT ONE
+//     message so creating a watch on a conversation with a pending reply produces
+//     a draft immediately; a self/automated newest stays silent. Pre-existing
+//     mail OLDER than the baseline is excluded by `after:` forever — never a
+//     backlog draft, regardless of inbox size (only the single newest is drafted).
 //
 //  2. STEADY-STATE, window NOT truncated: drain OLDEST-FIRST, cap the matches at
 //     MAX_MESSAGES_PER_TICK, advance the cursor ONCE to the LAST CONSUMED item's
@@ -682,19 +685,35 @@ export async function detect(
   throwOnGwsErrorBody(listOut);
   const window = parseMessageWindow(listOut);
 
-  // Regime 1: SEEDING — baseline the cursor at the newest match, draft nothing.
+  // Regime 1: SEEDING — baseline the cursor at the newest match. If that newest
+  // match is a non-self inbound (passes the SAME drop filter as steady state),
+  // draft THAT ONE message so creating a watch on a conversation with a pending
+  // reply immediately produces a draft for it; older backlog is still excluded by
+  // `after:` forever (only the single newest qualifying message is drafted).
   if (isSeeding) {
     const newest = window.ids[0];
     const seen: string[] = [];
     let cursor: string;
+    let seedItem: ResultItem | undefined;
     if (newest) {
-      const internalDate = await fetchInternalDate(gwsSpawn, newest);
+      // Fetch the newest's metadata so the drop filter + body fetch see real
+      // headers (seeding was previously metadata-only on internalDate alone).
+      const newestMeta = parseMessageMetadata(await gwsSpawn(buildGetArgs(newest)), newest);
+      const internalDate = newestMeta.internalDate ? Number(newestMeta.internalDate) : 0;
       cursor = String(internalDate > 0 ? internalDate : Date.now());
       seen.push(newest);
+      // The newest is a pending inbound to answer => draft this ONE message
+      // (fetch its body exactly as the steady path does). A self/automated newest
+      // drops, so seeding stays silent (there's nothing pending to reply to).
+      if (!shouldDropMessage(newestMeta, selfEmail, args.sender)) {
+        newestMeta.body = await fetchMessageBody(gwsSpawn, newest, newestMeta.snippet ?? "");
+        seedItem = buildMatchItem(newestMeta);
+      }
       // Gmail's `after:<sec>` is INCLUSIVE of the boundary second, so any other
       // pre-existing message sharing the newest's exact second is re-listed on
       // the first steady tick. Record each such sibling now (they're already on
-      // this first listed page, newest-first) so they aren't drafted as "new".
+      // this first listed page, newest-first) so they aren't drafted as "new"
+      // (siblings are seen-only — only the single newest is ever drafted on seed).
       if (internalDate > 0) {
         const newestSec = Math.floor(internalDate / 1000);
         for (let i = 1; i < window.ids.length; i++) {
@@ -706,6 +725,13 @@ export async function detect(
       }
     } else {
       cursor = String(Date.now());
+    }
+    if (seedItem) {
+      const items: ResultItem[] = [seedItem];
+      // The seeded draft carries the watch's standing objective just like a steady
+      // match (one trusted item alongside the untrusted match).
+      if (args.objective) items.push(buildObjectiveItem(args.sender ?? args.query, args.objective));
+      return { kind: "context", items, state: { cursor, seen, status: "ok" } };
     }
     return { kind: "shortCircuit", summary: "[SILENT]", state: { cursor, seen, status: "ok" } };
   }
