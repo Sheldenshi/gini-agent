@@ -67,6 +67,13 @@ describe("extractText", () => {
     expect(result!.text).toContain("Hello Gini PDF fixture");
   });
 
+  test("pdf bytes as a Node Buffer extract (pdfjs rejects Uint8Array subclasses)", async () => {
+    const bytes = readFileSync(join(FIXTURES, "sample.pdf")); // Buffer
+    const result = await extractText(bytes, "application/pdf", "sample.pdf");
+    expect(result).not.toBeNull();
+    expect(result!.text).toContain("Hello Gini PDF fixture");
+  });
+
   test("docx fixture yields its raw text", async () => {
     const bytes = new Uint8Array(readFileSync(join(FIXTURES, "sample.docx")));
     const result = await extractText(
