@@ -208,9 +208,12 @@ launchd instances so foreground/conductor/tmux runs are unaffected.
   stop); on a foreground instance it SIGTERMs the PID and does not call
   bootout.
 - An auto-update on a launchd instance self-SIGTERMs and is respawned by
-  KeepAlive with the new code, and dispatches a detached
-  `gini autostart kick --kind web`; on a foreground instance it uses the
-  detached stop+start helper.
+  KeepAlive with the new code, and dispatches detached
+  `gini autostart kick` children for web AND the watchdog — the long-lived
+  watchdog loop never exits on its own and a code-only update leaves its
+  plist stamp unchanged, so the explicit kick is the only thing that
+  replaces its process with the new code. On a foreground instance the
+  update uses the detached stop+start helper.
 - A `gini watchdog` tick against a healthy instance takes no action; with
   the gateway down it `kickstart -k`s the gateway; with web down it
   `kickstart -k`s web (and queues a web crash report for consent-gated

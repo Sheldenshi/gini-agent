@@ -117,7 +117,7 @@ describe("scheduleRuntimeRestart", () => {
     rmSync(scratch, { recursive: true, force: true });
   });
 
-  test("launchd: kicks the web service and self-SIGTERMs (no orphaning stop+start helper)", async () => {
+  test("launchd: kicks the web service AND the watchdog, then self-SIGTERMs (no orphaning stop+start helper)", async () => {
     process.env.GINI_SUPERVISOR = "launchd";
     const { calls, spawn } = makeSpawnRecorder();
     const kills: Array<{ pid: number; signal: NodeJS.Signals | number }> = [];
@@ -128,15 +128,23 @@ describe("scheduleRuntimeRestart", () => {
     });
     expect(result).toBe(true);
 
-    // Exactly one spawn: `gini autostart kick --kind web`. No bash
-    // stop+start helper (that's the orphaning path we replaced).
-    expect(calls.length).toBe(1);
-    const call = calls[0]!;
-    expect(call.cmd).not.toBe("bash");
-    expect(call.args).toContain("autostart");
-    expect(call.args).toContain("kick");
-    expect(call.args).toEqual(expect.arrayContaining(["--kind", "web"]));
-    expect(call.args).toEqual(expect.arrayContaining(["--instance", "restart-launchd"]));
+    // Two spawns: `gini autostart kick --kind web` and `--kind watchdog`.
+    // The watchdog is a long-lived KeepAlive loop, so a code-only update
+    // never replaces its process unless the update kicks it. The gateway is
+    // NOT kicked (kickstart -k would force-kill it mid-drain — its restart
+    // is the self-SIGTERM below). No bash stop+start helper (that's the
+    // orphaning path we replaced).
+    expect(calls.length).toBe(2);
+    const kickedKinds: string[] = [];
+    for (const call of calls) {
+      expect(call.cmd).not.toBe("bash");
+      expect(call.args).toContain("autostart");
+      expect(call.args).toContain("kick");
+      expect(call.args).toEqual(expect.arrayContaining(["--instance", "restart-launchd"]));
+      kickedKinds.push(call.args[call.args.indexOf("--kind") + 1]!);
+    }
+    expect(kickedKinds.sort()).toEqual(["watchdog", "web"]);
+    expect(kickedKinds).not.toContain("gateway");
 
     // The self-SIGTERM is dispatched via setImmediate; let it run.
     await new Promise<void>((resolve) => setImmediate(resolve));
