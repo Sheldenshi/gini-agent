@@ -1,5 +1,6 @@
 import { submitTask } from "../agent";
-import type { JobRecord, JobRunRecord, RuntimeConfig, RuntimeState } from "../types";
+import { spawnSubagent } from "../capabilities/subagents";
+import type { JobRecord, JobRoute, JobRunRecord, RuntimeConfig, RuntimeState } from "../types";
 import { addAudit, appendEvent, appendLog, appendTrace, createChatMessage, createChatSession, createJob, createJobRun, createRun, insertChatBlock, isTerminalTaskStatus, mutateState, now, readState } from "../state";
 import { resolveEffectiveContext } from "../execution/effective-context";
 import { isKnownHook, runHook, type HookConfig } from "../hooks";
@@ -450,7 +451,13 @@ async function runPreRunHook(
   job: JobRecord,
   _run: JobRunRecord
 ): Promise<
-  | { action: "proceed"; context: string[]; onDispatched?: () => void | Promise<void>; state?: Record<string, unknown> }
+  | {
+      action: "proceed";
+      context: string[];
+      buckets?: Record<string, string[]>;
+      onDispatched?: () => void | Promise<void>;
+      state?: Record<string, unknown>;
+    }
   | { action: "shortCircuit"; summary?: string; state?: Record<string, unknown> }
   | { action: "error"; message: string; fatal: boolean }
 > {
@@ -473,6 +480,9 @@ async function runPreRunHook(
     return {
       action: "proceed",
       context: outcome.context,
+      // Surface routed buckets when the handler returned them; the scheduler
+      // fans out one worker per non-empty bucket. Absent ⇒ the legacy flat path.
+      ...(outcome.buckets ? { buckets: outcome.buckets } : {}),
       ...(outcome.onDispatched ? { onDispatched: outcome.onDispatched } : {}),
       ...(outcome.state !== undefined ? { state: outcome.state } : {})
     };
@@ -773,6 +783,17 @@ export async function runDueJobs(config: RuntimeConfig): Promise<void> {
         await finalizeHookError(config, job, run, hook.message, "schedule", hook.fatal);
         continue;
       }
+      // Routed (fan-out) path: spawn one worker per non-empty bucket into its
+      // route's session, then finalize the ONE per-tick run "completed". Commit
+      // ONLY the dispatched buckets' sub-state (per-bucket at-least-once). The
+      // legacy single-turn path below is untouched when there are no buckets.
+      if (hook.buckets) {
+        const { dispatchedRouteKeys } = await dispatchFanOut(config, job, run, "schedule", hook.buckets);
+        await persistFanOutState(config, job.id, hook.state, dispatchedRouteKeys);
+        await finalizeFanOutRun(config, job, run, dispatchedRouteKeys);
+        if (hook.onDispatched) await hook.onDispatched();
+        continue;
+      }
       await dispatchPromptRun(config, job, run, "schedule", hook.context);
       // Commit the hook's deferred post-delivery state ONLY after dispatch
       // resolved (the drafting turn is spawned). dispatchPromptRun finalizes its
@@ -975,6 +996,210 @@ async function dispatchPromptRun(
   return { jobId: job.id, runId: run.id, taskId: task.id };
 }
 
+// Finalize the ONE per-tick JobRunRecord "completed" after a fan-out dispatched
+// all its buckets. A fan-out tick spawns N independent worker tasks (each a
+// constrained subagent into its route's session); each worker delivers its own
+// assistant message via the normal chat path. The tick's run is NOT bound to any
+// single one of those tasks, so we finalize it INLINE by run.id — never routing
+// it through finalizeJobRunFromTask (which assumes one run -> one task and would
+// mis-bind to one worker). Mirrors finalizeShortCircuit's inline completed write:
+// completed status, job lastSuccessAt + cleared lastError, oneShot auto-pause +
+// audit, and the job.run.completed event. The `status === "running"` guard makes
+// a cancel race a no-op (no double finalize).
+async function finalizeFanOutRun(
+  config: RuntimeConfig,
+  job: JobRecord,
+  run: JobRunRecord,
+  dispatchedRouteKeys: string[]
+): Promise<void> {
+  await mutateState(config.instance, (state) => {
+    const runItem = state.jobRuns.find((candidate) => candidate.id === run.id);
+    const jobItem = state.jobs.find((candidate) => candidate.id === job.id);
+    if (!runItem) return;
+    if (runItem.status !== "running") return;
+    const completedAt = now();
+    runItem.status = "completed";
+    runItem.summary = "[SILENT]";
+    runItem.error = undefined;
+    runItem.completedAt = completedAt;
+    runItem.updatedAt = completedAt;
+    if (jobItem) {
+      jobItem.lastSuccessAt = completedAt;
+      jobItem.lastError = undefined;
+      if (jobItem.oneShot === true && jobItem.status === "active") {
+        jobItem.status = "paused";
+        jobItem.updatedAt = completedAt;
+        addAudit(
+          state,
+          {
+            actor: "runtime",
+            action: "job.oneshot.completed",
+            target: jobItem.id,
+            risk: "low",
+            evidence: { runId: run.id, runStatus: runItem.status }
+          },
+          { jobId: jobItem.id, agentId: jobItem.agentId }
+        );
+      }
+    }
+    appendEvent(
+      state,
+      {
+        kind: "job",
+        action: "job.run.completed",
+        target: job.id,
+        jobId: job.id,
+        risk: "low",
+        summary: "Fan-out dispatched all routed buckets.",
+        data: { runId: run.id, fanOut: true, dispatchedRouteKeys }
+      },
+      { jobId: job.id, agentId: job.agentId }
+    );
+  });
+}
+
+// Fan out a routed pre-run hook result: for each non-empty bucket, spawn ONE
+// constrained worker (subagent) into that route's chat session, fed the route's
+// worker config + the bucket's fenced context. Empty buckets spawn nothing
+// (per-concern short-circuit; an idle concern costs zero model turns). Returns
+// the routeKeys that successfully dispatched so the caller can advance ONLY their
+// sub-cursors (per-bucket at-least-once: a failed bucket keeps its prior cursor
+// and re-detects next tick).
+//
+// Each route dispatch is wrapped in its own try/catch so one failing route can't
+// derail its siblings. A route with no JobRecord.routes entry falls back to the
+// job's own chatSessionId (audited job.route.missing); a route pointing at a
+// deleted session is audited (job.route.session_missing) and skipped without
+// blocking siblings. The ONE per-tick JobRunRecord is finalized by the caller via
+// finalizeFanOutRun — workers deliver independently via the chat path.
+async function dispatchFanOut(
+  config: RuntimeConfig,
+  job: JobRecord,
+  run: JobRunRecord,
+  trigger: "schedule" | "manual" | "replay",
+  buckets: Record<string, string[]>
+): Promise<{ dispatchedRouteKeys: string[] }> {
+  const dispatchedRouteKeys: string[] = [];
+  for (const [routeKey, bucketContext] of Object.entries(buckets)) {
+    // Empty bucket → no worker (zero-idle-turn discipline).
+    if (bucketContext.length === 0) continue;
+    try {
+      // Resolve the route. An unmapped routeKey falls back to the job's own
+      // session so the bucket still gets delivered (audited so a missing route is
+      // visible). A mapped route whose session was deleted is audited + skipped.
+      const route: JobRoute | undefined = job.routes?.[routeKey];
+      let chatSessionId: string;
+      if (route) {
+        const sessionExists = readState(config.instance).chatSessions.some((s) => s.id === route.chatSessionId);
+        if (!sessionExists) {
+          await mutateState(config.instance, (state) => {
+            addAudit(
+              state,
+              {
+                actor: "runtime",
+                action: "job.route.session_missing",
+                target: job.id,
+                risk: "low",
+                evidence: { jobId: job.id, runId: run.id, routeKey, chatSessionId: route.chatSessionId }
+              },
+              { jobId: job.id, agentId: job.agentId }
+            );
+          });
+          continue;
+        }
+        chatSessionId = route.chatSessionId;
+      } else {
+        if (!job.chatSessionId) {
+          // No route and no job session to fall back to — nothing to deliver into.
+          await mutateState(config.instance, (state) => {
+            addAudit(
+              state,
+              {
+                actor: "runtime",
+                action: "job.route.missing",
+                target: job.id,
+                risk: "low",
+                evidence: { jobId: job.id, runId: run.id, routeKey, fellBackTo: null }
+              },
+              { jobId: job.id, agentId: job.agentId }
+            );
+          });
+          continue;
+        }
+        await mutateState(config.instance, (state) => {
+          addAudit(
+            state,
+            {
+              actor: "runtime",
+              action: "job.route.missing",
+              target: job.id,
+              risk: "low",
+              evidence: { jobId: job.id, runId: run.id, routeKey, fellBackTo: job.chatSessionId }
+            },
+            { jobId: job.id, agentId: job.agentId }
+          );
+        });
+        chatSessionId = job.chatSessionId;
+      }
+
+      // Per-route prompt: the route's prompt (or the job's) + the job's static
+      // context + this bucket's fenced items, assembled at the same point
+      // dispatchPromptRun assembles its single-turn prompt.
+      const prompt = withCronHint(route?.prompt ?? job.prompt, [...job.context, ...bucketContext]);
+      // Spawn one constrained worker into the route's session. NO parentTaskId
+      // (a parentless constrained subagent — the depth cap no-ops without a
+      // parent chain), so the worker runs under the route's systemPrompt/toolsets/
+      // skills whitelist exactly like a delegated subagent.
+      await spawnSubagent(config, {
+        name: job.name,
+        prompt,
+        systemPrompt: route?.systemPrompt,
+        toolsets: route?.toolsets,
+        skills: route?.skills,
+        chatSessionId
+      });
+      dispatchedRouteKeys.push(routeKey);
+    } catch (error) {
+      // One route's failure must not derail its siblings. Log it; the bucket's
+      // cursor stays un-advanced (caller merges only dispatched routeKeys), so it
+      // re-detects next tick (per-bucket at-least-once).
+      appendLog(config.instance, "job.route.dispatch.error", {
+        jobId: job.id,
+        runId: run.id,
+        routeKey,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }
+  return { dispatchedRouteKeys };
+}
+
+// Merge ONLY the dispatched buckets' sub-state into the job's hookState, leaving a
+// failed (un-dispatched) bucket's prior sub-state intact so it re-detects next
+// tick (per-bucket at-least-once). Domain-agnostic contract: a routed handler
+// returns its new `state` keyed by routeKey at the top level — each top-level key
+// IS a bucket's routeKey. We start from the OLD hookState (every failed bucket's
+// cursor preserved) and overwrite only the dispatched routeKeys with their NEW
+// sub-state. A routeKey present in newState but not dispatched keeps its old slice;
+// a routeKey absent from newState is left as-is.
+async function persistFanOutState(
+  config: RuntimeConfig,
+  jobId: string,
+  newState: Record<string, unknown> | undefined,
+  dispatchedRouteKeys: string[]
+): Promise<void> {
+  if (newState === undefined || dispatchedRouteKeys.length === 0) return;
+  await mutateState(config.instance, (state) => {
+    const job = state.jobs.find((candidate) => candidate.id === jobId);
+    if (!job) return;
+    const merged: Record<string, unknown> = { ...(job.hookState ?? {}) };
+    for (const routeKey of dispatchedRouteKeys) {
+      if (routeKey in newState) merged[routeKey] = newState[routeKey];
+    }
+    job.hookState = merged;
+  });
+}
+
 export async function runJobNow(
   config: RuntimeConfig,
   jobId: string,
@@ -1068,6 +1293,15 @@ export async function runJobNow(
   if (hook.action === "error") {
     await finalizeHookError(config, job, run, hook.message, trigger, hook.fatal);
     return { jobId: job.id, runId: run.id, error: hook.message };
+  }
+  // Routed (fan-out) path mirrors runDueJobs: one worker per non-empty bucket,
+  // per-bucket at-least-once commit, then finalize the ONE per-tick run.
+  if (hook.buckets) {
+    const { dispatchedRouteKeys } = await dispatchFanOut(config, job, run, trigger, hook.buckets);
+    await persistFanOutState(config, job.id, hook.state, dispatchedRouteKeys);
+    await finalizeFanOutRun(config, job, run, dispatchedRouteKeys);
+    if (hook.onDispatched) await hook.onDispatched();
+    return { jobId: job.id, runId: run.id, fanOut: true, dispatchedRouteKeys };
   }
   const dispatched = await dispatchPromptRun(config, job, run, trigger, hook.context);
   // Commit the hook's deferred post-delivery state only after dispatch resolved.
