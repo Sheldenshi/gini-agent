@@ -2844,6 +2844,48 @@ describe("ensureShared default headless persistent launch", () => {
   });
 });
 
+// browser_vision native-image fast-path gate: the screenshot may enter the
+// conversation directly ONLY when the active model accepts image input AND
+// no secrets are registered for ANY active task (raw pixels cannot be
+// post-OCR-redacted, so the union registry must be empty). No provider
+// tool-result serializer can carry an image part yet, so browserVision
+// still routes every call through the aux side-call — this suite pins the
+// gate decision itself.
+describe("browser_vision native-image route gate", () => {
+  const configFor = (provider: RuntimeConfig["provider"]): RuntimeConfig => ({
+    instance: "test",
+    port: 7337,
+    token: "test",
+    provider,
+    workspaceRoot: "/tmp",
+    stateRoot: "/tmp/gini-vision-route-test",
+    logRoot: "/tmp/gini-vision-route-test-logs"
+  });
+
+  afterEach(() => {
+    browserTest.resetFilledSecretsForTest();
+  });
+
+  test("vision-capable model + empty cross-task secret registry → native-image", () => {
+    const route = browserTest.resolveVisionRouteForTest(configFor({ name: "anthropic", model: "claude-sonnet-4-5" }));
+    expect(route).toBe("native-image");
+  });
+
+  test("a secret registered by ANY task forces the aux side-call even on a vision-capable model", () => {
+    // The registering task is unrelated to the vision caller — the gate
+    // reads the cross-task union (shared BrowserContext can surface one
+    // task's credential on another task's page).
+    browserTest.recordFilledSecretForTest("unrelated-task", "hunter2-long-secret");
+    const route = browserTest.resolveVisionRouteForTest(configFor({ name: "anthropic", model: "claude-sonnet-4-5" }));
+    expect(route).toBe("aux-side-call");
+  });
+
+  test("a model without vision capability stays on the aux side-call", () => {
+    const route = browserTest.resolveVisionRouteForTest(configFor({ name: "echo", model: "gini-echo-v0" }));
+    expect(route).toBe("aux-side-call");
+  });
+});
+
 // browser_vision: screenshots the current page and asks the configured vision
 // model a question. We install a fake session with a stub `page.screenshot`
 // so we don't need a real Chromium, and route the provider through the echo

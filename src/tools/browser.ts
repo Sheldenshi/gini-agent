@@ -33,6 +33,7 @@ import { lookup } from "node:dns/promises";
 import { downloadsDir, instanceRoot } from "../paths";
 import { launchPersistentChrome } from "./chrome-discovery";
 import { generateAuxText, generateVisionAnalysis } from "../provider";
+import { resolveProviderModality } from "../provider-capabilities";
 import { assertInsideWorkspace, readState } from "../state";
 import { sanitizeUrlForAuditTarget } from "../execution/browser-fill-secrets-types";
 import type { BrowserConnectionRecord, BrowserDomainPolicy, Instance, RuntimeConfig } from "../types";
@@ -3952,6 +3953,22 @@ const MAX_SCREENSHOT_BYTES = 5 * 1024 * 1024;
 // the very content the screenshot is meant to show.
 const VISION_ANNOTATE_BADGE_CAP = 50;
 
+// Native-vision fast-path gate. When the active model accepts image
+// input, attaching the screenshot directly to the conversation would
+// save the aux round trip and the OCR fidelity loss of describing
+// pixels in text — but a raw image cannot be post-OCR-redacted, so the
+// native route is allowed ONLY when no secrets are registered for ANY
+// active task (allRegisteredSecrets() is the cross-task union; one
+// task's typed credential can be visible on another task's page via
+// the shared BrowserContext). With any secret registered, the aux
+// side-call with pre-blur + post-OCR redaction stays mandatory.
+type VisionRoute = "native-image" | "aux-side-call";
+
+function resolveVisionRoute(config: RuntimeConfig): VisionRoute {
+  if (allRegisteredSecrets().length > 0) return "aux-side-call";
+  return resolveProviderModality(config.provider).vision ? "native-image" : "aux-side-call";
+}
+
 // Screenshot the current page and ask the configured vision model a question
 // about it. Returns the model's text answer. The agent never sees the
 // screenshot bytes — vision is a side call mediated by the provider layer so
@@ -4119,6 +4136,18 @@ export async function browserVision(
       const prompt = annotate
         ? `${question}\n\nThe numbered badges overlaid on the screenshot are element refs (badge "e12" = @e12 in the page snapshot); cite them when referring to specific elements.`
         : question;
+      // Route selection (see resolveVisionRoute). "native-image" means
+      // the screenshot is ALLOWED to enter the conversation directly —
+      // but every provider tool-result serializer is string-only today
+      // (translateMessagesToAnthropic JSON-stringifies tool_result
+      // parts; the chat-completions `tool` role and codex
+      // function_call_output accept no image parts), so there is no
+      // transport for an image tool result yet. Until that plumbing
+      // exists the native route degrades to the same aux side-call;
+      // the gate is evaluated and pinned by tests HERE so the
+      // transport swap is local to this branch when it lands.
+      const route = resolveVisionRoute(config);
+      void route;
       const result = await generateVisionAnalysis(config, {
         prompt,
         imageBase64,
@@ -4689,5 +4718,11 @@ export const __test = {
   // asserted without driving a full page walk.
   renderSnapshotDiffForTest(prevText: string, currText: string): string | undefined {
     return renderSnapshotDiff(prevText, currText);
+  },
+  // Expose the browser_vision route gate (native-image vs aux side-call)
+  // so its secret-registry × model-capability matrix can be pinned
+  // without a provider call.
+  resolveVisionRouteForTest(config: RuntimeConfig): VisionRoute {
+    return resolveVisionRoute(config);
   }
 };
