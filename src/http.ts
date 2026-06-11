@@ -46,7 +46,7 @@ import { getGoogleAccount, googleAccountsRoot } from "./state/google-accounts";
 import { listProviders } from "./integrations/connectors/registry";
 import { runConnectorDetection } from "./jobs/connector-detection";
 import { createScheduledJob, listJobRuns, removeJob, replayJobRun, runJobNow, updateJob, updateJobStatus } from "./jobs";
-import { addEmailWatcher, listEmailWatchers, removeEmailWatcher, setEmailWatcherEnabled } from "./state/email-watchers";
+import { addEmailWatcher, clearEmailWatcherObjective, getEmailWatcher, listEmailWatchers, removeEmailWatcher, setEmailTriageEnabled, setEmailWatcherEnabled, setEmailWatcherObjective } from "./state/email-watchers";
 import { migrateLegacyMemories, recall, reflect, retain } from "./memory";
 import { embeddingStatus, reembedAllBanks, reembedBank } from "./memory/embedding";
 import { rerankerStatus } from "./memory/reranker";
@@ -1407,22 +1407,56 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["GET", /^\/api\/email\/watchers$/, () => json(listEmailWatchers(config))],
     ["POST", /^\/api\/email\/watchers$/, async (request) => {
       const payload = await body(request);
+      // Whole-inbox triage opt-in (ADR email-watch.md): `triage: true` provisions
+      // the broad respond-or-flag concern for the active agent, `false` tears it
+      // down. Triage is OPT-IN and independent of targeted watches; when triage is
+      // the only field, toggle it without creating a normal watcher.
+      if (payload.triage !== undefined && payload.triage !== null) {
+        if (typeof payload.triage !== "boolean") {
+          return json({ error: "Invalid input: triage must be a boolean" }, 400);
+        }
+        const enabled = await setEmailTriageEnabled(config, readState(config.instance).activeAgentId, payload.triage);
+        if (payload.sender === undefined && payload.query === undefined && payload.threadId === undefined) {
+          return json({ triage: enabled }, 201);
+        }
+      }
       return json(await addEmailWatcher(config, {
         sender: typeof payload.sender === "string" ? payload.sender : undefined,
         query: typeof payload.query === "string" ? payload.query : undefined,
-        account: typeof payload.account === "string" ? payload.account : undefined
+        account: typeof payload.account === "string" ? payload.account : undefined,
+        objective: typeof payload.objective === "string" ? payload.objective : undefined,
+        threadId: typeof payload.threadId === "string" ? payload.threadId : undefined,
+        followUpAfterHours: typeof payload.followUpAfterHours === "number" ? payload.followUpAfterHours : undefined
       }), 201);
     }],
     ["DELETE", /^\/api\/email\/watchers\/([^/]+)$/, async (_request, params) => json(await removeEmailWatcher(config, params[0]))],
-    // PATCH toggles a watcher's enabled flag, rebuilding the shared job's watch
-    // list (disabling the last enabled watcher tears the shared job down; enabling
-    // recreates it).
+    // PATCH toggles a watcher's enabled flag and/or updates its objective,
+    // rebuilding the shared job's watch list (disabling the last enabled
+    // watcher tears the shared job down; enabling recreates it; a new
+    // objective rides the rebuilt hook config into the next tick). An explicit
+    // `objective: null` CLEARS the objective (distinct from omitted = unchanged
+    // and "" = rejected by validateObjective).
     ["PATCH", /^\/api\/email\/watchers\/([^/]+)$/, async (request, params) => {
       const payload = await body(request);
-      if (typeof payload.enabled !== "boolean") {
+      if (payload.enabled === undefined && payload.objective === undefined) {
+        return json({ error: "Invalid input: provide enabled (boolean) and/or objective (string or null to clear)" }, 400);
+      }
+      if (payload.enabled !== undefined && typeof payload.enabled !== "boolean") {
         return json({ error: "Invalid input: enabled must be a boolean" }, 400);
       }
-      const updated = await setEmailWatcherEnabled(config, params[0], payload.enabled);
+      if (payload.objective !== undefined && payload.objective !== null && typeof payload.objective !== "string") {
+        return json({ error: "Invalid input: objective must be a string or null" }, 400);
+      }
+      let updated = getEmailWatcher(config, params[0]);
+      if (!updated) return json({ error: `Email watcher not found: ${params[0]}` }, 404);
+      if (payload.objective === null) {
+        updated = await clearEmailWatcherObjective(config, params[0]);
+      } else if (typeof payload.objective === "string") {
+        updated = await setEmailWatcherObjective(config, params[0], payload.objective);
+      }
+      if (typeof payload.enabled === "boolean") {
+        updated = await setEmailWatcherEnabled(config, params[0], payload.enabled);
+      }
       if (!updated) return json({ error: `Email watcher not found: ${params[0]}` }, 404);
       return json(updated);
     }],

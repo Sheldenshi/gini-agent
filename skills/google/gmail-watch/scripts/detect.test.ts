@@ -27,6 +27,10 @@ interface Meta {
   subject?: string;
   date?: string;
   snippet?: string;
+  // Optional headers for the cross-account dedup tests: the RFC Message-ID
+  // (stable across accounts) and the To recipient (drives dedup precedence).
+  to?: string;
+  messageId?: string;
 }
 
 const PREAMBLE = "Using keyring backend: keyring\n";
@@ -59,7 +63,9 @@ function metadataResponse(meta: Meta): string {
         headers: [
           { name: "From", value: meta.from ?? "" },
           { name: "Subject", value: meta.subject ?? "" },
-          { name: "Date", value: meta.date ?? "" }
+          { name: "Date", value: meta.date ?? "" },
+          ...(meta.to !== undefined ? [{ name: "To", value: meta.to }] : []),
+          ...(meta.messageId !== undefined ? [{ name: "Message-ID", value: meta.messageId }] : [])
         ]
       }
     })
@@ -130,8 +136,18 @@ function itemPayload(text: string): Record<string, unknown> {
   return JSON.parse(json) as Record<string, unknown>;
 }
 
-function draftedIds(items: { text: string }[] | undefined): string[] {
-  return (items ?? []).map((i) => itemPayload(i.text).id as string);
+// Drafted = untrusted match items only (trusted objective/notice items carry
+// no JSON payload).
+function draftedIds(items: { text: string; untrusted: boolean }[] | undefined): string[] {
+  return (items ?? []).filter((i) => i.untrusted).map((i) => itemPayload(i.text).id as string);
+}
+
+// Flatten every routed bucket into one items[] (the multi-watch result no longer
+// carries a flat items[] — matches are partitioned per concern by routeKey).
+function allBucketItems(
+  buckets: Record<string, { text: string; untrusted: boolean }[]> | undefined
+): { text: string; untrusted: boolean }[] {
+  return Object.values(buckets ?? {}).flat();
 }
 
 describe("parse + safety helpers", () => {
@@ -153,6 +169,17 @@ describe("parse + safety helpers", () => {
     // self j@gmail.com must NOT drop aj@gmail.com (substring match would).
     expect(shouldDropMessage({ id: "x", from: "AJ <aj@gmail.com>" }, "j@gmail.com")).toBe(false);
     expect(shouldDropMessage({ id: "x", from: "Alice <alice@x.com>" }, "me@example.com")).toBe(false);
+  });
+
+  test("an explicitly watched sender bypasses the automated heuristic; self still drops", () => {
+    // Watching noreply@ups.com by name must fire despite the AUTOMATED_FROM hit.
+    expect(shouldDropMessage({ id: "x", from: "UPS <noreply@ups.com>" }, "me@example.com", "noreply@ups.com")).toBe(false);
+    // Case-insensitive equality on the parsed address.
+    expect(shouldDropMessage({ id: "x", from: "NoReply@UPS.com" }, "me@example.com", "noreply@ups.com")).toBe(false);
+    // A DIFFERENT automated sender on the same watch still drops.
+    expect(shouldDropMessage({ id: "x", from: "notifications@github.com" }, "me@example.com", "noreply@ups.com")).toBe(true);
+    // Self-drop is mandatory — even when self IS the watched address.
+    expect(shouldDropMessage({ id: "x", from: "me@example.com" }, "me@example.com", "me@example.com")).toBe(true);
   });
 
   test("parseFromAddress extracts the bare address from either form", () => {
@@ -186,38 +213,122 @@ describe("parse + safety helpers", () => {
 });
 
 describe("detect — regimes", () => {
-  test("seeding baselines from the newest match, drafts nothing, records boundary seen", async () => {
+  test("seeding drafts the newest pending inbound, baselines, records boundary seen", async () => {
     const spawn = stubSpawn(["m2", "m1"], {
       m1: { id: "m1", internalDate: "1000", from: "alice@x.com", subject: "a" },
       m2: { id: "m2", internalDate: "2000", from: "alice@x.com", subject: "b" }
     });
     const r = await detect({ query: "from:alice@x.com is:unread", state: null }, spawn, "me@example.com");
-    expect(r.kind).toBe("shortCircuit");
+    // The newest match is a non-self inbound => seed drafts THAT ONE message.
+    expect(r.kind).toBe("context");
+    expect(draftedIds(r.items)).toEqual(["m2"]);
     expect(r.state.cursor).toBe("2000");
     // Only the newest boundary id is recorded (different seconds => no sibling).
     expect(r.state.seen).toEqual(["m2"]);
   });
 
-  test("seeding on a truncated window baselines at the newest without enumerating", async () => {
+  test("seeding drafts ONLY the newest, not the older backlog; next tick does not re-draft", async () => {
+    // Three matching messages already in the inbox. Seed drafts ONLY the newest;
+    // the older two are never drafted (excluded by `after:` forever).
+    const corpus: Meta[] = [
+      { id: "s-new", internalDate: "1780000003000", from: "Alice <alice@x.com>", subject: "newest" },
+      { id: "s-mid", internalDate: "1780000002000", from: "Alice <alice@x.com>", subject: "mid" },
+      { id: "s-old", internalDate: "1780000001000", from: "Alice <alice@x.com>", subject: "old" }
+    ];
+    const spawn = afterHonoringSpawn(corpus);
+    const seed = await detect({ query: "from:alice@x.com", state: null }, spawn, "me@example.com");
+    expect(seed.kind).toBe("context");
+    // ONLY the newest is drafted — not the older backlog.
+    expect(draftedIds(seed.items)).toEqual(["s-new"]);
+    expect(seed.state.cursor).toBe("1780000003000");
+    expect(seed.state.seen).toEqual(["s-new"]);
+
+    // The next steady tick (with the seeded state) re-lists nothing newer => no
+    // re-draft of the seeded message.
+    const steady = await detect({ query: "from:alice@x.com", state: seed.state }, spawn, "me@example.com");
+    expect(steady.kind).toBe("shortCircuit");
+  });
+
+  test("seeding stays silent when the newest is self (nothing pending to answer)", async () => {
+    const spawn = stubSpawn(["m2", "m1"], {
+      m1: { id: "m1", internalDate: "1000", from: "alice@x.com", subject: "a" },
+      m2: { id: "m2", internalDate: "2000", from: "me@example.com", subject: "our reply" }
+    });
+    const r = await detect({ query: "from:alice@x.com is:unread", state: null }, spawn, "me@example.com");
+    // The newest is our OWN message => draft nothing, baseline silently.
+    expect(r.kind).toBe("shortCircuit");
+    expect(r.summary).toBe("[SILENT]");
+    expect(r.state.cursor).toBe("2000");
+    expect(r.state.seen).toEqual(["m2"]);
+  });
+
+  test("seeding stays silent when the newest is an automated sender", async () => {
+    const spawn = stubSpawn(["m2", "m1"], {
+      m1: { id: "m1", internalDate: "1000", from: "alice@x.com", subject: "a" },
+      m2: { id: "m2", internalDate: "2000", from: "no-reply@service.com", subject: "auto" }
+    });
+    const r = await detect({ query: "is:unread", state: null }, spawn, "me@example.com");
+    // The newest is automated (the steady drop filter rejects it) => silent seed.
+    expect(r.kind).toBe("shortCircuit");
+    expect(r.summary).toBe("[SILENT]");
+    expect(r.state.cursor).toBe("2000");
+    expect(r.state.seen).toEqual(["m2"]);
+  });
+
+  test("seeding carries the objective and the fetched body on the seeded draft", async () => {
+    const meta: Meta = { id: "m2", internalDate: "2000", from: "Alice <alice@x.com>", subject: "offer", snippet: "snip" };
+    const fullBody = "The full pending email body the drafting turn replies to.";
+    const spawn: GwsSpawn = async (args) => {
+      const joined = args.join(" ");
+      if (joined.includes("messages list")) return listResponse(["m2", "m1"]);
+      if (joined.includes("messages get") && joined.includes('"format":"full"')) {
+        return PREAMBLE + JSON.stringify({ id: "m2", payload: { mimeType: "text/plain", body: { data: Buffer.from(fullBody, "utf8").toString("base64url") } } });
+      }
+      if (joined.includes("messages get")) {
+        const id = getArgId(joined)!;
+        return id === "m2" ? metadataResponse(meta) : metadataResponse({ id, internalDate: "1000", from: "alice@x.com" });
+      }
+      return PREAMBLE + "{}";
+    };
+    const r = await detect(
+      { query: "from:alice@x.com", sender: "alice@x.com", objective: "Get a refund", state: null },
+      spawn,
+      "me@example.com"
+    );
+    expect(r.kind).toBe("context");
+    expect(itemPayload(r.items![0]!.text).body).toBe(fullBody);
+    const trusted = r.items!.filter((i) => !i.untrusted);
+    expect(trusted).toHaveLength(1);
+    expect(trusted[0]!.text).toBe("Objective for this watch (alice@x.com): Get a refund");
+  });
+
+  test("seeding on a truncated window baselines + drafts the newest without enumerating", async () => {
     const newest = "huge-newest";
-    let getCount = 0;
+    let metaGets = 0;
     const spawn: GwsSpawn = async (args) => {
       const joined = args.join(" ");
       if (joined.includes("messages list")) {
         const tail = Array.from({ length: 40 }, (_, i) => [`old-${i}`]);
         return pagedListResponse([[newest], ...tail], true);
       }
+      if (joined.includes("messages get") && joined.includes('"format":"full"')) {
+        return PREAMBLE + JSON.stringify({ id: newest, payload: { mimeType: "text/plain", body: { data: Buffer.from("body", "utf8").toString("base64url") } } });
+      }
       if (joined.includes("messages get")) {
-        getCount += 1;
+        metaGets += 1;
         const id = getArgId(joined)!;
         return metadataResponse({ id, internalDate: id === newest ? "8000" : "7000", from: "alice@x.com" });
       }
       return PREAMBLE + "{}";
     };
     const r = await detect({ query: "is:unread", state: null }, spawn, "me@example.com");
-    expect(r.kind).toBe("shortCircuit");
-    // Newest + one older-tail probe (different second) — bounded, not a full enum.
-    expect(getCount).toBe(2);
+    // Seeding runs BEFORE the truncated regime: the newest is a pending inbound,
+    // so it's drafted and the older backlog tail is never walked.
+    expect(r.kind).toBe("context");
+    expect(draftedIds(r.items)).toEqual([newest]);
+    // Newest + one older-tail metadata probe (different second) — bounded, not a
+    // full enumeration of the truncated window.
+    expect(metaGets).toBe(2);
     expect(r.state.cursor).toBe("8000");
     expect(r.state.seen).toEqual([newest]);
   });
@@ -249,11 +360,14 @@ describe("detect — regimes", () => {
     };
 
     const seed = await detect({ query: "is:unread", state: null }, inclusiveAfter, "me@example.com");
-    expect(seed.kind).toBe("shortCircuit");
+    // The newest (s-new) is a non-self inbound => drafted; the same-second sibling
+    // s-sib is seen-only (only the single newest is ever drafted on seed).
+    expect(seed.kind).toBe("context");
+    expect(draftedIds(seed.items)).toEqual(["s-new"]);
     expect(seed.state.cursor).toBe("1780000000900");
     expect(new Set(seed.state.seen)).toEqual(new Set(["s-new", "s-sib"]));
 
-    // Steady fire: the same-second sibling is re-listed but in `seen` => no draft.
+    // Steady fire: both same-second ids are re-listed but in `seen` => no re-draft.
     const steady = await detect(
       { query: "is:unread", state: seed.state },
       inclusiveAfter,
@@ -278,6 +392,53 @@ describe("detect — regimes", () => {
     expect(draftedIds(r.items)).toEqual(["m2"]);
     // Cursor advanced to the last consumed item (m4, the newest dropped).
     expect(r.state.cursor).toBe("3200");
+  });
+
+  test("a watch's explicit sender lets an automated address through end to end", async () => {
+    const spawn = stubSpawn(["u1", "u2"], {
+      u1: { id: "u1", internalDate: "3000", from: "UPS <noreply@ups.com>", subject: "package" },
+      u2: { id: "u2", internalDate: "3100", from: "me@example.com", subject: "self" }
+    });
+    const r = await detect(
+      { query: "from:noreply@ups.com", sender: "noreply@ups.com", state: { cursor: "1000", seen: [] } },
+      spawn,
+      "me@example.com"
+    );
+    // The watched automated address fires; self is still dropped.
+    expect(r.kind).toBe("context");
+    expect(draftedIds(r.items)).toEqual(["u1"]);
+  });
+
+  test("a matched tick appends ONE trusted objective item; a no-match tick emits none", async () => {
+    const spawn = stubSpawn(["o1"], {
+      o1: { id: "o1", internalDate: "3000", from: "Alice <alice@x.com>", subject: "offer" }
+    });
+    const r = await detect(
+      {
+        query: "from:alice@x.com",
+        sender: "alice@x.com",
+        objective: "Get a refund or a replacement",
+        state: { cursor: "1000", seen: [] }
+      },
+      spawn,
+      "me@example.com"
+    );
+    expect(r.kind).toBe("context");
+    expect(matchCount(r.items)).toBe(1);
+    // Exactly one TRUSTED item: the objective, labeled by the watched sender,
+    // outside the untrusted fence (the runner renders trusted items unfenced).
+    const trusted = r.items!.filter((i) => !i.untrusted);
+    expect(trusted).toHaveLength(1);
+    expect(trusted[0]!.text).toBe("Objective for this watch (alice@x.com): Get a refund or a replacement");
+
+    // Nothing new on the next tick => shortCircuit, no objective item.
+    const quiet = await detect(
+      { query: "from:alice@x.com", sender: "alice@x.com", objective: "Get a refund or a replacement", state: r.state },
+      stubSpawn([], {}),
+      "me@example.com"
+    );
+    expect(quiet.kind).toBe("shortCircuit");
+    expect(quiet.items).toBeUndefined();
   });
 
   test("bounds the query with after:<epochSec> once a cursor exists, but not on seeding", async () => {
@@ -394,6 +555,608 @@ describe("detect — regimes", () => {
   });
 });
 
+describe("detect — body in matched items", () => {
+  // base64url-encode a string the way Gmail returns part `body.data`.
+  function b64url(s: string): string {
+    return Buffer.from(s, "utf8").toString("base64url");
+  }
+
+  // A `messages get format=full` response with a single text/plain part.
+  function fullPlainResponse(id: string, meta: Meta, plain: string): string {
+    return (
+      PREAMBLE +
+      JSON.stringify({
+        id,
+        internalDate: meta.internalDate,
+        snippet: meta.snippet ?? "",
+        payload: {
+          mimeType: "text/plain",
+          headers: [{ name: "From", value: meta.from ?? "" }],
+          body: { data: b64url(plain) }
+        }
+      })
+    );
+  }
+
+  // A `messages get format=full` response with a multipart text/html part only.
+  function fullHtmlResponse(id: string, meta: Meta, html: string): string {
+    return (
+      PREAMBLE +
+      JSON.stringify({
+        id,
+        internalDate: meta.internalDate,
+        snippet: meta.snippet ?? "",
+        payload: {
+          mimeType: "multipart/alternative",
+          headers: [{ name: "From", value: meta.from ?? "" }],
+          parts: [{ mimeType: "text/html", body: { data: b64url(html) } }]
+        }
+      })
+    );
+  }
+
+  // Was `format=full` requested in this `messages get` args line?
+  function isFullGet(joined: string): boolean {
+    return joined.includes("messages get") && joined.includes('"format":"full"');
+  }
+
+  test("a matched item carries the fetched text/plain body", async () => {
+    const meta: Meta = { id: "m2", internalDate: "3000", from: "Alice <alice@x.com>", subject: "offer", snippet: "short snippet" };
+    const fullBody = "Hi there — here is the full body of the email with the real content.";
+    const spawn: GwsSpawn = async (args) => {
+      const joined = args.join(" ");
+      if (joined.includes("messages list")) return listResponse(["m2"]);
+      if (isFullGet(joined)) return fullPlainResponse("m2", meta, fullBody);
+      if (joined.includes("messages get")) return metadataResponse(meta);
+      return PREAMBLE + "{}";
+    };
+    const r = await detect(
+      { query: "from:alice@x.com", state: { cursor: "1000", seen: [] } },
+      spawn,
+      "me@example.com"
+    );
+    expect(r.kind).toBe("context");
+    expect(itemPayload(r.items![0]!.text).body).toBe(fullBody);
+  });
+
+  test("a body-fetch error falls back to the snippet without failing the tick", async () => {
+    const meta: Meta = { id: "m2", internalDate: "3000", from: "Alice <alice@x.com>", subject: "offer", snippet: "snippet fallback" };
+    const spawn: GwsSpawn = async (args) => {
+      const joined = args.join(" ");
+      if (joined.includes("messages list")) return listResponse(["m2"]);
+      // The full-format body fetch throws; detection must degrade to the snippet.
+      if (isFullGet(joined)) throw new Error("transport blew up");
+      if (joined.includes("messages get")) return metadataResponse(meta);
+      return PREAMBLE + "{}";
+    };
+    const r = await detect(
+      { query: "from:alice@x.com", state: { cursor: "1000", seen: [] } },
+      spawn,
+      "me@example.com"
+    );
+    // The tick still produces the match — body is the snippet, not a thrown fault.
+    expect(r.kind).toBe("context");
+    expect(matchCount(r.items)).toBe(1);
+    expect(itemPayload(r.items![0]!.text).body).toBe("snippet fallback");
+  });
+
+  test("a text/html-only body is tag-stripped", async () => {
+    const meta: Meta = { id: "m2", internalDate: "3000", from: "Alice <alice@x.com>", subject: "offer", snippet: "s" };
+    const html = "<html><head><style>p{color:red}</style></head><body><p>Hello&nbsp;<b>world</b></p></body></html>";
+    const spawn: GwsSpawn = async (args) => {
+      const joined = args.join(" ");
+      if (joined.includes("messages list")) return listResponse(["m2"]);
+      if (isFullGet(joined)) return fullHtmlResponse("m2", meta, html);
+      if (joined.includes("messages get")) return metadataResponse(meta);
+      return PREAMBLE + "{}";
+    };
+    const r = await detect(
+      { query: "from:alice@x.com", state: { cursor: "1000", seen: [] } },
+      spawn,
+      "me@example.com"
+    );
+    const body = itemPayload(r.items![0]!.text).body as string;
+    // Tags + the <style> block stripped; entity decoded; whitespace collapsed.
+    expect(body).toBe("Hello world");
+    expect(body).not.toContain("<");
+    expect(body).not.toContain("color:red");
+  });
+
+  test("a long body is truncated with a marker", async () => {
+    const meta: Meta = { id: "m2", internalDate: "3000", from: "Alice <alice@x.com>", subject: "offer", snippet: "s" };
+    const long = "x".repeat(5000);
+    const spawn: GwsSpawn = async (args) => {
+      const joined = args.join(" ");
+      if (joined.includes("messages list")) return listResponse(["m2"]);
+      if (isFullGet(joined)) return fullPlainResponse("m2", meta, long);
+      if (joined.includes("messages get")) return metadataResponse(meta);
+      return PREAMBLE + "{}";
+    };
+    const r = await detect(
+      { query: "from:alice@x.com", state: { cursor: "1000", seen: [] } },
+      spawn,
+      "me@example.com"
+    );
+    const body = itemPayload(r.items![0]!.text).body as string;
+    expect(body.endsWith("…[truncated]")).toBe(true);
+    expect(body.length).toBe(4000 + "…[truncated]".length);
+  });
+
+  test("a silent seed (newest is self) does NOT fetch a body (no format=full get)", async () => {
+    let fullGets = 0;
+    const spawn: GwsSpawn = async (args) => {
+      const joined = args.join(" ");
+      if (joined.includes("messages list")) return listResponse(["m2", "m1"]);
+      if (isFullGet(joined)) {
+        fullGets += 1;
+        return PREAMBLE + "{}";
+      }
+      if (joined.includes("messages get")) {
+        const id = getArgId(joined)!;
+        // Newest is our OWN message => silent seed, no body fetch.
+        return metadataResponse({ id, internalDate: id === "m2" ? "2000" : "1000", from: id === "m2" ? "me@example.com" : "alice@x.com" });
+      }
+      return PREAMBLE + "{}";
+    };
+    const r = await detect({ query: "from:alice@x.com", state: null }, spawn, "me@example.com");
+    expect(r.kind).toBe("shortCircuit"); // silent seed (self newest), drafts nothing
+    expect(fullGets).toBe(0);
+  });
+
+  test("a short-circuit (only-dropped) tick does NOT fetch a body", async () => {
+    let fullGets = 0;
+    const spawn: GwsSpawn = async (args) => {
+      const joined = args.join(" ");
+      if (joined.includes("messages list")) return listResponse(["m2"]);
+      if (isFullGet(joined)) {
+        fullGets += 1;
+        return PREAMBLE + "{}";
+      }
+      // The only new message is automated => dropped, no surviving match.
+      if (joined.includes("messages get")) return metadataResponse({ id: "m2", internalDate: "3000", from: "no-reply@x.com", subject: "auto" });
+      return PREAMBLE + "{}";
+    };
+    const r = await detect(
+      { query: "in:inbox", state: { cursor: "1000", seen: [] } },
+      spawn,
+      "me@example.com"
+    );
+    expect(r.kind).toBe("shortCircuit");
+    // The dropped message never triggers a body fetch.
+    expect(fullGets).toBe(0);
+  });
+});
+
+describe("detect — thread mode", () => {
+  // A `threads get format=metadata` response: the whole conversation's
+  // message metadata in one document.
+  function threadResponse(threadId: string, metas: Meta[]): string {
+    return (
+      PREAMBLE +
+      JSON.stringify({
+        id: threadId,
+        messages: metas.map((m) => ({
+          id: m.id,
+          threadId,
+          internalDate: m.internalDate,
+          snippet: m.snippet ?? "",
+          payload: {
+            headers: [
+              { name: "From", value: m.from ?? "" },
+              { name: "Subject", value: m.subject ?? "" },
+              { name: "Date", value: m.date ?? "" }
+            ]
+          }
+        }))
+      })
+    );
+  }
+
+  function threadSpawn(threadId: string, metas: Meta[]): GwsSpawn {
+    return async (args) => {
+      const joined = args.join(" ");
+      if (joined.includes("threads get")) return threadResponse(threadId, metas);
+      return PREAMBLE + "{}";
+    };
+  }
+
+  test("fetches the thread via a metadata-level threads get", async () => {
+    const calls: string[] = [];
+    const spawn: GwsSpawn = async (args) => {
+      calls.push(args.join(" "));
+      return threadResponse("t-1", []);
+    };
+    await detect({ query: "thread:t-1", threadId: "t-1", state: null }, spawn, "me@example.com");
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toContain("gmail users threads get");
+    expect(calls[0]).toContain('"id":"t-1"');
+    expect(calls[0]).toContain('"format":"metadata"');
+    // Metadata only — never bodies. To + Message-ID ride for cross-account dedup.
+    expect(calls[0]).toContain('"metadataHeaders":["From","Subject","Date","To","Message-ID"]');
+  });
+
+  test("a single-quote-bearing threadId is shell-neutralized in the spawned --params arg", async () => {
+    // The serialized --params is single-quoted for `zsh -lc`. A crafted threadId
+    // carrying a single quote must not break out of that quoting and inject a
+    // command — every embedded quote is shell-escaped to '\''.
+    const evil = `x'; touch /tmp/PWNED; '`;
+    let paramsArg = "";
+    const spawn: GwsSpawn = async (args) => {
+      const i = args.indexOf("--params");
+      if (i >= 0) paramsArg = args[i + 1]!;
+      return threadResponse(evil, []);
+    };
+    await detect({ query: `thread:${evil}`, threadId: evil, state: null }, spawn, "me@example.com");
+    // The arg is `'<body>'` where every single quote inside <body> is the
+    // escape sequence '\'' (close-quote, literal-quote, reopen-quote). Replay
+    // what the shell does — drop the outer quotes, turn each '\'' back into one
+    // literal quote — and the result is exactly the original JSON: the crafted
+    // value can't break out and the injected command never becomes a token.
+    expect(paramsArg.startsWith("'") && paramsArg.endsWith("'")).toBe(true);
+    const shellValue = paramsArg.slice(1, -1).split(`'\\''`).join("'");
+    expect(JSON.parse(shellValue).id).toBe(evil);
+  });
+
+  test("seeding stays silent when the newest thread message is self", async () => {
+    const spawn = threadSpawn("t-1", [
+      { id: "m1", internalDate: "1000", from: "support@x.com", subject: "case opened" },
+      { id: "m2", internalDate: "2000", from: "me@example.com", subject: "re: case" }
+    ]);
+    const r = await detect({ query: "thread:t-1", threadId: "t-1", state: null }, spawn, "me@example.com");
+    // The thread's last word is ours (the ball is in their court) => silent seed.
+    expect(r.kind).toBe("shortCircuit");
+    expect(r.state.cursor).toBe("2000");
+    expect(r.state.seen).toEqual(["m2"]);
+    expect(r.state.status).toBe("ok");
+  });
+
+  test("seeding drafts the newest thread message when it is from the counterparty", async () => {
+    const spawn = threadSpawn("t-1", [
+      { id: "m1", internalDate: "1000", from: "me@example.com", subject: "case opened" },
+      // The counterparty has already replied — the pending message a watch added
+      // to this thread should draft a reply to immediately.
+      { id: "m2", internalDate: "2000", from: "support@x.com", subject: "re: case", snippet: "here's our answer" }
+    ]);
+    const r = await detect(
+      { query: "thread:t-1", threadId: "t-1", objective: "Get a refund", state: null },
+      spawn,
+      "me@example.com"
+    );
+    expect(r.kind).toBe("context");
+    expect(draftedIds(r.items)).toEqual(["m2"]);
+    // The seeded draft carries the thread id + the standing objective.
+    expect(itemPayload(r.items![0]!.text).threadId).toBe("t-1");
+    const trusted = r.items!.filter((i) => !i.untrusted);
+    expect(trusted).toHaveLength(1);
+    expect(trusted[0]!.text).toBe("Objective for this watch (thread:t-1): Get a refund");
+    // Baselined at the newest; only that one message rides forward in `seen`.
+    expect(r.state.cursor).toBe("2000");
+    expect(r.state.seen).toEqual(["m2"]);
+    // The next tick (with the seeded state) re-detects nothing => no re-draft.
+    const steady = await detect({ query: "thread:t-1", threadId: "t-1", state: r.state }, spawn, "me@example.com");
+    expect(steady.kind).toBe("shortCircuit");
+  });
+
+  test("a rotated automated address triggers (no automated filter); self never does", async () => {
+    const spawn = threadSpawn("t-1", [
+      { id: "m1", internalDate: "1000", from: "support@x.com", subject: "case" },
+      // The ticket system replies from a rotated no-reply address — exactly
+      // what a thread watch exists to catch.
+      { id: "m2", internalDate: "3000", from: "Case 123 <no-reply@case-123.x.zendesk.com>", subject: "update", snippet: "we shipped it" },
+      // Our own reply advances the cursor but never triggers.
+      { id: "m3", internalDate: "4000", from: "Me <me@example.com>", subject: "re: update" }
+    ]);
+    const r = await detect(
+      { query: "thread:t-1", threadId: "t-1", state: { cursor: "1000", seen: ["m1"] } },
+      spawn,
+      "me@example.com"
+    );
+    expect(r.kind).toBe("context");
+    expect(matchCount(r.items)).toBe(1);
+    expect(draftedIds(r.items)).toEqual(["m2"]);
+    // The match payload carries the thread id so the drafting turn reads the
+    // full conversation.
+    expect(itemPayload(r.items![0]!.text).threadId).toBe("t-1");
+    // Cursor advanced past our own reply too.
+    expect(r.state.cursor).toBe("4000");
+    expect(r.state.seen).toEqual(["m3"]);
+  });
+
+  test("a surviving thread match carries the fetched body; a silent (self-newest) seed does not fetch one", async () => {
+    let fullGets = 0;
+    const fullBody = "The ticket bot's full reply with the substantive content.";
+    // Seeding-state thread: the newest message is OUR OWN => silent seed.
+    let seedingThread = true;
+    const spawn: GwsSpawn = async (args) => {
+      const joined = args.join(" ");
+      if (joined.includes("messages get") && joined.includes('"format":"full"')) {
+        fullGets += 1;
+        return (
+          PREAMBLE +
+          JSON.stringify({
+            id: "m2",
+            payload: { mimeType: "text/plain", body: { data: Buffer.from(fullBody, "utf8").toString("base64url") } }
+          })
+        );
+      }
+      if (joined.includes("threads get")) {
+        return seedingThread
+          ? threadResponse("t-1", [
+              { id: "m1", internalDate: "1000", from: "support@x.com", subject: "case" },
+              { id: "m0", internalDate: "1500", from: "me@example.com", subject: "our last word" }
+            ])
+          : threadResponse("t-1", [
+              { id: "m1", internalDate: "1000", from: "support@x.com", subject: "case" },
+              { id: "m2", internalDate: "3000", from: "bot@x.zendesk.com", subject: "update", snippet: "short" }
+            ]);
+      }
+      return PREAMBLE + "{}";
+    };
+    // Seeding tick on a self-newest thread drafts nothing => no body fetch.
+    const seed = await detect({ query: "thread:t-1", threadId: "t-1", state: null }, spawn, "me@example.com");
+    expect(seed.kind).toBe("shortCircuit");
+    expect(fullGets).toBe(0);
+
+    // Steady tick: the bot's new message survives => its body is fetched.
+    seedingThread = false;
+    const r = await detect(
+      { query: "thread:t-1", threadId: "t-1", state: { cursor: "1000", seen: ["m1"] } },
+      spawn,
+      "me@example.com"
+    );
+    expect(r.kind).toBe("context");
+    expect(draftedIds(r.items)).toEqual(["m2"]);
+    expect(itemPayload(r.items![0]!.text).body).toBe(fullBody);
+    expect(fullGets).toBe(1);
+  });
+
+  test("a self-only new message advances the cursor silently", async () => {
+    const spawn = threadSpawn("t-1", [
+      { id: "m1", internalDate: "1000", from: "support@x.com", subject: "case" },
+      { id: "m2", internalDate: "5000", from: "me@example.com", subject: "our reply" }
+    ]);
+    const r = await detect(
+      { query: "thread:t-1", threadId: "t-1", state: { cursor: "1000", seen: ["m1"] } },
+      spawn,
+      "me@example.com"
+    );
+    expect(r.kind).toBe("shortCircuit");
+    expect(r.state.cursor).toBe("5000");
+  });
+
+  test("a matched thread tick appends the trusted objective item with a thread label", async () => {
+    const spawn = threadSpawn("t-9", [
+      { id: "m1", internalDate: "1000", from: "support@x.com", subject: "case" },
+      { id: "m2", internalDate: "2000", from: "agent@x.zendesk.com", subject: "offer" }
+    ]);
+    const r = await detect(
+      { query: "thread:t-9", threadId: "t-9", objective: "Get a full refund", state: { cursor: "1000", seen: ["m1"] } },
+      spawn,
+      "me@example.com"
+    );
+    expect(r.kind).toBe("context");
+    const trusted = r.items!.filter((i) => !i.untrusted);
+    expect(trusted).toHaveLength(1);
+    expect(trusted[0]!.text).toBe("Objective for this watch (thread:t-9): Get a full refund");
+  });
+
+  test("follow-up nudge fires once per outbound message when the counterparty is silent", async () => {
+    // Our own message is the thread's last, sent far past the 24h threshold.
+    const spawn = threadSpawn("t-1", [
+      { id: "m1", internalDate: "1000", from: "support@x.com", subject: "case" },
+      { id: "m2", internalDate: "2000", from: "me@example.com", subject: "our offer" }
+    ]);
+    const args = {
+      query: "thread:t-1",
+      threadId: "t-1",
+      followUpAfterHours: 24,
+      objective: "Get a refund",
+      state: { cursor: "2000", seen: ["m2"] }
+    };
+    const r1 = await detect(args, spawn, "me@example.com");
+    // The nudge wakes a model turn (context) with TRUSTED items only: the
+    // nudge notice + the objective.
+    expect(r1.kind).toBe("context");
+    expect(matchCount(r1.items)).toBe(0);
+    const trusted = r1.items!.filter((i) => !i.untrusted);
+    expect(trusted).toHaveLength(2);
+    expect(trusted[0]!.text).toContain("No reply on this watched thread since 1970-01-01T00:00:02.000Z (over 24 hours).");
+    expect(trusted[0]!.text).toContain("Draft a polite follow-up that advances the objective.");
+    expect(trusted[1]!.text).toBe("Objective for this watch (thread:t-1): Get a refund");
+    expect(r1.state.lastNudgedForMessageId).toBe("m2");
+
+    // Same outbound message on the next tick => NO second nudge (the id is
+    // pinned), not a nudge-per-tick storm.
+    const r2 = await detect({ ...args, state: r1.state }, spawn, "me@example.com");
+    expect(r2.kind).toBe("shortCircuit");
+    expect(r2.state.lastNudgedForMessageId).toBe("m2");
+  });
+
+  test("follow-up nudge respects the threshold and the last-sender", async () => {
+    // Last message is ours but RECENT — below the threshold, no nudge.
+    const recent = String(Date.now() - 60_000);
+    const recentSpawn = threadSpawn("t-1", [
+      { id: "m1", internalDate: "1000", from: "support@x.com", subject: "case" },
+      { id: "m2", internalDate: recent, from: "me@example.com", subject: "ours" }
+    ]);
+    const r1 = await detect(
+      { query: "thread:t-1", threadId: "t-1", followUpAfterHours: 24, state: { cursor: recent, seen: ["m2"] } },
+      recentSpawn,
+      "me@example.com"
+    );
+    expect(r1.kind).toBe("shortCircuit");
+    expect(r1.state.lastNudgedForMessageId).toBeUndefined();
+
+    // Last message is THEIRS (old) — the ball is in our court, no nudge.
+    const theirsSpawn = threadSpawn("t-1", [
+      { id: "m1", internalDate: "1000", from: "me@example.com", subject: "ours" },
+      { id: "m2", internalDate: "2000", from: "support@x.com", subject: "theirs" }
+    ]);
+    const r2 = await detect(
+      { query: "thread:t-1", threadId: "t-1", followUpAfterHours: 24, state: { cursor: "2000", seen: ["m2"] } },
+      theirsSpawn,
+      "me@example.com"
+    );
+    expect(r2.kind).toBe("shortCircuit");
+    expect(r2.state.lastNudgedForMessageId).toBeUndefined();
+  });
+
+  test("a newer outbound message resets the nudge cycle", async () => {
+    // Already nudged for m2; a NEWER self message m3 (also past the
+    // threshold) changes the last-message id => a fresh nudge.
+    const spawn = threadSpawn("t-1", [
+      { id: "m1", internalDate: "1000", from: "support@x.com", subject: "case" },
+      { id: "m2", internalDate: "2000", from: "me@example.com", subject: "first follow-up" },
+      { id: "m3", internalDate: "3000", from: "me@example.com", subject: "second follow-up" }
+    ]);
+    const r = await detect(
+      {
+        query: "thread:t-1",
+        threadId: "t-1",
+        followUpAfterHours: 24,
+        state: { cursor: "3000", seen: ["m3"], lastNudgedForMessageId: "m2" }
+      },
+      spawn,
+      "me@example.com"
+    );
+    expect(r.kind).toBe("context");
+    expect(r.state.lastNudgedForMessageId).toBe("m3");
+  });
+
+  test("thread detection is at-least-once: old state re-detects, new state goes silent", async () => {
+    const spawn = threadSpawn("t-1", [
+      { id: "m1", internalDate: "1000", from: "support@x.com", subject: "case" },
+      { id: "m2", internalDate: "2000", from: "bot@x.zendesk.com", subject: "update" }
+    ]);
+    const oldState = { cursor: "1000", seen: ["m1"] };
+    const r1 = await detect({ query: "thread:t-1", threadId: "t-1", state: oldState }, spawn, "me@example.com");
+    expect(draftedIds(r1.items)).toEqual(["m2"]);
+    // Commit skipped => re-run with the old state re-detects the same message.
+    const r2 = await detect({ query: "thread:t-1", threadId: "t-1", state: oldState }, spawn, "me@example.com");
+    expect(draftedIds(r2.items)).toEqual(["m2"]);
+    // Committed state => silent.
+    const r3 = await detect({ query: "thread:t-1", threadId: "t-1", state: r1.state }, spawn, "me@example.com");
+    expect(r3.kind).toBe("shortCircuit");
+  });
+
+  // A gws error BODY (exit 0) on a `threads get` — a missing/inaccessible thread
+  // yields `{"error":{...}}`, not an empty thread. It must surface as a watch
+  // fault (status:"error" + a lastError), NOT seed-to-now / short-circuit ok.
+  function threadErrorSpawn(body: Record<string, unknown>): GwsSpawn {
+    return async (args) => {
+      const joined = args.join(" ");
+      if (joined.includes("auth status")) return PREAMBLE + '{"token_valid":true}';
+      if (joined.includes("getProfile")) return PREAMBLE + '{"emailAddress":"me@example.com"}';
+      if (joined.includes("threads get")) return PREAMBLE + JSON.stringify(body);
+      return PREAMBLE + "{}";
+    };
+  }
+  const NOT_FOUND_BODY = { error: { code: 404, message: "Requested entity was not found.", reason: "notFound" } };
+
+  test("a 404 error body on a steady-state thread tick reports error, cursor unchanged", async () => {
+    const r = await run(
+      { query: "thread:t-x", threadId: "t-x", state: { cursor: "5000", seen: ["m1"] } },
+      threadErrorSpawn(NOT_FOUND_BODY)
+    );
+    // Surfaced as a fault, NOT swallowed as an empty thread.
+    expect(r.kind).toBe("shortCircuit");
+    expect(r.state.status).toBe("error");
+    expect(r.state.lastError && r.state.lastError.length > 0).toBe(true);
+    // Cursor/seen preserved — NOT advanced, NOT seeded to now().
+    expect(r.state.cursor).toBe("5000");
+    expect(r.state.seen).toEqual(["m1"]);
+  });
+
+  test("a 404 error body on the FIRST (seeding) thread tick reports error, no baseline cursor", async () => {
+    const r = await run(
+      { query: "thread:t-x", threadId: "t-x", state: null },
+      threadErrorSpawn(NOT_FOUND_BODY)
+    );
+    expect(r.kind).toBe("shortCircuit");
+    expect(r.state.status).toBe("error");
+    expect(r.state.lastError && r.state.lastError.length > 0).toBe(true);
+    // No baseline cursor was written (seeding a bad thread must NOT baseline to now).
+    expect(r.state.cursor).toBeUndefined();
+    expect(r.state.seen).toBeUndefined();
+  });
+
+  test("a genuine empty thread still seeds/short-circuits ok (no regression)", async () => {
+    const emptyThread: GwsSpawn = async (args) => {
+      const joined = args.join(" ");
+      if (joined.includes("auth status")) return PREAMBLE + '{"token_valid":true}';
+      if (joined.includes("getProfile")) return PREAMBLE + '{"emailAddress":"me@example.com"}';
+      if (joined.includes("threads get")) return threadResponse("t-e", []);
+      return PREAMBLE + "{}";
+    };
+    const r = await run({ query: "thread:t-e", threadId: "t-e", state: null }, emptyThread);
+    expect(r.kind).toBe("shortCircuit");
+    expect(r.state.status).toBe("ok");
+    expect(r.state.lastError).toBeUndefined();
+    // An empty (but valid) thread baselines to now() as before.
+    expect(Number(r.state.cursor)).toBeGreaterThan(0);
+  });
+
+  test("a thread error body's lastError is scrubbed (no raw paths leak)", async () => {
+    const r = await run(
+      { query: "thread:t-x", threadId: "t-x", state: { cursor: "5000", seen: [] } },
+      threadErrorSpawn({ error: { code: 500, message: "boom reading /Users/alice/.config/gws/token.json", reason: "backendError" } })
+    );
+    expect(r.state.status).toBe("error");
+    expect(r.state.lastError).not.toContain("/Users/alice");
+    expect(r.state.lastError).toContain("<path>");
+  });
+
+  test("a same-second-as-cursor message visible on a later tick is still drafted", async () => {
+    // Gmail internalDate is second-granular: our outbound and the ticket bot's
+    // auto-ack land in the same epoch second. The bot's message is visible only
+    // on a later tick, so a ms-exact `> cursor` test would drop it forever.
+    const cursor = "1780000000000"; // our reply, at the cursor second
+    const sibling = "1780000000000"; // bot reply, SAME second, not yet seen
+    const spawn = threadSpawn("t-1", [
+      { id: "m1", internalDate: "1779990000000", from: "support@x.com", subject: "case" },
+      { id: "m2", internalDate: cursor, from: "me@example.com", subject: "our offer" },
+      { id: "m3", internalDate: sibling, from: "bot@x.zendesk.com", subject: "auto-ack", snippet: "received" }
+    ]);
+    const r = await detect(
+      { query: "thread:t-1", threadId: "t-1", state: { cursor, seen: ["m2"] } },
+      spawn,
+      "me@example.com"
+    );
+    expect(r.kind).toBe("context");
+    expect(draftedIds(r.items)).toEqual(["m3"]);
+    // Both same-second ids ride forward in `seen` so neither re-drafts next tick.
+    expect(new Set(r.state.seen)).toEqual(new Set(["m2", "m3"]));
+  });
+
+  test("runWatches routes a thread watch through thread detection", async () => {
+    const spawn: GwsSpawn = async (args) => {
+      const joined = args.join(" ");
+      if (joined.includes("auth status")) return PREAMBLE + '{"token_valid":true}';
+      if (joined.includes("getProfile")) return PREAMBLE + '{"emailAddress":"me@example.com"}';
+      if (joined.includes("threads get")) {
+        return threadResponse("t-1", [
+          { id: "m1", internalDate: "1000", from: "support@x.com", subject: "case" },
+          { id: "m2", internalDate: "2000", from: "no-reply@case-1.x.zendesk.com", subject: "update" }
+        ]);
+      }
+      throw new Error(`unexpected gws call: ${joined}`);
+    };
+    const r = await runWatches(
+      {
+        // Legacy byWatcher INPUT is still read transparently (the first new tick
+        // rewrites it flat). routeKey defaults to watcherId.
+        watches: [{ watcherId: "w-t", query: "thread:t-1", threadId: "t-1" }],
+        state: { byWatcher: { "w-t": { cursor: "1000", seen: ["m1"] } } }
+      },
+      spawn
+    );
+    expect(r.kind).toBe("context");
+    expect(draftedIds(r.buckets!["w-t"])).toEqual(["m2"]);
+    expect(r.state["w-t"]!.cursor).toBe("2000");
+    expect(r.state["w-t"]!.status).toBe("ok");
+  });
+});
+
 describe("run — health in state", () => {
   test("signed-out tick emits status:needs_auth with cursor/seen unchanged", async () => {
     const signedOut: GwsSpawn = async (args) => {
@@ -425,16 +1188,41 @@ describe("run — health in state", () => {
     expect(r.state.seen).toEqual(["m2"]);
   });
 
+  test("a list error body (exit 0) reports status:error, cursor/seen unchanged", async () => {
+    // gws can return a Google API error as a JSON body on a `messages list` too.
+    // It is a fault, not an empty window — surface it, don't seed/advance.
+    const listError: GwsSpawn = async (args) => {
+      const joined = args.join(" ");
+      if (joined.includes("auth status")) return PREAMBLE + '{"token_valid":true}';
+      if (joined.includes("getProfile")) return PREAMBLE + '{"emailAddress":"me@example.com"}';
+      if (joined.includes("messages list")) {
+        return PREAMBLE + JSON.stringify({ error: { code: 400, message: "Invalid query.", reason: "invalidArgument" } });
+      }
+      return PREAMBLE + "{}";
+    };
+    const r = await run({ query: "is:unread", state: { cursor: "7000", seen: ["m2"] } }, listError);
+    expect(r.kind).toBe("shortCircuit");
+    expect(r.state.status).toBe("error");
+    expect(r.state.lastError && r.state.lastError.length > 0).toBe(true);
+    expect(r.state.cursor).toBe("7000");
+    expect(r.state.seen).toEqual(["m2"]);
+  });
+
   test("a healthy signed-in tick returns detect's status:ok result", async () => {
     const healthy: GwsSpawn = async (args) => {
       const joined = args.join(" ");
       if (joined.includes("auth status")) return PREAMBLE + '{"token_valid":true}';
       if (joined.includes("getProfile")) return PREAMBLE + '{"emailAddress":"me@example.com"}';
       if (joined.includes("messages list")) return listResponse(["m2", "m1"]);
+      // Newest is our own message => a silent seed (drafts nothing).
+      if (joined.includes("messages get")) {
+        const id = getArgId(joined)!;
+        return metadataResponse({ id, internalDate: id === "m2" ? "2000" : "1000", from: "me@example.com" });
+      }
       return PREAMBLE + "{}";
     };
     const r = await run({ query: "is:unread", state: null }, healthy);
-    expect(r.kind).toBe("shortCircuit"); // seeding
+    expect(r.kind).toBe("shortCircuit"); // silent seed (self newest)
     expect(r.state.status).toBe("ok");
     expect(r.state.lastError).toBeUndefined();
   });
@@ -506,23 +1294,24 @@ describe("runWatches — multi-watch (one shared job)", () => {
     const r = await runWatches(
       {
         watches: [
-          { watcherId: "w-alice", query: "from:alice@x.com is:unread" },
-          { watcherId: "w-bob", query: "from:bob@x.com is:unread" }
+          { watcherId: "w-alice", routeKey: "w-alice", query: "from:alice@x.com is:unread", sender: "alice@x.com" },
+          { watcherId: "w-bob", routeKey: "w-bob", query: "from:bob@x.com is:unread", sender: "bob@x.com" }
         ],
-        state: { byWatcher: { "w-alice": { cursor: "1000", seen: [] }, "w-bob": { cursor: "1000", seen: [] } } }
+        state: { "w-alice": { cursor: "1000", seen: [] }, "w-bob": { cursor: "1000", seen: [] } }
       },
       spawn
     );
-    // ONE drafting turn carries BOTH senders' matches, each labeled by sender.
+    // Each concern gets its OWN bucket keyed by routeKey, each match labeled by sender.
     expect(r.kind).toBe("context");
-    expect(matchCount(r.items)).toBe(2);
-    expect(r.items!.some((i) => i.text.startsWith("New email from Alice <alice@x.com> — "))).toBe(true);
-    expect(r.items!.some((i) => i.text.startsWith("New email from Bob <bob@x.com> — "))).toBe(true);
-    // Per-watch state advanced independently.
-    expect(r.state.byWatcher["w-alice"]!.cursor).toBe("3000");
-    expect(r.state.byWatcher["w-bob"]!.cursor).toBe("4000");
-    expect(r.state.byWatcher["w-alice"]!.status).toBe("ok");
-    expect(r.state.byWatcher["w-bob"]!.status).toBe("ok");
+    expect(matchCount(r.buckets!["w-alice"])).toBe(1);
+    expect(matchCount(r.buckets!["w-bob"])).toBe(1);
+    expect(r.buckets!["w-alice"]!.some((i) => i.text.startsWith("New email from Alice <alice@x.com> — "))).toBe(true);
+    expect(r.buckets!["w-bob"]!.some((i) => i.text.startsWith("New email from Bob <bob@x.com> — "))).toBe(true);
+    // Per-watch state advanced independently, keyed by routeKey at the top level.
+    expect(r.state["w-alice"]!.cursor).toBe("3000");
+    expect(r.state["w-bob"]!.cursor).toBe("4000");
+    expect(r.state["w-alice"]!.status).toBe("ok");
+    expect(r.state["w-bob"]!.status).toBe("ok");
   });
 
   test("a per-watch gws error isolates to that watch; the others still draft", async () => {
@@ -549,23 +1338,23 @@ describe("runWatches — multi-watch (one shared job)", () => {
     const r = await runWatches(
       {
         watches: [
-          { watcherId: "w-bad", query: "from:bad@x.com is:unread" },
-          { watcherId: "w-good", query: "from:good@x.com is:unread" }
+          { watcherId: "w-bad", query: "from:bad@x.com is:unread", sender: "bad@x.com" },
+          { watcherId: "w-good", query: "from:good@x.com is:unread", sender: "good@x.com" }
         ],
-        state: { byWatcher: { "w-bad": { cursor: "1000", seen: [] }, "w-good": { cursor: "1000", seen: [] } } }
+        state: { "w-bad": { cursor: "1000", seen: [] }, "w-good": { cursor: "1000", seen: [] } }
       },
       spawn
     );
-    // The good watch still drafts; the bad watch is marked error with a SCRUBBED
-    // lastError and its cursor unchanged.
+    // The good watch still drafts into its bucket; the bad watch is marked error
+    // with a SCRUBBED lastError and its cursor unchanged (no bucket for it).
     expect(r.kind).toBe("context");
-    expect(matchCount(r.items)).toBe(1);
-    expect(draftedIds(r.items)).toEqual(["g1"]);
-    expect(r.state.byWatcher["w-good"]!.status).toBe("ok");
-    expect(r.state.byWatcher["w-good"]!.cursor).toBe("5000");
-    expect(r.state.byWatcher["w-bad"]!.status).toBe("error");
-    expect(r.state.byWatcher["w-bad"]!.lastError).toBe("transport blew up reading <path>");
-    expect(r.state.byWatcher["w-bad"]!.cursor).toBe("1000");
+    expect(r.buckets!["w-bad"]).toBeUndefined();
+    expect(draftedIds(r.buckets!["w-good"])).toEqual(["g1"]);
+    expect(r.state["w-good"]!.status).toBe("ok");
+    expect(r.state["w-good"]!.cursor).toBe("5000");
+    expect(r.state["w-bad"]!.status).toBe("error");
+    expect(r.state["w-bad"]!.lastError).toBe("transport blew up reading <path>");
+    expect(r.state["w-bad"]!.cursor).toBe("1000");
   });
 
   test("signed-out marks every watch needs_auth, no model turn, cursors unchanged", async () => {
@@ -577,43 +1366,62 @@ describe("runWatches — multi-watch (one shared job)", () => {
     const r = await runWatches(
       {
         watches: [
-          { watcherId: "w1", query: "from:a@x.com is:unread" },
-          { watcherId: "w2", query: "from:b@x.com is:unread" }
+          { watcherId: "w1", query: "from:a@x.com is:unread", sender: "a@x.com" },
+          { watcherId: "w2", query: "from:b@x.com is:unread", sender: "b@x.com" }
         ],
-        state: { byWatcher: { w1: { cursor: "1000", seen: ["x"] }, w2: { cursor: "2000", seen: [] } } }
+        state: { w1: { cursor: "1000", seen: ["x"] }, w2: { cursor: "2000", seen: [] } }
       },
       signedOut
     );
     expect(r.kind).toBe("shortCircuit");
     expect(r.summary).toBe("[SILENT]");
-    expect(r.state.byWatcher.w1!.status).toBe("needs_auth");
-    expect(r.state.byWatcher.w2!.status).toBe("needs_auth");
+    expect(r.state.w1!.status).toBe("needs_auth");
+    expect(r.state.w2!.status).toBe("needs_auth");
     // Cursors/seen carried through unchanged (don't advance past unread mail).
-    expect(r.state.byWatcher.w1!.cursor).toBe("1000");
-    expect(r.state.byWatcher.w1!.seen).toEqual(["x"]);
-    expect(r.state.byWatcher.w2!.cursor).toBe("2000");
+    expect(r.state.w1!.cursor).toBe("1000");
+    expect(r.state.w1!.seen).toEqual(["x"]);
+    expect(r.state.w2!.cursor).toBe("2000");
   });
 
-  test("seeding a fresh watch (no per-watch state) baselines without drafting", async () => {
+  test("seeding a fresh watch drafts the newest pending inbound and baselines", async () => {
     const spawn = multiSpawn(
       { "from:new@x.com is:unread": ["n1"] },
       { n1: { id: "n1", internalDate: "9000", from: "New <new@x.com>", subject: "hi" } }
     );
     const r = await runWatches(
-      { watches: [{ watcherId: "w-new", query: "from:new@x.com is:unread" }], state: null },
+      { watches: [{ watcherId: "w-new", query: "from:new@x.com is:unread", sender: "new@x.com" }], state: null },
       spawn
     );
-    expect(r.kind).toBe("shortCircuit");
-    expect(r.summary).toBe("[SILENT]");
-    // Baselined at the newest, drafted nothing, recorded the boundary id.
-    expect(r.state.byWatcher["w-new"]!.cursor).toBe("9000");
-    expect(r.state.byWatcher["w-new"]!.seen).toEqual(["n1"]);
-    expect(r.state.byWatcher["w-new"]!.status).toBe("ok");
+    // The newest is a pending non-self inbound => the seeded draft rides the
+    // watch's OWN routeKey bucket, and the watch baselines its cursor/seen.
+    expect(r.kind).toBe("context");
+    expect(draftedIds(r.buckets!["w-new"])).toEqual(["n1"]);
+    expect(r.state["w-new"]!.cursor).toBe("9000");
+    expect(r.state["w-new"]!.seen).toEqual(["n1"]);
+    expect(r.state["w-new"]!.status).toBe("ok");
   });
 
-  test("per-watch backlog notices join into one non-silent shortCircuit summary", async () => {
-    // Two watches both hit truncated windows (no draftable match); their notices
-    // join into one summary so the shared thread surfaces both.
+  test("seeding a fresh watch whose newest is self baselines silently (no bucket)", async () => {
+    const spawn = multiSpawn(
+      { "from:new@x.com is:unread": ["n1"] },
+      { n1: { id: "n1", internalDate: "9000", from: "me@example.com", subject: "our reply" } }
+    );
+    const r = await runWatches(
+      { watches: [{ watcherId: "w-new", query: "from:new@x.com is:unread", sender: "new@x.com" }], state: null },
+      spawn
+    );
+    // The newest is our own message => silent seed, no bucket opened.
+    expect(r.kind).toBe("shortCircuit");
+    expect(r.summary).toBe("[SILENT]");
+    expect(r.state["w-new"]!.cursor).toBe("9000");
+    expect(r.state["w-new"]!.seen).toEqual(["n1"]);
+    expect(r.state["w-new"]!.status).toBe("ok");
+  });
+
+  test("per-watch backlog notices route into each concern's own bucket", async () => {
+    // Two watches both hit truncated windows (no draftable match); each watch's
+    // notice routes into ITS OWN routeKey bucket as a trusted item, so each
+    // concern's worker surfaces its own backlog notice.
     const corpusA: Meta[] = Array.from({ length: 60 }, (_, i) => ({
       id: `a${i}`,
       internalDate: String(12_000_000 + i * 1000),
@@ -654,28 +1462,29 @@ describe("runWatches — multi-watch (one shared job)", () => {
     const r = await runWatches(
       {
         watches: [
-          { watcherId: "w-a", query: "from:alice@x.com is:unread" },
-          { watcherId: "w-b", query: "from:bob@x.com is:unread" }
+          { watcherId: "w-a", query: "from:alice@x.com is:unread", sender: "alice@x.com" },
+          { watcherId: "w-b", query: "from:bob@x.com is:unread", sender: "bob@x.com" }
         ],
-        state: { byWatcher: { "w-a": { cursor: "1000", seen: [] }, "w-b": { cursor: "1000", seen: [] } } }
+        state: { "w-a": { cursor: "1000", seen: [] }, "w-b": { cursor: "1000", seen: [] } }
       },
       spawn
     );
-    expect(r.kind).toBe("shortCircuit");
-    expect(r.summary).not.toBe("[SILENT]");
-    // Both watches' backlog notices are present in the joined summary.
-    expect(r.summary).toContain("from:alice@x.com is:unread");
-    expect(r.summary).toContain("from:bob@x.com is:unread");
+    // Each notice is a trusted item in its OWN concern's bucket (a context turn).
+    expect(r.kind).toBe("context");
+    expect(r.buckets!["w-a"]).toHaveLength(1);
+    expect(r.buckets!["w-a"]![0]!.untrusted).toBe(false);
+    expect(r.buckets!["w-a"]![0]!.text).toContain("from:alice@x.com is:unread");
+    expect(r.buckets!["w-b"]![0]!.text).toContain("from:bob@x.com is:unread");
     // Both cursors jumped to their newest.
-    expect(r.state.byWatcher["w-a"]!.cursor).toBe(String(12_000_000 + 59 * 1000));
-    expect(r.state.byWatcher["w-b"]!.cursor).toBe(String(13_000_000 + 59 * 1000));
+    expect(r.state["w-a"]!.cursor).toBe(String(12_000_000 + 59 * 1000));
+    expect(r.state["w-b"]!.cursor).toBe(String(13_000_000 + 59 * 1000));
   });
 
-  test("a sibling match in the same tick as a backlog carries the notice as a trusted item", async () => {
+  test("a sibling match and a backlog notice land in their own concern buckets", async () => {
     // One watch produces a fresh draftable match; another hits a truncated
-    // (page-cap) window in the SAME tick. The match makes this a context result,
-    // so the backlog notice must ride along (as a TRUSTED item) instead of being
-    // dropped while the truncated watch's cursor advances.
+    // (page-cap) window in the SAME tick. The match opens the alice bucket; the
+    // backlog notice opens the bulk bucket as a TRUSTED item — neither is dropped
+    // and both advance their own cursor.
     const backlog: Meta[] = Array.from({ length: 60 }, (_, i) => ({
       id: `bk${i}`,
       internalDate: String(20_000_000 + i * 1000),
@@ -713,32 +1522,524 @@ describe("runWatches — multi-watch (one shared job)", () => {
     const r = await runWatches(
       {
         watches: [
-          { watcherId: "w-alice", query: "from:alice@x.com is:unread" },
-          { watcherId: "w-bulk", query: "from:bulk@x.com is:unread" }
+          { watcherId: "w-alice", query: "from:alice@x.com is:unread", sender: "alice@x.com" },
+          { watcherId: "w-bulk", query: "from:bulk@x.com is:unread", sender: "bulk@x.com" }
         ],
-        state: { byWatcher: { "w-alice": { cursor: "1000", seen: [] }, "w-bulk": { cursor: "1000", seen: [] } } }
+        state: { "w-alice": { cursor: "1000", seen: [] }, "w-bulk": { cursor: "1000", seen: [] } }
       },
       spawn
     );
-    // The match makes it a context turn carrying BOTH the draft AND the notice.
     expect(r.kind).toBe("context");
-    // Exactly one draftable (untrusted) match — Alice's fresh email.
-    expect(matchCount(r.items)).toBe(1);
-    expect(r.items!.some((i) => i.untrusted && i.text.startsWith("New email from Alice <alice@x.com> — "))).toBe(true);
-    // The backlog notice rides along as a TRUSTED item (not dropped).
-    const notice = r.items!.filter((i) => !i.untrusted);
+    // Alice's bucket carries exactly her fresh draftable match.
+    expect(matchCount(r.buckets!["w-alice"])).toBe(1);
+    expect(r.buckets!["w-alice"]!.some((i) => i.untrusted && i.text.startsWith("New email from Alice <alice@x.com> — "))).toBe(true);
+    // The bulk bucket carries the backlog notice as a TRUSTED item (not dropped).
+    const notice = r.buckets!["w-bulk"]!.filter((i) => !i.untrusted);
     expect(notice).toHaveLength(1);
     expect(notice[0]!.text).toContain("backlog");
     expect(notice[0]!.text).toContain("from:bulk@x.com is:unread");
     // The truncated watch's cursor still jumped to its newest.
-    expect(r.state.byWatcher["w-bulk"]!.cursor).toBe(String(20_000_000 + 59 * 1000));
+    expect(r.state["w-bulk"]!.cursor).toBe(String(20_000_000 + 59 * 1000));
   });
 
-  test("no watches yields a silent shortCircuit with empty byWatcher", async () => {
+  test("a watch entry's sender + objective ride through to the bypass and the trusted item", async () => {
+    const spawn = multiSpawn(
+      { "from:noreply@ups.com": ["p1"] },
+      { p1: { id: "p1", internalDate: "4000", from: "UPS <noreply@ups.com>", subject: "shipped" } }
+    );
+    const r = await runWatches(
+      {
+        watches: [{ watcherId: "w-ups", query: "from:noreply@ups.com", sender: "noreply@ups.com", objective: "Track the package until delivered" }],
+        state: { "w-ups": { cursor: "1000", seen: [] } }
+      },
+      spawn
+    );
+    expect(r.kind).toBe("context");
+    expect(draftedIds(r.buckets!["w-ups"])).toEqual(["p1"]);
+    const trusted = r.buckets!["w-ups"]!.filter((i) => !i.untrusted);
+    expect(trusted).toHaveLength(1);
+    expect(trusted[0]!.text).toBe("Objective for this watch (noreply@ups.com): Track the package until delivered");
+  });
+
+  test("no watches yields a silent shortCircuit with empty state", async () => {
     const spawn = multiSpawn({}, {});
     const r = await runWatches({ watches: [], state: null }, spawn);
     expect(r.kind).toBe("shortCircuit");
     expect(r.summary).toBe("[SILENT]");
-    expect(r.state.byWatcher).toEqual({});
+    expect(r.state).toEqual({});
+  });
+
+  test("buckets are keyed by routeKey, defaulting to watcherId", async () => {
+    const spawn = multiSpawn(
+      { "from:alice@x.com": ["a1"] },
+      { a1: { id: "a1", internalDate: "3000", from: "Alice <alice@x.com>", subject: "hi" } }
+    );
+    const r = await runWatches(
+      {
+        // routeKey explicitly diverges from watcherId — the bucket + state key follow it.
+        watches: [{ watcherId: "w-alice", routeKey: "concern-alice", query: "from:alice@x.com", sender: "alice@x.com" }],
+        state: { "concern-alice": { cursor: "1000", seen: [] } }
+      },
+      spawn
+    );
+    expect(r.kind).toBe("context");
+    expect(Object.keys(r.buckets!)).toEqual(["concern-alice"]);
+    expect(draftedIds(r.buckets!["concern-alice"])).toEqual(["a1"]);
+    expect(r.state["concern-alice"]!.cursor).toBe("3000");
+  });
+
+  test("a targeted concern claims its mail; a broad watch drops the already-claimed id", async () => {
+    // The SAME email (id m1, from alice) is listed by BOTH a targeted alice watch
+    // and a broad in:inbox watch. Precedence: alice claims it, so the broad bucket
+    // never re-drafts it. A second inbox-only email (m2) routes to the broad bucket.
+    const spawn: GwsSpawn = async (args) => {
+      const joined = args.join(" ");
+      if (joined.includes("auth status")) return PREAMBLE + '{"token_valid":true}';
+      if (joined.includes("getProfile")) return PREAMBLE + '{"emailAddress":"me@example.com"}';
+      if (joined.includes("messages list")) {
+        const q = joined.match(/"q":"([^"]*)"/)?.[1]?.replace(/ after:\d+$/, "") ?? "";
+        if (q.startsWith("from:alice")) return listResponse(["m1"]);
+        return listResponse(["m2", "m1"]); // in:inbox lists both, newest-first
+      }
+      if (joined.includes("messages get")) {
+        const hit = getArgId(joined);
+        const byId: Record<string, Meta> = {
+          m1: { id: "m1", internalDate: "3000", from: "Alice <alice@x.com>", subject: "from alice" },
+          m2: { id: "m2", internalDate: "4000", from: "Carol <carol@x.com>", subject: "random" }
+        };
+        return hit && byId[hit] ? metadataResponse(byId[hit]) : PREAMBLE + "{}";
+      }
+      return PREAMBLE + "{}";
+    };
+    const r = await runWatches(
+      {
+        watches: [
+          { watcherId: "w-alice", routeKey: "w-alice", query: "from:alice@x.com", sender: "alice@x.com" },
+          { watcherId: "w-triage", routeKey: "triage", query: "in:inbox" }
+        ],
+        state: { "w-alice": { cursor: "1000", seen: [] }, triage: { cursor: "1000", seen: [] } }
+      },
+      spawn
+    );
+    expect(r.kind).toBe("context");
+    // m1 lands in the TARGETED bucket only — never the broad bucket.
+    expect(draftedIds(r.buckets!["w-alice"])).toEqual(["m1"]);
+    // The broad bucket keeps only the unclaimed remainder.
+    expect(draftedIds(r.buckets!["triage"])).toEqual(["m2"]);
+    // Both watches' cursors advanced over what each consumed.
+    expect(r.state["w-alice"]!.cursor).toBe("3000");
+    expect(r.state.triage!.cursor).toBe("4000");
+  });
+
+  test("a broad watch whose only match is claimed opens no bucket", async () => {
+    // The single inbox email is alice's, already claimed by the targeted watch, so
+    // the broad bucket has nothing left and is omitted (no idle worker turn).
+    const spawn: GwsSpawn = async (args) => {
+      const joined = args.join(" ");
+      if (joined.includes("auth status")) return PREAMBLE + '{"token_valid":true}';
+      if (joined.includes("getProfile")) return PREAMBLE + '{"emailAddress":"me@example.com"}';
+      if (joined.includes("messages list")) {
+        const q = joined.match(/"q":"([^"]*)"/)?.[1]?.replace(/ after:\d+$/, "") ?? "";
+        if (q.startsWith("from:alice")) return listResponse(["m1"]);
+        return listResponse(["m1"]);
+      }
+      if (joined.includes("messages get")) {
+        const hit = getArgId(joined);
+        return hit === "m1"
+          ? metadataResponse({ id: "m1", internalDate: "3000", from: "Alice <alice@x.com>", subject: "hi" })
+          : PREAMBLE + "{}";
+      }
+      return PREAMBLE + "{}";
+    };
+    const r = await runWatches(
+      {
+        watches: [
+          { watcherId: "w-alice", routeKey: "w-alice", query: "from:alice@x.com", sender: "alice@x.com" },
+          { watcherId: "w-triage", routeKey: "triage", query: "in:inbox" }
+        ],
+        state: { "w-alice": { cursor: "1000", seen: [] }, triage: { cursor: "1000", seen: [] } }
+      },
+      spawn
+    );
+    expect(r.kind).toBe("context");
+    expect(draftedIds(r.buckets!["w-alice"])).toEqual(["m1"]);
+    // Empty broad bucket omitted entirely.
+    expect(r.buckets!["triage"]).toBeUndefined();
+    expect(Object.keys(r.buckets!)).toEqual(["w-alice"]);
+    // The broad watch's cursor still advanced over the message it consumed (and
+    // dropped to precedence), so it won't re-list it.
+    expect(r.state.triage!.cursor).toBe("3000");
+  });
+
+  test("per-bucket state round-trips by routeKey for the generic commit", async () => {
+    // The returned state is keyed by routeKey at the TOP level (NOT nested under
+    // byWatcher), so the generic persistFanOutState can merge ONLY the dispatched
+    // routeKeys. Feed the returned state straight back as the next tick's input.
+    const spawn = multiSpawn(
+      { "from:alice@x.com": ["a1"] },
+      { a1: { id: "a1", internalDate: "3000", from: "Alice <alice@x.com>", subject: "hi" } }
+    );
+    const r1 = await runWatches(
+      {
+        watches: [{ watcherId: "w-alice", routeKey: "w-alice", query: "from:alice@x.com", sender: "alice@x.com" }],
+        state: { "w-alice": { cursor: "1000", seen: [] } }
+      },
+      spawn
+    );
+    expect(draftedIds(r1.buckets!["w-alice"])).toEqual(["a1"]);
+    // Round-trip the flat state back in: a1 is now at/behind the cursor and seen,
+    // so the next tick re-detects nothing (no bucket).
+    const r2 = await runWatches(
+      { watches: [{ watcherId: "w-alice", routeKey: "w-alice", query: "from:alice@x.com", sender: "alice@x.com" }], state: r1.state },
+      spawn
+    );
+    expect(r2.kind).toBe("shortCircuit");
+    expect(allBucketItems(r2.buckets)).toHaveLength(0);
+  });
+
+  // A multi-account spawn: like multiSpawn, but records the configDir each gws
+  // call ran under so the per-watch account targeting can be asserted. Returns the
+  // same canned responses regardless of dir (the account binding is the env, not
+  // the data).
+  function dirRecordingSpawn(
+    byQuery: Record<string, string[]>,
+    metaById: Record<string, Meta>,
+    seen: { dirs: string[] }
+  ): GwsSpawn {
+    return async (args: string[], configDir?: string) => {
+      seen.dirs.push(configDir ?? "<default>");
+      const joined = args.join(" ");
+      if (joined.includes("auth status")) return PREAMBLE + '{"token_valid":true}';
+      if (joined.includes("getProfile")) return PREAMBLE + '{"emailAddress":"me@example.com"}';
+      if (joined.includes("messages list")) {
+        const q = listQuery(joined) ?? "";
+        const base = q.replace(/ after:\d+$/, "");
+        return listResponse(byQuery[base] ?? byQuery[q] ?? []);
+      }
+      if (joined.includes("messages get")) {
+        const hit = getArgId(joined);
+        return hit && metaById[hit] ? metadataResponse(metaById[hit]) : PREAMBLE + "{}";
+      }
+      return PREAMBLE + "{}";
+    };
+  }
+
+  test("a watch with configDir runs EVERY gws call under that account's dir", async () => {
+    const seen = { dirs: [] as string[] };
+    const spawn = dirRecordingSpawn(
+      { "from:alice@x.com": ["a1"] },
+      { a1: { id: "a1", internalDate: "3000", from: "Alice <alice@x.com>", subject: "hi" } },
+      seen
+    );
+    const r = await runWatches(
+      {
+        watches: [{ watcherId: "w-a", query: "from:alice@x.com", sender: "alice@x.com", configDir: "/dir/gacct_a" }],
+        state: { "w-a": { cursor: "1000", seen: [] } }
+      },
+      spawn
+    );
+    expect(r.kind).toBe("context");
+    expect(draftedIds(r.buckets!["w-a"])).toEqual(["a1"]);
+    // auth status + getProfile + list + get + body-fetch all carried the dir; no
+    // gws call leaked to the default config dir.
+    expect(seen.dirs.length).toBeGreaterThan(0);
+    expect(seen.dirs.every((d) => d === "/dir/gacct_a")).toBe(true);
+  });
+
+  test("a watch WITHOUT configDir runs gws on the default config dir (no env)", async () => {
+    const seen = { dirs: [] as string[] };
+    const spawn = dirRecordingSpawn(
+      { "from:alice@x.com": ["a1"] },
+      { a1: { id: "a1", internalDate: "3000", from: "Alice <alice@x.com>", subject: "hi" } },
+      seen
+    );
+    const r = await runWatches(
+      {
+        watches: [{ watcherId: "w-a", query: "from:alice@x.com", sender: "alice@x.com" }],
+        state: { "w-a": { cursor: "1000", seen: [] } }
+      },
+      spawn
+    );
+    expect(r.kind).toBe("context");
+    expect(seen.dirs.length).toBeGreaterThan(0);
+    expect(seen.dirs.every((d) => d === "<default>")).toBe(true);
+  });
+
+  test("two account-scoped watches each target their OWN dir in one tick", async () => {
+    const seen = { dirs: [] as string[] };
+    const spawn: GwsSpawn = async (args, configDir) => {
+      const joined = args.join(" ");
+      if (joined.includes("auth status")) return PREAMBLE + '{"token_valid":true}';
+      if (joined.includes("getProfile")) return PREAMBLE + '{"emailAddress":"me@example.com"}';
+      if (joined.includes("messages list")) {
+        const q = listQuery(joined)?.replace(/ after:\d+$/, "") ?? "";
+        // Tag the listed id by the dir the call ran under so we can assert each
+        // watch polled its own account.
+        if (q.startsWith("from:alice")) {
+          seen.dirs.push(`alice:${configDir}`);
+          return listResponse(["a1"]);
+        }
+        seen.dirs.push(`bob:${configDir}`);
+        return listResponse(["b1"]);
+      }
+      if (joined.includes("messages get")) {
+        const hit = getArgId(joined);
+        const byId: Record<string, Meta> = {
+          a1: { id: "a1", internalDate: "3000", from: "Alice <alice@x.com>", subject: "hi" },
+          b1: { id: "b1", internalDate: "4000", from: "Bob <bob@x.com>", subject: "yo" }
+        };
+        return hit && byId[hit] ? metadataResponse(byId[hit]) : PREAMBLE + "{}";
+      }
+      return PREAMBLE + "{}";
+    };
+    const r = await runWatches(
+      {
+        watches: [
+          { watcherId: "w-a", query: "from:alice@x.com", sender: "alice@x.com", configDir: "/dir/gacct_a" },
+          { watcherId: "w-b", query: "from:bob@x.com", sender: "bob@x.com", configDir: "/dir/gacct_b" }
+        ],
+        state: { "w-a": { cursor: "1000", seen: [] }, "w-b": { cursor: "1000", seen: [] } }
+      },
+      spawn
+    );
+    expect(r.kind).toBe("context");
+    expect(draftedIds(r.buckets!["w-a"])).toEqual(["a1"]);
+    expect(draftedIds(r.buckets!["w-b"])).toEqual(["b1"]);
+    expect(seen.dirs).toContain("alice:/dir/gacct_a");
+    expect(seen.dirs).toContain("bob:/dir/gacct_b");
+    // No cross-account leak: alice's list never ran under bob's dir and vice versa.
+    expect(seen.dirs).not.toContain("alice:/dir/gacct_b");
+    expect(seen.dirs).not.toContain("bob:/dir/gacct_a");
+  });
+});
+
+describe("runWatches — cross-account Message-ID dedup", () => {
+  function listQuery(joined: string): string | undefined {
+    return joined.match(/"q":"([^"]*)"/)?.[1];
+  }
+
+  // A two-account spawn: a list/get response routed by the configDir the call ran
+  // under (each account targets its own dir) AND the watch's query. The SAME
+  // underlying email appears in each account with a DIFFERENT gmail id but the
+  // SAME Message-ID — the exact cross-account-duplicate shape detection must
+  // collapse. `byDir` maps a configDir to its { query -> ids } + metadata.
+  function twoAccountSpawn(
+    byDir: Record<string, { byQuery: Record<string, string[]>; metaById: Record<string, Meta> }>
+  ): GwsSpawn {
+    return async (args: string[], configDir?: string) => {
+      const dir = configDir ?? "<default>";
+      const acct = byDir[dir];
+      const joined = args.join(" ");
+      if (joined.includes("auth status")) return PREAMBLE + '{"token_valid":true}';
+      if (joined.includes("getProfile")) return PREAMBLE + '{"emailAddress":"me@example.com"}';
+      if (!acct) return PREAMBLE + "{}";
+      if (joined.includes("messages list")) {
+        const q = (listQuery(joined) ?? "").replace(/ after:\d+$/, "");
+        return listResponse(acct.byQuery[q] ?? []);
+      }
+      if (joined.includes("messages get")) {
+        const hit = getArgId(joined);
+        return hit && acct.metaById[hit] ? metadataResponse(acct.metaById[hit]!) : PREAMBLE + "{}";
+      }
+      return PREAMBLE + "{}";
+    };
+  }
+
+  test("the same Message-ID across two accounts drafts exactly once (To-recipient wins)", async () => {
+    // One email To alice@x.com lands in both inboxes: alice's copy is gmail id A1,
+    // bob's copy is B1 — but both carry Message-ID <mid-1>. alice is the
+    // To-recipient, so alice's watch drafts; bob's is suppressed.
+    const spawn = twoAccountSpawn({
+      "/dir/gacct_a": {
+        byQuery: { "in:inbox": ["A1"] },
+        metaById: { A1: { id: "A1", internalDate: "3000", from: "Carol <carol@x.com>", subject: "hi", to: "alice@x.com", messageId: "<mid-1>" } }
+      },
+      "/dir/gacct_b": {
+        byQuery: { "in:inbox": ["B1"] },
+        metaById: { B1: { id: "B1", internalDate: "3000", from: "Carol <carol@x.com>", subject: "hi", to: "alice@x.com", messageId: "<mid-1>" } }
+      }
+    });
+    const r = await runWatches(
+      {
+        watches: [
+          { watcherId: "w-a", routeKey: "w-a", query: "in:inbox", account: "alice@x.com", configDir: "/dir/gacct_a" },
+          { watcherId: "w-b", routeKey: "w-b", query: "in:inbox", account: "bob@x.com", configDir: "/dir/gacct_b" }
+        ],
+        state: { "w-a": { cursor: "1000", seen: [] }, "w-b": { cursor: "1000", seen: [] } }
+      },
+      spawn
+    );
+    expect(r.kind).toBe("context");
+    // alice (the To-recipient) drafts; bob's bucket is suppressed entirely.
+    expect(draftedIds(r.buckets!["w-a"])).toEqual(["A1"]);
+    expect(r.buckets!["w-b"]).toBeUndefined();
+    // The LOSER's cursor still advanced over its own copy, so it won't re-draft.
+    expect(r.state["w-b"]!.cursor).toBe("3000");
+    expect(r.state["w-a"]!.cursor).toBe("3000");
+  });
+
+  test("the loser records seen + does NOT re-draft on the next tick", async () => {
+    const byDir = {
+      "/dir/gacct_a": {
+        byQuery: { "in:inbox": ["A1"] },
+        metaById: { A1: { id: "A1", internalDate: "3000", from: "Carol <carol@x.com>", subject: "hi", to: "alice@x.com", messageId: "<mid-1>" } }
+      },
+      "/dir/gacct_b": {
+        byQuery: { "in:inbox": ["B1"] },
+        metaById: { B1: { id: "B1", internalDate: "3000", from: "Carol <carol@x.com>", subject: "hi", to: "alice@x.com", messageId: "<mid-1>" } }
+      }
+    };
+    const spawn = twoAccountSpawn(byDir);
+    const watches = [
+      { watcherId: "w-a", routeKey: "w-a", query: "in:inbox", account: "alice@x.com", configDir: "/dir/gacct_a" },
+      { watcherId: "w-b", routeKey: "w-b", query: "in:inbox", account: "bob@x.com", configDir: "/dir/gacct_b" }
+    ];
+    const r1 = await runWatches(
+      { watches, state: { "w-a": { cursor: "1000", seen: [] }, "w-b": { cursor: "1000", seen: [] } } },
+      spawn
+    );
+    expect(draftedIds(r1.buckets!["w-a"])).toEqual(["A1"]);
+    expect(r1.buckets!["w-b"]).toBeUndefined();
+    // Feed the returned state back: the loser's advanced cursor + seen mean B1 is
+    // no longer "new", so the next tick re-drafts nothing (no double reply later).
+    const r2 = await runWatches({ watches, state: r1.state }, spawn);
+    expect(r2.kind).toBe("shortCircuit");
+    expect(allBucketItems(r2.buckets)).toHaveLength(0);
+  });
+
+  test("precedence falls back to account email ascending when neither is the To-recipient", async () => {
+    // The email is To a third party, so neither account is the To-recipient — the
+    // deterministic tie-break (account email ascending) picks alice over bob
+    // regardless of watch order.
+    const spawn = twoAccountSpawn({
+      "/dir/gacct_a": {
+        byQuery: { "in:inbox": ["A1"] },
+        metaById: { A1: { id: "A1", internalDate: "3000", from: "Carol <carol@x.com>", subject: "hi", to: "list@x.com", messageId: "<mid-2>" } }
+      },
+      "/dir/gacct_b": {
+        byQuery: { "in:inbox": ["B1"] },
+        metaById: { B1: { id: "B1", internalDate: "3000", from: "Carol <carol@x.com>", subject: "hi", to: "list@x.com", messageId: "<mid-2>" } }
+      }
+    });
+    const r = await runWatches(
+      {
+        watches: [
+          { watcherId: "w-b", routeKey: "w-b", query: "in:inbox", account: "bob@x.com", configDir: "/dir/gacct_b" },
+          { watcherId: "w-a", routeKey: "w-a", query: "in:inbox", account: "alice@x.com", configDir: "/dir/gacct_a" }
+        ],
+        state: { "w-a": { cursor: "1000", seen: [] }, "w-b": { cursor: "1000", seen: [] } }
+      },
+      spawn
+    );
+    expect(r.kind).toBe("context");
+    // alice@x.com < bob@x.com, so alice wins the tie-break regardless of watch order.
+    expect(draftedIds(r.buckets!["w-a"])).toEqual(["A1"]);
+    expect(r.buckets!["w-b"]).toBeUndefined();
+  });
+
+  test("distinct Message-IDs across accounts are NOT deduped (each drafts)", async () => {
+    // Two genuinely different emails (different Message-IDs), one per account —
+    // not a cross-account duplicate, so both draft.
+    const spawn = twoAccountSpawn({
+      "/dir/gacct_a": {
+        byQuery: { "in:inbox": ["A1"] },
+        metaById: { A1: { id: "A1", internalDate: "3000", from: "Carol <carol@x.com>", subject: "a", to: "alice@x.com", messageId: "<mid-a>" } }
+      },
+      "/dir/gacct_b": {
+        byQuery: { "in:inbox": ["B1"] },
+        metaById: { B1: { id: "B1", internalDate: "3000", from: "Dave <dave@x.com>", subject: "b", to: "bob@x.com", messageId: "<mid-b>" } }
+      }
+    });
+    const r = await runWatches(
+      {
+        watches: [
+          { watcherId: "w-a", routeKey: "w-a", query: "in:inbox", account: "alice@x.com", configDir: "/dir/gacct_a" },
+          { watcherId: "w-b", routeKey: "w-b", query: "in:inbox", account: "bob@x.com", configDir: "/dir/gacct_b" }
+        ],
+        state: { "w-a": { cursor: "1000", seen: [] }, "w-b": { cursor: "1000", seen: [] } }
+      },
+      spawn
+    );
+    expect(r.kind).toBe("context");
+    expect(draftedIds(r.buckets!["w-a"])).toEqual(["A1"]);
+    expect(draftedIds(r.buckets!["w-b"])).toEqual(["B1"]);
+  });
+
+  test("single-account behavior is unchanged (no Message-ID dedup when one account sees a message)", async () => {
+    // One account, two distinct messages each with its own Message-ID — the dedup
+    // pass groups by Message-ID but finds only one account per group, so it never
+    // suppresses anything. Both drafts survive.
+    const spawn: GwsSpawn = async (args, configDir) => {
+      void configDir;
+      const joined = args.join(" ");
+      if (joined.includes("auth status")) return PREAMBLE + '{"token_valid":true}';
+      if (joined.includes("getProfile")) return PREAMBLE + '{"emailAddress":"me@example.com"}';
+      if (joined.includes("messages list")) {
+        const q = (listQuery(joined) ?? "").replace(/ after:\d+$/, "");
+        if (q.startsWith("from:alice")) return listResponse(["m1"]);
+        return listResponse(["m2"]);
+      }
+      if (joined.includes("messages get")) {
+        const hit = getArgId(joined);
+        const byId: Record<string, Meta> = {
+          m1: { id: "m1", internalDate: "3000", from: "Alice <alice@x.com>", subject: "a", to: "me@example.com", messageId: "<mid-1>" },
+          m2: { id: "m2", internalDate: "4000", from: "Bob <bob@x.com>", subject: "b", to: "me@example.com", messageId: "<mid-2>" }
+        };
+        return hit && byId[hit] ? metadataResponse(byId[hit]!) : PREAMBLE + "{}";
+      }
+      return PREAMBLE + "{}";
+    };
+    const r = await runWatches(
+      {
+        watches: [
+          { watcherId: "w-alice", routeKey: "w-alice", query: "from:alice@x.com", sender: "alice@x.com", configDir: "/dir/gacct_a" },
+          { watcherId: "w-bob", routeKey: "w-bob", query: "from:bob@x.com", sender: "bob@x.com", configDir: "/dir/gacct_a" }
+        ],
+        state: { "w-alice": { cursor: "1000", seen: [] }, "w-bob": { cursor: "1000", seen: [] } }
+      },
+      spawn
+    );
+    expect(r.kind).toBe("context");
+    expect(draftedIds(r.buckets!["w-alice"])).toEqual(["m1"]);
+    expect(draftedIds(r.buckets!["w-bob"])).toEqual(["m2"]);
+  });
+
+  test("within-account targeted-vs-triage dedup (by gmail id) still works", async () => {
+    // Regression guard for the existing within-account precedence: a targeted
+    // watch and a triage watch on the SAME account list the SAME gmail id; the
+    // targeted watch claims it and triage drops it (unchanged by the Message-ID
+    // dedup, which fires only across DISTINCT accounts).
+    const spawn: GwsSpawn = async (args) => {
+      const joined = args.join(" ");
+      if (joined.includes("auth status")) return PREAMBLE + '{"token_valid":true}';
+      if (joined.includes("getProfile")) return PREAMBLE + '{"emailAddress":"me@example.com"}';
+      if (joined.includes("messages list")) {
+        const q = (listQuery(joined) ?? "").replace(/ after:\d+$/, "");
+        if (q.startsWith("from:alice")) return listResponse(["m1"]);
+        return listResponse(["m2", "m1"]);
+      }
+      if (joined.includes("messages get")) {
+        const hit = getArgId(joined);
+        const byId: Record<string, Meta> = {
+          m1: { id: "m1", internalDate: "3000", from: "Alice <alice@x.com>", subject: "a", to: "me@example.com", messageId: "<mid-1>" },
+          m2: { id: "m2", internalDate: "4000", from: "Carol <carol@x.com>", subject: "c", to: "me@example.com", messageId: "<mid-2>" }
+        };
+        return hit && byId[hit] ? metadataResponse(byId[hit]!) : PREAMBLE + "{}";
+      }
+      return PREAMBLE + "{}";
+    };
+    const r = await runWatches(
+      {
+        watches: [
+          { watcherId: "w-alice", routeKey: "w-alice", query: "from:alice@x.com", sender: "alice@x.com" },
+          { watcherId: "w-triage", routeKey: "triage", query: "in:inbox" }
+        ],
+        state: { "w-alice": { cursor: "1000", seen: [] }, triage: { cursor: "1000", seen: [] } }
+      },
+      spawn
+    );
+    expect(r.kind).toBe("context");
+    expect(draftedIds(r.buckets!["w-alice"])).toEqual(["m1"]);
+    expect(draftedIds(r.buckets!["triage"])).toEqual(["m2"]);
   });
 });

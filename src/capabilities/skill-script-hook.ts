@@ -39,18 +39,38 @@ import { findSkillScript, invokeSkillScript } from "./skill-scripts";
 // race.
 const SCRIPT_TIMEOUT_MS = 20_000;
 
-// A skill-script hook result, as the script emits it on stdout. `items` carry
-// raw untrusted external content (the runner fences them); `summary` is the
-// shortCircuit run summary; `state` is the script's opaque next state.
+// A skill-script hook result, as the script emits it on stdout. A `context`
+// result carries raw untrusted external content the runner fences — either as a
+// flat `items` list (single default route) or as `buckets` keyed by routeKey
+// (fan-out: one worker per non-empty bucket). `summary` is the shortCircuit run
+// summary; `state` is the script's opaque next state.
 interface SkillScriptOutput {
   kind: "shortCircuit" | "context";
   items?: HookContextItem[];
+  buckets?: Record<string, HookContextItem[]>;
   summary?: string;
   state?: Record<string, unknown>;
 }
 
 function asString(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+// Validate a raw items array (flat result or one fan-out bucket) into typed
+// HookContextItems, or return the discriminated shape error.
+function validateItems(raw: unknown): { ok: true; items: HookContextItem[] } | { ok: false; error: string } {
+  if (!Array.isArray(raw)) {
+    return { ok: false, error: "skill-script: context result is missing an items array" };
+  }
+  const items: HookContextItem[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object" || typeof (item as { text?: unknown }).text !== "string") {
+      return { ok: false, error: "skill-script: context item must be { text, untrusted }" };
+    }
+    const it = item as { text: string; untrusted?: unknown };
+    items.push({ text: it.text, untrusted: it.untrusted === true });
+  }
+  return { ok: true, items };
 }
 
 // Validate the parsed stdout into a typed HookResult, or return a config-error
@@ -78,22 +98,34 @@ function toHookResult(parsed: unknown): { ok: true; result: HookResult } | { ok:
   }
 
   if (out.kind === "context") {
-    if (!Array.isArray(out.items)) {
-      return { ok: false, error: "skill-script: context result is missing an items array" };
-    }
-    const items: HookContextItem[] = [];
-    for (const item of out.items) {
-      if (!item || typeof item !== "object" || typeof (item as { text?: unknown }).text !== "string") {
-        return { ok: false, error: "skill-script: context item must be { text, untrusted }" };
+    // A context result carries EITHER a flat `items` list (single default route)
+    // OR `buckets` keyed by routeKey (fan-out). Validate whichever is present.
+    if (out.buckets !== undefined) {
+      if (!out.buckets || typeof out.buckets !== "object" || Array.isArray(out.buckets)) {
+        return { ok: false, error: "skill-script: context buckets must be a routeKey→items object" };
       }
-      const it = item as { text: string; untrusted?: unknown };
-      items.push({ text: it.text, untrusted: it.untrusted === true });
+      const buckets: Record<string, HookContextItem[]> = {};
+      for (const [routeKey, rawItems] of Object.entries(out.buckets)) {
+        const validated = validateItems(rawItems);
+        if (!validated.ok) return validated;
+        buckets[routeKey] = validated.items;
+      }
+      return {
+        ok: true,
+        result: {
+          kind: "context",
+          buckets,
+          ...(state !== undefined ? { state } : {})
+        }
+      };
     }
+    const validated = validateItems(out.items);
+    if (!validated.ok) return validated;
     return {
       ok: true,
       result: {
         kind: "context",
-        items,
+        items: validated.items,
         ...(state !== undefined ? { state } : {})
       }
     };

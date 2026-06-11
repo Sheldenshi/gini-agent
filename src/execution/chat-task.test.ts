@@ -34,6 +34,7 @@ import {
   ensureAgentBank,
   ensureDefaultBank,
   insertMemoryUnit,
+  listChatBlocks,
   mutateState,
   now,
   readState,
@@ -1509,6 +1510,115 @@ describe("chat-task loop", () => {
     expect(content).toContain(jobId);
     expect(content).toContain("Weekly research digest");
     expect(content).toContain("every 604800s");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // [SILENT] sentinel suppression at the chat-block layer. A scheduled
+  // job (or fan-out subagent worker) that has nothing to report responds
+  // with exactly "[SILENT]". The legacy message layer drops the
+  // ChatMessageRecord, but the UI renders chat blocks — so a completed
+  // turn whose final text is exactly "[SILENT]" must NOT leave a visible
+  // assistant_text block behind.
+  test("suppresses the assistant_text block when the final turn text is exactly [SILENT]", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-silent-suppress");
+    const provider = normalizeProvider(config.provider);
+
+    const sessionId = await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "Inbox triage");
+      const run = createRun(state, {
+        kind: "conversation_turn",
+        title: "Watcher turn",
+        input: "kick off",
+        conversationId: session.id
+      });
+      return { runId: run.id, sessionId: session.id };
+    });
+
+    setEchoToolCallingResponse({
+      provider,
+      text: "[SILENT]",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "anything new?", { mode: "chat", runId: sessionId.runId, chatSessionId: sessionId.sessionId });
+    const finished = await waitForTerminal(config, task.id);
+    expect(finished.status).toBe("completed");
+
+    const blocks = listChatBlocks(config.instance, sessionId.sessionId);
+    expect(blocks.some((b) => b.kind === "assistant_text")).toBe(false);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("does NOT suppress when the final text merely contains [SILENT]", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-silent-contains");
+    const provider = normalizeProvider(config.provider);
+
+    const sessionId = await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "Inbox triage");
+      const run = createRun(state, {
+        kind: "conversation_turn",
+        title: "Watcher turn",
+        input: "kick off",
+        conversationId: session.id
+      });
+      return { runId: run.id, sessionId: session.id };
+    });
+
+    setEchoToolCallingResponse({
+      provider,
+      text: "[SILENT] but here's an update",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "anything new?", { mode: "chat", runId: sessionId.runId, chatSessionId: sessionId.sessionId });
+    const finished = await waitForTerminal(config, task.id);
+    expect(finished.status).toBe("completed");
+
+    const blocks = listChatBlocks(config.instance, sessionId.sessionId);
+    const assistantText = blocks.filter((b) => b.kind === "assistant_text");
+    expect(assistantText).toHaveLength(1);
+    expect(assistantText[0]).toMatchObject({ text: "[SILENT] but here's an update" });
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("writes a normal assistant_text block when the final text is real content", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-silent-normal");
+    const provider = normalizeProvider(config.provider);
+
+    const sessionId = await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "Inbox triage");
+      const run = createRun(state, {
+        kind: "conversation_turn",
+        title: "Watcher turn",
+        input: "kick off",
+        conversationId: session.id
+      });
+      return { runId: run.id, sessionId: session.id };
+    });
+
+    setEchoToolCallingResponse({
+      provider,
+      text: "You have one new invoice from Acme.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "anything new?", { mode: "chat", runId: sessionId.runId, chatSessionId: sessionId.sessionId });
+    const finished = await waitForTerminal(config, task.id);
+    expect(finished.status).toBe("completed");
+
+    const blocks = listChatBlocks(config.instance, sessionId.sessionId);
+    const assistantText = blocks.filter((b) => b.kind === "assistant_text");
+    expect(assistantText).toHaveLength(1);
+    expect(assistantText[0]).toMatchObject({ text: "You have one new invoice from Acme." });
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
@@ -3304,6 +3414,204 @@ describe("chat-task loop", () => {
     // The handler ran on approval — the agent row now exists.
     const stateAfter = readState(config.instance);
     expect(stateAfter.agents.some((a) => a.name === "E2E2")).toBe(true);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // Fan-out watch worker history. A session-bound subagent (chatSessionId set,
+  // no run.conversationId — exactly how dispatchFanOut spawns a concern-channel
+  // worker) must land its turn in the channel's durable chatMessages so a later
+  // turn in the same channel replays the draft instead of seeing empty history.
+  test("session-bound subagent persists its transcript + final text and a later turn replays them", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    writeFileSync(join(workspaceRoot, "thread.md"), "From: shelden@berkeley.edu\nSubject: meeting");
+    const config = buildConfig(workspaceRoot, "chat-task-fanout-history");
+    const provider = normalizeProvider(config.provider);
+
+    const { sessionId, subagentId } = await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "Email: shelden@berkeley.edu");
+      const subagent = createSubagentRecord(state, {
+        name: "email-watch",
+        prompt: "watch worker",
+        toolsets: ["file"],
+        systemPrompt: "You are an email watch worker."
+      });
+      return { sessionId: session.id, subagentId: subagent.id };
+    });
+
+    // Turn 1: the worker reads the thread (a tool call → tool_transcript rows)
+    // then proposes a draft (the turn-ending final text). No runId, so the run/
+    // conversationId path is dead — the chatSessionId fallback must carry it.
+    setEchoToolCallingResponse({
+      provider,
+      text: "Reading the thread.",
+      toolCalls: [{ id: "c1", type: "function", function: { name: "file_read", arguments: JSON.stringify({ path: "thread.md" }) } }],
+      finishReason: "tool_calls"
+    });
+    setEchoToolCallingResponse({
+      provider,
+      text: "PROPOSED REPLY: Thanks, I can meet Tuesday at 2pm.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const worker = await submitTask(config, "Draft a reply to the latest email.", { mode: "chat", chatSessionId: sessionId, subagentId });
+    const finishedWorker = await waitForTerminal(config, worker.id);
+    expect(finishedWorker.status).toBe("completed");
+
+    const afterTurn1 = readState(config.instance).chatMessages.filter((m) => m.sessionId === sessionId);
+    // Transcript rows stamped into the channel (fix #1).
+    expect(afterTurn1.some((m) => m.kind === "tool_transcript")).toBe(true);
+    // Exactly one durable assistant summary row carrying the draft (fix #2).
+    const draftRows = afterTurn1.filter(
+      (m) => m.role === "assistant" && m.kind !== "tool_transcript" && m.kind !== "approval_reason"
+    );
+    expect(draftRows.length).toBe(1);
+    expect(draftRows[0]!.content).toContain("PROPOSED REPLY");
+    expect(draftRows[0]!.taskId).toBe(worker.id);
+
+    clearEchoToolCallingResponses();
+    setEchoToolCallingResponse({
+      provider,
+      text: "Sent.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    // Turn 2: a follow-up "send" in the same channel. Its system/messages must
+    // replay the prior worker draft via priorChatMessages.
+    const followUp = await submitTask(config, "send", { mode: "chat", chatSessionId: sessionId });
+    const finishedFollowUp = await waitForTerminal(config, followUp.id);
+    expect(finishedFollowUp.status).toBe("completed");
+
+    const calls = getEchoToolCallingCalls();
+    const lastTurn = calls[calls.length - 1]!;
+    const replayed = lastTurn.map((m) => (typeof m.content === "string" ? m.content : "")).join("\n");
+    expect(replayed).toContain("PROPOSED REPLY: Thanks, I can meet Tuesday at 2pm.");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // No double-write for a normal turn. A normal web/chat turn gets its summary
+  // chatMessage from syncChatTaskResult — the finalize persistence must not add
+  // a second assistant row. Here we model the normal path: a run-bound chat task
+  // (run.conversationId === session) with NO subagentId. Finalize must NOT
+  // create a summary row (it's gated to the subagent path), so calling
+  // syncChatTaskResult once yields exactly one assistant summary message.
+  test("normal chat turn persists exactly one assistant summary (no double-write)", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-no-double-write");
+    const provider = normalizeProvider(config.provider);
+
+    const sessionId = await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "General chat");
+      const run = createRun(state, {
+        kind: "conversation_turn",
+        title: "Turn",
+        input: "kick off",
+        conversationId: session.id
+      });
+      return { runId: run.id, sessionId: session.id };
+    });
+
+    setEchoToolCallingResponse({
+      provider,
+      text: "Here is your answer.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "what is 2+2?", { mode: "chat", runId: sessionId.runId, chatSessionId: sessionId.sessionId });
+    const finished = await waitForTerminal(config, task.id);
+    expect(finished.status).toBe("completed");
+
+    // Finalize did NOT write a summary row for a non-subagent turn.
+    const beforeSync = readState(config.instance).chatMessages.filter(
+      (m) => m.sessionId === sessionId.sessionId && m.role === "assistant" && m.kind !== "tool_transcript" && m.kind !== "approval_reason"
+    );
+    expect(beforeSync.length).toBe(0);
+
+    const { syncChatTaskResult } = await import("./chat");
+    const synced = await syncChatTaskResult(config, sessionId.sessionId, task.id);
+    expect(synced?.content).toBe("Here is your answer.");
+
+    const afterSync = readState(config.instance).chatMessages.filter(
+      (m) => m.sessionId === sessionId.sessionId && m.role === "assistant" && m.kind !== "tool_transcript" && m.kind !== "approval_reason"
+    );
+    expect(afterSync.length).toBe(1);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // A parent-delegated subagent with NO chatSessionId resolves no session, so
+  // neither the transcript nor the final text is persisted — its result flows
+  // back to the parent as a tool result, not into any channel's history.
+  test("parent-delegated subagent with no chat session persists nothing", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-delegated-subagent");
+    const provider = normalizeProvider(config.provider);
+
+    const subagentId = await mutateState(config.instance, (state) => {
+      const subagent = createSubagentRecord(state, {
+        name: "researcher",
+        prompt: "research subagent",
+        toolsets: ["file"],
+        systemPrompt: "You are a research subagent."
+      });
+      return subagent.id;
+    });
+
+    setEchoToolCallingResponse({
+      provider,
+      text: "Research complete: the answer is 42.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "research the question", { mode: "chat", subagentId });
+    const finished = await waitForTerminal(config, task.id);
+    expect(finished.status).toBe("completed");
+
+    const messages = readState(config.instance).chatMessages.filter((m) => m.taskId === task.id);
+    expect(messages.length).toBe(0);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // [SILENT] from a session-bound subagent persists NO summary chatMessage —
+  // the suppression that holds for blocks/the legacy layer must also gate the
+  // finalize persistence so a "nothing to report" watch run leaves no row.
+  test("session-bound subagent with a [SILENT] final persists no summary chatMessage", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-fanout-silent");
+    const provider = normalizeProvider(config.provider);
+
+    const { sessionId, subagentId } = await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "Email: quiet@example.com");
+      const subagent = createSubagentRecord(state, {
+        name: "email-watch",
+        prompt: "watch worker",
+        toolsets: ["file"],
+        systemPrompt: "You are an email watch worker."
+      });
+      return { sessionId: session.id, subagentId: subagent.id };
+    });
+
+    setEchoToolCallingResponse({
+      provider,
+      text: "[SILENT]",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const worker = await submitTask(config, "anything to reply to?", { mode: "chat", chatSessionId: sessionId, subagentId });
+    const finished = await waitForTerminal(config, worker.id);
+    expect(finished.status).toBe("completed");
+
+    const summaryRows = readState(config.instance).chatMessages.filter(
+      (m) => m.sessionId === sessionId && m.role === "assistant" && m.kind !== "tool_transcript" && m.kind !== "approval_reason"
+    );
+    expect(summaryRows.length).toBe(0);
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });

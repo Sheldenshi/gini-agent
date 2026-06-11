@@ -3,8 +3,8 @@ import { flagValue, restAfter } from "../args";
 import { api } from "../api";
 import { print } from "../output";
 
-// `gini email list | add --from <sender> [--query <q>] | remove <id>
-//   | disable <id> | enable <id>`.
+// `gini email list | add --from <sender> [--query <q>] [--objective <goal>]
+//   | remove <id> | disable <id> | enable <id>`.
 // Thin client over /api/email/watchers (ADR email-watch.md).
 export async function email(ctx: CliContext): Promise<void> {
   const { config, cliArgs } = ctx;
@@ -12,10 +12,11 @@ export async function email(ctx: CliContext): Promise<void> {
   if (sub === "add") {
     const sender = flagValue(cliArgs, "--from");
     const query = flagValue(cliArgs, "--query");
-    if (!sender && !query) throw new Error("Usage: gini email add --from <sender> [--query <gmail-query>]");
+    const objective = flagValue(cliArgs, "--objective");
+    if (!sender && !query) throw new Error("Usage: gini email add --from <sender> [--query <gmail-query>] [--objective <goal>]");
     print(await api(config, "/api/email/watchers", {
       method: "POST",
-      body: JSON.stringify({ sender, query })
+      body: JSON.stringify({ sender, query, objective })
     }));
     return;
   }

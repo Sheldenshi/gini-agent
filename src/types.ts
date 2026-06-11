@@ -661,6 +661,23 @@ export interface RuntimeState {
   relays: RelayRecord[];
   notifications: NotificationRecord[];
   emailWatchers: EmailWatcherRecord[];
+  // Run-once marker for the retired-query-shape heal (ISO timestamp of the
+  // first heal pass). Once set, the heal returns early so it can never rewrite
+  // a user's raw query that happens to match a retired auto-built shape on a
+  // later boot. Legacy states omit it (treated as "not yet healed").
+  emailWatcherQueryHealedAt?: string;
+  // Run-once marker for the per-concern channel migration (ISO timestamp of the
+  // first pass). Once set, the migration returns early so a watcher provisioned
+  // its own channel exactly once; later boots leave an already-migrated install
+  // alone. Legacy states omit it (treated as "not yet migrated").
+  emailWatcherChannelsMigratedAt?: string;
+  // Per-agent opt-in for whole-inbox triage (ADR email-watch.md). An agent id
+  // appears here ONLY when the user explicitly asked to triage their entire
+  // inbox ("respond-or-flag all my new mail"); the empty string is the sentinel
+  // for legacy/hand-edited watchers with no agentId. Triage is opt-in: a normal
+  // sender/thread watch never adds an entry, so it never provisions the broad
+  // `in:inbox` triage concern. Absent/empty for installs that never opted in.
+  emailTriageAgents?: string[];
   events: RuntimeEvent[];
   jobRuns: JobRunRecord[];
   chatSessions: ChatSessionRecord[];
@@ -1366,18 +1383,69 @@ export interface EmailWatcherRecord {
   // rows; create always stamps it.
   agentId?: string;
   provider: "gmail";
-  // The watched account's address. v1 watches the single signed-in `gws`
-  // identity; recorded for the multi-account future.
+  // The watched account's address. Resolved at rebuild to the account whose gws
+  // config dir detection targets (the single registered+signed-in account when
+  // unset). The detection script polls exactly this account's inbox via that
+  // account's configDir; see ADR email-watch.md.
   accountEmail?: string;
+  // A visible warning when the watcher's accountEmail can't be resolved to a
+  // registered Google account at rebuild — detection then falls back to the
+  // default gws config dir (it may be watching the wrong inbox), so the mismatch
+  // is surfaced here instead of silently watching the wrong account. Cleared once
+  // the account resolves. Not derived from the backing job's hookState (unlike
+  // status/lastError), so a detection tick never clobbers it.
+  accountWarning?: string;
   // Forward-looking per-account credential handle. Unused in v1 (gws holds
   // one identity); recorded so the multi-account phase has a stable key.
   credentialName?: string;
-  // Gmail search query the worker polls (e.g. "from:alice@x.com is:unread").
+  // Gmail search query the worker polls (e.g. "from:alice@x.com").
   query: string;
+  // The explicitly watched sender address (set when the watcher was created via
+  // the `sender` input, not a raw query). The detection script bypasses the
+  // automated-sender heuristic for mail from EXACTLY this address (the user
+  // asked for it by name — e.g. noreply@ups.com must fire); self is still
+  // always dropped. Raw-query watches have no single sender and keep the
+  // heuristic.
+  sender?: string;
+  // The user's standing instructions for this watch ("get a refund or a
+  // replacement", "keep responding until resolved"), distilled from the goal
+  // the user stated at setup (revisable via update). Injected by the
+  // detection script as a TRUSTED context item on ticks where this watch
+  // matches, so the drafting turn knows what the reply should achieve.
+  // Validated at write time (trimmed, capped); never sourced from email
+  // content.
+  objective?: string;
+  // Gmail thread id for a THREAD-KEYED watch ("watch this conversation").
+  // Ticket systems rotate sending addresses (support@x.com replies arrive
+  // from case-123@x.zendesk.com), so the thread — not a sender query — is the
+  // durable unit. Mode is derived: threadId set => thread watch (this field
+  // is authoritative for detection; `query` holds a human-readable
+  // `thread:<id>` label only); unset => query watch.
+  threadId?: string;
+  // Thread watches only: when the thread's last message is the user's own and
+  // older than this many hours, the detection script nudges a turn to draft a
+  // polite follow-up (exactly once per outbound message — the nudged message
+  // id is pinned in the watch state). Validated: positive number, rejected on
+  // query watches.
+  followUpAfterHours?: number;
   // Optional Gmail label ids to scope the query. Unused in v1.
   labelIds?: string[];
   // Dedicated chat session the woken turn posts its proposed reply into.
+  // Shared across an agent's watchers in the legacy single-channel model; kept
+  // for back-compat (a watcher with no `channelId` falls back to this).
   chatSessionId?: string;
+  // This concern's OWN channel — where the fan-out scheduler dispatches THIS
+  // watcher's drafting turn (one routed worker per non-empty detection bucket).
+  // Provisioned on add (and backfilled once by the channel migration); a watcher
+  // without it routes to the shared `chatSessionId`. See ADR email-watch.md.
+  channelId?: string;
+  // Optional system-prompt persona for this concern's drafting worker, layered
+  // over the shared playbook (e.g. a tone/role for one watch). Drives the routed
+  // worker's systemPrompt; unset => the shared playbook only.
+  persona?: string;
+  // Optional toolset whitelist for this concern's drafting worker (constrains
+  // the routed subagent). Unset => the worker's default toolset.
+  toolsets?: string[];
   // Backing scheduled job that drives this watcher (interval-driven cron job
   // with a `skill-script` preRunHook bound to `chatSessionId`). The job is the
   // scheduler; the watcher is the durable detection identity. Optional only for
@@ -1620,6 +1688,25 @@ export interface SkillVersion {
   requiredPermissions: string[];
 }
 
+// A fan-out destination for one routed hook bucket (see ADR job-pre-run-hooks.md
+// and the concern fan-out design). When a pre-run hook returns ROUTED buckets
+// (keyed by an opaque routeKey), the scheduler dispatches ONE worker turn per
+// non-empty bucket into the route resolved from `JobRecord.routes[routeKey]`.
+// Domain-agnostic: the routeKey -> destination mapping is trusted, typed config
+// here, never derived from the (untrusted) handler output. All fields except
+// `chatSessionId` are optional and constrain the spawned worker:
+//   - `systemPrompt`/`toolsets`/`skills` constrain the per-route subagent worker
+//     (objective + playbook + whitelist), exactly like a spawn_subagent call.
+//   - `prompt`, when set, replaces `job.prompt` for this route's worker.
+// Absent `routes` on a job ⇒ today's single-turn behavior.
+export interface JobRoute {
+  chatSessionId: string;
+  systemPrompt?: string;
+  toolsets?: string[];
+  skills?: string[];
+  prompt?: string;
+}
+
 export interface JobRecord {
   id: string;
   instance: Instance;
@@ -1645,6 +1732,13 @@ export interface JobRecord {
   // handler/script (e.g. the gmail-watch cursor + a small boundary dedup set).
   // See ADR job-pre-run-hooks.md.
   hookState?: Record<string, unknown>;
+  // Fan-out routing table for a routed pre-run hook. Maps each hook routeKey to a
+  // JobRoute (where/how to dispatch that bucket's worker). When a pre-run hook
+  // returns ROUTED buckets, the scheduler spawns one worker per non-empty bucket
+  // into `routes[routeKey]`. Absent ⇒ today's single-turn behavior (one turn into
+  // `chatSessionId`). Domain-agnostic; the email layer populates this from its
+  // per-concern channels. See ADR job-pre-run-hooks.md.
+  routes?: Record<string, JobRoute>;
   // Interval-driven schedule. Optional — cron-driven jobs (cronExpression
   // set) carry no intervalSeconds at all. Exactly one of (intervalSeconds,
   // cronExpression) is the active driver per job. The pair is validated

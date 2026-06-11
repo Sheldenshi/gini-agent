@@ -109,6 +109,7 @@ export {
   summarizeThreads,
   summarizeThreadsForInstance,
   deleteChatBlocksForSession,
+  deleteChatBlock,
   findInFlightAssistantTextForTask,
   taskProducedAssistantText,
   getLatestMessagesBySession,
@@ -206,6 +207,11 @@ export {
   getEmailWatcher,
   updateEmailWatcher,
   setEmailWatcherEnabled,
+  setEmailTriageEnabled,
+  setEmailWatcherObjective,
+  clearEmailWatcherObjective,
+  validateObjective,
+  validateThreadId,
   removeEmailWatcher,
   backfillEmailWatcherJobs
 } from "./email-watchers";

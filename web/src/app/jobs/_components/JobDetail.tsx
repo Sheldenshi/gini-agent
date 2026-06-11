@@ -6,6 +6,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { EmptyState } from "@/components/PageHeader";
 import { StatusPill } from "@/components/StatusPill";
 import type { JobRecord, JobRunRecord } from "@runtime/types";
+import { JobFanout } from "@/components/chat/JobFanout";
 import { RunList } from "./RunList";
 import { EditJobDialog } from "./EditJobDialog";
 import { scheduleLabel } from "./schedule-label";
@@ -88,6 +89,9 @@ export function JobDetail({
                     </ul>
                   </Section>
                 ) : null}
+                {/* Fan-out concerns. Renders nothing when the job has no
+                    routes; JobFanout owns the generic-vs-email branch. */}
+                <JobFanout job={job} />
                 {job.lastError ? (
                   <Section title="Last error">
                     <pre className="whitespace-pre-wrap text-xs text-red-400">{job.lastError}</pre>

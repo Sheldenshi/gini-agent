@@ -5565,6 +5565,32 @@ describe("email watcher routes", () => {
     expect(response.status).toBe(404);
   });
 
+  test("PATCH /api/email/watchers/:id clears the objective with an explicit null", async () => {
+    const config = testConfig("http-email-patch-clear");
+    const handler = createHandler(config);
+    const created = await call(handler, config, "/api/email/watchers", {
+      method: "POST",
+      body: JSON.stringify({ sender: "bob@example.com", objective: "Get a refund" })
+    });
+    const id = (created as { id: string }).id;
+    expect((created as { objective?: string }).objective).toBe("Get a refund");
+    // Explicit null clears (distinct from omitted = unchanged, "" = 400).
+    const cleared = await call(handler, config, `/api/email/watchers/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ objective: null })
+    });
+    expect((cleared as { objective?: string }).objective).toBeUndefined();
+    // An empty-string objective is still rejected.
+    const empty = await rawCall(
+      handler,
+      config,
+      `/api/email/watchers/${id}`,
+      { method: "PATCH", body: JSON.stringify({ objective: "" }) },
+      config.token
+    );
+    expect(empty.status).toBe(400);
+  });
+
   test("POST /api/google/accounts rejects a configDir outside the allowed roots", async () => {
     const config = testConfig("http-google-accounts-configdir");
     const handler = createHandler(config);

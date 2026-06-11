@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useMemo, useState } from "react";
-import { ArrowRight, List, Calendar, Trash2 } from "lucide-react";
+import { ArrowLeft, ArrowRight, List, Calendar, Trash2 } from "lucide-react";
 import { useMutation } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -15,6 +15,7 @@ import { CalendarView } from "@/app/jobs/_components/calendar/calendar-view";
 import { adaptJob, adaptRun } from "@/app/jobs/_components/calendar/types";
 import { api } from "@/lib/api";
 import { useInvalidate, useJobRuns, useJobs } from "@/lib/queries";
+import { JobFanout } from "@/components/chat/JobFanout";
 import type { JobRecord, JobRunRecord, JobStatus } from "@runtime/types";
 
 type View = "list" | "calendar";
@@ -37,6 +38,7 @@ export function JobsTab() {
   const invalidate = useInvalidate();
   const [view, setView] = useState<View>("list");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
+  const [selectedId, setSelectedId] = useState<string | null>(null);
   // Job pending delete confirmation. Null when the dialog is closed. Deleting a
   // job cascade-removes its run history, so the confirmation is mandatory.
   const [deletingJob, setDeletingJob] = useState<JobRecord | null>(null);
@@ -71,6 +73,10 @@ export function JobsTab() {
   });
 
   const allJobs = jobs.data ?? [];
+  const selectedJob = useMemo(
+    () => (selectedId ? (allJobs.find((j) => j.id === selectedId) ?? null) : null),
+    [allJobs, selectedId]
+  );
   const filteredJobs = useMemo(
     () => (statusFilter === "all" ? allJobs : allJobs.filter((j) => j.status === statusFilter)),
     [allJobs, statusFilter]
@@ -110,7 +116,13 @@ export function JobsTab() {
         <ViewToggle view={view} onChange={setView} />
       </div>
 
-      {view === "list" ? (
+      {view === "list" && selectedJob ? (
+        <ScrollArea className="min-h-0 flex-1">
+          <div className="px-8 pb-8 pt-6">
+            <JobDetailPanel job={selectedJob} onBack={() => setSelectedId(null)} />
+          </div>
+        </ScrollArea>
+      ) : view === "list" ? (
         <ScrollArea className="min-h-0 flex-1">
           <div className="flex gap-6 px-8 pb-8 pt-6">
             {/* Jobs column */}
@@ -142,6 +154,7 @@ export function JobsTab() {
                     job={job}
                     actionPending={action.isPending}
                     onAction={(op) => action.mutate({ id: job.id, op })}
+                    onSelect={() => setSelectedId(job.id)}
                     onRequestDelete={() => setDeletingJob(job)}
                   />
                 ))
@@ -261,21 +274,29 @@ function ViewToggle({ view, onChange }: { view: View; onChange: (v: View) => voi
   );
 }
 
-// Job card — design `y6aU9` (Job List Item).
+// Job card — design `y6aU9` (Job List Item). The header is a click target that
+// opens the job detail (fan-out) view; the action buttons stop propagation so
+// Run/Pause/Resume don't also select.
 function JobCard({
   job,
   actionPending,
   onAction,
+  onSelect,
   onRequestDelete
 }: {
   job: JobRecord;
   actionPending: boolean;
   onAction: (op: "run" | "pause" | "resume") => void;
+  onSelect: () => void;
   onRequestDelete: () => void;
 }) {
   return (
     <div className="flex flex-col gap-3.5 rounded-[10px] border border-border bg-card p-4">
-      <div className="flex items-start justify-between gap-2.5">
+      <button
+        type="button"
+        onClick={onSelect}
+        className="flex items-start justify-between gap-2.5 text-left transition-opacity hover:opacity-80"
+      >
         <div className="flex min-w-0 flex-col gap-1.5">
           <p className="truncate text-[15px] font-semibold text-foreground">{job.name}</p>
           <p className="truncate font-mono text-[11.5px] text-muted-foreground" title={job.cronExpression ?? undefined}>
@@ -283,7 +304,7 @@ function JobCard({
           </p>
         </div>
         <JobStatusBadge status={job.status} />
-      </div>
+      </button>
       <div className="flex flex-col gap-[5px] text-[12.5px] text-muted-foreground">
         <span>last run {job.lastRunAt ? new Date(job.lastRunAt).toLocaleString() : "—"}</span>
         <span>next {job.nextRunAt ? new Date(job.nextRunAt).toLocaleString() : "—"}</span>
@@ -330,6 +351,45 @@ function JobCard({
           Delete
         </button>
       </div>
+    </div>
+  );
+}
+
+// Job detail (fan-out) view shown when a JobCard is selected. Renders a back
+// control + the job summary + the fan-out concern list. JobFanout owns the
+// generic-vs-email branch; this panel stays domain-agnostic.
+function JobDetailPanel({ job, onBack }: { job: JobRecord; onBack: () => void }) {
+  return (
+    <div className="flex max-w-[680px] flex-col gap-5">
+      <button
+        type="button"
+        onClick={onBack}
+        className="flex w-fit items-center gap-1.5 text-[13px] font-semibold text-muted-foreground transition-colors hover:text-foreground"
+      >
+        <ArrowLeft className="size-[14px]" />
+        Back to jobs
+      </button>
+
+      <div className="flex flex-col gap-3.5 rounded-[10px] border border-border bg-card p-4">
+        <div className="flex items-start justify-between gap-2.5">
+          <div className="flex min-w-0 flex-col gap-1.5">
+            <p className="truncate text-[17px] font-semibold text-foreground">{job.name}</p>
+            <p className="truncate font-mono text-[11.5px] text-muted-foreground" title={job.cronExpression ?? undefined}>
+              {job.id} · {scheduleLabel(job)}
+            </p>
+          </div>
+          <JobStatusBadge status={job.status} />
+        </div>
+        <div className="flex flex-col gap-[5px] text-[12.5px] text-muted-foreground">
+          <span>last run {job.lastRunAt ? new Date(job.lastRunAt).toLocaleString() : "—"}</span>
+          <span>next {job.nextRunAt ? new Date(job.nextRunAt).toLocaleString() : "—"}</span>
+          <span className="font-medium text-muted-foreground">
+            {job.runCount} runs · {job.missedRuns} missed
+          </span>
+        </div>
+      </div>
+
+      <JobFanout job={job} />
     </div>
   );
 }

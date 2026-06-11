@@ -7,6 +7,7 @@ import type {
   BrowserConnectionRecord,
   ChatBlock,
   ConnectorRecord,
+  EmailWatcherRecord,
   ImprovementProposal,
   JobRecord,
   JobRunRecord,
@@ -187,6 +188,36 @@ export function useJobRuns(jobId?: string) {
     ),
     refetchInterval: 60_000,
     enabled: Boolean(agentId)
+  });
+}
+
+// Email watchers backing the fan-out concern UI. The list is read-only here;
+// edits go through the mutations below, never job.routes (the routes are
+// recomputed server-side from the watchers, so jobs is invalidated too).
+export function useEmailWatchers() {
+  return useQuery<EmailWatcherRecord[]>({
+    queryKey: ["email-watchers"],
+    queryFn: () => api<EmailWatcherRecord[]>("/email/watchers"),
+    refetchInterval: 60_000
+  });
+}
+
+// PATCH a watcher's enabled flag and/or objective. `objective: null` clears it;
+// omitting a field leaves it unchanged (matches the gateway contract).
+export function useUpdateEmailWatcher() {
+  const invalidate = useInvalidate();
+  return useMutation<EmailWatcherRecord, Error, { id: string; enabled?: boolean; objective?: string | null }>({
+    mutationFn: ({ id, ...body }) =>
+      api<EmailWatcherRecord>(`/email/watchers/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+    onSuccess: () => invalidate(["email-watchers", "jobs"])
+  });
+}
+
+export function useRemoveEmailWatcher() {
+  const invalidate = useInvalidate();
+  return useMutation<unknown, Error, string>({
+    mutationFn: (id: string) => api(`/email/watchers/${id}`, { method: "DELETE" }),
+    onSuccess: () => invalidate(["email-watchers", "jobs"])
   });
 }
 

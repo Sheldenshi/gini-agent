@@ -985,6 +985,16 @@ export function deleteChatBlocksForSession(
   return result.changes ?? 0;
 }
 
+// Delete a single block by id. Used to retract an in-flight streamed
+// assistant_text block that the turn ultimately suppresses (the cron
+// [SILENT] sentinel). Returns true when a row was removed; idempotent
+// for ids that no longer exist.
+export function deleteChatBlock(instance: Instance, blockId: string): boolean {
+  const db = getMemoryDb(instance);
+  const result = db.run("DELETE FROM chat_blocks WHERE id = ?", [blockId]);
+  return (result.changes ?? 0) > 0;
+}
+
 // Subscribe to a session's block stream. Returns an unsubscribe function;
 // the SSE route in src/http.ts calls this on ReadableStream.cancel() so
 // a closed connection doesn't accumulate dead listeners.

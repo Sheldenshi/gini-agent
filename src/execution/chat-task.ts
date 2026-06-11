@@ -97,6 +97,7 @@ import {
 import {
   emitAuthorizationRequested,
   emitSetupRequested,
+  deleteAssistantTextBlock,
   emitAssistantTextStart,
   emitPhase,
   emitSystemNote,
@@ -933,9 +934,20 @@ function findBoundJobsForTask(state: RuntimeState, task: Task): JobRecord[] {
 // Returns undefined for tasks with no chat session (subagent children,
 // imperative CLI runs) — those paths skip transcript persistence.
 function resolveChatSessionId(state: RuntimeState, task: Task): string | undefined {
-  if (!task.runId) return undefined;
-  const run = state.runs.find((r) => r.id === task.runId);
-  return run?.conversationId ?? undefined;
+  // Prefer the run's conversationId (the legacy binding for job-delivery and
+  // create_job chat tasks). Fall back to task.chatSessionId so a session-bound
+  // subagent — e.g. a fan-out watch worker spawned into a concern channel,
+  // whose run has no conversationId — still stamps its transcript into the
+  // channel it emits blocks to (the emit path keys on task.chatSessionId, so
+  // without this fallback the transcript and the blocks land in different
+  // sessions and the channel's history loses the worker's turn). A normal turn
+  // is unaffected (run.conversationId === task.chatSessionId), and a
+  // parent-delegated subagent with no chatSessionId still resolves undefined.
+  if (task.runId) {
+    const run = state.runs.find((r) => r.id === task.runId);
+    if (run?.conversationId) return run.conversationId;
+  }
+  return task.chatSessionId ?? undefined;
 }
 
 // Persist one tool-calling transcript row so the model can replay its own
@@ -2451,7 +2463,19 @@ async function runLoop(
       // cancelTask owns the streaming-text flip in that case so the
       // partial-text invariant from ADR risks §4 holds.
       if (finished.status === "completed") {
-        if (inFlightAssistantBlockId) {
+        // [SILENT] sentinel — a scheduled job (or fan-out subagent
+        // worker) with nothing to report responds with exactly
+        // "[SILENT]" to suppress delivery. The legacy message layer
+        // (syncChatTaskResult) drops the ChatMessageRecord, but the UI
+        // renders chat blocks, so we must also retract the assistant_text
+        // block here or the channel shows a literal "[SILENT]" row. Mirror
+        // the legacy exactness: only the literal token (trailing
+        // whitespace tolerated), never content that merely contains it.
+        if (finalText.trim() === "[SILENT]") {
+          if (inFlightAssistantBlockId) {
+            deleteAssistantTextBlock(emitCtx, inFlightAssistantBlockId);
+          }
+        } else if (inFlightAssistantBlockId) {
           finalizeAssistantText(emitCtx, inFlightAssistantBlockId, finalText || "(no content)");
         } else if (finalText) {
           // No streaming deltas observed (provider returned the whole
@@ -2469,6 +2493,44 @@ async function runLoop(
       });
       await updateRunFromTask(config, finished);
       await syncSubagentFromTask(config, finished);
+      // Persist the FINAL turn-ending text as a durable assistant chatMessage
+      // for the session-bound-subagent path (a fan-out watch worker spawned
+      // into a concern channel). A normal chat turn gets this row from
+      // syncChatTaskResult (web /sync, messaging pollers, finalizeJobRunFromTask
+      // for jobId-bearing tasks); the fan-out worker is spawned via
+      // spawnSubagent and none of those fire, so its draft never becomes a
+      // chatMessage and the next turn in the channel replays empty history. We
+      // mirror syncChatTaskResult's own short-circuit (an existing non-transcript
+      // assistant row) so this never double-writes, and suppress the [SILENT]
+      // sentinel exactly like the block/legacy paths above.
+      if (
+        finished.status === "completed" &&
+        finished.subagentId &&
+        !finished.jobId &&
+        transcriptSessionId &&
+        finalText.trim().length > 0 &&
+        finalText.trim() !== "[SILENT]"
+      ) {
+        await mutateState(config.instance, (state) => {
+          if (!state.chatSessions.some((s) => s.id === transcriptSessionId)) return;
+          const already = state.chatMessages.some(
+            (m) =>
+              m.taskId === taskId &&
+              m.role === "assistant" &&
+              m.kind !== "approval_reason" &&
+              m.kind !== "tool_transcript"
+          );
+          if (already) return;
+          createChatMessage(state, {
+            sessionId: transcriptSessionId,
+            role: "assistant",
+            content: finalText,
+            taskId,
+            runId: finished.runId,
+            ...(finished.threadId ? { threadId: finished.threadId } : {})
+          });
+        });
+      }
       // Chat-mode tasks spawned by a scheduled job (create_job tool path)
       // need the same finalize hook the imperative path uses, otherwise
       // the JobRunRecord stays stuck in `running` and the chat-session

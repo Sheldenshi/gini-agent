@@ -28,6 +28,7 @@
 
 import {
   appendTrace,
+  deleteChatBlock,
   insertChatBlock,
   readState,
   updateToolCallBlock,
@@ -219,6 +220,19 @@ export function finalizeAssistantText(
     streaming: false
   });
   return updated?.kind === "assistant_text" ? updated : undefined;
+}
+
+// Retract an in-flight streamed assistant_text block instead of
+// finalizing it. Used when the completed turn's text is the cron
+// [SILENT] sentinel — the legacy message layer suppresses delivery, so
+// the chat-block layer must not leave a visible "[SILENT]" row behind.
+// No-op without an emit context (subagent children with no session).
+export function deleteAssistantTextBlock(
+  ctx: ChatEmitContext | undefined,
+  blockId: string
+): void {
+  if (!ctx) return;
+  deleteChatBlock(ctx.instance, blockId);
 }
 
 // Insert a tool_call block in `running` status right before dispatch.

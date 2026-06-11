@@ -38,6 +38,15 @@ if (args.mode === "shortcircuit") {
   process.stdout.write(JSON.stringify({ kind: "shortCircuit", summary: "[SILENT]", state: { n: n + 1 } }));
 } else if (args.mode === "malformed") {
   process.stdout.write(JSON.stringify({ kind: "context" })); // missing items
+} else if (args.mode === "buckets") {
+  process.stdout.write(JSON.stringify({
+    kind: "context",
+    buckets: {
+      r1: [{ text: "from:alice", untrusted: true }],
+      triage: [{ text: "from:bob", untrusted: true }]
+    },
+    state: { r1: { n: n + 1 }, triage: { n: n + 1 } }
+  }));
 } else if (args.mode === "fail") {
   process.stderr.write("boom");
   process.exit(3);
@@ -103,11 +112,28 @@ describe("skill-script hook handler", () => {
     });
     expect(result.kind).toBe("context");
     if (result.kind === "context") {
+      // The skill-script handler always returns the flat `items` carrier (never
+      // routed buckets), so narrow off the now-optional field before indexing.
       expect(result.items).toHaveLength(1);
-      expect(result.items[0]!.text).toBe("echo:from:alice");
-      expect(result.items[0]!.untrusted).toBe(true);
+      expect(result.items![0]!.text).toBe("echo:from:alice");
+      expect(result.items![0]!.untrusted).toBe(true);
       // State round-trip: in n=4 -> out n=5.
       expect(result.state).toEqual({ n: 5 });
+    }
+  });
+
+  test("maps a fan-out buckets context result", async () => {
+    const config = buildConfig("ssh-buckets");
+    await seedSkill(config);
+    const result = await fire(config, { skill: "fixture-skill", script: "echo", mode: "buckets" });
+    expect(result.kind).toBe("context");
+    if (result.kind === "context") {
+      expect(result.items).toBeUndefined();
+      expect(Object.keys(result.buckets ?? {}).sort()).toEqual(["r1", "triage"]);
+      expect(result.buckets!.r1![0]!.text).toBe("from:alice");
+      expect(result.buckets!.r1![0]!.untrusted).toBe(true);
+      expect(result.buckets!.triage![0]!.text).toBe("from:bob");
+      expect((result.state as { r1?: { n?: number } }).r1?.n).toBe(1);
     }
   });
 

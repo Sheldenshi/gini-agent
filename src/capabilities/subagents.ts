@@ -42,6 +42,11 @@ export interface SpawnSubagentInput {
   // it passes the parent task id so the SubagentRecord and the child task
   // both link back. Not part of the public API surface.
   parentTaskId?: string;
+  // Internal: when a fan-out consumer (the jobs scheduler) spawns a worker into
+  // a specific chat session, it passes that session id so the child task is
+  // linked to it (the worker runs inside that channel). Threaded into submitTask
+  // and stamped onto session.taskIds. Not part of the public API surface.
+  chatSessionId?: string;
 }
 
 // Walk the parentTaskId chain back from `taskId` and return the depth in
@@ -86,6 +91,10 @@ export async function spawnSubagent(
   const parentTaskId =
     typeof (input as SpawnSubagentInput).parentTaskId === "string"
       ? (input as SpawnSubagentInput).parentTaskId
+      : undefined;
+  const chatSessionId =
+    typeof (input as SpawnSubagentInput).chatSessionId === "string"
+      ? (input as SpawnSubagentInput).chatSessionId
       : undefined;
 
   // Depth cap. We compute against a snapshot — race-free enough for the PoC
@@ -162,7 +171,8 @@ export async function spawnSubagent(
       mode: "chat",
       parentTaskId,
       subagentId: subagent.id,
-      agentId: parentAgentId
+      agentId: parentAgentId,
+      chatSessionId
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -197,6 +207,16 @@ export async function spawnSubagent(
     const item = state.subagents.find((candidate) => candidate.id === subagent.id);
     if (!item) return { childTaskShouldCancel: false as const };
     item.taskId = task.id;
+    // Link the worker task to its chat session so getChatSession picks up the
+    // in-flight task (and synthesizes a placeholder) the same way dispatchPromptRun
+    // does for a job's own session. A session deleted mid-spawn just skips this.
+    if (chatSessionId) {
+      const session = state.chatSessions.find((candidate) => candidate.id === chatSessionId);
+      if (session && !session.taskIds.includes(task.id)) {
+        session.taskIds.push(task.id);
+        session.updatedAt = now();
+      }
+    }
     if (item.status === "cancelled" || item.status === "failed") {
       // Keep the prior terminal verdict; just record the taskId so
       // observability tools can correlate the audit trail. Signal

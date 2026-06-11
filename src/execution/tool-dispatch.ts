@@ -26,7 +26,7 @@ import {
   now,
   readState
 } from "../state";
-import { addEmailWatcher, listEmailWatchers, removeEmailWatcher, setEmailWatcherEnabled } from "../state/email-watchers";
+import { accountSelectionNeeded, addEmailWatcher, clearEmailWatcherObjective, listEmailWatchers, removeEmailWatcher, setEmailTriageEnabled, setEmailWatcherEnabled, setEmailWatcherObjective } from "../state/email-watchers";
 import { ApprovalRaceLostError, ApprovedActionFailedError, TaskAlreadyTerminalError, cancelTask, findTask, resolveAuthorization, runTerminalCommand } from "../agent";
 import { walkFiles, simpleDiff } from "../tools/file";
 import { codeExecutionCommand } from "../tools/code";
@@ -1955,7 +1955,12 @@ async function emailWatchTool(
     const summary = watchers.map((w) => ({
       id: w.id,
       query: w.query,
+      sender: w.sender,
+      threadId: w.threadId,
+      followUpAfterHours: w.followUpAfterHours,
+      objective: w.objective,
       accountEmail: w.accountEmail,
+      ...(w.accountWarning ? { accountWarning: w.accountWarning } : {}),
       enabled: w.enabled,
       status: w.status,
       chatSessionId: w.chatSessionId,
@@ -1991,12 +1996,40 @@ async function emailWatchTool(
       : `Disabled email watcher ${updated.id} (query: ${updated.query}); polling paused.`;
   }
 
+  if (action === "update") {
+    // Revise a watcher's standing objective (the user changed the goal
+    // mid-conversation), or clear it entirely (clearObjective: true) when the
+    // user drops the standing goal. Deep validation (trim, cap, empty) lives in
+    // the shared state helper so the tool, HTTP, and CLI channels enforce the
+    // same contract.
+    const id = requireString(args, "id");
+    if (args.clearObjective === true) {
+      const updated = await clearEmailWatcherObjective(config, id);
+      if (!updated) throw new Error(`Email watcher not found: ${id}`);
+      appendTrace(config.instance, taskId, {
+        type: "tool",
+        message: "Cleared email watcher objective",
+        data: { watcherId: updated.id }
+      });
+      return `Cleared objective for email watcher ${updated.id}.`;
+    }
+    const objective = requireString(args, "objective");
+    const updated = await setEmailWatcherObjective(config, id, objective);
+    if (!updated) throw new Error(`Email watcher not found: ${id}`);
+    appendTrace(config.instance, taskId, {
+      type: "tool",
+      message: "Updated email watcher objective",
+      data: { watcherId: updated.id }
+    });
+    return `Updated objective for email watcher ${updated.id}: ${updated.objective}`;
+  }
+
   if (action !== "add") {
-    throw new Error(`Invalid input: action must be one of "add" | "list" | "remove" | "disable" | "enable" (got ${action}).`);
+    throw new Error(`Invalid input: action must be one of "add" | "list" | "remove" | "disable" | "enable" | "update" (got ${action}).`);
   }
 
   // action === "add". Build the Gmail query: a raw `query` wins; otherwise
-  // `from:<sender> is:unread`; otherwise just `is:unread`.
+  // `from:<sender>`; otherwise the whole inbox (`in:inbox`).
   let sender: string | undefined;
   if (args.sender !== undefined && args.sender !== null) {
     if (typeof args.sender !== "string" || args.sender.length === 0) {
@@ -2018,17 +2051,80 @@ async function emailWatchTool(
     }
     account = args.account;
   }
+  // Deep objective validation (trim, cap, empty) lives in addEmailWatcher so
+  // every channel enforces the same contract; this is the type gate only.
+  let objective: string | undefined;
+  if (args.objective !== undefined && args.objective !== null) {
+    if (typeof args.objective !== "string" || args.objective.length === 0) {
+      throw new Error("Invalid input: objective must be a non-empty string.");
+    }
+    objective = args.objective;
+  }
+  let threadId: string | undefined;
+  if (args.threadId !== undefined && args.threadId !== null) {
+    if (typeof args.threadId !== "string" || args.threadId.length === 0) {
+      throw new Error("Invalid input: threadId must be a non-empty string.");
+    }
+    threadId = args.threadId;
+  }
+  // Deep validation (positive, thread watches only) lives in addEmailWatcher.
+  let followUpAfterHours: number | undefined;
+  if (args.followUpAfterHours !== undefined && args.followUpAfterHours !== null) {
+    if (typeof args.followUpAfterHours !== "number") {
+      throw new Error("Invalid input: followUpAfterHours must be a number.");
+    }
+    followUpAfterHours = args.followUpAfterHours;
+  }
   // Inherit the originating task's agent so the watcher + its dedicated chat
   // session (and the future woken turns) attribute to the right agent.
   const owningAgentId = readState(config.instance).tasks.find((t) => t.id === taskId)?.agentId;
-  const watcher = await addEmailWatcher(config, { sender, query: rawQuery, account, agentId: owningAgentId });
+
+  // Whole-inbox triage opt-in: `triage: true` provisions the broad respond-or-flag
+  // concern over the ENTIRE inbox; `triage: false` tears it down. Triage is OPT-IN
+  // — only set it when the user explicitly asked to triage all their new mail, never
+  // when they name a specific sender/thread. When triage is the ONLY thing requested
+  // (no sender/query/threadId), opt in/out without creating a normal watcher.
+  if (args.triage !== undefined && args.triage !== null) {
+    if (typeof args.triage !== "boolean") {
+      throw new Error("Invalid input: triage must be a boolean.");
+    }
+    await setEmailTriageEnabled(config, owningAgentId, args.triage);
+    appendTrace(config.instance, taskId, {
+      type: "tool",
+      message: args.triage ? "Enabled inbox triage" : "Disabled inbox triage"
+    });
+    if (sender === undefined && rawQuery === undefined && threadId === undefined) {
+      return args.triage
+        ? "Whole-inbox triage enabled: newly-arrived mail no specific watch claims gets a proposed reply or a flag in the Inbox triage channel. Never sends without your approval."
+        : "Whole-inbox triage disabled. Targeted sender/thread watches are unaffected.";
+    }
+  }
+
+  // Belt-and-suspenders for multi-account selection: when no `account` was given
+  // and 2+ Google accounts are signed in, do NOT default arbitrarily — return a
+  // hint that lists the accounts and tells the model to ask the user (ask_user),
+  // then re-add with the chosen `account`. One signed-in account auto-defaults
+  // (Phase A); an explicit `account` resolves; so this fires only on a genuinely
+  // ambiguous add. No watcher is created.
+  const selectionHint = await accountSelectionNeeded(account);
+  if (selectionHint) {
+    appendTrace(config.instance, taskId, {
+      type: "tool",
+      message: "Email watch needs account selection"
+    });
+    return selectionHint;
+  }
+
+  const watcher = await addEmailWatcher(config, { sender, query: rawQuery, account, objective, threadId, followUpAfterHours, agentId: owningAgentId });
 
   appendTrace(config.instance, taskId, {
     type: "tool",
     message: "Created email watcher",
-    data: { watcherId: watcher.id, query: watcher.query, chatSessionId: watcher.chatSessionId }
+    data: { watcherId: watcher.id, query: watcher.query, chatSessionId: watcher.chatSessionId, accountEmail: watcher.accountEmail }
   });
-  return `Watching email (query: ${watcher.query}). Watcher ${watcher.id}; proposed replies will appear in its chat thread (${watcher.chatSessionId}). It polls about once a minute and never sends without your approval.`;
+  const accountLabel = watcher.accountEmail ? ` in ${watcher.accountEmail}` : "";
+  const warning = watcher.accountWarning ? ` Note: ${watcher.accountWarning}` : "";
+  return `Watching email${accountLabel} (query: ${watcher.query}). Watcher ${watcher.id}; proposed replies will appear in its chat thread (${watcher.chatSessionId}). It polls about once a minute and never sends without your approval.${warning}`;
 }
 
 // Explicit on-demand memory recall. Wraps the same `recall()` entrypoint
