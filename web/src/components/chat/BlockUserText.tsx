@@ -69,7 +69,7 @@ export function BlockUserText({ block }: { block: UserTextBlock }) {
         </ul>
       ) : null}
       {hasText ? (
-        <div className="ml-auto max-w-[80%] whitespace-pre-wrap rounded-xl bg-secondary px-3 py-2.5 text-sm leading-snug text-secondary-foreground dark:bg-primary dark:text-primary-foreground">
+        <div className="ml-auto max-w-[80%] whitespace-pre-wrap break-words rounded-xl bg-secondary px-3 py-2.5 text-sm leading-snug text-secondary-foreground dark:bg-primary dark:text-primary-foreground">
           {block.text}
         </div>
       ) : null}

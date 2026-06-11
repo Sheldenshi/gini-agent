@@ -188,6 +188,7 @@
 .chat-markdown {
   font-size: 13px;
   line-height: 1.55;
+  overflow-wrap: anywhere;
 }
 .chat-markdown > :first-child { margin-top: 0; }
 .chat-markdown > :last-child { margin-bottom: 0; }
