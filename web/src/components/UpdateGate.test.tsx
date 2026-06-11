@@ -23,6 +23,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, jest, mock, setSyste
 import { act, fireEvent, render as rtlRender, screen } from "@testing-library/react";
 import { defaultScheduler, notifyManager, QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { UpdateGateProvider, useUpdateGate } from "./UpdateGate";
+import { GATEWAY_RESTARTING_MESSAGE, GATEWAY_UNREACHABLE_CODE } from "@/lib/gateway-codes";
 import type { GiniUpdateResult, GiniVersionInfo } from "@runtime/types";
 
 // react-query delivers observer notifications through a deferred scheduler by
@@ -537,6 +538,22 @@ describe("UpdateGate", () => {
     fireEvent.click(screen.getByRole("button", { name: "start-update" }));
     await flush();
     expect(phase()).toBe("updating");
+  });
+
+  test("the BFF's gateway_unreachable 503 keeps the gate up (gateway died mid-POST, not a pre-flight failure)", async () => {
+    // The wire shape the BFF answers with when the gateway drops the in-flight
+    // POST: a structured 503 envelope. It carries an HTTP status like a real
+    // gateway error, so a status-only release check would tear the gate down
+    // in exactly the restart window it exists to cover — the unreachable tag
+    // from the shared envelope contract must keep the blur.
+    updateResponse = async () =>
+      jsonResponse({ error: GATEWAY_RESTARTING_MESSAGE, code: GATEWAY_UNREACHABLE_CODE }, 503);
+    renderGate();
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: "start-update" }));
+    await flush();
+    expect(phase()).toBe("updating");
+    expect(window.sessionStorage.getItem(STORAGE_KEY)).not.toBeNull();
   });
 
   test("the stall timer releases a gate that never completes", async () => {
