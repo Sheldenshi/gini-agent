@@ -119,7 +119,12 @@ export interface SetSetupProviderResult {
 
 export async function setSetupProvider(
   config: RuntimeConfig,
-  payload: Record<string, unknown>
+  payload: Record<string, unknown>,
+  // clearAuthFailureOnSuccess (default true): a successful write normally
+  // drops the provider's needs-reauth record (issue #233). Selection-only
+  // callers (setDefaultModel) opt out — a model pick proves nothing about
+  // the credential.
+  options?: { clearAuthFailureOnSuccess?: boolean }
 ): Promise<SetSetupProviderResult> {
   // Field name is `provider` to match the CLI (`gini provider set ...`).
   const providerName = typeof payload.provider === "string" ? payload.provider : "";
@@ -257,9 +262,11 @@ export async function setSetupProvider(
     // re-verify is the user re-establishing the credential (issue #233). The
     // next provider call re-records if it still fails. Cleared BEFORE the
     // plist-refresh SIGTERM below so the write can't be lost to the restart.
-    await clearProviderAuthFailureIfPresent(config.instance, providerName as ProviderName, {
-      reason: "provider configuration updated"
-    });
+    if (options?.clearAuthFailureOnSuccess !== false) {
+      await clearProviderAuthFailureIfPresent(config.instance, providerName as ProviderName, {
+        reason: "provider configuration updated"
+      });
+    }
 
     // Request plist refresh via a marker file + SIGTERM. A simpler
     // approach (setImmediate → setTimeout(200ms) → detached spawn)
@@ -328,9 +335,11 @@ export async function setSetupProvider(
     writeRuntimeConfig(config);
     // Config write supersedes the needs-reauth record (see the env-keyed
     // branch above for the rationale).
-    await clearProviderAuthFailureIfPresent(config.instance, "bedrock", {
-      reason: "provider configuration updated"
-    });
+    if (options?.clearAuthFailureOnSuccess !== false) {
+      await clearProviderAuthFailureIfPresent(config.instance, "bedrock", {
+        reason: "provider configuration updated"
+      });
+    }
     return { ok: true, provider: providerHealth(config), plistRefreshNeeded: false };
   }
   // providerName === "codex"
@@ -351,9 +360,11 @@ export async function setSetupProvider(
   // The presence gate above passed, so the user has (re-)established codex
   // credentials — this is the setup Verify seam. Clear the needs-reauth
   // record; the next codex call re-records if the token is still dead.
-  await clearProviderAuthFailureIfPresent(config.instance, "codex", {
-    reason: "provider configuration updated"
-  });
+  if (options?.clearAuthFailureOnSuccess !== false) {
+    await clearProviderAuthFailureIfPresent(config.instance, "codex", {
+      reason: "provider configuration updated"
+    });
+  }
   // Codex switching DOES require a plist refresh: the gateway's config.json
   // is the source of truth for which provider it boots with, and that's
   // already updated. But the plist still has GINI_INSTANCE etc — no env

@@ -77,7 +77,10 @@ therefore also persists a per-provider auth-failure record:
      (`setSetupProvider`) for that provider — this covers the Add Provider
      key form, key rotation, the Settings Edit dialog, `set_provider`
      self-tool writes, and the codex setup **Verify** (whose presence gate
-     passing is the verify signal);
+     passing is the verify signal); the default-model selection endpoint
+     (`setDefaultModel`) routes through `setSetupProvider` but opts out of
+     the clear (`clearAuthFailureOnSuccess: false`) because a model-only
+     selection does not re-establish the credential;
   3. provider removal (`removeSetupProvider`) — a removed provider must not
      resurface a stale record when re-added.
 - **Exposure.** `GET /api/providers/catalog` enriches each row with
