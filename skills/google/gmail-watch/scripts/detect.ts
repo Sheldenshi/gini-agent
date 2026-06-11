@@ -8,7 +8,7 @@
 // of an agent's watched senders).
 //
 // Contract:
-//   stdin:  JSON { watches: [{ watcherId, routeKey?, query, account? }, ...],
+//   stdin:  JSON { watches: [{ watcherId, routeKey?, query, account?, configDir? }, ...],
 //                  state: { [routeKey]: DetectState } | { byWatcher? } | null }
 //   stdout: JSON { kind, buckets?, summary?, state: { [routeKey]: DetectState } }
 //   exit:   0 always (a gws/transport / signed-out condition is reported PER WATCH
@@ -129,6 +129,12 @@ interface Watch {
   routeKey?: string;
   query: string;
   account?: string;
+  // The gws config dir of the account this watch targets (resolved runtime-side
+  // from `account` via Gini's google-accounts registry). When set, every gws
+  // call for this watch runs with GOOGLE_WORKSPACE_CLI_CONFIG_DIR=<configDir> so
+  // detection polls exactly that account's inbox. Absent => default gws config
+  // dir (back-compat: a single-account install with no registered account).
+  configDir?: string;
   sender?: string;
   objective?: string;
   threadId?: string;
@@ -192,20 +198,29 @@ interface DetectResult {
 
 // ── gws subprocess boundary (injectable for the unit test) ───────────────────
 
-export type GwsSpawn = (args: string[]) => Promise<string>;
+// A gws spawn. The optional `configDir` targets a SPECIFIC Google account: gws
+// reads its client config + token from GOOGLE_WORKSPACE_CLI_CONFIG_DIR when set,
+// so a per-watch configDir makes that watch poll exactly the account Gini
+// registered for it. Omitted => gws reads its DEFAULT config dir (~/.config/gws).
+// The unit-test stub ignores the second arg, so existing tests are unaffected.
+export type GwsSpawn = (args: string[], configDir?: string) => Promise<string>;
 
 // Default gws spawn: `zsh -lc "gws ..."`, stdin ignored, kill-on-timeout,
-// inheriting the env the skill-script runner provides (PATH/HOME + GINI_*). gws
-// reads its own client config + token from ~/.config/gws/, so no credentials are
-// injected. stdout AND stderr are drained CONCURRENTLY: a piped stream that is
-// never read can fill its OS buffer (~64KB) and deadlock the child until the
-// kill timer fires; gws emits its keyring preamble to stderr.
-export async function defaultGwsSpawn(args: string[]): Promise<string> {
+// inheriting the env the skill-script runner provides (PATH/HOME + GINI_*). When
+// `configDir` is set, GOOGLE_WORKSPACE_CLI_CONFIG_DIR is added to the env so gws
+// reads THAT account's client config + token; when absent gws reads its default
+// config dir (~/.config/gws). No other credentials are injected. stdout AND
+// stderr are drained CONCURRENTLY: a piped stream that is never read can fill its
+// OS buffer (~64KB) and deadlock the child until the kill timer fires; gws emits
+// its keyring preamble to stderr.
+export async function defaultGwsSpawn(args: string[], configDir?: string): Promise<string> {
   const proc = spawn(["zsh", "-lc", `gws ${args.join(" ")}`], {
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",
-    env: { ...process.env }
+    env: configDir
+      ? { ...process.env, GOOGLE_WORKSPACE_CLI_CONFIG_DIR: configDir }
+      : { ...process.env }
   });
   const timeout = setTimeout(() => {
     try { proc.kill(); } catch { /* already exited */ }
@@ -1088,28 +1103,28 @@ export async function runWatches(args: DetectArgsMulti, gwsSpawn: GwsSpawn): Pro
   const buckets: Record<string, ResultItem[]> = {};
   const silentNotices: string[] = [];
 
-  // Resolve auth + self ONCE for the shared gws session. A signed-out session is
-  // shared by every watch, so short-circuit the whole tick marking each watch
-  // needs_auth (cursor/seen unchanged).
-  let signedIn: boolean;
-  try {
-    signedIn = parseGwsAuthStatus(await gwsSpawn(buildAuthStatusArgs())).signedIn;
-  } catch (error) {
-    // The auth probe itself faulted — a transport-level error shared across the
-    // session. Mark every watch error with its cursor/seen unchanged.
-    const scrubbed = scrubError(error instanceof Error ? error.message : String(error));
-    for (const watch of watches) {
-      stateOut[watchRouteKey(watch)] = { ...readWatchState(args.state, watchRouteKey(watch)), status: "error", lastError: scrubbed };
+  // Each watch now targets a SPECIFIC account (its configDir), so auth state and
+  // the self-address are per-account, not per-tick. Bind each watch's gws spawn
+  // to its configDir (a watch with no configDir binds to the default gws dir) and
+  // resolve {signedIn, self} once per distinct configDir, cached so co-located
+  // watches on the same account share a single auth probe + getProfile.
+  const accountAuth = new Map<string, { signedIn: boolean; selfEmail?: string; error?: string }>();
+  const boundSpawnFor = (configDir?: string): GwsSpawn => (a) => gwsSpawn(a, configDir);
+  async function resolveAccount(configDir?: string): Promise<{ signedIn: boolean; selfEmail?: string; error?: string }> {
+    const key = configDir ?? "";
+    const cached = accountAuth.get(key);
+    if (cached) return cached;
+    const spawn = boundSpawnFor(configDir);
+    let resolved: { signedIn: boolean; selfEmail?: string; error?: string };
+    try {
+      const signedIn = parseGwsAuthStatus(await spawn(buildAuthStatusArgs())).signedIn;
+      resolved = signedIn ? { signedIn, selfEmail: await resolveSelfEmail(spawn) } : { signedIn };
+    } catch (error) {
+      resolved = { signedIn: false, error: scrubError(error instanceof Error ? error.message : String(error)) };
     }
-    return { kind: "shortCircuit", summary: "[SILENT]", state: stateOut };
+    accountAuth.set(key, resolved);
+    return resolved;
   }
-  if (!signedIn) {
-    for (const watch of watches) {
-      stateOut[watchRouteKey(watch)] = { ...readWatchState(args.state, watchRouteKey(watch)), status: "needs_auth", lastError: undefined };
-    }
-    return { kind: "shortCircuit", summary: "[SILENT]", state: stateOut };
-  }
-  const selfEmail = await resolveSelfEmail(gwsSpawn);
 
   // Targeted watches run first so they CLAIM their matched ids before any broad
   // watch is assigned; a broad watch's already-claimed matches are dropped.
@@ -1119,6 +1134,21 @@ export async function runWatches(args: DetectArgsMulti, gwsSpawn: GwsSpawn): Pro
   for (const watch of ordered) {
     const routeKey = watchRouteKey(watch);
     const stateIn = readWatchState(args.state, routeKey);
+
+    // Per-account auth gate. A signed-out or auth-faulted account marks ONLY its
+    // own watches (cursor/seen unchanged) — accounts are independent, so a fault
+    // on one never short-circuits a healthy other.
+    const auth = await resolveAccount(watch.configDir);
+    if (auth.error !== undefined) {
+      stateOut[routeKey] = { ...stateIn, status: "error", lastError: auth.error };
+      continue;
+    }
+    if (!auth.signedIn) {
+      stateOut[routeKey] = { ...stateIn, status: "needs_auth", lastError: undefined };
+      continue;
+    }
+
+    const boundSpawn = boundSpawnFor(watch.configDir);
     // run() never throws (it maps gws faults onto status in state). The extra
     // try/catch is belt-and-suspenders so a bug in one watch can never abort the
     // others — that watch is marked error and the rest still run.
@@ -1134,8 +1164,8 @@ export async function runWatches(args: DetectArgsMulti, gwsSpawn: GwsSpawn): Pro
           followUpAfterHours: watch.followUpAfterHours,
           state: stateIn
         },
-        gwsSpawn,
-        selfEmail
+        boundSpawn,
+        auth.selfEmail
       );
     } catch (error) {
       stateOut[routeKey] = {
