@@ -787,7 +787,7 @@ export async function runDueJobs(config: RuntimeConfig): Promise<void> {
       // route's session, then finalize the ONE per-tick run "completed". Commit
       // ONLY the dispatched buckets' sub-state (per-bucket at-least-once). The
       // legacy single-turn path below is untouched when there are no buckets.
-      if (hook.buckets) {
+      if (hook.buckets && Object.keys(hook.buckets).length > 0) {
         const { dispatchedRouteKeys, attemptedRouteKeys } = await dispatchFanOut(config, job, run, "schedule", hook.buckets);
         await persistFanOutState(config, job.id, hook.state, dispatchedRouteKeys, attemptedRouteKeys);
         await finalizeFanOutRun(config, job, run, dispatchedRouteKeys);
@@ -1310,7 +1310,7 @@ export async function runJobNow(
   }
   // Routed (fan-out) path mirrors runDueJobs: one worker per non-empty bucket,
   // per-bucket at-least-once commit, then finalize the ONE per-tick run.
-  if (hook.buckets) {
+  if (hook.buckets && Object.keys(hook.buckets).length > 0) {
     const { dispatchedRouteKeys, attemptedRouteKeys } = await dispatchFanOut(config, job, run, trigger, hook.buckets);
     await persistFanOutState(config, job.id, hook.state, dispatchedRouteKeys, attemptedRouteKeys);
     await finalizeFanOutRun(config, job, run, dispatchedRouteKeys);

@@ -336,6 +336,42 @@ describe("recurring-job fan-out", () => {
     });
   });
 
+  test("an empty buckets object falls through to the legacy flat path", async () => {
+    const config = buildConfig(workspaceRoot, "fanout-empty-buckets");
+    const provider = normalizeProvider(config.provider);
+    setEchoToolCallingResponse({ provider, text: "done", toolCalls: [], finishReason: "stop" });
+    const jobSession = "session_job";
+    await createSession(config, jobSession);
+
+    // A handler that returns an EMPTY buckets object (no routed mail) must behave
+    // as the legacy single dispatch into the job session, not a no-op fan-out run.
+    __registerHookForTest("test-fanout-empty-buckets", async () => ({
+      kind: "context",
+      buckets: {},
+      state: { cursor: "z1" }
+    }));
+
+    const job = await createScheduledJob(config, {
+      name: "fanout-empty-buckets",
+      intervalSeconds: 60,
+      prompt: "draft a reply",
+      chatSessionId: jobSession,
+      preRunHook: { handlerId: "test-fanout-empty-buckets", config: {} }
+    });
+    // No routes set.
+
+    const result = await runJobNow(config, job.id, "manual");
+    // Legacy path returns a single taskId (not a fan-out result).
+    expect((result as { taskId?: string }).taskId).toBeString();
+    expect((result as { fanOut?: boolean }).fanOut).toBeUndefined();
+
+    const state = readState(config.instance);
+    const jobTasks = state.tasks.filter((t) => t.jobId === job.id);
+    expect(jobTasks).toHaveLength(1);
+    // The hook state committed as a single opaque blob (legacy persistHookState).
+    expect(state.jobs.find((j) => j.id === job.id)?.hookState).toEqual({ cursor: "z1" });
+  });
+
   test("a flat items result with no routes takes exactly the legacy single dispatch", async () => {
     const config = buildConfig(workspaceRoot, "fanout-legacy");
     const provider = normalizeProvider(config.provider);
