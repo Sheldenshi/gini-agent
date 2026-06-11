@@ -16,7 +16,7 @@ import { consumeAutostartRefresh } from "./runtime/autostart-refresh";
 import { reconcileAutostartPlistOnStartup } from "./runtime/autostart-reconcile";
 import { installCrashHandlers } from "./runtime/crash-handlers";
 import { maybeAskAboutCrashes } from "./runtime/crash-recovery";
-import { closeAll as closeBrowserSessions, setBrowserInstance } from "./tools/browser";
+import { closeAll as closeBrowserSessions, setBrowserInstance, setBrowserRecording } from "./tools/browser";
 import { createTelegramPollerSupervisor } from "./integrations/telegram-poller";
 import { createDiscordPollerSupervisor } from "./integrations/discord-poller";
 import { createApnsDispatcher } from "./integrations/apns/dispatcher";
@@ -61,6 +61,9 @@ writePid(config);
 // the headless launch path (which is fine for unit tests that import the
 // tools directly).
 setBrowserInstance(config.instance);
+// Opt-in browser session trace recording (OFF unless the config flag is
+// explicitly true). Read once at boot, like the instance registration.
+setBrowserRecording(config.browserRecording === true);
 
 // Clear any stale browser connection record on startup. A managed record
 // only describes a Chrome window the runtime previously opened — that

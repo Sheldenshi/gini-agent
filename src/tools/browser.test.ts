@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, mock, test } from "bun:test";
-import { existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   __test as browserTest,
@@ -31,6 +31,7 @@ import {
   safetyCheck,
   sanitizeDownloadFilename,
   setBrowserInstance,
+  setBrowserRecording,
   withTeardownLock
 } from "./browser";
 import { dispatchToolCall } from "../execution/tool-dispatch";
@@ -2897,6 +2898,146 @@ describe("browser session provider seam", () => {
     expect(disconnectedKinds).toEqual(["persistent"]);
     // The shared slot was cleared by the provider-mediated teardown.
     expect(browserTest.uninstallFakeBrowserForTest().kind).toBe(null);
+  });
+});
+
+// Opt-in session trace recording (RuntimeConfig.browserRecording): tracing
+// starts on session create only when enabled, stops + saves into the
+// instance-scoped browser-traces dir on session close (with an audit row),
+// and retention keeps only the newest TRACE_RETENTION_MAX archives.
+describe("browser session trace recording", () => {
+  const TEST_ROOT = "/tmp/gini-browser-trace-recording";
+
+  const makeTracingContext = () => {
+    const startCalls: Array<Record<string, unknown>> = [];
+    const stopCalls: Array<string | undefined> = [];
+    const fakePage = {
+      on: () => undefined,
+      close: () => Promise.resolve(),
+      goto: () => Promise.resolve(null),
+      url: () => "about:blank",
+      title: () => Promise.resolve(""),
+      evaluate: () => Promise.resolve([])
+    };
+    const context = {
+      pages: () => [],
+      newPage: async () => fakePage,
+      close: async () => undefined,
+      tracing: {
+        start: async (options: Record<string, unknown>) => {
+          startCalls.push(options);
+        },
+        stop: async (options?: { path?: string }) => {
+          stopCalls.push(options?.path);
+          if (options?.path) writeFileSync(options.path, "fake-trace-zip");
+        }
+      }
+    };
+    return { context, startCalls, stopCalls };
+  };
+
+  afterEach(() => {
+    mock.restore();
+    browserTest.resetSessionTraceForTest();
+    browserTest.uninstallFakeBrowserForTest();
+    browserTest.clearFakeSessionsForTest();
+    browserTest.clearPendingSharedForTest();
+    browserTest.resetChromiumImportForTest();
+    setBrowserInstance("dev");
+    rmSync(TEST_ROOT, { recursive: true, force: true });
+  });
+
+  test("enabled: tracing starts on session create and stop saves + audits on session close", async () => {
+    process.env["GINI_STATE_ROOT"] = TEST_ROOT;
+    const instance = `trace-on-${process.pid}`;
+    rmSync(`${TEST_ROOT}/instances/${instance}`, { recursive: true, force: true });
+    setBrowserInstance(instance);
+    setBrowserRecording(true);
+
+    const { context, startCalls, stopCalls } = makeTracingContext();
+    mock.module("playwright-core", () => ({
+      chromium: {
+        executablePath: () => "/fake/path/to/chromium",
+        launchPersistentContext: async () => context
+      }
+    }));
+    browserTest.resetChromiumImportForTest();
+
+    try {
+      await browserNavigate("trace-task", { url: "https://example.com/" });
+    } catch {
+      // Snapshot wiring may throw on the fake page; tracing is what's pinned.
+    }
+    expect(startCalls).toEqual([{ screenshots: true, snapshots: true }]);
+    expect(browserTest.activeTraceTaskIdForTest()).toBe("trace-task");
+
+    await browserTest.closeSessionForTest("trace-task");
+    expect(stopCalls.length).toBe(1);
+    const savedPath = stopCalls[0]!;
+    expect(savedPath).toContain(`/instances/${instance}/browser-traces/`);
+    expect(savedPath).toContain("trace-task");
+    expect(savedPath.endsWith(".zip")).toBe(true);
+    expect(existsSync(savedPath)).toBe(true);
+    expect(browserTest.activeTraceTaskIdForTest()).toBe(null);
+    // The save wrote a browser.trace_saved audit row pointing at the archive.
+    const audit = readState(instance).audit.find((row) => row.action === "browser.trace_saved");
+    expect(audit?.target).toBe(savedPath);
+    expect(audit?.taskId).toBe("trace-task");
+    expect(audit?.evidence?.["sizeBytes"]).toBe("fake-trace-zip".length);
+  });
+
+  test("disabled (default): no tracing calls on create or close", async () => {
+    process.env["GINI_STATE_ROOT"] = TEST_ROOT;
+    const instance = `trace-off-${process.pid}`;
+    rmSync(`${TEST_ROOT}/instances/${instance}`, { recursive: true, force: true });
+    setBrowserInstance(instance);
+    // Deliberately no setBrowserRecording(true) — off is the default.
+
+    const { context, startCalls, stopCalls } = makeTracingContext();
+    mock.module("playwright-core", () => ({
+      chromium: {
+        executablePath: () => "/fake/path/to/chromium",
+        launchPersistentContext: async () => context
+      }
+    }));
+    browserTest.resetChromiumImportForTest();
+
+    try {
+      await browserNavigate("trace-off-task", { url: "https://example.com/" });
+    } catch {
+      // ignore — see above.
+    }
+    await browserTest.closeSessionForTest("trace-off-task");
+
+    expect(startCalls.length).toBe(0);
+    expect(stopCalls.length).toBe(0);
+    expect(readState(instance).audit.some((row) => row.action === "browser.trace_saved")).toBe(false);
+  });
+
+  test("retention prunes to the newest 10 trace archives", () => {
+    const dir = join(TEST_ROOT, "prune");
+    mkdirSync(dir, { recursive: true });
+    // 13 archives with strictly increasing mtimes, plus a non-zip bystander.
+    const base = Date.now() / 1000 - 1000;
+    for (let i = 0; i < 13; i++) {
+      const path = join(dir, `trace-${String(i).padStart(2, "0")}.zip`);
+      writeFileSync(path, "x");
+      utimesSync(path, base + i, base + i);
+    }
+    writeFileSync(join(dir, "notes.txt"), "not a trace");
+
+    browserTest.pruneTraceFilesForTest(dir);
+
+    const remaining = readdirSync(dir).sort();
+    expect(remaining.filter((name) => name.endsWith(".zip")).length).toBe(10);
+    // The three OLDEST archives were deleted; the newest survive.
+    expect(remaining).not.toContain("trace-00.zip");
+    expect(remaining).not.toContain("trace-01.zip");
+    expect(remaining).not.toContain("trace-02.zip");
+    expect(remaining).toContain("trace-03.zip");
+    expect(remaining).toContain("trace-12.zip");
+    // Non-zip files are never touched.
+    expect(remaining).toContain("notes.txt");
   });
 });
 

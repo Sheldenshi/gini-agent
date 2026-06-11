@@ -25,16 +25,16 @@
 // approval-gated (high risk): upload can exfiltrate workspace files to a
 // remote site, download writes remote bytes onto the local disk.
 import type { Browser, BrowserContext, Locator, Page } from "playwright-core";
-import { existsSync, mkdirSync, realpathSync, statSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, realpathSync, statSync, unlinkSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { isIP } from "node:net";
 import { lookup } from "node:dns/promises";
-import { downloadsDir, instanceRoot } from "../paths";
+import { browserTracesDir, downloadsDir, instanceRoot } from "../paths";
 import { launchPersistentChrome } from "./chrome-discovery";
 import { generateAuxText, generateVisionAnalysis } from "../provider";
 import { resolveProviderModality } from "../provider-capabilities";
-import { assertInsideWorkspace, readState } from "../state";
+import { addAudit, assertInsideWorkspace, mutateState, readState } from "../state";
 import { sanitizeUrlForAuditTarget } from "../execution/browser-fill-secrets-types";
 import type { BrowserConnectionRecord, BrowserDomainPolicy, Instance, RuntimeConfig } from "../types";
 
@@ -701,6 +701,139 @@ function startSweeper(): void {
   if (typeof sweepTimer.unref === "function") sweepTimer.unref();
 }
 
+// ---------------- Session trace recording (opt-in) ----------------
+//
+// When RuntimeConfig.browserRecording is true (server boot calls
+// setBrowserRecording), browser sessions record a Playwright trace for
+// debugging/audit review. Tracing (context.tracing start/stop) is used
+// instead of recordVideo because video must be configured when the
+// context is CREATED — impossible for both the persistent context
+// (launched before any task exists) and a CDP-attached user Chrome —
+// while tracing can start on an already-live context in either mode. The
+// BrowserContext is shared across tasks, so only one trace runs at a
+// time: the first session created while none is active claims it;
+// sessions starting while a trace is in flight are simply not recorded.
+//
+// Trace archives are raw Playwright captures (DOM snapshots +
+// screenshots) and do NOT pass through the secret-redaction layer — they
+// can contain anything the page displayed. They are written only to local
+// disk under <instanceRoot>/browser-traces/, never enter the model
+// context, and every save writes a browser.trace_saved audit row. That is
+// why the feature is opt-in and OFF by default.
+const TRACE_RETENTION_MAX = 10;
+let browserRecordingEnabled = false;
+// taskId of the session holding the single context-wide trace, or null.
+let activeTraceTaskId: string | null = null;
+
+// Called at server boot alongside setBrowserInstance. Safe to call
+// repeatedly; affects sessions created after the call.
+export function setBrowserRecording(enabled: boolean): void {
+  browserRecordingEnabled = enabled === true;
+}
+
+// typeof-guarded view of context.tracing so lightweight test fakes (and a
+// hypothetical context without tracing support) degrade to "no recording"
+// instead of throwing.
+interface ContextTracing {
+  start?: (options: { screenshots: boolean; snapshots: boolean }) => Promise<void>;
+  stop?: (options?: { path?: string }) => Promise<void>;
+}
+function tracingOf(context: BrowserContext): ContextTracing | undefined {
+  const tracing = (context as BrowserContext & { tracing?: ContextTracing }).tracing;
+  return tracing && typeof tracing === "object" ? tracing : undefined;
+}
+
+// Start the context-wide trace for a freshly-created session. Best-effort:
+// any failure leaves the session fully functional, just unrecorded.
+async function startSessionTrace(taskId: string, context: BrowserContext): Promise<void> {
+  if (!browserRecordingEnabled || activeTraceTaskId !== null) return;
+  const tracing = tracingOf(context);
+  if (typeof tracing?.start !== "function") return;
+  // Reserve the slot BEFORE the await so a concurrently-created second
+  // session can't start a competing trace on the same shared context.
+  activeTraceTaskId = taskId;
+  try {
+    await tracing.start({ screenshots: true, snapshots: true });
+  } catch {
+    activeTraceTaskId = null;
+  }
+}
+
+// Bounded retention: keep the newest TRACE_RETENTION_MAX archives, delete
+// the rest. Newness is mtime-based so retention survives filename-format
+// changes. Best-effort throughout.
+function pruneTraceFiles(dir: string): void {
+  let entries: Array<{ path: string; mtimeMs: number }>;
+  try {
+    entries = readdirSync(dir)
+      .filter((name) => name.endsWith(".zip"))
+      .map((name) => {
+        const path = join(dir, name);
+        return { path, mtimeMs: statSync(path).mtimeMs };
+      });
+  } catch {
+    return;
+  }
+  entries.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  for (const stale of entries.slice(TRACE_RETENTION_MAX)) {
+    try {
+      unlinkSync(stale.path);
+    } catch {
+      // best effort
+    }
+  }
+}
+
+// Stop and save the trace when the owning session closes (explicit close,
+// idle sweep, disconnect, process exit). Best-effort end to end — a
+// failed save must never block session teardown.
+async function stopSessionTrace(taskId: string, context: BrowserContext): Promise<void> {
+  if (activeTraceTaskId !== taskId) return;
+  activeTraceTaskId = null;
+  const tracing = tracingOf(context);
+  if (typeof tracing?.stop !== "function") return;
+  if (!runtimeInstance) {
+    // No instance to scope the archive under (raw test imports) — end the
+    // trace without saving so the context stops buffering.
+    await tracing.stop().catch(() => undefined);
+    return;
+  }
+  const instance = runtimeInstance;
+  try {
+    const dir = browserTracesDir(instance);
+    mkdirSync(dir, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const safeTask = taskId.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 80);
+    const path = join(dir, `trace-${stamp}-${safeTask}.zip`);
+    await tracing.stop({ path });
+    pruneTraceFiles(dir);
+    let sizeBytes: number | null = null;
+    try {
+      sizeBytes = statSync(path).size;
+    } catch {
+      // Playwright always writes the archive on stop({ path }); a missing
+      // file just means a fake/degenerate tracer — keep the audit row.
+    }
+    await mutateState(instance, (state) => {
+      addAudit(
+        state,
+        {
+          actor: "runtime",
+          action: "browser.trace_saved",
+          target: path,
+          risk: "low",
+          taskId,
+          runId: state.tasks.find((task) => task.id === taskId)?.runId,
+          evidence: { path, sizeBytes }
+        },
+        { taskId }
+      );
+    });
+  } catch {
+    // best effort — never block teardown on a failed trace save.
+  }
+}
+
 async function getOrCreate(taskId: string): Promise<Session> {
   const existing = sessions.get(taskId);
   if (existing) {
@@ -754,6 +887,9 @@ async function getOrCreate(taskId: string): Promise<Session> {
     attachConsole(taskId, page);
     attachDialogHandler(taskId, page);
     attachNetworkCapture(taskId, page);
+    // Opt-in session trace recording — no-op unless enabled at boot and
+    // no other session already holds the context-wide trace.
+    await startSessionTrace(taskId, context);
     return session;
   })().finally(() => {
     pendingSessions.delete(taskId);
@@ -812,6 +948,9 @@ async function closeSession(taskId: string): Promise<void> {
   // registry would never be consulted again for this task —
   // keeping it would just leak memory across many tasks.
   clearFilledSecrets(taskId);
+  // Stop + save the opt-in session trace while the context is still live
+  // (no-op unless this task holds the trace). Never throws.
+  await stopSessionTrace(taskId, session.context);
   try {
     // Shared context (persistent/cdp): close every page the agent opened
     // during this task. The user's window, tabs the user opened
@@ -897,6 +1036,9 @@ export async function disconnectSharedBrowser(): Promise<void> {
       // by process exit.
       clearFilledSecrets(id);
       if (!session) continue;
+      // Stop + save the opt-in session trace before the context goes away
+      // (no-op unless this task holds the trace). Never throws.
+      await stopSessionTrace(id, session.context);
       try {
         // Persistent and cdp both share a single context — close just the
         // pages we own. teardownHandle below closes the whole context for
@@ -969,6 +1111,9 @@ export async function closeAll(): Promise<void> {
     // per-task secret-redaction registry alongside the session.
     clearFilledSecrets(id);
     if (!session) continue;
+    // Stop + save the opt-in session trace before teardown (no-op unless
+    // this task holds the trace). Never throws.
+    await stopSessionTrace(id, session.context);
     try {
       // Close every agent-owned page. In CDP mode this is the only thing
       // that reaps agent-opened tabs (the user's browser stays alive).
@@ -4549,6 +4694,20 @@ export const __test = {
   setSessionProviderForTest(kind: Mode, provider: BrowserSessionProvider | null): void {
     sessionProviders[kind] =
       provider ?? (kind === "persistent" ? persistentSessionProvider : cdpSessionProvider);
+  },
+  // Reset the opt-in recording flag and any active trace claim so
+  // recording tests don't leak state into siblings.
+  resetSessionTraceForTest(): void {
+    browserRecordingEnabled = false;
+    activeTraceTaskId = null;
+  },
+  activeTraceTaskIdForTest(): string | null {
+    return activeTraceTaskId;
+  },
+  // Direct access to the bounded-retention pruner so the keep-newest-N
+  // behavior can be pinned without driving a whole session lifecycle.
+  pruneTraceFilesForTest(dir: string): void {
+    pruneTraceFiles(dir);
   },
   // Install a fake shared handle so the close-path tests can assert
   // teardown behavior without launching Chromium. The `headed` flag

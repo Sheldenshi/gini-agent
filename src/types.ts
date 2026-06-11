@@ -315,6 +315,14 @@ export interface RuntimeConfig {
     // falls back to the provider-derived default.
     priorContextTokens?: number;
   };
+  // Opt-in browser session trace recording, OFF by default (enabled only
+  // when explicitly true; read at server boot). When enabled, browser
+  // sessions record a Playwright trace that is saved under
+  // <instanceRoot>/browser-traces/ when the session closes, with bounded
+  // retention and a browser.trace_saved audit row per save. Trace archives
+  // are raw page captures for local debugging/audit review — they never
+  // enter the model context. See src/tools/browser.ts.
+  browserRecording?: boolean;
 }
 
 // ChatBlock — semantic, typed conversation block emitted by the runtime so
