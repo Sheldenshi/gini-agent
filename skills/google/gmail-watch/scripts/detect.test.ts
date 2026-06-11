@@ -136,6 +136,14 @@ function draftedIds(items: { text: string; untrusted: boolean }[] | undefined): 
   return (items ?? []).filter((i) => i.untrusted).map((i) => itemPayload(i.text).id as string);
 }
 
+// Flatten every routed bucket into one items[] (the multi-watch result no longer
+// carries a flat items[] — matches are partitioned per concern by routeKey).
+function allBucketItems(
+  buckets: Record<string, { text: string; untrusted: boolean }[]> | undefined
+): { text: string; untrusted: boolean }[] {
+  return Object.values(buckets ?? {}).flat();
+}
+
 describe("parse + safety helpers", () => {
   test("parseGwsAuthStatus reads token_valid", () => {
     expect(parseGwsAuthStatus(PREAMBLE + '{"token_valid":true}').signedIn).toBe(true);
@@ -727,15 +735,17 @@ describe("detect — thread mode", () => {
     };
     const r = await runWatches(
       {
+        // Legacy byWatcher INPUT is still read transparently (the first new tick
+        // rewrites it flat). routeKey defaults to watcherId.
         watches: [{ watcherId: "w-t", query: "thread:t-1", threadId: "t-1" }],
         state: { byWatcher: { "w-t": { cursor: "1000", seen: ["m1"] } } }
       },
       spawn
     );
     expect(r.kind).toBe("context");
-    expect(draftedIds(r.items)).toEqual(["m2"]);
-    expect(r.state.byWatcher["w-t"]!.cursor).toBe("2000");
-    expect(r.state.byWatcher["w-t"]!.status).toBe("ok");
+    expect(draftedIds(r.buckets!["w-t"])).toEqual(["m2"]);
+    expect(r.state["w-t"]!.cursor).toBe("2000");
+    expect(r.state["w-t"]!.status).toBe("ok");
   });
 });
 
@@ -851,23 +861,24 @@ describe("runWatches — multi-watch (one shared job)", () => {
     const r = await runWatches(
       {
         watches: [
-          { watcherId: "w-alice", query: "from:alice@x.com is:unread" },
-          { watcherId: "w-bob", query: "from:bob@x.com is:unread" }
+          { watcherId: "w-alice", routeKey: "w-alice", query: "from:alice@x.com is:unread", sender: "alice@x.com" },
+          { watcherId: "w-bob", routeKey: "w-bob", query: "from:bob@x.com is:unread", sender: "bob@x.com" }
         ],
-        state: { byWatcher: { "w-alice": { cursor: "1000", seen: [] }, "w-bob": { cursor: "1000", seen: [] } } }
+        state: { "w-alice": { cursor: "1000", seen: [] }, "w-bob": { cursor: "1000", seen: [] } }
       },
       spawn
     );
-    // ONE drafting turn carries BOTH senders' matches, each labeled by sender.
+    // Each concern gets its OWN bucket keyed by routeKey, each match labeled by sender.
     expect(r.kind).toBe("context");
-    expect(matchCount(r.items)).toBe(2);
-    expect(r.items!.some((i) => i.text.startsWith("New email from Alice <alice@x.com> — "))).toBe(true);
-    expect(r.items!.some((i) => i.text.startsWith("New email from Bob <bob@x.com> — "))).toBe(true);
-    // Per-watch state advanced independently.
-    expect(r.state.byWatcher["w-alice"]!.cursor).toBe("3000");
-    expect(r.state.byWatcher["w-bob"]!.cursor).toBe("4000");
-    expect(r.state.byWatcher["w-alice"]!.status).toBe("ok");
-    expect(r.state.byWatcher["w-bob"]!.status).toBe("ok");
+    expect(matchCount(r.buckets!["w-alice"])).toBe(1);
+    expect(matchCount(r.buckets!["w-bob"])).toBe(1);
+    expect(r.buckets!["w-alice"]!.some((i) => i.text.startsWith("New email from Alice <alice@x.com> — "))).toBe(true);
+    expect(r.buckets!["w-bob"]!.some((i) => i.text.startsWith("New email from Bob <bob@x.com> — "))).toBe(true);
+    // Per-watch state advanced independently, keyed by routeKey at the top level.
+    expect(r.state["w-alice"]!.cursor).toBe("3000");
+    expect(r.state["w-bob"]!.cursor).toBe("4000");
+    expect(r.state["w-alice"]!.status).toBe("ok");
+    expect(r.state["w-bob"]!.status).toBe("ok");
   });
 
   test("a per-watch gws error isolates to that watch; the others still draft", async () => {
@@ -894,23 +905,23 @@ describe("runWatches — multi-watch (one shared job)", () => {
     const r = await runWatches(
       {
         watches: [
-          { watcherId: "w-bad", query: "from:bad@x.com is:unread" },
-          { watcherId: "w-good", query: "from:good@x.com is:unread" }
+          { watcherId: "w-bad", query: "from:bad@x.com is:unread", sender: "bad@x.com" },
+          { watcherId: "w-good", query: "from:good@x.com is:unread", sender: "good@x.com" }
         ],
-        state: { byWatcher: { "w-bad": { cursor: "1000", seen: [] }, "w-good": { cursor: "1000", seen: [] } } }
+        state: { "w-bad": { cursor: "1000", seen: [] }, "w-good": { cursor: "1000", seen: [] } }
       },
       spawn
     );
-    // The good watch still drafts; the bad watch is marked error with a SCRUBBED
-    // lastError and its cursor unchanged.
+    // The good watch still drafts into its bucket; the bad watch is marked error
+    // with a SCRUBBED lastError and its cursor unchanged (no bucket for it).
     expect(r.kind).toBe("context");
-    expect(matchCount(r.items)).toBe(1);
-    expect(draftedIds(r.items)).toEqual(["g1"]);
-    expect(r.state.byWatcher["w-good"]!.status).toBe("ok");
-    expect(r.state.byWatcher["w-good"]!.cursor).toBe("5000");
-    expect(r.state.byWatcher["w-bad"]!.status).toBe("error");
-    expect(r.state.byWatcher["w-bad"]!.lastError).toBe("transport blew up reading <path>");
-    expect(r.state.byWatcher["w-bad"]!.cursor).toBe("1000");
+    expect(r.buckets!["w-bad"]).toBeUndefined();
+    expect(draftedIds(r.buckets!["w-good"])).toEqual(["g1"]);
+    expect(r.state["w-good"]!.status).toBe("ok");
+    expect(r.state["w-good"]!.cursor).toBe("5000");
+    expect(r.state["w-bad"]!.status).toBe("error");
+    expect(r.state["w-bad"]!.lastError).toBe("transport blew up reading <path>");
+    expect(r.state["w-bad"]!.cursor).toBe("1000");
   });
 
   test("signed-out marks every watch needs_auth, no model turn, cursors unchanged", async () => {
@@ -922,21 +933,21 @@ describe("runWatches — multi-watch (one shared job)", () => {
     const r = await runWatches(
       {
         watches: [
-          { watcherId: "w1", query: "from:a@x.com is:unread" },
-          { watcherId: "w2", query: "from:b@x.com is:unread" }
+          { watcherId: "w1", query: "from:a@x.com is:unread", sender: "a@x.com" },
+          { watcherId: "w2", query: "from:b@x.com is:unread", sender: "b@x.com" }
         ],
-        state: { byWatcher: { w1: { cursor: "1000", seen: ["x"] }, w2: { cursor: "2000", seen: [] } } }
+        state: { w1: { cursor: "1000", seen: ["x"] }, w2: { cursor: "2000", seen: [] } }
       },
       signedOut
     );
     expect(r.kind).toBe("shortCircuit");
     expect(r.summary).toBe("[SILENT]");
-    expect(r.state.byWatcher.w1!.status).toBe("needs_auth");
-    expect(r.state.byWatcher.w2!.status).toBe("needs_auth");
+    expect(r.state.w1!.status).toBe("needs_auth");
+    expect(r.state.w2!.status).toBe("needs_auth");
     // Cursors/seen carried through unchanged (don't advance past unread mail).
-    expect(r.state.byWatcher.w1!.cursor).toBe("1000");
-    expect(r.state.byWatcher.w1!.seen).toEqual(["x"]);
-    expect(r.state.byWatcher.w2!.cursor).toBe("2000");
+    expect(r.state.w1!.cursor).toBe("1000");
+    expect(r.state.w1!.seen).toEqual(["x"]);
+    expect(r.state.w2!.cursor).toBe("2000");
   });
 
   test("seeding a fresh watch (no per-watch state) baselines without drafting", async () => {
@@ -945,20 +956,21 @@ describe("runWatches — multi-watch (one shared job)", () => {
       { n1: { id: "n1", internalDate: "9000", from: "New <new@x.com>", subject: "hi" } }
     );
     const r = await runWatches(
-      { watches: [{ watcherId: "w-new", query: "from:new@x.com is:unread" }], state: null },
+      { watches: [{ watcherId: "w-new", query: "from:new@x.com is:unread", sender: "new@x.com" }], state: null },
       spawn
     );
     expect(r.kind).toBe("shortCircuit");
     expect(r.summary).toBe("[SILENT]");
     // Baselined at the newest, drafted nothing, recorded the boundary id.
-    expect(r.state.byWatcher["w-new"]!.cursor).toBe("9000");
-    expect(r.state.byWatcher["w-new"]!.seen).toEqual(["n1"]);
-    expect(r.state.byWatcher["w-new"]!.status).toBe("ok");
+    expect(r.state["w-new"]!.cursor).toBe("9000");
+    expect(r.state["w-new"]!.seen).toEqual(["n1"]);
+    expect(r.state["w-new"]!.status).toBe("ok");
   });
 
-  test("per-watch backlog notices join into one non-silent shortCircuit summary", async () => {
-    // Two watches both hit truncated windows (no draftable match); their notices
-    // join into one summary so the shared thread surfaces both.
+  test("per-watch backlog notices route into each concern's own bucket", async () => {
+    // Two watches both hit truncated windows (no draftable match); each watch's
+    // notice routes into ITS OWN routeKey bucket as a trusted item, so each
+    // concern's worker surfaces its own backlog notice.
     const corpusA: Meta[] = Array.from({ length: 60 }, (_, i) => ({
       id: `a${i}`,
       internalDate: String(12_000_000 + i * 1000),
@@ -999,28 +1011,29 @@ describe("runWatches — multi-watch (one shared job)", () => {
     const r = await runWatches(
       {
         watches: [
-          { watcherId: "w-a", query: "from:alice@x.com is:unread" },
-          { watcherId: "w-b", query: "from:bob@x.com is:unread" }
+          { watcherId: "w-a", query: "from:alice@x.com is:unread", sender: "alice@x.com" },
+          { watcherId: "w-b", query: "from:bob@x.com is:unread", sender: "bob@x.com" }
         ],
-        state: { byWatcher: { "w-a": { cursor: "1000", seen: [] }, "w-b": { cursor: "1000", seen: [] } } }
+        state: { "w-a": { cursor: "1000", seen: [] }, "w-b": { cursor: "1000", seen: [] } }
       },
       spawn
     );
-    expect(r.kind).toBe("shortCircuit");
-    expect(r.summary).not.toBe("[SILENT]");
-    // Both watches' backlog notices are present in the joined summary.
-    expect(r.summary).toContain("from:alice@x.com is:unread");
-    expect(r.summary).toContain("from:bob@x.com is:unread");
+    // Each notice is a trusted item in its OWN concern's bucket (a context turn).
+    expect(r.kind).toBe("context");
+    expect(r.buckets!["w-a"]).toHaveLength(1);
+    expect(r.buckets!["w-a"]![0]!.untrusted).toBe(false);
+    expect(r.buckets!["w-a"]![0]!.text).toContain("from:alice@x.com is:unread");
+    expect(r.buckets!["w-b"]![0]!.text).toContain("from:bob@x.com is:unread");
     // Both cursors jumped to their newest.
-    expect(r.state.byWatcher["w-a"]!.cursor).toBe(String(12_000_000 + 59 * 1000));
-    expect(r.state.byWatcher["w-b"]!.cursor).toBe(String(13_000_000 + 59 * 1000));
+    expect(r.state["w-a"]!.cursor).toBe(String(12_000_000 + 59 * 1000));
+    expect(r.state["w-b"]!.cursor).toBe(String(13_000_000 + 59 * 1000));
   });
 
-  test("a sibling match in the same tick as a backlog carries the notice as a trusted item", async () => {
+  test("a sibling match and a backlog notice land in their own concern buckets", async () => {
     // One watch produces a fresh draftable match; another hits a truncated
-    // (page-cap) window in the SAME tick. The match makes this a context result,
-    // so the backlog notice must ride along (as a TRUSTED item) instead of being
-    // dropped while the truncated watch's cursor advances.
+    // (page-cap) window in the SAME tick. The match opens the alice bucket; the
+    // backlog notice opens the bulk bucket as a TRUSTED item — neither is dropped
+    // and both advance their own cursor.
     const backlog: Meta[] = Array.from({ length: 60 }, (_, i) => ({
       id: `bk${i}`,
       internalDate: String(20_000_000 + i * 1000),
@@ -1058,25 +1071,24 @@ describe("runWatches — multi-watch (one shared job)", () => {
     const r = await runWatches(
       {
         watches: [
-          { watcherId: "w-alice", query: "from:alice@x.com is:unread" },
-          { watcherId: "w-bulk", query: "from:bulk@x.com is:unread" }
+          { watcherId: "w-alice", query: "from:alice@x.com is:unread", sender: "alice@x.com" },
+          { watcherId: "w-bulk", query: "from:bulk@x.com is:unread", sender: "bulk@x.com" }
         ],
-        state: { byWatcher: { "w-alice": { cursor: "1000", seen: [] }, "w-bulk": { cursor: "1000", seen: [] } } }
+        state: { "w-alice": { cursor: "1000", seen: [] }, "w-bulk": { cursor: "1000", seen: [] } }
       },
       spawn
     );
-    // The match makes it a context turn carrying BOTH the draft AND the notice.
     expect(r.kind).toBe("context");
-    // Exactly one draftable (untrusted) match — Alice's fresh email.
-    expect(matchCount(r.items)).toBe(1);
-    expect(r.items!.some((i) => i.untrusted && i.text.startsWith("New email from Alice <alice@x.com> — "))).toBe(true);
-    // The backlog notice rides along as a TRUSTED item (not dropped).
-    const notice = r.items!.filter((i) => !i.untrusted);
+    // Alice's bucket carries exactly her fresh draftable match.
+    expect(matchCount(r.buckets!["w-alice"])).toBe(1);
+    expect(r.buckets!["w-alice"]!.some((i) => i.untrusted && i.text.startsWith("New email from Alice <alice@x.com> — "))).toBe(true);
+    // The bulk bucket carries the backlog notice as a TRUSTED item (not dropped).
+    const notice = r.buckets!["w-bulk"]!.filter((i) => !i.untrusted);
     expect(notice).toHaveLength(1);
     expect(notice[0]!.text).toContain("backlog");
     expect(notice[0]!.text).toContain("from:bulk@x.com is:unread");
     // The truncated watch's cursor still jumped to its newest.
-    expect(r.state.byWatcher["w-bulk"]!.cursor).toBe(String(20_000_000 + 59 * 1000));
+    expect(r.state["w-bulk"]!.cursor).toBe(String(20_000_000 + 59 * 1000));
   });
 
   test("a watch entry's sender + objective ride through to the bypass and the trusted item", async () => {
@@ -1087,22 +1099,150 @@ describe("runWatches — multi-watch (one shared job)", () => {
     const r = await runWatches(
       {
         watches: [{ watcherId: "w-ups", query: "from:noreply@ups.com", sender: "noreply@ups.com", objective: "Track the package until delivered" }],
-        state: { byWatcher: { "w-ups": { cursor: "1000", seen: [] } } }
+        state: { "w-ups": { cursor: "1000", seen: [] } }
       },
       spawn
     );
     expect(r.kind).toBe("context");
-    expect(draftedIds(r.items)).toEqual(["p1"]);
-    const trusted = r.items!.filter((i) => !i.untrusted);
+    expect(draftedIds(r.buckets!["w-ups"])).toEqual(["p1"]);
+    const trusted = r.buckets!["w-ups"]!.filter((i) => !i.untrusted);
     expect(trusted).toHaveLength(1);
     expect(trusted[0]!.text).toBe("Objective for this watch (noreply@ups.com): Track the package until delivered");
   });
 
-  test("no watches yields a silent shortCircuit with empty byWatcher", async () => {
+  test("no watches yields a silent shortCircuit with empty state", async () => {
     const spawn = multiSpawn({}, {});
     const r = await runWatches({ watches: [], state: null }, spawn);
     expect(r.kind).toBe("shortCircuit");
     expect(r.summary).toBe("[SILENT]");
-    expect(r.state.byWatcher).toEqual({});
+    expect(r.state).toEqual({});
+  });
+
+  test("buckets are keyed by routeKey, defaulting to watcherId", async () => {
+    const spawn = multiSpawn(
+      { "from:alice@x.com": ["a1"] },
+      { a1: { id: "a1", internalDate: "3000", from: "Alice <alice@x.com>", subject: "hi" } }
+    );
+    const r = await runWatches(
+      {
+        // routeKey explicitly diverges from watcherId — the bucket + state key follow it.
+        watches: [{ watcherId: "w-alice", routeKey: "concern-alice", query: "from:alice@x.com", sender: "alice@x.com" }],
+        state: { "concern-alice": { cursor: "1000", seen: [] } }
+      },
+      spawn
+    );
+    expect(r.kind).toBe("context");
+    expect(Object.keys(r.buckets!)).toEqual(["concern-alice"]);
+    expect(draftedIds(r.buckets!["concern-alice"])).toEqual(["a1"]);
+    expect(r.state["concern-alice"]!.cursor).toBe("3000");
+  });
+
+  test("a targeted concern claims its mail; a broad watch drops the already-claimed id", async () => {
+    // The SAME email (id m1, from alice) is listed by BOTH a targeted alice watch
+    // and a broad in:inbox watch. Precedence: alice claims it, so the broad bucket
+    // never re-drafts it. A second inbox-only email (m2) routes to the broad bucket.
+    const spawn: GwsSpawn = async (args) => {
+      const joined = args.join(" ");
+      if (joined.includes("auth status")) return PREAMBLE + '{"token_valid":true}';
+      if (joined.includes("getProfile")) return PREAMBLE + '{"emailAddress":"me@example.com"}';
+      if (joined.includes("messages list")) {
+        const q = joined.match(/"q":"([^"]*)"/)?.[1]?.replace(/ after:\d+$/, "") ?? "";
+        if (q.startsWith("from:alice")) return listResponse(["m1"]);
+        return listResponse(["m2", "m1"]); // in:inbox lists both, newest-first
+      }
+      if (joined.includes("messages get")) {
+        const hit = getArgId(joined);
+        const byId: Record<string, Meta> = {
+          m1: { id: "m1", internalDate: "3000", from: "Alice <alice@x.com>", subject: "from alice" },
+          m2: { id: "m2", internalDate: "4000", from: "Carol <carol@x.com>", subject: "random" }
+        };
+        return hit && byId[hit] ? metadataResponse(byId[hit]) : PREAMBLE + "{}";
+      }
+      return PREAMBLE + "{}";
+    };
+    const r = await runWatches(
+      {
+        watches: [
+          { watcherId: "w-alice", routeKey: "w-alice", query: "from:alice@x.com", sender: "alice@x.com" },
+          { watcherId: "w-triage", routeKey: "triage", query: "in:inbox" }
+        ],
+        state: { "w-alice": { cursor: "1000", seen: [] }, triage: { cursor: "1000", seen: [] } }
+      },
+      spawn
+    );
+    expect(r.kind).toBe("context");
+    // m1 lands in the TARGETED bucket only — never the broad bucket.
+    expect(draftedIds(r.buckets!["w-alice"])).toEqual(["m1"]);
+    // The broad bucket keeps only the unclaimed remainder.
+    expect(draftedIds(r.buckets!["triage"])).toEqual(["m2"]);
+    // Both watches' cursors advanced over what each consumed.
+    expect(r.state["w-alice"]!.cursor).toBe("3000");
+    expect(r.state.triage!.cursor).toBe("4000");
+  });
+
+  test("a broad watch whose only match is claimed opens no bucket", async () => {
+    // The single inbox email is alice's, already claimed by the targeted watch, so
+    // the broad bucket has nothing left and is omitted (no idle worker turn).
+    const spawn: GwsSpawn = async (args) => {
+      const joined = args.join(" ");
+      if (joined.includes("auth status")) return PREAMBLE + '{"token_valid":true}';
+      if (joined.includes("getProfile")) return PREAMBLE + '{"emailAddress":"me@example.com"}';
+      if (joined.includes("messages list")) {
+        const q = joined.match(/"q":"([^"]*)"/)?.[1]?.replace(/ after:\d+$/, "") ?? "";
+        if (q.startsWith("from:alice")) return listResponse(["m1"]);
+        return listResponse(["m1"]);
+      }
+      if (joined.includes("messages get")) {
+        const hit = getArgId(joined);
+        return hit === "m1"
+          ? metadataResponse({ id: "m1", internalDate: "3000", from: "Alice <alice@x.com>", subject: "hi" })
+          : PREAMBLE + "{}";
+      }
+      return PREAMBLE + "{}";
+    };
+    const r = await runWatches(
+      {
+        watches: [
+          { watcherId: "w-alice", routeKey: "w-alice", query: "from:alice@x.com", sender: "alice@x.com" },
+          { watcherId: "w-triage", routeKey: "triage", query: "in:inbox" }
+        ],
+        state: { "w-alice": { cursor: "1000", seen: [] }, triage: { cursor: "1000", seen: [] } }
+      },
+      spawn
+    );
+    expect(r.kind).toBe("context");
+    expect(draftedIds(r.buckets!["w-alice"])).toEqual(["m1"]);
+    // Empty broad bucket omitted entirely.
+    expect(r.buckets!["triage"]).toBeUndefined();
+    expect(Object.keys(r.buckets!)).toEqual(["w-alice"]);
+    // The broad watch's cursor still advanced over the message it consumed (and
+    // dropped to precedence), so it won't re-list it.
+    expect(r.state.triage!.cursor).toBe("3000");
+  });
+
+  test("per-bucket state round-trips by routeKey for the generic commit", async () => {
+    // The returned state is keyed by routeKey at the TOP level (NOT nested under
+    // byWatcher), so the generic persistFanOutState can merge ONLY the dispatched
+    // routeKeys. Feed the returned state straight back as the next tick's input.
+    const spawn = multiSpawn(
+      { "from:alice@x.com": ["a1"] },
+      { a1: { id: "a1", internalDate: "3000", from: "Alice <alice@x.com>", subject: "hi" } }
+    );
+    const r1 = await runWatches(
+      {
+        watches: [{ watcherId: "w-alice", routeKey: "w-alice", query: "from:alice@x.com", sender: "alice@x.com" }],
+        state: { "w-alice": { cursor: "1000", seen: [] } }
+      },
+      spawn
+    );
+    expect(draftedIds(r1.buckets!["w-alice"])).toEqual(["a1"]);
+    // Round-trip the flat state back in: a1 is now at/behind the cursor and seen,
+    // so the next tick re-detects nothing (no bucket).
+    const r2 = await runWatches(
+      { watches: [{ watcherId: "w-alice", routeKey: "w-alice", query: "from:alice@x.com", sender: "alice@x.com" }], state: r1.state },
+      spawn
+    );
+    expect(r2.kind).toBe("shortCircuit");
+    expect(allBucketItems(r2.buckets)).toHaveLength(0);
   });
 });
