@@ -31,7 +31,14 @@ import type { RuntimeState } from "../types";
 // tools) while preserving access to the whole catalog. `indexSummary` is the
 // one-line description used in that index (falls back to the description's
 // first sentence when omitted).
-const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: string; deferred?: boolean; indexSummary?: string }> = [
+//
+// `crossToolsetHint` is a routing sentence that points the model at a
+// sibling toolset (e.g. browser_navigate → web_search for plain content
+// retrieval). buildToolCatalog appends it to the description only when the
+// referenced toolset is reachable in the assembled catalog — same gate the
+// referenced tools themselves pass — so the model is never steered toward
+// tools it doesn't have.
+const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: string; deferred?: boolean; indexSummary?: string; crossToolsetHint?: { toolset: string; text: string } }> = [
   {
     toolset: "file",
     displayLabel: "Read file",
@@ -123,6 +130,10 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     // to `count` ranked results as compact text the model can cite.
     toolset: "web_search",
     displayLabel: "Web search",
+    crossToolsetHint: {
+      toolset: "browser",
+      text: "For interacting with pages — clicking, typing, authenticated sessions — use the browser tools (browser_navigate) instead."
+    },
     type: "function",
     function: {
       name: "web_search",
@@ -145,6 +156,10 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   {
     toolset: "messaging",
     displayLabel: "Fetch URL",
+    crossToolsetHint: {
+      toolset: "browser",
+      text: "For interacting with pages — clicking, typing, authenticated sessions — use the browser tools (browser_navigate) instead."
+    },
     type: "function",
     function: {
       name: "web_fetch",
@@ -311,6 +326,10 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   {
     toolset: "browser",
     displayLabel: "Open page",
+    crossToolsetHint: {
+      toolset: "web_search",
+      text: "The browser is for interacting with pages (clicking, typing, authenticated sessions); for plain content retrieval prefer web_search / web_fetch."
+    },
     type: "function",
     function: {
       name: "browser_navigate",
@@ -1918,6 +1937,7 @@ export type ToolCatalogTool = ToolFunctionSpec & {
   displayLabel?: string;
   deferred?: boolean;
   indexSummary?: string;
+  crossToolsetHint?: { toolset: string; text: string };
 };
 
 // Public read-only copy. Returned ordering is stable so the toolsHash is
@@ -2099,6 +2119,20 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     if (!enabled.has(tool.toolset)) return false;
     if (agentToolsetFilter && !agentToolsetFilter.has(tool.toolset)) return false;
     return true;
+  }).map((tool) => {
+    // Apply or strip cross-toolset routing hints (see the TOOL_DEFS doc
+    // comment). The hint joins the description only when its referenced
+    // toolset passes the same enabled + agent-whitelist gate the referenced
+    // tools pass; otherwise it's dropped so the model never chases tools
+    // that aren't in the catalog. The annotation itself never survives
+    // assembly — toProviderTools must not see it.
+    const hint = tool.crossToolsetHint;
+    if (!hint) return tool;
+    const { crossToolsetHint: _hint, ...rest } = tool;
+    const reachable = enabled.has(hint.toolset)
+      && (!agentToolsetFilter || agentToolsetFilter.has(hint.toolset));
+    if (!reachable) return rest;
+    return { ...rest, function: { ...rest.function, description: `${rest.function.description} ${hint.text}` } };
   });
 }
 
@@ -2112,12 +2146,12 @@ export function hashCatalog(tools: ToolCatalogTool[]): string {
 }
 
 // Return the OpenAI tool spec without the `toolset` / `displayLabel` /
-// `deferred` / `indexSummary` annotations we use for filtering, chat
-// rendering, and the deferred-tools index. The provider only knows the
-// `type/function` shape.
+// `deferred` / `indexSummary` / `crossToolsetHint` annotations we use for
+// filtering, chat rendering, and the deferred-tools index. The provider
+// only knows the `type/function` shape.
 export function toProviderTools(tools: ToolCatalogTool[]): ToolFunctionSpec[] {
   return tools.map(
-    ({ toolset: _toolset, displayLabel: _displayLabel, deferred: _deferred, indexSummary: _indexSummary, ...rest }) => rest
+    ({ toolset: _toolset, displayLabel: _displayLabel, deferred: _deferred, indexSummary: _indexSummary, crossToolsetHint: _crossToolsetHint, ...rest }) => rest
   );
 }
 
