@@ -12,10 +12,14 @@ import { family } from "@/src/theme";
 export function ThreadRepliesChip({
   replyCount,
   lastReplyAt,
+  align = "start",
   onPress
 }: {
   replyCount: number;
   lastReplyAt?: string;
+  // Which edge the chip hugs: "start" under a left-aligned assistant
+  // reply, "end" under a right-aligned user message.
+  align?: "start" | "end";
   onPress: () => void;
 }) {
   const last = lastReplyAt ? relativeTime(lastReplyAt) : null;
@@ -23,7 +27,7 @@ export function ThreadRepliesChip({
     <TouchableOpacity
       onPress={onPress}
       activeOpacity={0.7}
-      style={styles.chip}
+      style={[styles.chip, { alignSelf: align === "end" ? "flex-end" : "flex-start" }]}
       accessibilityRole="button"
       accessibilityLabel={`${replyCount} ${replyCount === 1 ? "reply" : "replies"} in thread`}
     >
@@ -83,7 +87,6 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     gap: 10,
-    alignSelf: "flex-start",
     backgroundColor: "#EEF2FF",
     borderWidth: 1,
     borderColor: "#DCE3FB",
