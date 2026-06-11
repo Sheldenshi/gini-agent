@@ -10,7 +10,6 @@ import { withProviderAuthStatus } from "../provider";
 import {
   clearProviderAuthFailure,
   clearProviderAuthFailureIfPresent,
-  getProviderAuthFailure,
   recordProviderAuthFailure
 } from "./provider-auth";
 import { mutateState, readState } from "./store";
@@ -159,18 +158,6 @@ describe("provider-auth state", () => {
     );
     expect(kept).toBe(false);
     expect(readState(instance).providerAuthFailures?.openai).toBeDefined();
-  });
-
-  test("getProviderAuthFailure reads the record and tolerates the field being absent", async () => {
-    const instance = "pauth-get";
-    let state = readState(instance);
-    expect(getProviderAuthFailure(state, "codex")).toBeUndefined();
-    await mutateState(instance, (s) => {
-      recordProviderAuthFailure(s, { provider: "codex", detail: "expired" });
-    });
-    state = readState(instance);
-    expect(getProviderAuthFailure(state, "codex")?.detail).toBe("expired");
-    expect(getProviderAuthFailure(state, "openai")).toBeUndefined();
   });
 });
 

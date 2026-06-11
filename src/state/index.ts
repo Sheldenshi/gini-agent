@@ -16,13 +16,7 @@ export {
 } from "./store";
 export { appendTrace, readTrace, tracePath, appendLog } from "./trace";
 export { addAudit, appendEvent } from "./audit";
-export {
-  recordProviderAuthFailure,
-  clearProviderAuthFailure,
-  clearProviderAuthFailureIfPresent,
-  getProviderAuthFailure
-} from "./provider-auth";
-export type { ProviderAuthFailureInput } from "./provider-auth";
+export { recordProviderAuthFailure, clearProviderAuthFailureIfPresent } from "./provider-auth";
 export {
   getMemoryDb,
   closeMemoryDb,

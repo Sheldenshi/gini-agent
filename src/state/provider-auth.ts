@@ -117,10 +117,3 @@ export async function clearProviderAuthFailureIfPresent(
   if (!readState(instance).providerAuthFailures?.[provider]) return false;
   return mutateState(instance, (state) => clearProviderAuthFailure(state, provider, options));
 }
-
-export function getProviderAuthFailure(
-  state: RuntimeState,
-  provider: ProviderName
-): ProviderAuthFailureRecord | undefined {
-  return state.providerAuthFailures?.[provider];
-}
