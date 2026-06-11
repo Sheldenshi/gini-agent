@@ -8,12 +8,21 @@
 // of an agent's watched senders).
 //
 // Contract:
-//   stdin:  JSON { watches: [{ watcherId, query, account? }, ...], state: { byWatcher? } | null }
-//   stdout: JSON { kind, items?, summary?, state: { byWatcher } }
+//   stdin:  JSON { watches: [{ watcherId, routeKey?, query, account? }, ...],
+//                  state: { [routeKey]: DetectState } | { byWatcher? } | null }
+//   stdout: JSON { kind, buckets?, summary?, state: { [routeKey]: DetectState } }
 //   exit:   0 always (a gws/transport / signed-out condition is reported PER WATCH
 //           as a status in that watch's state, never a non-zero exit, so the
 //           backing job stays alive and the email read path can derive each
 //           watcher's displayed status)
+//
+// Fan-out: each watch carries a `routeKey` (default = watcherId). The result is no
+// longer a flat items[] — it's ROUTED buckets keyed by routeKey (only non-empty
+// ones), so the generic scheduler spawns one drafting worker per concern into that
+// route's own channel. The returned STATE is keyed by routeKey at the TOP LEVEL
+// (NOT nested under byWatcher) so the generic per-bucket at-least-once commit can
+// partition each concern's cursor independently. A legacy `{ byWatcher }` INPUT is
+// still read transparently (the first tick rewrites it flat).
 //
 // It iterates the watches and, for each, polls `gws` for new matching message ids,
 // dedups against that watch's caller-supplied state (cursor + a tiny boundary
@@ -104,6 +113,10 @@ interface DetectArgs {
 // every add/remove/enable/disable.
 interface Watch {
   watcherId: string;
+  // Fan-out routing key: where this concern's detection bucket is dispatched.
+  // Defaults to watcherId when omitted, so a 1:1 watcher↔route mapping needs no
+  // extra config; the email layer sets it = watcher.id.
+  routeKey?: string;
   query: string;
   account?: string;
   sender?: string;
@@ -113,21 +126,24 @@ interface Watch {
 }
 
 // The shared job's multi-watch input: the list of enabled watches + the opaque
-// per-watch state keyed by watcherId.
+// per-watch state. State is keyed by routeKey at the TOP LEVEL; a legacy
+// `{ byWatcher }` blob is still accepted and read transparently for one
+// transition tick (the first new tick rewrites it flat).
 interface DetectArgsMulti {
   watches?: Watch[];
-  state?: { byWatcher?: Record<string, DetectState> } | null;
+  state?: (Record<string, DetectState> & { byWatcher?: Record<string, DetectState> }) | null;
 }
 
-// The shared job's multi-watch output: all surviving matches across the watches
-// as untrusted items (labeled by sender), an optional non-silent summary (the
-// per-watch backlog notices joined), and the new per-watch state keyed by
-// watcherId for the caller to persist.
+// The shared job's multi-watch output: ROUTED buckets keyed by routeKey (only
+// non-empty ones), each carrying that concern's surviving matches (untrusted) +
+// its trusted context (objective / backlog notice / follow-up); an optional
+// non-silent summary on a fully-silent tick; and the new per-watch state keyed by
+// routeKey at the TOP LEVEL for the generic per-bucket commit to partition.
 interface DetectResultMulti {
   kind: "shortCircuit" | "context";
-  items?: ResultItem[];
+  buckets?: Record<string, ResultItem[]>;
   summary?: string;
-  state: { byWatcher: Record<string, DetectState> };
+  state: Record<string, DetectState>;
 }
 
 interface EmailMetadata {
@@ -412,6 +428,23 @@ export function buildMatchItem(meta: EmailMetadata): ResultItem {
     snippet: meta.snippet ?? ""
   });
   return { text: `New email from ${from} — ${payload}`, untrusted: true };
+}
+
+// The Gmail message id embedded in a match item, for cross-watch precedence
+// dedup. Only untrusted match items carry the `{...,"id":...}` payload buildMatchItem
+// emits; trusted items (objective / backlog notice / follow-up) have none and
+// return undefined (they're never deduped — they're per-concern context, not mail).
+export function matchItemId(item: ResultItem): string | undefined {
+  if (!item.untrusted) return undefined;
+  const start = item.text.indexOf("{");
+  if (start < 0) return undefined;
+  try {
+    const doc = JSON.parse(item.text.slice(start));
+    const id = doc && typeof doc === "object" ? (doc as { id?: unknown }).id : undefined;
+    return typeof id === "string" ? id : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 // The user's standing objective for a watch, as ONE TRUSTED item
@@ -795,35 +828,56 @@ export async function run(
   }
 }
 
-// Run one detection tick across ALL enabled watches of the shared email-watch job
-// (one job + one thread for every watched sender). The gws session is a single
-// signed-in identity, so the auth check + self-address resolution are done ONCE
-// and shared; each watch then runs its own hardened single-watch regime against
-// its own per-watch state in `byWatcher[watcherId]`.
+// Resolve a watch's in-state from the multi-watch input. State is keyed by
+// routeKey at the top level; a legacy `{ byWatcher }` blob is still read for one
+// transition tick (the first new tick rewrites it flat). A watch is "targeted"
+// when it names a single sender or a thread — those CLAIM their matches first so a
+// broad `in:inbox` watch never re-drafts mail a targeted concern already owns.
+function watchRouteKey(watch: Watch): string {
+  return watch.routeKey ?? watch.watcherId;
+}
+function readWatchState(
+  input: DetectArgsMulti["state"],
+  routeKey: string
+): DetectState {
+  if (!input) return {};
+  return input[routeKey] ?? input.byWatcher?.[routeKey] ?? {};
+}
+function isTargeted(watch: Watch): boolean {
+  return Boolean(watch.sender || watch.threadId);
+}
+
+// Run one detection tick across ALL enabled watches of the shared email-watch job.
+// The gws session is a single signed-in identity, so the auth check + self-address
+// resolution are done ONCE and shared; each watch then runs its own hardened
+// single-watch regime against its own per-watch state keyed by routeKey.
 //
 //   - Signed out: every watch is marked needs_auth with its cursor/seen unchanged
 //     (a session-level condition, shared across watches), 0 model turns.
 //   - Per-watch: each watch is wrapped in its own try/catch so one sender's
 //     gws/transport fault marks ONLY that watch's status:"error" (cursor/seen
 //     unchanged) and the other watches still run and can still draft.
-//   - Aggregation: all surviving matches across the watches become the items of a
-//     single `context` result (the ONE drafting turn drafts a reply per match,
-//     each labeled by sender). Per-watch backlog notices ride along: when at least
-//     one watch matched they're appended as TRUSTED context items on the same
-//     context result (so a backlog notice firing in the same tick as a sibling
-//     match isn't dropped while its cursor advances); when nothing matched they're
-//     joined into one non-silent shortCircuit summary instead.
+//   - Fan-out: each watch's surviving matches + its trusted context (objective /
+//     backlog notice / follow-up) land in ITS OWN routeKey bucket, so the generic
+//     scheduler spawns one drafting worker per concern into that concern's channel.
+//     Empty buckets are omitted (per-concern short-circuit; an idle concern costs
+//     zero model turns). When EVERY bucket is empty the whole tick is a silent
+//     shortCircuit (a joined non-silent backlog notice if any fired with no match).
+//   - Precedence: TARGETED watches (sender / thread) run first and CLAIM their
+//     matched message ids; a broad `in:inbox` watch then DROPS any already-claimed
+//     id so one email matching a targeted concern + the broad watch lands in the
+//     targeted bucket only (no double-draft). Per-watch newness/dedup
+//     (cursor+seen) is unchanged — precedence only reassigns which bucket an item
+//     is delivered in; every watch's cursor still advances over what IT consumed.
 //
-// Commit timing is preserved by the consumer: a context result's state is
-// persisted only after the drafting turn dispatches (at-least-once across the
-// whole batch — a re-detect/re-drop on dispatch failure is idempotent); a
-// shortCircuit's state persists immediately.
+// Commit timing is preserved by the consumer: a context bucket's state is
+// persisted only after THAT bucket's drafting worker dispatches (at-least-once
+// per concern); a fully-silent tick's state persists immediately.
 export async function runWatches(args: DetectArgsMulti, gwsSpawn: GwsSpawn): Promise<DetectResultMulti> {
   const watches = Array.isArray(args.watches) ? args.watches : [];
-  const byWatcherIn = args.state?.byWatcher ?? {};
-  const byWatcherOut: Record<string, DetectState> = {};
-  const items: ResultItem[] = [];
-  const notices: string[] = [];
+  const stateOut: Record<string, DetectState> = {};
+  const buckets: Record<string, ResultItem[]> = {};
+  const silentNotices: string[] = [];
 
   // Resolve auth + self ONCE for the shared gws session. A signed-out session is
   // shared by every watch, so short-circuit the whole tick marking each watch
@@ -836,20 +890,26 @@ export async function runWatches(args: DetectArgsMulti, gwsSpawn: GwsSpawn): Pro
     // session. Mark every watch error with its cursor/seen unchanged.
     const scrubbed = scrubError(error instanceof Error ? error.message : String(error));
     for (const watch of watches) {
-      byWatcherOut[watch.watcherId] = { ...(byWatcherIn[watch.watcherId] ?? {}), status: "error", lastError: scrubbed };
+      stateOut[watchRouteKey(watch)] = { ...readWatchState(args.state, watchRouteKey(watch)), status: "error", lastError: scrubbed };
     }
-    return { kind: "shortCircuit", summary: "[SILENT]", state: { byWatcher: byWatcherOut } };
+    return { kind: "shortCircuit", summary: "[SILENT]", state: stateOut };
   }
   if (!signedIn) {
     for (const watch of watches) {
-      byWatcherOut[watch.watcherId] = { ...(byWatcherIn[watch.watcherId] ?? {}), status: "needs_auth", lastError: undefined };
+      stateOut[watchRouteKey(watch)] = { ...readWatchState(args.state, watchRouteKey(watch)), status: "needs_auth", lastError: undefined };
     }
-    return { kind: "shortCircuit", summary: "[SILENT]", state: { byWatcher: byWatcherOut } };
+    return { kind: "shortCircuit", summary: "[SILENT]", state: stateOut };
   }
   const selfEmail = await resolveSelfEmail(gwsSpawn);
 
-  for (const watch of watches) {
-    const stateIn = byWatcherIn[watch.watcherId] ?? {};
+  // Targeted watches run first so they CLAIM their matched ids before any broad
+  // watch is assigned; a broad watch's already-claimed matches are dropped.
+  const ordered = [...watches].sort((a, b) => Number(isTargeted(b)) - Number(isTargeted(a)));
+  const claimedIds = new Set<string>();
+
+  for (const watch of ordered) {
+    const routeKey = watchRouteKey(watch);
+    const stateIn = readWatchState(args.state, routeKey);
     // run() never throws (it maps gws faults onto status in state). The extra
     // try/catch is belt-and-suspenders so a bug in one watch can never abort the
     // others — that watch is marked error and the rest still run.
@@ -869,38 +929,49 @@ export async function runWatches(args: DetectArgsMulti, gwsSpawn: GwsSpawn): Pro
         selfEmail
       );
     } catch (error) {
-      byWatcherOut[watch.watcherId] = {
+      stateOut[routeKey] = {
         ...stateIn,
         status: "error",
         lastError: scrubError(error instanceof Error ? error.message : String(error))
       };
       continue;
     }
-    byWatcherOut[watch.watcherId] = result.state;
+    stateOut[routeKey] = result.state;
     if (result.kind === "context" && result.items) {
-      items.push(...result.items);
+      // Precedence: a broad (non-targeted) watch drops match items already claimed
+      // by a targeted watch this tick; a targeted watch claims its own. Trusted
+      // items (objective / follow-up) carry no id and always ride through.
+      const kept: ResultItem[] = [];
+      for (const item of result.items) {
+        const id = matchItemId(item);
+        if (id) {
+          if (!isTargeted(watch) && claimedIds.has(id)) continue;
+          if (isTargeted(watch)) claimedIds.add(id);
+        }
+        kept.push(item);
+      }
+      // A broad watch can drop EVERY match to precedence, leaving only trusted
+      // items (objective rides ONLY on a real match, so a fully-claimed broad
+      // watch yields nothing). Only open a bucket when an actual match survives —
+      // an empty/match-less bucket spawns no worker.
+      if (kept.some((i) => i.untrusted)) buckets[routeKey] = kept;
     } else if (result.summary && result.summary.trim() !== "[SILENT]" && result.summary.trim().length > 0) {
-      // A non-silent shortCircuit summary (a per-watch backlog notice) — collect
-      // it for the joined summary when no watch produced a draftable match.
-      notices.push(result.summary);
+      // A non-silent shortCircuit summary (a per-watch backlog notice). Route it
+      // into THIS concern's bucket as a TRUSTED item so the concern's worker
+      // surfaces it; collect for the joined silent-tick summary as a fallback.
+      buckets[routeKey] = [{ text: result.summary, untrusted: false }];
+      silentNotices.push(result.summary);
     }
   }
 
-  // Any matches across the watches => ONE drafting turn (context). Otherwise a
-  // shortCircuit: a joined backlog notice if any fired, else silent.
-  if (items.length > 0) {
-    // A sibling watch can hit a truncated-window backlog in the SAME tick that
-    // another watch produces a draftable match. The matching watch makes this a
-    // context result (which commits every watch's advanced cursor on dispatch),
-    // so the backlog notice would otherwise be dropped while its cursor still
-    // advances — losing it for that episode. Carry each notice as a TRUSTED
-    // context item (untrusted:false) so the single drafting turn surfaces the
-    // backlog notice(s) alongside the drafts.
-    const noticeItems: ResultItem[] = notices.map((text) => ({ text, untrusted: false }));
-    return { kind: "context", items: [...items, ...noticeItems], state: { byWatcher: byWatcherOut } };
+  const routeKeys = Object.keys(buckets);
+  if (routeKeys.length === 0) {
+    // Every bucket empty: a silent tick (zero idle turns). Surface any backlog
+    // notice that fired without a sibling match as one non-silent summary.
+    const summary = silentNotices.length > 0 ? silentNotices.join("\n\n") : "[SILENT]";
+    return { kind: "shortCircuit", summary, state: stateOut };
   }
-  const summary = notices.length > 0 ? notices.join("\n\n") : "[SILENT]";
-  return { kind: "shortCircuit", summary, state: { byWatcher: byWatcherOut } };
+  return { kind: "context", buckets, state: stateOut };
 }
 
 async function main(): Promise<void> {
@@ -908,12 +979,12 @@ async function main(): Promise<void> {
   try {
     args = await readStdinJson<DetectArgsMulti>();
   } catch (error) {
-    // Bad stdin is reported as a shortCircuit with an empty byWatcher state, not a
+    // Bad stdin is reported as a shortCircuit with empty per-route state, not a
     // non-zero exit, so the backing job stays alive. No prior state to preserve.
     process.stdout.write(JSON.stringify({
       kind: "shortCircuit",
       summary: "[SILENT]",
-      state: { byWatcher: {} }
+      state: {}
     } satisfies DetectResultMulti));
     return;
   }
