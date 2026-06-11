@@ -959,6 +959,12 @@ type WalkerFakeEl = {
   // throwing getter (via Object.defineProperty) for cross-origin ones.
   contentDocument?: unknown;
   parentElement: WalkerFakeEl | null;
+  // Direct child text nodes the prose-text walker reads (Node.TEXT_NODE
+  // === 3). Synthesized from the `directText` init field; element
+  // children live under `children`, not here, so the walker's direct-text
+  // read never picks them up. Absent unless a test opts in, so existing
+  // walker tests stay byte-identical.
+  childNodes?: Array<{ nodeType: number; textContent: string }>;
   getAttribute(name: string): string | null;
   setAttribute(name: string, value: string): void;
   removeAttribute(name: string): void;
@@ -979,6 +985,7 @@ const makeWalkerEl = (init: {
   cursor?: string;
   children?: WalkerFakeEl[];
   textContent?: string;
+  directText?: string;
   attrs?: Record<string, string>;
 }): WalkerFakeEl => {
   const visible = init.visible ?? true;
@@ -997,6 +1004,9 @@ const makeWalkerEl = (init: {
     _visible: visible,
     _cursor: init.cursor ?? "auto",
     parentElement: null,
+    ...(init.directText !== undefined
+      ? { childNodes: [{ nodeType: 3, textContent: init.directText }] }
+      : {}),
     getAttribute(name: string) {
       return Object.prototype.hasOwnProperty.call(this._attrs, name) ? this._attrs[name]! : null;
     },
@@ -1323,6 +1333,152 @@ describe("snapshot walker — cursor-interactive clickables", () => {
 // SNAPSHOT_CHAR_BUDGET, the [...truncated] marker carries the count of
 // entries that never made it into the text, so the model can weigh
 // scrolling on against stopping.
+// Prose-text emission (FULL mode only). The accessibility walk drops
+// plain text containers (comment bodies, article paragraphs) because they
+// carry no interactive role; the full-mode prose branch emits ONE "text"
+// row per leaf prose container, reading its DIRECT text nodes (not the
+// recursive textContent that would re-emit nested controls' names). Diff
+// (full=false) walks never run the branch, so post-action snapshots stay
+// noise-free.
+describe("snapshot walker — prose text rows", () => {
+  const makeEl = makeWalkerEl;
+  const installFakeDom = installWalkerDom;
+  const makeFakePage = (): import("playwright-core").Page =>
+    ({
+      evaluate: <A, R>(fn: (arg: A) => R | Promise<R>, arg?: A): Promise<R> => Promise.resolve(fn(arg as A)),
+      locator: (sel: string) => ({ __sel: sel } as unknown)
+    } as unknown as import("playwright-core").Page);
+
+  afterEach(() => {
+    browserTest.resetFilledSecretsForTest();
+  });
+
+  test("full mode emits a text row for a prose container; inline link still emits its own row, no duplication", async () => {
+    // <div class="commtext">  ← prose container, no role
+    //   "This is a great point about "  ← direct text node
+    //   <a href="...">the article</a>   ← inline child, own link row
+    //   " and I agree."                  ← direct text node
+    // </div>
+    const link = makeEl({ tagName: "A", textContent: "the article", attrs: { href: "https://example.com/a" } });
+    const commtext = makeEl({
+      tagName: "DIV",
+      directText: "This is a great point about and I agree.",
+      children: [link]
+    });
+    const body = makeEl({ tagName: "BODY", children: [commtext] });
+    const restore = installFakeDom(body);
+    try {
+      const full = await browserTest.snapshotForTest(makeFakePage(), true);
+      // The prose container's direct text is surfaced as a text row.
+      expect(full.text).toContain('text "This is a great point about and I agree."');
+      // The inline <a> still emits its own link row.
+      expect(full.text).toContain("link");
+      expect(full.text).toContain("the article");
+      // The link's name appears once (its own row), never folded into the
+      // prose row — reading direct text nodes only avoids the duplication.
+      const proseRow = full.text.split("\n").find((l) => l.includes(' text "')) ?? "";
+      expect(proseRow).not.toContain("the article");
+    } finally {
+      restore();
+    }
+  });
+
+  test("diff mode (full=false) emits NO text row", async () => {
+    const commtext = makeEl({
+      tagName: "DIV",
+      directText: "Some prose that full mode would surface."
+    });
+    const body = makeEl({ tagName: "BODY", children: [commtext] });
+    const restore = installFakeDom(body);
+    try {
+      const diff = await browserTest.snapshotForTest(makeFakePage(), false);
+      expect(diff.text).not.toContain("text \"");
+      expect(diff.text).not.toContain("Some prose");
+    } finally {
+      restore();
+    }
+  });
+
+  test("a prose container with a non-inline child element does not emit a text row", async () => {
+    // A <div> wrapping a <div> is a structural container, not a leaf prose
+    // block — its text belongs to the descendants, walked separately.
+    const inner = makeEl({ tagName: "DIV", directText: "Inner prose." });
+    const outer = makeEl({
+      tagName: "DIV",
+      directText: "Outer wrapper text.",
+      children: [inner]
+    });
+    const body = makeEl({ tagName: "BODY", children: [outer] });
+    const restore = installFakeDom(body);
+    try {
+      const full = await browserTest.snapshotForTest(makeFakePage(), true);
+      // The leaf inner div emits a text row; the structural outer does not.
+      expect(full.text).toContain('text "Inner prose."');
+      expect(full.text).not.toContain("Outer wrapper text.");
+    } finally {
+      restore();
+    }
+  });
+
+  test("a text row longer than the per-row cap is sliced", async () => {
+    const long = "z".repeat(900);
+    const commtext = makeEl({ tagName: "P", directText: long });
+    const body = makeEl({ tagName: "BODY", children: [commtext] });
+    const restore = installFakeDom(body);
+    try {
+      const full = await browserTest.snapshotForTest(makeFakePage(), true);
+      const proseRow = full.text.split("\n").find((l) => l.includes(' text "')) ?? "";
+      const m = /text "(z+)"/.exec(proseRow);
+      expect(m).not.toBeNull();
+      // SNAPSHOT_TEXT_ROW_MAX_CHARS = 400.
+      expect(m![1]!.length).toBe(400);
+    } finally {
+      restore();
+    }
+  });
+
+  test("a registered secret embedded in prose is redacted in the emitted text row", async () => {
+    const secret = "hunter2-super-secret-value";
+    browserTest.recordFilledSecretForTest("t-prose-secret", secret);
+    const commtext = makeEl({
+      tagName: "P",
+      directText: `My password is ${secret} please keep it safe.`
+    });
+    const body = makeEl({ tagName: "BODY", children: [commtext] });
+    const restore = installFakeDom(body);
+    try {
+      const full = await browserTest.snapshotForTest(makeFakePage(), true, "t-prose-secret");
+      const proseRow = full.text.split("\n").find((l) => l.includes(' text "')) ?? "";
+      expect(proseRow).toContain("[redacted]");
+      expect(full.text).not.toContain(secret);
+    } finally {
+      restore();
+    }
+  });
+
+  test("prose-heavy full-mode page rides the existing char-budget truncation path", async () => {
+    // 400 prose blocks of ~900 chars each → far past the 32k char budget;
+    // the prose rows must clip via the existing counted marker, not blow
+    // the budget. Asserts the assembled text stays bounded.
+    const children: WalkerFakeEl[] = [];
+    for (let i = 0; i < 400; i++) {
+      children.push(makeEl({ tagName: "P", directText: `block-${i}-${"y".repeat(880)}` }));
+    }
+    const body = makeEl({ tagName: "BODY", children });
+    const restore = installFakeDom(body);
+    try {
+      const full = await browserTest.snapshotForTest(makeFakePage(), true);
+      expect(full.truncated).toBe(true);
+      expect(full.text).toMatch(/\[\.\.\.truncated \+\d+ more entries\]/);
+      // The kept body (everything before the marker) stays within budget.
+      const kept = full.text.split("\n[...truncated")[0]!;
+      expect(kept.length).toBeLessThanOrEqual(32_000);
+    } finally {
+      restore();
+    }
+  });
+});
+
 describe("snapshot walker — char-budget truncation count", () => {
   const makeEl = makeWalkerEl;
   const installFakeDom = installWalkerDom;

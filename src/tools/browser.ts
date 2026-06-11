@@ -1510,6 +1510,14 @@ const SNAPSHOT_HIDDEN_BUDGET = 50;
 // cursor-interactivity pass; see ADR browser-automation-engine.md.
 const SNAPSHOT_CLICKABLE_BUDGET = 75;
 
+// Per-row cap on prose-text emission (full-mode only). A prose container
+// (e.g. a comment body, an article paragraph block) gets ONE "text" row
+// holding its direct text content, sliced to this length so a single
+// long block can't dominate the snapshot. Many rows still ride the
+// shared SNAPSHOT_CHAR_BUDGET, so a text-heavy page truncates via the
+// existing counted markers / aux-summary remainder path.
+const SNAPSHOT_TEXT_ROW_MAX_CHARS = 400;
+
 // Bot-wall / challenge-page detection. Challenge interstitials
 // (Cloudflare "Just a moment...", CAPTCHA walls, Akamai / PerimeterX
 // blocks) render no DOM the agent can act on and never change on
@@ -1727,7 +1735,7 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
   };
 
   const raw = await page.evaluate(
-    ({ attr, fullMode, hiddenBudget, clickableBudget, startId }: { attr: string; fullMode: boolean; hiddenBudget: number; clickableBudget: number; startId: number }) => {
+    ({ attr, fullMode, hiddenBudget, clickableBudget, textRowMaxChars, startId }: { attr: string; fullMode: boolean; hiddenBudget: number; clickableBudget: number; textRowMaxChars: number; startId: number }) => {
       const INTERACTIVE_TAGS = new Set([
         "A",
         "BUTTON",
@@ -1823,6 +1831,42 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
         if (rect.width === 0 && rect.height === 0) return false;
         const style = viewOf(el).getComputedStyle(el as HTMLElement);
         if (style.display === "none" || style.visibility === "hidden") return false;
+        return true;
+      };
+
+      // Prose-text emission (full mode only). A prose container — a div /
+      // p of comment-body or article text whose element children are only
+      // inline/text-level (e.g. <a>, <span>, <b>) — carries no interactive
+      // role, so the accessibility walk would drop its text entirely. The
+      // helpers below read the element's DIRECT text nodes only (NOT
+      // recursive textContent, which would re-emit nested controls' names
+      // that already get their own rows) and decide whether the element is
+      // a leaf prose block worth one "text" row.
+      const INLINE_TEXT_TAGS = new Set([
+        "A", "ABBR", "B", "BR", "CITE", "CODE", "EM", "I", "MARK", "P",
+        "Q", "S", "SMALL", "SPAN", "STRONG", "SUB", "SUP", "TIME", "U", "WBR"
+      ]);
+      // Direct child text nodes only — never descends into element
+      // children, so a nested emitted control's name isn't duplicated here.
+      // Test fakes without childNodes return "" (no text row), keeping
+      // existing walker tests byte-identical unless they opt in.
+      const directText = (el: Element): string => {
+        const nodes = (el as Element & { childNodes?: ArrayLike<{ nodeType: number; textContent: string | null }> }).childNodes;
+        if (!nodes) return "";
+        let acc = "";
+        for (const node of Array.from(nodes)) {
+          // Node.TEXT_NODE === 3
+          if (node.nodeType === 3) acc += `${node.textContent ?? ""} `;
+        }
+        return acc.replace(/\s+/g, " ").trim();
+      };
+      // A leaf prose block: every element child is inline/text-level (so
+      // its prose belongs to this container, not to a nested structural
+      // region that will be walked separately). Empty-children counts.
+      const isProseContainer = (el: Element): boolean => {
+        for (const child of Array.from(el.children)) {
+          if (!INLINE_TEXT_TAGS.has(child.tagName)) return false;
+        }
         return true;
       };
 
@@ -2122,10 +2166,31 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
               SECTION: "region"
             };
             const fallbackRole = role ?? tagToRole[tag];
+            let emittedLandmark = false;
             if (fallbackRole && landmarkRoles.includes(fallbackRole)) {
               const text = (el.textContent ?? "").replace(/\s+/g, " ").trim().slice(0, 200);
               if (text) {
                 out.push({ ref: "", role: fallbackRole, name: text, value: "", url: "", depth, full: true, hidden: false, frameRef: frameId });
+                emittedLandmark = true;
+              }
+            }
+            // Prose-text fallback: a visible, non-interactive, non-clickable
+            // leaf prose container (its element children are only
+            // inline/text-level) gets ONE low-priority "text" row holding
+            // its DIRECT text content. This captures comment bodies /
+            // article paragraphs the accessibility walk would otherwise
+            // drop. Skipped when a landmark row already covered this element
+            // (no double-emit) and for data-gini-secret-stamped elements
+            // (their text is the typed value — never emit raw). Inline child
+            // links/spans still emit their own rows via the recursion below;
+            // reading direct text nodes only means their names aren't
+            // duplicated in this row. Sliced to bound a single block; the
+            // post-pass redaction + SNAPSHOT_CHAR_BUDGET apply to it like
+            // every other row.
+            if (!emittedLandmark && el.getAttribute("data-gini-secret") === null && isProseContainer(el)) {
+              const prose = directText(el).slice(0, textRowMaxChars);
+              if (prose.length > 1) {
+                out.push({ ref: "", role: "text", name: prose, value: "", url: "", depth, full: true, hidden: false, frameRef: frameId });
               }
             }
           }
@@ -2135,7 +2200,7 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
       walk(document.body, 0, false);
       return { entries: out, hiddenEmitted, hiddenTotal, hiddenBudget, clickableEmitted, clickableTotal, nextId };
     },
-    { attr: REF_ATTR, fullMode: full, hiddenBudget: SNAPSHOT_HIDDEN_BUDGET, clickableBudget: SNAPSHOT_CLICKABLE_BUDGET, startId }
+    { attr: REF_ATTR, fullMode: full, hiddenBudget: SNAPSHOT_HIDDEN_BUDGET, clickableBudget: SNAPSHOT_CLICKABLE_BUDGET, textRowMaxChars: SNAPSHOT_TEXT_ROW_MAX_CHARS, startId }
   );
 
   const refs = new Map<string, RefTarget>();
