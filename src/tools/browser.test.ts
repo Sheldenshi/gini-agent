@@ -3796,6 +3796,25 @@ describe("browser dialog capture and browser_dialog", () => {
     expect(records[4]!.message).toBe("dialog 7");
   });
 
+  test("browser_dialog refuses a promptText containing a registered secret and arms nothing", async () => {
+    const { page, handlers } = makeDialogPage();
+    browserTest.installFakeSessionWithPageForTest("dlg-secret-arm", page as Partial<import("playwright-core").Page>);
+    browserTest.attachDialogHandlerForTest("dlg-secret-arm", page);
+    browserTest.recordFilledSecretForTest("dlg-secret-arm", "hunter2secret");
+
+    const raw = await browserDialog("dlg-secret-arm", { action: "accept", promptText: "pw: hunter2secret" });
+    expect(raw).not.toContain("hunter2secret");
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toContain("registered secret");
+
+    // Nothing was armed: the next dialog takes the default dismiss path
+    // and never receives the prompt text.
+    const { dialog, responses } = makeFakeDialog({ type: "prompt", message: "Password?" });
+    handlers.get("dialog")!(dialog);
+    expect(responses).toEqual(["dismiss"]);
+  });
+
   test("a registered secret inside the dialog message is redacted in the surfaced record", async () => {
     const { page, handlers } = makeDialogPage();
     browserTest.installFakeSessionWithPageForTest("dlg-redact", page as Partial<import("playwright-core").Page>);
@@ -4047,6 +4066,26 @@ describe("browserCookies", () => {
     const parsed = JSON.parse(await browserCookies("cookies-none", {})) as { success: boolean; error?: string };
     expect(parsed.success).toBe(false);
     expect(parsed.error).toMatch(/not supported/);
+  });
+
+  test("refuses to read cookies while the page sits on a disallowed origin", async () => {
+    const cookieCalls: Array<string | undefined> = [];
+    const page = { url: () => "http://127.0.0.1:7338/admin" } as unknown as Partial<import("playwright-core").Page>;
+    const context = {
+      cookies: async (url?: string) => {
+        cookieCalls.push(url);
+        return [sessionCookie];
+      }
+    } as unknown as Partial<import("playwright-core").BrowserContext>;
+    browserTest.installFakeSessionWithPageAndContextForTest("cookies-blocked", page, context);
+
+    const raw = await browserCookies("cookies-blocked", {});
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toContain("refusing to read cookies");
+    // The cookie surface was never consulted.
+    expect(cookieCalls).toEqual([]);
+    expect(raw).not.toContain("supersecretsessiontoken");
   });
 });
 
@@ -4968,7 +5007,12 @@ describe("browserDownloadApproved", () => {
   // download promise with a stubbed Download.
   function installDownloadSession(
     taskId: string,
-    download: { suggestedFilename: () => string; saveAs: (p: string) => Promise<void> },
+    download: {
+      suggestedFilename: () => string;
+      saveAs: (p: string) => Promise<void>;
+      url?: () => string;
+      cancel?: () => Promise<void>;
+    },
     opts: { clickThrows?: boolean } = {}
   ): { clicks: () => number } {
     let clicks = 0;
@@ -4991,19 +5035,50 @@ describe("browserDownloadApproved", () => {
 
   test("clicks the ref, saves under the instance downloads dir, and reports path/size/suggested filename", async () => {
     const download = {
+      url: () => "https://cdn.example.com/files/invoice.pdf",
       suggestedFilename: () => "invoice.pdf",
       saveAs: async (p: string) => writeFileSync(p, "PDF-BYTES")
     };
     const counter = installDownloadSession("dl-ok", download);
 
     const raw = await browserDownloadApproved("dl-ok", "@e2", "dl-ok-inst");
-    const parsed = JSON.parse(raw) as { success: boolean; path?: string; size?: number; suggestedFilename?: string };
+    const parsed = JSON.parse(raw) as { success: boolean; path?: string; size?: number; suggestedFilename?: string; downloadUrl?: string };
     expect(parsed.success).toBe(true);
     expect(counter.clicks()).toBe(1);
     expect(parsed.path).toBe(join(downloadsDirFor("dl-ok-inst"), "invoice.pdf"));
     expect(parsed.size).toBe("PDF-BYTES".length);
     expect(parsed.suggestedFilename).toBe("invoice.pdf");
+    // The real source the bytes came from rides the result for the audit row.
+    expect(parsed.downloadUrl).toBe("https://cdn.example.com/files/invoice.pdf");
     expect(existsSync(parsed.path!)).toBe(true);
+  });
+
+  test("blocks a download whose source URL fails the SSRF gate, cancelling before any save", async () => {
+    let cancelled = 0;
+    let saved = 0;
+    const download = {
+      // The page URL is allowed; the element's actual download source
+      // resolves to the cloud metadata endpoint — the gate must check the
+      // SOURCE, not the page.
+      url: () => "http://169.254.169.254/latest/meta-data/iam",
+      suggestedFilename: () => "meta.txt",
+      saveAs: async (p: string) => {
+        saved++;
+        writeFileSync(p, "x");
+      },
+      cancel: async () => {
+        cancelled++;
+      }
+    };
+    installDownloadSession("dl-ssrf", download);
+
+    const raw = await browserDownloadApproved("dl-ssrf", "@e2", "dl-ssrf-inst");
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toContain("download source URL");
+    expect(cancelled).toBe(1);
+    expect(saved).toBe(0);
+    expect(existsSync(downloadsDirFor("dl-ssrf-inst"))).toBe(false);
   });
 
   test("sanitizes a traversal-laden suggested filename down to its basename", async () => {

@@ -2200,9 +2200,9 @@ async function runApprovedAction(
       return abortedResult;
     }
     const result = outcome.value;
-    let parsed: { success?: boolean; error?: string; path?: string; size?: number } = {};
+    let parsed: { success?: boolean; error?: string; path?: string; size?: number; downloadUrl?: string | null } = {};
     try {
-      parsed = JSON.parse(result) as { success?: boolean; error?: string; path?: string; size?: number };
+      parsed = JSON.parse(result) as { success?: boolean; error?: string; path?: string; size?: number; downloadUrl?: string | null };
     } catch {
       parsed = { success: true };
     }
@@ -2221,6 +2221,10 @@ async function runApprovedAction(
             ...extraEvidence,
             ref,
             source: sourceUrl || null,
+            // The URL the bytes actually came from (page-URL `source` is
+            // only where the click happened) — reported by the gated
+            // download path in browser.ts.
+            downloadUrl: parsed.downloadUrl ?? null,
             savedPath: parsed.path ?? null,
             size: parsed.size ?? null,
             success: parsed.success !== false,

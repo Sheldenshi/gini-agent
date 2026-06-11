@@ -3603,6 +3603,19 @@ export async function browserDialog(taskId: string, args: Record<string, unknown
     return fail("Argument 'promptText' must be a string.");
   }
   const promptText = typeof args.promptText === "string" ? args.promptText : undefined;
+  // promptText is typed into page JS when the dialog fires — an outbound
+  // channel into the page. Defensive mirror of the browser_fill_form gate:
+  // a registered secret fails closed with a generic message that never
+  // echoes the value (values under the redaction floor are skipped for the
+  // same false-positive reason recordFilledSecret refuses them).
+  if (promptText !== undefined) {
+    for (const secret of allRegisteredSecrets()) {
+      if (secret.length < FILLED_SECRET_MIN_REDACTION_LENGTH) continue;
+      if (promptText.includes(secret)) {
+        return fail("Blocked: promptText contains a registered secret. Use browser_fill_secrets for credentials/secrets.");
+      }
+    }
+  }
   try {
     return await withSession(taskId, async (session) => {
       pendingDialogResponses.set(taskId, {
@@ -3687,6 +3700,15 @@ export async function browserCookies(taskId: string, args: Record<string, unknow
       const context = session.context;
       if (!context || typeof context.cookies !== "function") {
         return fail("Cookie read is not supported by this browser session.");
+      }
+      // Cookies are live page/origin state. Like every other live-page
+      // reader (console, vision, the snapshot boundary), refuse to read
+      // them while the page sits on a disallowed origin — otherwise a
+      // redirect onto a blocked host would let its cookie metadata reach
+      // the model.
+      const originBlock = await disallowedOriginReason(session.page, taskId);
+      if (originBlock) {
+        return fail(`${originBlock} (refusing to read cookies from a disallowed origin)`);
       }
       const pageUrl = typeof session.page.url === "function" ? session.page.url() : "";
       // Scope to the current page when it has a real http(s) URL so the
@@ -4615,6 +4637,22 @@ export async function browserDownloadApproved(
       downloadPromise.catch(() => undefined);
       await target.locator.click({ timeout: 10_000 });
       const download = await downloadPromise;
+      // Trust boundary: the approval named the PAGE the click happens on,
+      // but the browser fetches the download from wherever the element
+      // points (redirect targets, signed CDN URLs, attacker-controlled
+      // hrefs) — so the actual download SOURCE must pass the same SSRF
+      // gate + agent domain policy as navigation before any bytes are
+      // saved. On a block the transfer is cancelled and nothing is kept.
+      const downloadUrl = typeof download.url === "function" ? download.url() : "";
+      const sourceBlock = downloadUrl
+        ? safetyCheck(downloadUrl) ?? domainPolicyBlockReason(downloadUrl, agentDomainPolicyForTask(taskId))
+        : undefined;
+      if (sourceBlock) {
+        if (typeof download.cancel === "function") {
+          await download.cancel().catch(() => undefined);
+        }
+        return fail(`${sourceBlock} (download source URL)`);
+      }
       const suggested = typeof download.suggestedFilename === "function" ? download.suggestedFilename() : "";
       const filename = sanitizeDownloadFilename(suggested || "download");
       const dir = downloadsDir(instance);
@@ -4633,6 +4671,10 @@ export async function browserDownloadApproved(
       }
       return ok({
         url: session.page.url(),
+        // The real source the bytes came from (gated above) — surfaced so
+        // the audit row records where the download actually originated,
+        // not just the page it was triggered from.
+        downloadUrl: downloadUrl || null,
         path: savedPath,
         suggestedFilename: suggested || null,
         size
