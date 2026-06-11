@@ -589,11 +589,14 @@ export function BlockSetupRequested({ block }: { block: SetupRequestedBlock }) {
           {expanded ? "Hide details" : "Show details"}
         </button>
       </div>
-      {/* While a chat.choice card is pending, the question renders inside the
-          choice body (with its leading icon) — a summary line above it would
-          duplicate it. Resolved chat.choice rows fall back to the past-tense
-          summary like every other card. */}
-      {!isConnectorRequest && !(isChatChoice && isPending) ? (
+      {/* While a pending chat.choice card is mounted, the question renders
+          inside the choice body (with its leading icon) — a summary line
+          above it would duplicate it. This condition must mirror the
+          ChoiceCard mount condition below exactly: until the setup row
+          loads, the card isn't rendered, so the summary (which carries the
+          question) must stay visible. Resolved chat.choice rows fall back
+          to the past-tense summary like every other card. */}
+      {!isConnectorRequest && !(isChatChoice && isPending && setup) ? (
         <p className="mt-1 text-xs text-muted-foreground">{displaySummary}</p>
       ) : null}
       {expanded && setup ? (
@@ -1006,18 +1009,13 @@ function parseChoiceOptions(raw: unknown): ChoiceOption[] {
   return out;
 }
 
-// Sentinel for the always-present freeform option. Option labels come from
-// the model but the dispatcher trims them, so a leading/trailing-space
-// collision is impossible; even a literal "__other__" option label is safe
-// because the radio value comparison uses this exact string only for the
-// card-injected row.
-const OTHER_VALUE = "__other__";
-
 // Single-select question card for a pending chat.choice SetupRequest. The
 // options come from the trusted setup payload; the card always adds its own
 // "Other (type your answer)" freeform row and a subtle Skip affordance
 // (Skip = the shared /cancel endpoint, which resumes the agent with a skip
-// fallback rather than failing the task).
+// fallback rather than failing the task). Selection state is the option
+// INDEX (or the literal "other" tag for the card-injected freeform row) so
+// no model-emitted option label can ever collide with the freeform row.
 function ChoiceCard({
   setupRequestId,
   question,
@@ -1032,7 +1030,7 @@ function ChoiceCard({
   skipPending: boolean;
 }) {
   const invalidate = useInvalidate();
-  const [selected, setSelected] = useState<string | null>(null);
+  const [selected, setSelected] = useState<number | "other" | null>(null);
   const [otherText, setOtherText] = useState("");
 
   const submit = useMutation({
@@ -1040,9 +1038,9 @@ function ChoiceCard({
       api<{ ok: boolean }>(`/setup-requests/${setupRequestId}/complete`, {
         method: "POST",
         body: JSON.stringify(
-          selected === OTHER_VALUE
+          selected === "other"
             ? { choice: { other: otherText.trim() } }
-            : { choice: { label: selected } }
+            : { choice: { label: typeof selected === "number" ? options[selected]?.label : null } }
         )
       }),
     onSuccess: () => {
@@ -1051,7 +1049,7 @@ function ChoiceCard({
     onError: (error: Error) => toast.error(error.message)
   });
 
-  const ready = selected === OTHER_VALUE ? otherText.trim().length > 0 : selected !== null;
+  const ready = selected === "other" ? otherText.trim().length > 0 : selected !== null;
 
   return (
     <div className="mt-2 space-y-2">
@@ -1060,7 +1058,7 @@ function ChoiceCard({
         <p className="text-sm font-medium">{question}</p>
       </div>
       <div className="space-y-1">
-        {options.map((option) => (
+        {options.map((option, index) => (
           <label
             key={option.label}
             className="flex cursor-pointer items-start gap-2 rounded-md border border-border bg-background/40 px-2 py-1.5 hover:bg-background/70"
@@ -1069,8 +1067,8 @@ function ChoiceCard({
               type="radio"
               name={`${setupRequestId}-choice`}
               className="mt-0.5"
-              checked={selected === option.label}
-              onChange={() => setSelected(option.label)}
+              checked={selected === index}
+              onChange={() => setSelected(index)}
               disabled={submit.isPending}
             />
             <span>
@@ -1086,13 +1084,13 @@ function ChoiceCard({
             type="radio"
             name={`${setupRequestId}-choice`}
             className="mt-0.5"
-            checked={selected === OTHER_VALUE}
-            onChange={() => setSelected(OTHER_VALUE)}
+            checked={selected === "other"}
+            onChange={() => setSelected("other")}
             disabled={submit.isPending}
           />
           <span className="text-xs text-foreground">Other (type your answer)</span>
         </label>
-        {selected === OTHER_VALUE ? (
+        {selected === "other" ? (
           <Input
             value={otherText}
             onChange={(e) => setOtherText(e.target.value)}

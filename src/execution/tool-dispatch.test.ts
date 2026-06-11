@@ -1806,4 +1806,36 @@ describe("ask_user dispatch", () => {
     }
     expect(readState(instance).setupRequests.filter((a) => a.taskId === task.id).length).toBe(0);
   });
+
+  test("surface guard: rejects a session whose only surface is an outbound mirror", async () => {
+    // Dedicated job-spawned sessions intentionally leave `source`
+    // undefined (so they don't compete for inbound routing) and record
+    // the bridge descriptor on `outboundMirror` instead — the guard
+    // must check both fields, or such a session would park in
+    // waiting_approval with no card anywhere to answer.
+    const instance = `ask-user-mirror-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const task = createTask(config.instance, "mirror ask_user test");
+    await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "job session");
+      // Job-spawned: no inbound source, only the outbound mirror.
+      session.outboundMirror = { kind: "telegram", bridgeId: "b1", chatId: 1, target: "t" };
+      task.chatSessionId = session.id;
+      upsertTask(state, task);
+    });
+    const result = await dispatchToolCall(
+      config,
+      task.id,
+      "ask_user",
+      "call_mirror",
+      JSON.stringify({ question: "Pick?", options: [{ label: "A" }, { label: "B" }] })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      const parsed = JSON.parse(result.result);
+      expect(parsed.ok).toBe(false);
+      expect(parsed.error).toContain("regular message");
+    }
+    expect(readState(instance).setupRequests.filter((a) => a.taskId === task.id).length).toBe(0);
+  });
 });
