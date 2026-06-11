@@ -5,7 +5,7 @@ license: MIT
 compatibility: "macOS and Linux. Requires the `gws` CLI authenticated against a Google account with Gmail scopes."
 metadata:
   gini:
-    version: 1.1.2
+    version: 1.2.0
     author: Gini
     platforms: [macos, linux]
     prerequisites:
@@ -91,6 +91,29 @@ gws gmail +send --to alice@example.com --subject 'Update' \
 gws gmail +send --to alice@example.com --subject 'Draft' --body 'WIP' --draft
 ```
 
+### Show a saved draft to the user
+
+After you save a draft (`--draft`), show it to the user inline so they can read it right in the chat — never tell them to open Gmail and search for it. Lead with one short sentence, then render the draft as a fenced `email-draft` block: optional `To:` / `Cc:` / `Subject:` header lines, a blank line, then the exact body you saved.
+
+````text
+I drafted this reply for you:
+
+```email-draft
+To: support@plaud.ai
+Subject: Follow-up on your Request #527545
+
+Hi there,
+
+I still haven't received the package, and the delivery photo shows it was left
+inside a publicly accessible gate. Could you reopen the case and coordinate a
+replacement or refund?
+
+Thanks
+```
+````
+
+Use the same recipient, subject, and body you passed to `gws gmail +send … --draft` so the card matches the saved draft. The app renders the `email-draft` block as a draft card; any non-rendering client degrades it to a readable code block.
+
 ### Read
 
 ```bash
@@ -149,5 +172,6 @@ gws gmail +watch        # streams new messages as NDJSON (one JSON object per li
 5. Do not bulk-send from a personal `@gmail.com` account. Google throttles or suspends accounts that look like bulk senders. Use a transactional provider for newsletters or anything addressed to more than a handful of recipients.
 6. Attachment cap is 25 MB total. For larger files, upload via `google-drive` and send the share link instead.
 7. Never paste raw message bodies that contain secrets (API keys, passwords, MFA codes) back into the chat transcript. Summarize, redact, or write to a file the user controls.
+8. When you save a draft, surface it to the user with an `email-draft` fenced block (see "Show a saved draft to the user") instead of pointing them at Gmail. The user should be able to read the draft without leaving the app.
 
 For flags not shown here, run `gws gmail --help` or `gws gmail <verb> --help` (e.g. `gws gmail +send --help`).

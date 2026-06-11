@@ -3,11 +3,14 @@ import { mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   __test as browserTest,
+  browserClick,
   browserConsole,
   browserDrag,
+  browserFillByLocator,
   browserHover,
   browserNavigate,
   browserSelectOption,
+  browserSnapshot,
   browserTabs,
   browserUploadFile,
   browserVision,
@@ -689,6 +692,158 @@ describe("snapshot walker — <select> option surfacing", () => {
   });
 });
 
+// Shared fake-DOM scaffolding for the snapshot-walker suites below. Each
+// test plants its own document.body, calls __test.snapshotForTest with a
+// fake page that runs the evaluate-callback locally, and restores globals
+// on exit. The element model is the superset every suite needs:
+// per-element computed cursor, parentElement wiring (makeWalkerEl links
+// children to their parent), <select>/<option> fields, and a
+// document.querySelector that resolves `label[for="..."]` over the
+// planted body tree.
+type WalkerFakeEl = {
+  tagName: string;
+  type?: string;
+  value?: string;
+  disabled?: boolean;
+  hidden?: boolean;
+  label?: string;
+  text?: string;
+  _attrs: Record<string, string>;
+  _children: WalkerFakeEl[];
+  _textContent: string;
+  _visible: boolean;
+  _cursor: string;
+  parentElement: WalkerFakeEl | null;
+  getAttribute(name: string): string | null;
+  setAttribute(name: string, value: string): void;
+  removeAttribute(name: string): void;
+  getBoundingClientRect(): { width: number; height: number };
+  get children(): WalkerFakeEl[];
+  get textContent(): string;
+  querySelectorAll(selector: string): WalkerFakeEl[];
+};
+const makeWalkerEl = (init: {
+  tagName: string;
+  type?: string;
+  value?: string;
+  disabled?: boolean;
+  hidden?: boolean;
+  label?: string;
+  text?: string;
+  visible?: boolean;
+  cursor?: string;
+  children?: WalkerFakeEl[];
+  textContent?: string;
+  attrs?: Record<string, string>;
+}): WalkerFakeEl => {
+  const visible = init.visible ?? true;
+  const children = init.children ?? [];
+  const el: WalkerFakeEl = {
+    tagName: init.tagName,
+    type: init.type,
+    value: init.value,
+    disabled: init.disabled,
+    hidden: init.hidden,
+    label: init.label,
+    text: init.text,
+    _attrs: { ...(init.attrs ?? {}) },
+    _children: children,
+    _textContent: init.textContent ?? "",
+    _visible: visible,
+    _cursor: init.cursor ?? "auto",
+    parentElement: null,
+    getAttribute(name: string) {
+      return Object.prototype.hasOwnProperty.call(this._attrs, name) ? this._attrs[name]! : null;
+    },
+    setAttribute(name: string, value: string) {
+      this._attrs[name] = value;
+    },
+    removeAttribute(name: string) {
+      delete this._attrs[name];
+    },
+    getBoundingClientRect() {
+      return this._visible ? { width: 100, height: 20 } : { width: 0, height: 0 };
+    },
+    get children() {
+      return this._children;
+    },
+    get textContent() {
+      return this._textContent;
+    },
+    querySelectorAll(selector: string) {
+      const matches: WalkerFakeEl[] = [];
+      const recurse = (node: WalkerFakeEl) => {
+        if (selector === "option") {
+          if (node.tagName === "OPTION") matches.push(node);
+        } else if (selector.startsWith("[") && selector.endsWith("]")) {
+          const attr = selector.slice(1, -1);
+          if (Object.prototype.hasOwnProperty.call(node._attrs, attr)) matches.push(node);
+        }
+        for (const child of node._children) recurse(child);
+      };
+      for (const child of this._children) recurse(child);
+      return matches;
+    }
+  };
+  for (const child of children) child.parentElement = el;
+  return el;
+};
+// Installs the fake DOM globals the walker reads from inside the
+// page.evaluate callback (which runs locally under the fake page). The
+// returned `restore` function puts the originals back.
+const installWalkerDom = (body: WalkerFakeEl): (() => void) => {
+  const originalDocument = (globalThis as Record<string, unknown>).document;
+  const originalWindow = (globalThis as Record<string, unknown>).window;
+  const originalCSS = (globalThis as Record<string, unknown>).CSS;
+  const findByLabelFor = (target: string): WalkerFakeEl | null => {
+    let found: WalkerFakeEl | null = null;
+    const recurse = (node: WalkerFakeEl) => {
+      if (found) return;
+      if (node.tagName === "LABEL" && node.getAttribute("for") === target) {
+        found = node;
+        return;
+      }
+      for (const child of node._children) recurse(child);
+    };
+    recurse(body);
+    return found;
+  };
+  (globalThis as unknown as { document: unknown }).document = {
+    body,
+    querySelectorAll: (selector: string) => body.querySelectorAll(selector),
+    querySelector: (sel: string) => {
+      const m = /^label\[for="(.+)"\]$/.exec(sel);
+      return m ? findByLabelFor(m[1]!) : null;
+    },
+    getElementById: (_id: string) => null
+  };
+  (globalThis as unknown as { window: unknown }).window = {
+    getComputedStyle: (el: unknown) => ({
+      display: "block",
+      visibility: "visible",
+      cursor: (el as WalkerFakeEl)._cursor ?? "auto"
+    })
+  };
+  (globalThis as unknown as { CSS: unknown }).CSS = { escape: (s: string) => s };
+  return () => {
+    if (originalDocument === undefined) {
+      delete (globalThis as Record<string, unknown>).document;
+    } else {
+      (globalThis as Record<string, unknown>).document = originalDocument;
+    }
+    if (originalWindow === undefined) {
+      delete (globalThis as Record<string, unknown>).window;
+    } else {
+      (globalThis as Record<string, unknown>).window = originalWindow;
+    }
+    if (originalCSS === undefined) {
+      delete (globalThis as Record<string, unknown>).CSS;
+    } else {
+      (globalThis as Record<string, unknown>).CSS = originalCSS;
+    }
+  };
+};
+
 // Tests for hidden-element surfacing in the snapshot walker. The walker
 // must emit invisible interactive elements (with a [hidden] marker) so
 // wait_for state:"hidden"/"attached"/"detached" can target them, AND must
@@ -696,114 +851,9 @@ describe("snapshot walker — <select> option surfacing", () => {
 // inputs behind styled-button uploaders are still drivable via
 // browser_upload_file.
 describe("snapshot walker — hidden interactive elements", () => {
-  // Shared fake-DOM scaffolding. Each test plants its own document.body,
-  // calls __test.snapshotForTest with a fake page that runs the
-  // evaluate-callback locally, and restores globals on exit.
-  type FakeEl = {
-    tagName: string;
-    type?: string;
-    value?: string;
-    disabled?: boolean;
-    hidden?: boolean;
-    label?: string;
-    text?: string;
-    _attrs: Record<string, string>;
-    _children: FakeEl[];
-    _textContent: string;
-    _visible: boolean;
-    getAttribute(name: string): string | null;
-    setAttribute(name: string, value: string): void;
-    removeAttribute(name: string): void;
-    getBoundingClientRect(): { width: number; height: number };
-    get children(): FakeEl[];
-    get textContent(): string;
-    querySelectorAll(selector: string): FakeEl[];
-  };
-  const makeEl = (init: Partial<FakeEl> & { tagName: string; visible?: boolean; children?: FakeEl[]; textContent?: string; attrs?: Record<string, string> }): FakeEl => {
-    const visible = init.visible ?? true;
-    const children = init.children ?? [];
-    const el: FakeEl = {
-      tagName: init.tagName,
-      type: init.type,
-      value: init.value,
-      disabled: init.disabled,
-      hidden: init.hidden,
-      label: init.label,
-      text: init.text,
-      _attrs: { ...(init.attrs ?? {}) },
-      _children: children,
-      _textContent: init.textContent ?? "",
-      _visible: visible,
-      getAttribute(name: string) {
-        return Object.prototype.hasOwnProperty.call(this._attrs, name) ? this._attrs[name]! : null;
-      },
-      setAttribute(name: string, value: string) {
-        this._attrs[name] = value;
-      },
-      removeAttribute(name: string) {
-        delete this._attrs[name];
-      },
-      getBoundingClientRect() {
-        return this._visible ? { width: 100, height: 20 } : { width: 0, height: 0 };
-      },
-      get children() {
-        return this._children;
-      },
-      get textContent() {
-        return this._textContent;
-      },
-      querySelectorAll(selector: string) {
-        const matches: FakeEl[] = [];
-        const recurse = (node: FakeEl) => {
-          if (selector === "option") {
-            if (node.tagName === "OPTION") matches.push(node);
-          } else if (selector.startsWith("[") && selector.endsWith("]")) {
-            const attr = selector.slice(1, -1);
-            if (Object.prototype.hasOwnProperty.call(node._attrs, attr)) matches.push(node);
-          }
-          for (const child of node._children) recurse(child);
-        };
-        for (const child of this._children) recurse(child);
-        return matches;
-      }
-    };
-    return el;
-  };
-  // Installs the fake DOM globals the walker reads from inside the
-  // page.evaluate callback (which runs locally under the fake page). The
-  // returned `restore` function puts the originals back.
-  const installFakeDom = (body: FakeEl): (() => void) => {
-    const originalDocument = (globalThis as Record<string, unknown>).document;
-    const originalWindow = (globalThis as Record<string, unknown>).window;
-    const originalCSS = (globalThis as Record<string, unknown>).CSS;
-    (globalThis as unknown as { document: unknown }).document = {
-      body,
-      querySelectorAll: (selector: string) => body.querySelectorAll(selector),
-      querySelector: (_sel: string) => null,
-      getElementById: (_id: string) => null
-    };
-    (globalThis as unknown as { window: unknown }).window = {
-      getComputedStyle: (_el: unknown) => ({ display: "block", visibility: "visible" })
-    };
-    (globalThis as unknown as { CSS: unknown }).CSS = { escape: (s: string) => s };
-    return () => {
-      if (originalDocument === undefined) {
-        delete (globalThis as Record<string, unknown>).document;
-      } else {
-        (globalThis as Record<string, unknown>).document = originalDocument;
-      }
-      if (originalWindow === undefined) {
-        delete (globalThis as Record<string, unknown>).window;
-      } else {
-        (globalThis as Record<string, unknown>).window = originalWindow;
-      }
-      if (originalCSS === undefined) {
-        delete (globalThis as Record<string, unknown>).CSS;
-      } else {
-        (globalThis as Record<string, unknown>).CSS = originalCSS;
-      }
-    };
-  };
+  type FakeEl = WalkerFakeEl;
+  const makeEl = makeWalkerEl;
+  const installFakeDom = installWalkerDom;
 
   // Fake Page whose page.evaluate(fn, arg) runs fn(arg) locally; the
   // locator factory returns a synthetic locator stub keyed by selector so
@@ -885,6 +935,920 @@ describe("snapshot walker — hidden interactive elements", () => {
       expect(result.text).toContain("[...hidden truncated]");
     } finally {
       restore();
+    }
+  });
+});
+
+// Tests for cursor-interactivity augmentation in the snapshot walker. A
+// visible element with no interactive tag and no explicit role still earns
+// a ref (role "clickable") when the page signals clickability via computed
+// cursor:pointer, an onclick attribute, or tabindex >= 0; inherited cursor
+// styles are deduped so only the outermost cursor-qualifying element emits.
+// Hidden radio/checkbox inputs with a visible associated <label> are
+// force-emitted with [hidden] like file inputs. See ADR
+// browser-automation-engine.md.
+describe("snapshot walker — cursor-interactive clickables", () => {
+  type FakeEl = WalkerFakeEl;
+  const makeEl = makeWalkerEl;
+  const installFakeDom = installWalkerDom;
+  const makeFakePage = (): import("playwright-core").Page =>
+    ({
+      evaluate: <A, R>(fn: (arg: A) => R | Promise<R>, arg?: A): Promise<R> => Promise.resolve(fn(arg as A)),
+      locator: (sel: string) => ({ __sel: sel } as unknown)
+    } as unknown as import("playwright-core").Page);
+
+  test("emits cursor:pointer div as [clickable] once, deduping inherited-cursor descendants", async () => {
+    // <body>
+    //   <div style="cursor:pointer">Open settings
+    //     <span>Open settings</span>      ← inherited cursor, deduped
+    //   </div>
+    //   <button>Save</button>             ← control: still a plain button
+    // </body>
+    const span = makeEl({ tagName: "SPAN", cursor: "pointer", textContent: "Open settings" });
+    const card = makeEl({ tagName: "DIV", cursor: "pointer", textContent: "Open settings", children: [span] });
+    const button = makeEl({ tagName: "BUTTON", textContent: "Save" });
+    const body = makeEl({ tagName: "BODY", children: [card, button] });
+    const restore = installFakeDom(body);
+    try {
+      const result = await browserTest.snapshotForTest(makeFakePage(), false);
+      const clickableLines = result.text.split("\n").filter((line) => line.includes(" clickable "));
+      expect(clickableLines.length).toBe(1);
+      expect(clickableLines[0]).toMatch(/\[@e\d+\] clickable "Open settings"/);
+      // The clickable ref resolves like any other ref.
+      const ref = /\[(@e\d+)\]/.exec(clickableLines[0]!)?.[1];
+      expect(ref).toBeDefined();
+      expect(result.refs.has(ref!)).toBe(true);
+      // Native controls are unaffected.
+      expect(result.text).toMatch(/\[@e\d+\] button "Save"/);
+    } finally {
+      restore();
+    }
+  });
+
+  test("own onclick/tabindex re-qualifies inside a cursor-pointer ancestor; tabindex=-1 and empty names don't", async () => {
+    // <div style="cursor:pointer">Cat card
+    //   <span onclick="like()">Like</span>       ← own handler, NOT deduped
+    //   <span tabindex="0">Share</span>          ← focusable, NOT deduped
+    //   <span tabindex="-1">Skip me</span>       ← not focusable, deduped
+    // </div>
+    // <div style="cursor:pointer"></div>         ← empty name, skipped
+    const like = makeEl({ tagName: "SPAN", cursor: "pointer", textContent: "Like", attrs: { onclick: "like()" } });
+    const share = makeEl({ tagName: "SPAN", cursor: "pointer", textContent: "Share", attrs: { tabindex: "0" } });
+    const skip = makeEl({ tagName: "SPAN", cursor: "pointer", textContent: "Skip me", attrs: { tabindex: "-1" } });
+    const card = makeEl({
+      tagName: "DIV",
+      cursor: "pointer",
+      textContent: "Cat card Like Share Skip me",
+      children: [like, share, skip]
+    });
+    const empty = makeEl({ tagName: "DIV", cursor: "pointer", textContent: "" });
+    const body = makeEl({ tagName: "BODY", children: [card, empty] });
+    const restore = installFakeDom(body);
+    try {
+      const result = await browserTest.snapshotForTest(makeFakePage(), false);
+      const clickableLines = result.text.split("\n").filter((line) => line.includes(" clickable "));
+      // Card + Like + Share; "Skip me" deduped, empty div skipped.
+      expect(clickableLines.length).toBe(3);
+      expect(result.text).toContain('clickable "Like"');
+      expect(result.text).toContain('clickable "Share"');
+      expect(result.text).not.toContain('"Skip me"');
+      expect(result.text).not.toContain("[...clickable truncated]");
+    } finally {
+      restore();
+    }
+  });
+
+  test("hidden radio/checkbox with a visible label is force-emitted past the hidden budget", async () => {
+    // Fill the hidden budget (50) with hidden role=dialog divs so the
+    // hidden-element fallback path can't be what emits the toggles — only
+    // the label-promotion force-emit can.
+    const filler: FakeEl[] = [];
+    for (let i = 0; i < 50; i++) {
+      filler.push(makeEl({ tagName: "DIV", visible: false, attrs: { role: "dialog" } }));
+    }
+    // <label>Subscribe <input type="radio" hidden></label>   ← wrapping label
+    const radio = makeEl({ tagName: "INPUT", type: "radio", visible: false });
+    const wrapLabel = makeEl({ tagName: "LABEL", textContent: "Subscribe", children: [radio] });
+    // <input type="checkbox" id="tos" hidden> <label for="tos">Agree</label>
+    const checkbox = makeEl({ tagName: "INPUT", type: "checkbox", visible: false, attrs: { id: "tos" } });
+    const forLabel = makeEl({ tagName: "LABEL", textContent: "Agree", attrs: { for: "tos" } });
+    // <input type="checkbox" hidden>   ← no label: stays on the capped path
+    const orphan = makeEl({ tagName: "INPUT", type: "checkbox", visible: false });
+    const body = makeEl({ tagName: "BODY", children: [...filler, wrapLabel, checkbox, forLabel, orphan] });
+    const restore = installFakeDom(body);
+    try {
+      const result = await browserTest.snapshotForTest(makeFakePage(), false);
+      // Both labeled toggles got refs despite the exhausted hidden budget.
+      expect(result.text).toMatch(/\[@e\d+\] radio \[hidden\]/);
+      expect(result.text).toMatch(/\[@e\d+\] checkbox \[hidden\]/);
+      // The orphan checkbox was over the hidden budget — exactly one
+      // checkbox line means the labeled one is the one that surfaced.
+      const checkboxLines = result.text.split("\n").filter((line) => line.includes(" checkbox "));
+      expect(checkboxLines.length).toBe(1);
+    } finally {
+      restore();
+    }
+  });
+
+  test("caps clickable emissions at 75 and appends [...clickable truncated] marker", async () => {
+    const children: FakeEl[] = [];
+    for (let i = 0; i < 80; i++) {
+      // onclick (not cursor) so ancestor dedupe can't interfere with the count.
+      children.push(makeEl({ tagName: "DIV", textContent: `row-${i}`, attrs: { onclick: "go()" } }));
+    }
+    const body = makeEl({ tagName: "BODY", children });
+    const restore = installFakeDom(body);
+    try {
+      const result = await browserTest.snapshotForTest(makeFakePage(), false);
+      const clickableLines = result.text.split("\n").filter((line) => line.includes(" clickable "));
+      expect(clickableLines.length).toBe(75);
+      expect(result.text).toContain("[...clickable truncated]");
+    } finally {
+      restore();
+    }
+  });
+});
+
+// Feature coverage for stable refs + post-action snapshot diffing: the
+// walker reuses an element's existing data-gini-ref stamp across
+// snapshots (new ids only for unstamped elements, allocation never
+// reuses a retired id), stamps/numbering reset only on navigation, and
+// action handlers return a line diff against the previous redacted
+// snapshot when the change is small. Explicit browser_snapshot always
+// returns the full tree.
+describe("snapshot stable refs and post-action diffs", () => {
+  type FakeEl = WalkerFakeEl;
+  const makeEl = makeWalkerEl;
+  const installFakeDom = installWalkerDom;
+  // Fake Page whose evaluate(fn, arg) runs fn(arg) locally and whose
+  // locator(sel) returns a stub locator with a click() that invokes the
+  // test-provided mutation — so browserClick can "change the page".
+  const makeFakePage = (state: { url: string; onClick?: () => void }): import("playwright-core").Page =>
+    ({
+      url: () => state.url,
+      title: async () => "Example",
+      waitForLoadState: async () => undefined,
+      evaluate: <A, R>(fn: (arg: A) => R | Promise<R>, arg?: A): Promise<R> => Promise.resolve(fn(arg as A)),
+      locator: (sel: string) => ({
+        __sel: sel,
+        click: async (_opts?: { timeout?: number }) => {
+          state.onClick?.();
+        }
+      })
+    } as unknown as import("playwright-core").Page);
+
+  afterEach(() => {
+    browserTest.clearFakeSessionsForTest();
+    browserTest.setInFlightDisconnectsForTest(0);
+  });
+
+  test("an element keeps its ref across snapshots; new elements allocate new higher ids", async () => {
+    const save = makeEl({ tagName: "BUTTON", textContent: "Save" });
+    const email = makeEl({ tagName: "INPUT", type: "text", value: "", attrs: { placeholder: "Email" } });
+    const body = makeEl({ tagName: "BODY", children: [save, email] });
+    const restore = installFakeDom(body);
+    const page = makeFakePage({ url: "https://example.com/" });
+    try {
+      const first = await browserTest.snapshotForTest(page, false);
+      expect(first.text).toContain('[@e1] button "Save"');
+      expect(first.text).toContain('[@e2] textbox "Email"');
+
+      const del = makeEl({ tagName: "BUTTON", textContent: "Delete" });
+      del.parentElement = body;
+      body._children.push(del);
+
+      const second = await browserTest.snapshotForTest(page, false);
+      expect(second.text).toContain('[@e1] button "Save"');
+      expect(second.text).toContain('[@e2] textbox "Email"');
+      expect(second.text).toContain('[@e3] button "Delete"');
+      expect(second.refs.has("@e1")).toBe(true);
+      expect(second.refs.has("@e3")).toBe(true);
+    } finally {
+      restore();
+    }
+  });
+
+  test("a removed element's id is never reused; navigation clears stamps and restarts at @e1", async () => {
+    const one = makeEl({ tagName: "BUTTON", textContent: "One" });
+    const two = makeEl({ tagName: "BUTTON", textContent: "Two" });
+    const body = makeEl({ tagName: "BODY", children: [one, two] });
+    const restore = installFakeDom(body);
+    const state = { url: "https://a.example/" };
+    const page = makeFakePage(state);
+    browserTest.installFakeSessionWithPageForTest("ref-nav-task", page as Partial<import("playwright-core").Page>);
+    try {
+      const first = await browserTest.snapshotForTest(page, false, "ref-nav-task");
+      expect(first.text).toContain('[@e1] button "One"');
+      expect(first.text).toContain('[@e2] button "Two"');
+
+      // Remove "One" and add "Three": Two keeps @e2, Three gets a fresh
+      // @e3 — the retired @e1 is NOT handed to a different element.
+      body._children.splice(0, 1);
+      const three = makeEl({ tagName: "BUTTON", textContent: "Three" });
+      three.parentElement = body;
+      body._children.push(three);
+      const second = await browserTest.snapshotForTest(page, false, "ref-nav-task");
+      expect(second.navigated).toBe(false);
+      expect(second.text).toContain('[@e2] button "Two"');
+      expect(second.text).toContain('[@e3] button "Three"');
+      expect(second.text).not.toContain("[@e1]");
+
+      // URL change = navigation: stamps cleared, numbering restarts.
+      state.url = "https://b.example/";
+      const third = await browserTest.snapshotForTest(page, false, "ref-nav-task");
+      expect(third.navigated).toBe(true);
+      expect(third.text).toContain('[@e1] button "Two"');
+      expect(third.text).toContain('[@e2] button "Three"');
+    } finally {
+      restore();
+    }
+  });
+
+  test("a duplicate (cloned) stamp is restamped with a fresh id", async () => {
+    // cloneNode copies attributes, so a cloned subtree carries the same
+    // stamp as its source; two elements sharing a ref would break
+    // strict-mode resolution. Only the first holder keeps the id.
+    const orig = makeEl({ tagName: "BUTTON", textContent: "Card", attrs: { "data-gini-ref": "e1" } });
+    const clone = makeEl({ tagName: "BUTTON", textContent: "Card", attrs: { "data-gini-ref": "e1" } });
+    const body = makeEl({ tagName: "BODY", children: [orig, clone] });
+    const restore = installFakeDom(body);
+    const page = makeFakePage({ url: "https://example.com/" });
+    try {
+      const result = await browserTest.snapshotForTest(page, false);
+      expect(result.text).toContain('[@e1] button "Card"');
+      expect(result.text).toContain('[@e2] button "Card"');
+      expect(orig._attrs["data-gini-ref"]).toBe("e1");
+      expect(clone._attrs["data-gini-ref"]).toBe("e2");
+    } finally {
+      restore();
+    }
+  });
+
+  test("a well-formed but oversized planted stamp neither sticks nor poisons the allocator", async () => {
+    // Number("9007199254740991") + 1 stops incrementing at float
+    // precision, so an unbounded scan would make every fresh allocation
+    // collide on one id. Ids beyond 9 digits are treated as unstamped.
+    const planted = makeEl({ tagName: "BUTTON", textContent: "Huge", attrs: { "data-gini-ref": "e9007199254740991" } });
+    const next = makeEl({ tagName: "BUTTON", textContent: "Next" });
+    const body = makeEl({ tagName: "BODY", children: [planted, next] });
+    const restore = installFakeDom(body);
+    const page = makeFakePage({ url: "https://example.com/" });
+    try {
+      const result = await browserTest.snapshotForTest(page, false);
+      expect(result.text).toContain('[@e1] button "Huge"');
+      expect(result.text).toContain('[@e2] button "Next"');
+      expect(planted._attrs["data-gini-ref"]).toBe("e1");
+    } finally {
+      restore();
+    }
+  });
+
+  test("a stamp that doesn't match the e<N> format is never honored", async () => {
+    // Only the walker writes well-formed stamps; any other value means
+    // the page set the attribute itself, and honoring it would let page
+    // content pick its own ref. It gets overwritten with a fresh id.
+    const bogus = makeEl({ tagName: "BUTTON", textContent: "Planted", attrs: { "data-gini-ref": "javascript:alert(1)" } });
+    const body = makeEl({ tagName: "BODY", children: [bogus] });
+    const restore = installFakeDom(body);
+    const page = makeFakePage({ url: "https://example.com/" });
+    try {
+      const result = await browserTest.snapshotForTest(page, false);
+      expect(result.text).toContain('[@e1] button "Planted"');
+      expect(bogus._attrs["data-gini-ref"]).toBe("e1");
+    } finally {
+      restore();
+    }
+  });
+
+  // Builds a 20-button page so the diff threshold has room to work with
+  // (the fixed diff header would dwarf a tiny page's full snapshot and
+  // force full mode regardless of the change size).
+  const makeButtonRows = (count: number): FakeEl[] => {
+    const rows: FakeEl[] = [];
+    for (let i = 1; i <= count; i++) {
+      rows.push(makeEl({ tagName: "BUTTON", textContent: `Item${String(i).padStart(2, "0")}` }));
+    }
+    return rows;
+  };
+
+  test("post-action snapshot returns a diff when the change is small", async () => {
+    const body = makeEl({ tagName: "BODY", children: makeButtonRows(20) });
+    const restore = installFakeDom(body);
+    const state: { url: string; onClick?: () => void } = { url: "https://example.com/" };
+    state.onClick = () => {
+      const added = makeEl({ tagName: "BUTTON", textContent: "NewButton" });
+      added.parentElement = body;
+      body._children.push(added);
+    };
+    const page = makeFakePage(state);
+    browserTest.installFakeSessionWithPageForTest("diff-small", page as Partial<import("playwright-core").Page>);
+    try {
+      const baseline = JSON.parse(await browserSnapshot("diff-small", {})) as { success: boolean; snapshot: string };
+      expect(baseline.success).toBe(true);
+      expect(baseline.snapshot).toContain('[@e1] button "Item01"');
+
+      const raw = await browserClick("diff-small", { ref: "@e1" });
+      const parsed = JSON.parse(raw) as { success: boolean; snapshot: string; snapshotMode: string };
+      expect(parsed.success).toBe(true);
+      expect(parsed.snapshotMode).toBe("diff");
+      expect(parsed.snapshot).toContain("[diff vs previous snapshot");
+      // The "+ " marker is followed by the line's own depth indent.
+      expect(parsed.snapshot).toMatch(/\+\s+\[@e21\] button "NewButton"/);
+      // Unchanged lines far from the change are omitted.
+      expect(parsed.snapshot).not.toContain("Item05");
+    } finally {
+      restore();
+    }
+  });
+
+  test("post-action snapshot returns the full tree when the change is large", async () => {
+    const body = makeEl({ tagName: "BODY", children: makeButtonRows(3) });
+    const restore = installFakeDom(body);
+    const state: { url: string; onClick?: () => void } = { url: "https://example.com/" };
+    state.onClick = () => {
+      const fresh: FakeEl[] = [];
+      for (let i = 1; i <= 8; i++) {
+        fresh.push(makeEl({ tagName: "BUTTON", textContent: `Other${i}` }));
+      }
+      for (const el of fresh) el.parentElement = body;
+      body._children.splice(0, body._children.length, ...fresh);
+    };
+    const page = makeFakePage(state);
+    browserTest.installFakeSessionWithPageForTest("diff-large", page as Partial<import("playwright-core").Page>);
+    try {
+      await browserSnapshot("diff-large", {});
+      const raw = await browserClick("diff-large", { ref: "@e1" });
+      const parsed = JSON.parse(raw) as { success: boolean; snapshot: string; snapshotMode: string };
+      expect(parsed.success).toBe(true);
+      expect(parsed.snapshotMode).toBe("full");
+      expect(parsed.snapshot).not.toContain("[diff vs previous snapshot");
+      expect(parsed.snapshot).toContain('button "Other1"');
+    } finally {
+      restore();
+    }
+  });
+
+  test("first snapshot after a navigation is full even from an action handler", async () => {
+    const body = makeEl({ tagName: "BODY", children: makeButtonRows(20) });
+    const restore = installFakeDom(body);
+    const state: { url: string; onClick?: () => void } = { url: "https://example.com/" };
+    state.onClick = () => {
+      state.url = "https://example.com/next";
+    };
+    const page = makeFakePage(state);
+    browserTest.installFakeSessionWithPageForTest("diff-nav", page as Partial<import("playwright-core").Page>);
+    try {
+      await browserSnapshot("diff-nav", {});
+      const raw = await browserClick("diff-nav", { ref: "@e1" });
+      const parsed = JSON.parse(raw) as { success: boolean; snapshot: string; snapshotMode: string };
+      expect(parsed.success).toBe(true);
+      expect(parsed.snapshotMode).toBe("full");
+      expect(parsed.snapshot).not.toContain("[diff vs previous snapshot");
+      expect(parsed.snapshot).toContain('[@e1] button "Item01"');
+    } finally {
+      restore();
+    }
+  });
+
+  test("explicit browser_snapshot always returns the full tree", async () => {
+    const body = makeEl({ tagName: "BODY", children: makeButtonRows(20) });
+    const restore = installFakeDom(body);
+    const page = makeFakePage({ url: "https://example.com/" });
+    browserTest.installFakeSessionWithPageForTest("snap-full", page as Partial<import("playwright-core").Page>);
+    try {
+      await browserSnapshot("snap-full", {});
+      // Mutate the page between snapshots — explicit re-snapshot still
+      // returns every line, never a diff.
+      const added = makeEl({ tagName: "BUTTON", textContent: "NewButton" });
+      added.parentElement = body;
+      body._children.push(added);
+      const raw = await browserSnapshot("snap-full", {});
+      const parsed = JSON.parse(raw) as { success: boolean; snapshot: string; snapshotMode?: string };
+      expect(parsed.success).toBe(true);
+      expect(parsed.snapshotMode).toBeUndefined();
+      expect(parsed.snapshot).not.toContain("[diff vs previous snapshot");
+      expect(parsed.snapshot).toContain('[@e1] button "Item01"');
+      expect(parsed.snapshot).toContain('[@e21] button "NewButton"');
+    } finally {
+      restore();
+    }
+  });
+
+  test("diff text is computed after redaction — registered secret bytes never appear", async () => {
+    const secret = "hunter2-secret-value";
+    // A data-gini-secret-stamped input feeds the live-DOM secret
+    // collector; a plain Notes input receives the secret bytes on click,
+    // simulating a page that copies typed credentials around.
+    const secretInput = makeEl({
+      tagName: "INPUT",
+      type: "text",
+      value: secret,
+      attrs: { "data-gini-secret": "true", placeholder: "Password" }
+    });
+    const notes = makeEl({ tagName: "INPUT", type: "text", value: "", attrs: { placeholder: "Notes" } });
+    const body = makeEl({ tagName: "BODY", children: [...makeButtonRows(20), secretInput, notes] });
+    const restore = installFakeDom(body);
+    const state: { url: string; onClick?: () => void } = { url: "https://example.com/" };
+    state.onClick = () => {
+      notes.value = secret;
+    };
+    const page = makeFakePage(state);
+    browserTest.installFakeSessionWithPageForTest("diff-redact", page as Partial<import("playwright-core").Page>);
+    try {
+      const baseline = JSON.parse(await browserSnapshot("diff-redact", {})) as { snapshot: string };
+      expect(baseline.snapshot).not.toContain(secret);
+
+      const raw = await browserClick("diff-redact", { ref: "@e1" });
+      expect(raw).not.toContain(secret);
+      const parsed = JSON.parse(raw) as { success: boolean; snapshot: string; snapshotMode: string };
+      expect(parsed.success).toBe(true);
+      expect(parsed.snapshotMode).toBe("diff");
+      expect(parsed.snapshot).toMatch(/\+\s+\[@e22\] textbox "Notes" value="\[redacted\]"/);
+    } finally {
+      restore();
+    }
+  });
+
+  test("a full=true snapshot does not poison the post-action diff base", async () => {
+    // full=true trees carry landmark/heading rows that full=false trees
+    // (and every post-action snapshot) lack; diffing against one would
+    // render each landmark as a spurious removal.
+    const heading = makeEl({ tagName: "H1", textContent: "Dashboard" });
+    const body = makeEl({ tagName: "BODY", children: [heading, ...makeButtonRows(20)] });
+    const restore = installFakeDom(body);
+    const state: { url: string; onClick?: () => void } = { url: "https://example.com/" };
+    state.onClick = () => {
+      const added = makeEl({ tagName: "BUTTON", textContent: "NewButton" });
+      added.parentElement = body;
+      body._children.push(added);
+    };
+    const page = makeFakePage(state);
+    browserTest.installFakeSessionWithPageForTest("diff-fullbase", page as Partial<import("playwright-core").Page>);
+    try {
+      await browserSnapshot("diff-fullbase", {});
+      const full = JSON.parse(await browserSnapshot("diff-fullbase", { full: true })) as { snapshot: string };
+      expect(full.snapshot).toContain('heading "Dashboard"');
+
+      const raw = await browserClick("diff-fullbase", { ref: "@e1" });
+      const parsed = JSON.parse(raw) as { success: boolean; snapshot: string; snapshotMode: string };
+      expect(parsed.success).toBe(true);
+      expect(parsed.snapshotMode).toBe("diff");
+      expect(parsed.snapshot).toMatch(/\+\s+\[@e21\] button "NewButton"/);
+      expect(parsed.snapshot).not.toContain('- heading "Dashboard"');
+    } finally {
+      restore();
+    }
+  });
+});
+
+describe("renderSnapshotDiff formatting", () => {
+  test("identical snapshots render an explicit '(no changes)' body", () => {
+    const text = 'button "Save"\nbutton "Cancel"';
+    const diff = browserTest.renderSnapshotDiffForTest(text, text);
+    expect(diff).toBeDefined();
+    expect(diff!).toContain("[diff vs previous snapshot");
+    expect(diff!).toContain("(no changes)");
+  });
+
+  test("non-contiguous hunks are separated by a gap marker", () => {
+    const prevLines = Array.from({ length: 12 }, (_, i) => `line${i}`);
+    const currLines = [...prevLines];
+    currLines[1] = "changedA";
+    currLines[10] = "changedB";
+    const diff = browserTest.renderSnapshotDiffForTest(prevLines.join("\n"), currLines.join("\n"));
+    expect(diff!).toContain("+ changedA");
+    expect(diff!).toContain("+ changedB");
+    // Without the marker, two distant changes read as neighboring lines.
+    expect(diff!).toContain("⋯");
+  });
+
+  test("an over-budget changed middle bails out instead of running the quadratic LCS", () => {
+    const a = Array.from({ length: 1100 }, (_, i) => `a${i}`).join("\n");
+    const b = Array.from({ length: 1100 }, (_, i) => `b${i}`).join("\n");
+    expect(browserTest.renderSnapshotDiffForTest(a, b)).toBeUndefined();
+  });
+});
+
+// Stale-ref self-healing: when an SPA re-render destroys the stamped
+// [data-gini-ref] node, action tools re-query by the role/name/nth
+// recorded at snapshot time, restamp the survivor with the SAME id, and
+// flag healedRef in the result. fill_secrets and upload stay fail-loud
+// on the exact stamped element (trust boundary — see ADR
+// browser-fill-secret.md).
+describe("stale-ref self-healing", () => {
+  afterEach(() => {
+    browserTest.clearFakeSessionsForTest();
+    browserTest.setInFlightDisconnectsForTest(0);
+  });
+
+  // Fake page for healing tests. The walker evaluate returns an empty
+  // page (post-action snapshot content isn't under test here);
+  // getByRole/getByText record their arguments and hand back the
+  // supplied candidate (default: a candidate matching nothing).
+  function makeHealPage(opts: {
+    roleCandidate?: Record<string, unknown>;
+    textCandidate?: Record<string, unknown>;
+  }) {
+    const calls = {
+      getByRole: [] as Array<{ role: string; options?: Record<string, unknown>; nth?: number }>,
+      getByText: [] as Array<{ text: string; options?: Record<string, unknown>; nth?: number }>,
+      locator: [] as string[]
+    };
+    // page.locator stubs record actions per selector — after a heal the
+    // action runs through the freshly-stamped selector, not the
+    // role/text candidate, and tests assert it landed there.
+    type LocatorStub = {
+      __sel: string;
+      clicks: Array<{ timeout?: number } | undefined>;
+      waits: Array<{ state?: string; timeout?: number } | undefined>;
+      click(o?: { timeout?: number }): Promise<void>;
+      waitFor(o?: { state?: string; timeout?: number }): Promise<void>;
+    };
+    const locatorStubs = new Map<string, LocatorStub>();
+    const locatorOf = (sel: string): LocatorStub => {
+      let stub = locatorStubs.get(sel);
+      if (!stub) {
+        const made: LocatorStub = {
+          __sel: sel,
+          clicks: [],
+          waits: [],
+          click: async (o?: { timeout?: number }) => {
+            made.clicks.push(o);
+          },
+          waitFor: async (o?: { state?: string; timeout?: number }) => {
+            made.waits.push(o);
+          }
+        };
+        locatorStubs.set(sel, made);
+        stub = made;
+      }
+      return stub;
+    };
+    const page = {
+      url: () => "https://example.com/app",
+      title: async () => "App",
+      waitForLoadState: async () => undefined,
+      evaluate: async () => ({ entries: [], hiddenEmitted: 0, hiddenTotal: 0, hiddenBudget: 0 }),
+      locator: (sel: string) => {
+        calls.locator.push(sel);
+        return locatorOf(sel);
+      },
+      getByRole: (role: string, options?: Record<string, unknown>) => {
+        const entry = { role, options, nth: undefined as number | undefined };
+        calls.getByRole.push(entry);
+        return {
+          nth: (n: number) => {
+            entry.nth = n;
+            return opts.roleCandidate ?? { count: async () => 0 };
+          }
+        };
+      },
+      getByText: (text: string, options?: Record<string, unknown>) => {
+        const entry = { text, options, nth: undefined as number | undefined };
+        calls.getByText.push(entry);
+        return {
+          nth: (n: number) => {
+            entry.nth = n;
+            return opts.textCandidate ?? { count: async () => 0 };
+          }
+        };
+      }
+    };
+    return { page: page as unknown as Partial<import("playwright-core").Page>, calls, locatorOf };
+  }
+
+  // A healing candidate that exists (count 1) and records the action +
+  // restamp landing on it. Its evaluate runs the supplied closure against
+  // a fake element (with a getComputedStyle window shim), so the real
+  // verdict checks — foreign stamp, cursor interactivity — are exercised.
+  function makeCandidate(init?: {
+    stamp?: string;
+    cursor?: string;
+    onclick?: boolean;
+    tabindex?: string;
+  }) {
+    const record = {
+      clicks: [] as Array<{ timeout?: number } | undefined>,
+      waits: [] as Array<{ state?: string; timeout?: number } | undefined>,
+      restamps: [] as Array<{ attr: string; id: string }>
+    };
+    const attrs = new Map<string, string>();
+    if (init?.stamp !== undefined) attrs.set("data-gini-ref", init.stamp);
+    if (init?.onclick) attrs.set("onclick", "void 0");
+    if (init?.tabindex !== undefined) attrs.set("tabindex", init.tabindex);
+    const el = {
+      getAttribute: (name: string) => attrs.get(name) ?? null,
+      setAttribute: (name: string, value: string) => {
+        attrs.set(name, value);
+        record.restamps.push({ attr: name, id: value });
+      }
+    };
+    const candidate = {
+      count: async () => 1,
+      click: async (o?: { timeout?: number }) => {
+        record.clicks.push(o);
+      },
+      waitFor: async (o?: { state?: string; timeout?: number }) => {
+        record.waits.push(o);
+      },
+      evaluate: async (fn: (el: unknown, arg: unknown) => unknown, arg: unknown) => {
+        const g = globalThis as Record<string, unknown>;
+        const originalWindow = g.window;
+        g.window = { getComputedStyle: () => ({ cursor: init?.cursor ?? "auto" }) };
+        try {
+          return fn(el, arg);
+        } finally {
+          if (originalWindow === undefined) delete g.window;
+          else g.window = originalWindow;
+        }
+      }
+    };
+    return { candidate, record };
+  }
+
+  test("click self-heals a lost stamp via role/name/nth, restamps the survivor, and flags healedRef", async () => {
+    const { candidate, record } = makeCandidate();
+    const { page, calls, locatorOf } = makeHealPage({ roleCandidate: candidate });
+    browserTest.installFakeSessionWithPageForTest("heal-click", page);
+    const refs = new Map<string, unknown>();
+    // Stamped locator matches nothing — the node was re-rendered away.
+    refs.set("@e5", { locator: { count: async () => 0 }, role: "button", name: "Submit", nth: 1 });
+    browserTest.setFakeSessionRefsForTest("heal-click", refs);
+
+    const raw = await browserClick("heal-click", { ref: "@e5" });
+    const parsed = JSON.parse(raw) as { success: boolean; healedRef?: boolean };
+    expect(parsed.success).toBe(true);
+    expect(parsed.healedRef).toBe(true);
+    // Re-query used the recorded role/name/nth, never the text fallback.
+    expect(calls.getByRole.length).toBe(1);
+    expect(calls.getByRole[0]!.role).toBe("button");
+    expect(calls.getByRole[0]!.options).toEqual({ name: "Submit", exact: true });
+    expect(calls.getByRole[0]!.nth).toBe(1);
+    expect(calls.getByText.length).toBe(0);
+    // The survivor was restamped with the SAME id, and the click ran
+    // through the freshly-stamped selector (pinning the action to the
+    // exact element that passed the heal checks) with the standard
+    // timeout.
+    expect(record.restamps).toEqual([{ attr: "data-gini-ref", id: "e5" }]);
+    expect(calls.locator).toContain('[data-gini-ref="e5"]');
+    const stamped = locatorOf('[data-gini-ref="e5"]');
+    expect(stamped.clicks.length).toBe(1);
+    expect(stamped.clicks[0]!.timeout).toBe(10_000);
+    expect(record.clicks.length).toBe(0);
+  });
+
+  test("a live stamp resolves on the fast path without any re-query or healedRef flag", async () => {
+    const clicks: Array<{ timeout?: number } | undefined> = [];
+    const stamped = {
+      count: async () => 1,
+      click: async (o?: { timeout?: number }) => {
+        clicks.push(o);
+      }
+    };
+    const { page, calls } = makeHealPage({});
+    browserTest.installFakeSessionWithPageForTest("heal-fast", page);
+    const refs = new Map<string, unknown>();
+    refs.set("@e5", { locator: stamped, role: "button", name: "Submit", nth: 0 });
+    browserTest.setFakeSessionRefsForTest("heal-fast", refs);
+
+    const raw = await browserClick("heal-fast", { ref: "@e5" });
+    const parsed = JSON.parse(raw) as { success: boolean; healedRef?: boolean };
+    expect(parsed.success).toBe(true);
+    expect(parsed.healedRef).toBeUndefined();
+    expect(clicks.length).toBe(1);
+    expect(calls.getByRole.length).toBe(0);
+    expect(calls.getByText.length).toBe(0);
+  });
+
+  test("no healing candidate yields the standard Unknown ref error", async () => {
+    // Default candidates count 0: the role re-query finds nothing, and a
+    // supported role with no match fails rather than guessing by text.
+    const { page, calls } = makeHealPage({});
+    browserTest.installFakeSessionWithPageForTest("heal-miss", page);
+    const refs = new Map<string, unknown>();
+    refs.set("@e7", { locator: { count: async () => 0 }, role: "button", name: "Gone", nth: 0 });
+    browserTest.setFakeSessionRefsForTest("heal-miss", refs);
+
+    const raw = await browserClick("heal-miss", { ref: "@e7" });
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toContain("Unknown ref @e7");
+    expect(parsed.error).toContain("fresh snapshot");
+    expect(calls.getByRole.length).toBe(1);
+    expect(calls.getByText.length).toBe(0);
+  });
+
+  test("role clickable heals via exact-text matching, not getByRole", async () => {
+    const { candidate } = makeCandidate({ cursor: "pointer" });
+    const { page, calls, locatorOf } = makeHealPage({ textCandidate: candidate });
+    browserTest.installFakeSessionWithPageForTest("heal-clickable", page);
+    const refs = new Map<string, unknown>();
+    refs.set("@e3", { locator: { count: async () => 0 }, role: "clickable", name: "Open card", nth: 2 });
+    browserTest.setFakeSessionRefsForTest("heal-clickable", refs);
+
+    const raw = await browserClick("heal-clickable", { ref: "@e3" });
+    const parsed = JSON.parse(raw) as { success: boolean; healedRef?: boolean };
+    expect(parsed.success).toBe(true);
+    expect(parsed.healedRef).toBe(true);
+    expect(calls.getByRole.length).toBe(0);
+    expect(calls.getByText.length).toBe(1);
+    expect(calls.getByText[0]!.text).toBe("Open card");
+    expect(calls.getByText[0]!.options).toEqual({ exact: true });
+    expect(calls.getByText[0]!.nth).toBe(2);
+    expect(locatorOf('[data-gini-ref="e3"]').clicks.length).toBe(1);
+  });
+
+  test("a candidate carrying a different stamp is never healed onto", async () => {
+    // The re-query landed on a live element already addressed by another
+    // ref; restamping it would fold two refs onto one node.
+    const { candidate, record } = makeCandidate({ stamp: "e9" });
+    const { page } = makeHealPage({ roleCandidate: candidate });
+    browserTest.installFakeSessionWithPageForTest("heal-foreign", page);
+    const refs = new Map<string, unknown>();
+    refs.set("@e5", { locator: { count: async () => 0 }, role: "button", name: "Submit", nth: 0 });
+    browserTest.setFakeSessionRefsForTest("heal-foreign", refs);
+
+    const raw = await browserClick("heal-foreign", { ref: "@e5" });
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toContain("Unknown ref @e5");
+    expect(record.clicks.length).toBe(0);
+    expect(record.restamps.length).toBe(0);
+  });
+
+  test("a same-text bystander that is not cursor-interactive is never healed onto", async () => {
+    // getByText also matches headings/spans containing the text; only an
+    // element that would itself qualify as a walker clickable is trusted.
+    const { candidate, record } = makeCandidate({ cursor: "auto" });
+    const { page, calls } = makeHealPage({ textCandidate: candidate });
+    browserTest.installFakeSessionWithPageForTest("heal-bystander", page);
+    const refs = new Map<string, unknown>();
+    refs.set("@e3", { locator: { count: async () => 0 }, role: "clickable", name: "Open card", nth: 0 });
+    browserTest.setFakeSessionRefsForTest("heal-bystander", refs);
+
+    const raw = await browserClick("heal-bystander", { ref: "@e3" });
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toContain("Unknown ref @e3");
+    expect(calls.getByText.length).toBe(1);
+    expect(record.clicks.length).toBe(0);
+    expect(record.restamps.length).toBe(0);
+  });
+
+  test("an own-onclick text candidate qualifies without cursor:pointer", async () => {
+    const { candidate } = makeCandidate({ onclick: true });
+    const { page, locatorOf } = makeHealPage({ textCandidate: candidate });
+    browserTest.installFakeSessionWithPageForTest("heal-onclick", page);
+    const refs = new Map<string, unknown>();
+    refs.set("@e3", { locator: { count: async () => 0 }, role: "clickable", name: "Open card", nth: 0 });
+    browserTest.setFakeSessionRefsForTest("heal-onclick", refs);
+
+    const raw = await browserClick("heal-onclick", { ref: "@e3" });
+    expect(JSON.parse(raw).success).toBe(true);
+    expect(locatorOf('[data-gini-ref="e3"]').clicks.length).toBe(1);
+  });
+
+  test("wait_for state visible self-heals and flags healedRef", async () => {
+    const { candidate } = makeCandidate();
+    const { page, calls, locatorOf } = makeHealPage({ roleCandidate: candidate });
+    browserTest.installFakeSessionWithPageForTest("heal-wait", page);
+    const refs = new Map<string, unknown>();
+    refs.set("@e4", { locator: { count: async () => 0 }, role: "status", name: "Saved", nth: 0 });
+    browserTest.setFakeSessionRefsForTest("heal-wait", refs);
+
+    const raw = await browserWaitFor("heal-wait", { ref: "@e4", state: "visible" });
+    const parsed = JSON.parse(raw) as { success: boolean; healedRef?: boolean };
+    expect(parsed.success).toBe(true);
+    expect(parsed.healedRef).toBe(true);
+    expect(calls.getByRole.length).toBe(1);
+    const waits = locatorOf('[data-gini-ref="e4"]').waits;
+    expect(waits.length).toBe(1);
+    expect(waits[0]!.state).toBe("visible");
+  });
+
+  test("wait_for visible polls the stamped locator when resolution and healing both miss", async () => {
+    // The element isn't there YET — waiting for it to appear is the
+    // tool's whole contract, so a failed heal must not fail the call.
+    const waits: Array<{ state?: string; timeout?: number } | undefined> = [];
+    const stamped = {
+      count: async () => 0,
+      waitFor: async (o?: { state?: string; timeout?: number }) => {
+        waits.push(o);
+      }
+    };
+    const { page, calls } = makeHealPage({});
+    browserTest.installFakeSessionWithPageForTest("heal-wait-poll", page);
+    const refs = new Map<string, unknown>();
+    refs.set("@e4", { locator: stamped, role: "status", name: "Saved", nth: 0 });
+    browserTest.setFakeSessionRefsForTest("heal-wait-poll", refs);
+
+    const raw = await browserWaitFor("heal-wait-poll", { ref: "@e4", state: "visible" });
+    const parsed = JSON.parse(raw) as { success: boolean; healedRef?: boolean };
+    expect(parsed.success).toBe(true);
+    expect(parsed.healedRef).toBeUndefined();
+    // Heal was attempted (role re-query ran) before falling back.
+    expect(calls.getByRole.length).toBe(1);
+    expect(waits.length).toBe(1);
+    expect(waits[0]!.state).toBe("visible");
+  });
+
+  test("wait_for state hidden never heals — the raw stamped locator does the waiting", async () => {
+    // A lost stamp often IS the disappearance being awaited; healing onto
+    // a re-rendered replacement would invert the wait's meaning.
+    let countCalls = 0;
+    const waits: Array<{ state?: string; timeout?: number } | undefined> = [];
+    const stamped = {
+      count: async () => {
+        countCalls += 1;
+        return 0;
+      },
+      waitFor: async (o?: { state?: string; timeout?: number }) => {
+        waits.push(o);
+      }
+    };
+    const { page, calls } = makeHealPage({});
+    browserTest.installFakeSessionWithPageForTest("heal-wait-hidden", page);
+    const refs = new Map<string, unknown>();
+    refs.set("@e4", { locator: stamped, role: "status", name: "Saved", nth: 0 });
+    browserTest.setFakeSessionRefsForTest("heal-wait-hidden", refs);
+
+    const raw = await browserWaitFor("heal-wait-hidden", { ref: "@e4", state: "hidden" });
+    const parsed = JSON.parse(raw) as { success: boolean; healedRef?: boolean };
+    expect(parsed.success).toBe(true);
+    expect(parsed.healedRef).toBeUndefined();
+    expect(waits.length).toBe(1);
+    expect(waits[0]!.state).toBe("hidden");
+    // No liveness probe, no re-query: the stamped locator was used as-is.
+    expect(countCalls).toBe(0);
+    expect(calls.getByRole.length).toBe(0);
+    expect(calls.getByText.length).toBe(0);
+  });
+
+  test("fill_secrets never self-heals: a lost stamp fails loudly via the literal stamped selector", async () => {
+    const { page, calls } = makeHealPage({});
+    // The stamped node is gone, so the literal-selector fill times out
+    // the way playwright would.
+    (page as { locator?: unknown }).locator = (sel: string) => {
+      calls.locator.push(sel);
+      return {
+        fill: async () => {
+          throw new Error("Timeout 10000ms exceeded.");
+        }
+      };
+    };
+    browserTest.installFakeSessionWithPageForTest("heal-fill", page);
+    // Healing metadata exists for the ref — and must NOT be consulted.
+    const refs = new Map<string, unknown>();
+    refs.set("@e5", { locator: { count: async () => 0 }, role: "textbox", name: "Password", nth: 0 });
+    browserTest.setFakeSessionRefsForTest("heal-fill", refs);
+
+    const result = await browserFillByLocator("heal-fill", { locator: "@e5", value: "sekrit-value-1234" });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.code).toBe("fill-error");
+    // Resolution went through the literal stamped selector only — no
+    // role/name re-query ever ran (trust boundary; see ADR
+    // browser-fill-secret.md).
+    expect(calls.locator).toEqual(['[data-gini-ref="e5"]']);
+    expect(calls.getByRole.length).toBe(0);
+    expect(calls.getByText.length).toBe(0);
+  });
+
+  test("upload never self-heals: acts only on the stamped element and fails loudly when detached", async () => {
+    const HEAL_ROOT = "/tmp/gini-browser-heal-upload-tests";
+    rmSync(HEAL_ROOT, { recursive: true, force: true });
+    mkdirSync(HEAL_ROOT, { recursive: true });
+    writeFileSync(join(HEAL_ROOT, "doc.txt"), "data\n");
+    try {
+      const { page, calls } = makeHealPage({});
+      browserTest.installFakeSessionWithPageForTest("heal-upload", page);
+      let setInputCalls = 0;
+      const refs = new Map<string, unknown>();
+      refs.set("@e2", {
+        locator: {
+          count: async () => 0,
+          setInputFiles: async () => {
+            setInputCalls += 1;
+            throw new Error("Element is not attached to the DOM");
+          }
+        },
+        role: "file",
+        name: "Resume",
+        nth: 0
+      });
+      browserTest.setFakeSessionRefsForTest("heal-upload", refs);
+
+      const raw = await browserUploadFile("heal-upload", { ref: "@e2", path: "doc.txt" }, HEAL_ROOT);
+      const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+      expect(parsed.success).toBe(false);
+      expect(parsed.error).toContain("not attached");
+      // The detached stamped element was the ONLY thing touched — no
+      // role/name re-query (trust boundary; see ADR
+      // browser-fill-secret.md).
+      expect(setInputCalls).toBe(1);
+      expect(calls.getByRole.length).toBe(0);
+      expect(calls.getByText.length).toBe(0);
+    } finally {
+      rmSync(HEAL_ROOT, { recursive: true, force: true });
     }
   });
 });
@@ -1336,6 +2300,298 @@ describe("browserVision", () => {
   });
 });
 
+// browser_vision annotate: numbered ref badges overlaid before the
+// screenshot. The fake page's evaluate(fn, arg) runs the callback locally
+// against a fake DOM installed on globalThis (same pattern as the
+// snapshot-walker tests), so the real injection/removal logic is exercised
+// without Chromium.
+describe("browserVision annotated screenshots", () => {
+  type VisionFakeEl = {
+    _attrs: Record<string, string>;
+    rect: { left: number; top: number; right: number; bottom: number; width: number; height: number };
+    dataset: Record<string, string | undefined>;
+    style: { filter?: string };
+    getAttribute(name: string): string | null;
+    getBoundingClientRect(): VisionFakeEl["rect"];
+  };
+  type FakeBadge = {
+    _attrs: Record<string, string>;
+    textContent: string;
+    style: { cssText: string };
+    setAttribute(name: string, value: string): void;
+    remove(): void;
+  };
+
+  const makeStamped = (
+    ref: string,
+    init?: { secret?: boolean; rect?: Partial<VisionFakeEl["rect"]> }
+  ): VisionFakeEl => ({
+    _attrs: { "data-gini-ref": ref, ...(init?.secret ? { "data-gini-secret": "true" } : {}) },
+    rect: { left: 10, top: 10, right: 110, bottom: 30, width: 100, height: 20, ...init?.rect },
+    dataset: {},
+    style: { filter: "" },
+    getAttribute(name: string) {
+      return Object.prototype.hasOwnProperty.call(this._attrs, name) ? this._attrs[name]! : null;
+    },
+    getBoundingClientRect() {
+      return this.rect;
+    }
+  });
+
+  // Installs fake document/window globals. Returns the LIVE badge list
+  // (appendChild pushes, badge.remove() splices — so length reflects what
+  // is currently in the overlay) and a restore callback for the globals.
+  const installFakeDom = (els: VisionFakeEl[], scroll?: { x: number; y: number }) => {
+    const badges: FakeBadge[] = [];
+    const originalDocument = (globalThis as Record<string, unknown>).document;
+    const originalWindow = (globalThis as Record<string, unknown>).window;
+    (globalThis as unknown as { document: unknown }).document = {
+      documentElement: { appendChild: (b: FakeBadge) => badges.push(b) },
+      querySelectorAll: (selector: string) => {
+        if (selector === "[data-gini-vision-badge]") return [...badges];
+        const attr = selector.slice(1, -1);
+        return els.filter((el) => Object.prototype.hasOwnProperty.call(el._attrs, attr));
+      },
+      createElement: (_tag: string) => {
+        const badge: FakeBadge = {
+          _attrs: {},
+          textContent: "",
+          style: { cssText: "" },
+          setAttribute(name: string, value: string) {
+            this._attrs[name] = value;
+          },
+          remove() {
+            const i = badges.indexOf(badge);
+            if (i >= 0) badges.splice(i, 1);
+          }
+        };
+        return badge;
+      }
+    };
+    (globalThis as unknown as { window: unknown }).window = {
+      innerWidth: 1280,
+      innerHeight: 800,
+      scrollX: scroll?.x ?? 0,
+      scrollY: scroll?.y ?? 0
+    };
+    const restore = () => {
+      if (originalDocument === undefined) delete (globalThis as Record<string, unknown>).document;
+      else (globalThis as Record<string, unknown>).document = originalDocument;
+      if (originalWindow === undefined) delete (globalThis as Record<string, unknown>).window;
+      else (globalThis as Record<string, unknown>).window = originalWindow;
+    };
+    return { badges, restore };
+  };
+
+  const evalLocally = (<A, R>(fn: (arg: A) => R | Promise<R>, arg?: A): Promise<R> =>
+    Promise.resolve(fn(arg as A))) as unknown as import("playwright-core").Page["evaluate"];
+
+  // Badges are filtered to refs the session holds, so each test registers
+  // the ids it expects badged (values are irrelevant — only keys are read).
+  const setSessionRefIds = (taskId: string, ids: string[]) => {
+    const refs = new Map<string, unknown>();
+    for (const id of ids) refs.set(`@${id}`, {});
+    browserTest.setFakeSessionRefsForTest(taskId, refs);
+  };
+
+  const config: RuntimeConfig = {
+    instance: "test",
+    port: 7337,
+    token: "test",
+    provider: { name: "echo", model: "gini-echo-v0" },
+    workspaceRoot: "/tmp",
+    stateRoot: "/tmp/gini-vision-test",
+    logRoot: "/tmp/gini-vision-test-logs"
+  };
+
+  afterEach(() => {
+    browserTest.clearFakeSessionsForTest();
+    browserTest.setInFlightDisconnectsForTest(0);
+    clearEchoVisionResponses();
+  });
+
+  test("annotate:true badges viewport-visible stamped elements, skips secret-stamped ones, and strips the overlay after", async () => {
+    const visible = makeStamped("e1");
+    const secret = makeStamped("e2", { secret: true });
+    // Below the 800px-tall fake viewport — must not be badged.
+    const offscreen = makeStamped("e3", { rect: { top: 5000, bottom: 5020 } });
+    const { badges, restore } = installFakeDom([visible, secret, offscreen]);
+    let badgeTextsAtScreenshot: string[] = [];
+    const fakePage = {
+      evaluate: evalLocally,
+      screenshot: async () => {
+        badgeTextsAtScreenshot = badges.map((b) => b.textContent);
+        return Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+      },
+      url: () => "https://example.com/annotated"
+    };
+    browserTest.installFakeSessionWithPageForTest("vision-annotate", fakePage);
+    setSessionRefIds("vision-annotate", ["e1", "e2", "e3"]);
+    setEchoVisionResponse({ text: "annotated answer" });
+    try {
+      const raw = await browserVision("vision-annotate", { question: "what?", annotate: true }, config);
+      expect(JSON.parse(raw).success).toBe(true);
+      // Only the viewport-visible, non-secret element was badged.
+      expect(badgeTextsAtScreenshot).toEqual(["e1"]);
+      // The overlay never survives the call.
+      expect(badges.length).toBe(0);
+    } finally {
+      restore();
+    }
+  });
+
+  test("badge injection caps at 50 badges", async () => {
+    const els = Array.from({ length: 60 }, (_, i) => makeStamped(`e${i + 1}`));
+    const { badges, restore } = installFakeDom(els);
+    let badgeCountAtScreenshot = -1;
+    const fakePage = {
+      evaluate: evalLocally,
+      screenshot: async () => {
+        badgeCountAtScreenshot = badges.length;
+        return Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+      },
+      url: () => "https://example.com/dense"
+    };
+    browserTest.installFakeSessionWithPageForTest("vision-cap", fakePage);
+    setSessionRefIds("vision-cap", els.map((el) => el._attrs["data-gini-ref"]!));
+    setEchoVisionResponse({ text: "dense answer" });
+    try {
+      const raw = await browserVision("vision-cap", { question: "what?", annotate: true }, config);
+      expect(JSON.parse(raw).success).toBe(true);
+      // VISION_ANNOTATE_BADGE_CAP keeps a ref-dense page legible.
+      expect(badgeCountAtScreenshot).toBe(50);
+      expect(badges.length).toBe(0);
+    } finally {
+      restore();
+    }
+  });
+
+  test("badges are document-absolute: viewport rect plus scroll offset", async () => {
+    const { badges, restore } = installFakeDom([makeStamped("e1")], { x: 5, y: 1000 });
+    let cssAtScreenshot = "";
+    const fakePage = {
+      evaluate: evalLocally,
+      screenshot: async () => {
+        cssAtScreenshot = badges[0]?.style.cssText ?? "";
+        return Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+      },
+      url: () => "https://example.com/scrolled"
+    };
+    browserTest.installFakeSessionWithPageForTest("vision-scrolled", fakePage);
+    setSessionRefIds("vision-scrolled", ["e1"]);
+    setEchoVisionResponse({ text: "scrolled answer" });
+    try {
+      const raw = await browserVision("vision-scrolled", { question: "what?", annotate: true }, config);
+      expect(JSON.parse(raw).success).toBe(true);
+      // position:fixed would pin the badge to the viewport and miss its
+      // element in a fullPage capture; document coordinates compose.
+      expect(cssAtScreenshot).toContain("position:absolute");
+      expect(cssAtScreenshot).toContain("left:15px");
+      expect(cssAtScreenshot).toContain("top:1010px");
+    } finally {
+      restore();
+    }
+  });
+
+  test("full:true badges below-fold elements the viewport filter would drop", async () => {
+    const belowFold = makeStamped("e1", { rect: { top: 5000, bottom: 5020 } });
+    const { badges, restore } = installFakeDom([belowFold]);
+    let badgeTextsAtScreenshot: string[] = [];
+    const fakePage = {
+      evaluate: evalLocally,
+      screenshot: async () => {
+        badgeTextsAtScreenshot = badges.map((b) => b.textContent);
+        return Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+      },
+      url: () => "https://example.com/long"
+    };
+    browserTest.installFakeSessionWithPageForTest("vision-fullpage", fakePage);
+    setSessionRefIds("vision-fullpage", ["e1"]);
+    setEchoVisionResponse({ text: "fullpage answer" });
+    try {
+      const raw = await browserVision("vision-fullpage", { question: "what?", annotate: true, full: true }, config);
+      expect(JSON.parse(raw).success).toBe(true);
+      expect(badgeTextsAtScreenshot).toEqual(["e1"]);
+    } finally {
+      restore();
+    }
+  });
+
+  test("stamped elements whose ref the session does not hold get no badge", async () => {
+    // e2 carries a stamp (char-budget drop, or page-planted attribute)
+    // but the session never mapped it — badging it would cite a ref the
+    // agent cannot act on.
+    const { badges, restore } = installFakeDom([makeStamped("e1"), makeStamped("e2")]);
+    let badgeTextsAtScreenshot: string[] = [];
+    const fakePage = {
+      evaluate: evalLocally,
+      screenshot: async () => {
+        badgeTextsAtScreenshot = badges.map((b) => b.textContent);
+        return Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+      },
+      url: () => "https://example.com/unmapped"
+    };
+    browserTest.installFakeSessionWithPageForTest("vision-unmapped", fakePage);
+    setSessionRefIds("vision-unmapped", ["e1"]);
+    setEchoVisionResponse({ text: "unmapped answer" });
+    try {
+      const raw = await browserVision("vision-unmapped", { question: "what?", annotate: true }, config);
+      expect(JSON.parse(raw).success).toBe(true);
+      expect(badgeTextsAtScreenshot).toEqual(["e1"]);
+    } finally {
+      restore();
+    }
+  });
+
+  test("the overlay is stripped even when the screenshot throws", async () => {
+    const { badges, restore } = installFakeDom([makeStamped("e1")]);
+    const fakePage = {
+      evaluate: evalLocally,
+      screenshot: async () => {
+        // Badges are up at this point; the throw must not strand them.
+        expect(badges.length).toBe(1);
+        throw new Error("capture exploded");
+      },
+      url: () => "https://example.com/boom"
+    };
+    browserTest.installFakeSessionWithPageForTest("vision-strip-on-fail", fakePage);
+    setSessionRefIds("vision-strip-on-fail", ["e1"]);
+    try {
+      const raw = await browserVision("vision-strip-on-fail", { question: "what?", annotate: true }, config);
+      const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+      expect(parsed.success).toBe(false);
+      expect(parsed.error).toContain("capture exploded");
+      expect(badges.length).toBe(0);
+    } finally {
+      restore();
+    }
+  });
+
+  test("the ref-badge mapping sentence reaches the vision prompt only when annotate is set", async () => {
+    // No DOM here: a page without evaluate skips the overlay entirely, and
+    // the unseeded echo provider answers "Vision stub: <prompt>" so the
+    // exact prompt is observable in the answer.
+    const fakePage = {
+      screenshot: async () => Buffer.from([0x89, 0x50, 0x4e, 0x47]),
+      url: () => "https://example.com/prompt"
+    };
+    browserTest.installFakeSessionWithPageForTest("vision-prompt-on", fakePage);
+    const annotatedRaw = await browserVision("vision-prompt-on", { question: "describe the page", annotate: true }, config);
+    const annotated = JSON.parse(annotatedRaw) as { success: boolean; answer?: string };
+    expect(annotated.success).toBe(true);
+    expect(annotated.answer).toContain("describe the page");
+    expect(annotated.answer).toContain("numbered badges");
+    expect(annotated.answer).toContain("@e12");
+
+    browserTest.installFakeSessionWithPageForTest("vision-prompt-off", fakePage);
+    const plainRaw = await browserVision("vision-prompt-off", { question: "describe the page" }, config);
+    const plain = JSON.parse(plainRaw) as { success: boolean; answer?: string };
+    expect(plain.success).toBe(true);
+    expect(plain.answer).toContain("describe the page");
+    expect(plain.answer).not.toContain("badge");
+  });
+});
+
 // Shared helper: build a minimal fake Page that satisfies the surface our
 // tool entry points exercise (evaluate for snapshot, title/url, optional
 // waitForLoadState). Tests planted refs directly via setFakeSessionRefsForTest
@@ -1746,7 +3002,7 @@ describe("browserTabs", () => {
     browserTest.setInFlightDisconnectsForTest(0);
   });
 
-  test("list returns one entry per page with active flag", async () => {
+  test("list returns one entry per page with a stable tN handle and active flag", async () => {
     const p0 = makeFakeTabPage("p0", "https://a.example/");
     const p1 = makeFakeTabPage("p1", "https://b.example/");
     const pages = [p0, p1];
@@ -1760,15 +3016,16 @@ describe("browserTabs", () => {
     const parsed = JSON.parse(raw) as {
       success: boolean;
       url?: string;
-      tabs?: Array<{ index: number; url: string; title: string; active: boolean }>;
+      tabs?: Array<{ id: string; url: string; title: string; active: boolean }>;
     };
     expect(parsed.success).toBe(true);
     expect(parsed.url).toBe("https://b.example/");
     expect(parsed.tabs).toBeDefined();
     expect(parsed.tabs!.length).toBe(2);
-    expect(parsed.tabs![0]!.index).toBe(0);
+    expect(parsed.tabs![0]!.id).toBe("t1");
     expect(parsed.tabs![0]!.url).toBe("https://a.example/");
     expect(parsed.tabs![0]!.active).toBe(false);
+    expect(parsed.tabs![1]!.id).toBe("t2");
     expect(parsed.tabs![1]!.active).toBe(true);
   });
 
@@ -1795,9 +3052,12 @@ describe("browserTabs", () => {
     browserTest.setFakeSessionRefsForTest("tabs-new", staleRefs);
 
     const raw = await browserTabs("tabs-new", { action: "new", url: "https://c.example/" });
-    const parsed = JSON.parse(raw) as { success: boolean; url?: string };
+    const parsed = JSON.parse(raw) as { success: boolean; url?: string; id?: string };
     expect(parsed.success).toBe(true);
     expect(parsed.url).toBe("https://c.example/");
+    // The response carries the new tab's stable handle so the model can
+    // address it without re-listing.
+    expect(parsed.id).toMatch(/^t\d+$/);
     expect(gotoCalls.length).toBe(1);
     expect(gotoCalls[0]!.url).toBe("https://c.example/");
     // session.page should have been swapped to the new tab.
@@ -1828,7 +3088,7 @@ describe("browserTabs", () => {
     expect(newPageCalls).toBe(0);
   });
 
-  test("switch swaps the active page and clears refs", async () => {
+  test("switch swaps the active page by handle and clears refs", async () => {
     const p0 = makeFakeTabPage("p0", "https://a.example/");
     const p1 = makeFakeTabPage("p1", "https://b.example/");
     const pages = [p0, p1];
@@ -1837,11 +3097,13 @@ describe("browserTabs", () => {
       newPage: (async () => p0) as unknown as import("playwright-core").BrowserContext["newPage"]
     };
     browserTest.installFakeSessionWithPageAndContextForTest("tabs-switch", p0, context);
+    // Handles are assigned lazily on list — t1=p0, t2=p1.
+    await browserTabs("tabs-switch", { action: "list" });
     const stale = new Map<string, unknown>();
     stale.set("@e1", {});
     browserTest.setFakeSessionRefsForTest("tabs-switch", stale);
 
-    const raw = await browserTabs("tabs-switch", { action: "switch", index: 1 });
+    const raw = await browserTabs("tabs-switch", { action: "switch", id: "t2" });
     const parsed = JSON.parse(raw) as { success: boolean };
     expect(parsed.success).toBe(true);
     const active = browserTest.getFakeSessionPageForTest("tabs-switch") as FakeTabPage | undefined;
@@ -1849,18 +3111,20 @@ describe("browserTabs", () => {
     expect(browserTest.getFakeSessionRefsForTest("tabs-switch")?.size ?? 0).toBe(0);
   });
 
-  test("switch fails for an out-of-range index", async () => {
+  test("switch fails for an unknown handle and points the model at list", async () => {
     const p0 = makeFakeTabPage("p0", "https://a.example/");
     const context: Partial<import("playwright-core").BrowserContext> = {
       pages: (() => [p0]) as unknown as import("playwright-core").BrowserContext["pages"],
       newPage: (async () => p0) as unknown as import("playwright-core").BrowserContext["newPage"]
     };
     browserTest.installFakeSessionWithPageAndContextForTest("tabs-switch-bad", p0, context);
-    const raw = await browserTabs("tabs-switch-bad", { action: "switch", index: 5 });
-    expect(JSON.parse(raw).error).toContain("No tab at index 5");
+    const raw = await browserTabs("tabs-switch-bad", { action: "switch", id: "t5" });
+    const error = JSON.parse(raw).error as string;
+    expect(error).toContain("No tab with id t5");
+    expect(error).toMatch(/list/);
   });
 
-  test("close closes the page, swaps if needed, and clears refs", async () => {
+  test("close closes the page by handle, swaps if needed, and clears refs", async () => {
     const p0 = makeFakeTabPage("p0", "https://a.example/");
     const p1 = makeFakeTabPage("p1", "https://b.example/");
     const pages = [p0, p1];
@@ -1870,11 +3134,12 @@ describe("browserTabs", () => {
     };
     // Active page is p1; we'll close it and expect the session to swap to p0.
     browserTest.installFakeSessionWithPageAndContextForTest("tabs-close-active", p1, context);
+    await browserTabs("tabs-close-active", { action: "list" });
     const stale = new Map<string, unknown>();
     stale.set("@e1", {});
     browserTest.setFakeSessionRefsForTest("tabs-close-active", stale);
 
-    const raw = await browserTabs("tabs-close-active", { action: "close", index: 1 });
+    const raw = await browserTabs("tabs-close-active", { action: "close", id: "t2" });
     const parsed = JSON.parse(raw) as { success: boolean };
     expect(parsed.success).toBe(true);
     expect(p1._closed).toBe(true);
@@ -1897,14 +3162,65 @@ describe("browserTabs", () => {
       }) as unknown as import("playwright-core").BrowserContext["newPage"]
     };
     browserTest.installFakeSessionWithPageAndContextForTest("tabs-close-last", only, context);
+    await browserTabs("tabs-close-last", { action: "list" });
 
-    const raw = await browserTabs("tabs-close-last", { action: "close", index: 0 });
+    const raw = await browserTabs("tabs-close-last", { action: "close", id: "t1" });
     const parsed = JSON.parse(raw) as { success: boolean };
     expect(parsed.success).toBe(true);
     expect(only._closed).toBe(true);
     expect(newPageCalls).toBe(1);
     const active = browserTest.getFakeSessionPageForTest("tabs-close-last") as FakeTabPage | undefined;
     expect(active?._label).toBe("after");
+  });
+
+  test("handles are stable across a close: t2 still addresses the same page after t1 closes", async () => {
+    const p0 = makeFakeTabPage("p0", "https://a.example/");
+    const p1 = makeFakeTabPage("p1", "https://b.example/");
+    const p2 = makeFakeTabPage("p2", "https://c.example/");
+    const pages = [p0, p1, p2];
+    const context: Partial<import("playwright-core").BrowserContext> = {
+      pages: (() => pages.filter((p) => !p._closed)) as unknown as import("playwright-core").BrowserContext["pages"],
+      newPage: (async () => makeFakeTabPage("fresh", "about:blank")) as unknown as import("playwright-core").BrowserContext["newPage"]
+    };
+    browserTest.installFakeSessionWithPageAndContextForTest("tabs-stable", p2, context);
+    await browserTabs("tabs-stable", { action: "list" }); // t1=p0, t2=p1, t3=p2
+
+    const closeRaw = await browserTabs("tabs-stable", { action: "close", id: "t1" });
+    expect(JSON.parse(closeRaw).success).toBe(true);
+    // After closing t1, a positional scheme would now call p1 "tab 0" — the
+    // stable handle t2 must still reach p1.
+    const listRaw = await browserTabs("tabs-stable", { action: "list" });
+    const listed = JSON.parse(listRaw) as { tabs?: Array<{ id: string; url: string }> };
+    expect(listed.tabs!.map((t) => t.id)).toEqual(["t2", "t3"]);
+    const switchRaw = await browserTabs("tabs-stable", { action: "switch", id: "t2" });
+    expect(JSON.parse(switchRaw).success).toBe(true);
+    const active = browserTest.getFakeSessionPageForTest("tabs-stable") as FakeTabPage | undefined;
+    expect(active?._label).toBe("p1");
+  });
+
+  test("a closed tab's handle is never reused: a new tab gets a fresh handle and the old one stays dead", async () => {
+    const p0 = makeFakeTabPage("p0", "https://a.example/");
+    const p1 = makeFakeTabPage("p1", "https://b.example/");
+    const fresh = makeFakeTabPage("fresh", "https://c.example/");
+    const pages = [p0, p1];
+    const context: Partial<import("playwright-core").BrowserContext> = {
+      pages: (() => pages.filter((p) => !p._closed)) as unknown as import("playwright-core").BrowserContext["pages"],
+      newPage: (async () => {
+        pages.push(fresh);
+        return fresh;
+      }) as unknown as import("playwright-core").BrowserContext["newPage"]
+    };
+    browserTest.installFakeSessionWithPageAndContextForTest("tabs-no-reuse", p0, context);
+    await browserTabs("tabs-no-reuse", { action: "list" }); // t1=p0, t2=p1
+
+    await browserTabs("tabs-no-reuse", { action: "close", id: "t2" });
+    const newRaw = await browserTabs("tabs-no-reuse", { action: "new" });
+    const opened = JSON.parse(newRaw) as { success: boolean; id?: string };
+    expect(opened.success).toBe(true);
+    // The fresh tab must NOT inherit the retired t2 — the counter is monotonic.
+    expect(opened.id).toBe("t3");
+    const switchRaw = await browserTabs("tabs-no-reuse", { action: "switch", id: "t2" });
+    expect(JSON.parse(switchRaw).error).toContain("No tab with id t2");
   });
 
   test("rejects an unknown action", async () => {
@@ -1918,17 +3234,17 @@ describe("browserTabs", () => {
     expect(JSON.parse(raw).error).toMatch(/action.*list.*new.*switch.*close/);
   });
 
-  test("rejects missing index on switch/close", async () => {
+  test("rejects missing id on switch/close", async () => {
     const p0 = makeFakeTabPage("p0", "https://a.example/");
     const context: Partial<import("playwright-core").BrowserContext> = {
       pages: (() => [p0]) as unknown as import("playwright-core").BrowserContext["pages"],
       newPage: (async () => p0) as unknown as import("playwright-core").BrowserContext["newPage"]
     };
-    browserTest.installFakeSessionWithPageAndContextForTest("tabs-missing-index", p0, context);
-    const rawSwitch = await browserTabs("tabs-missing-index", { action: "switch" });
-    expect(JSON.parse(rawSwitch).error).toMatch(/non-negative integer/);
-    const rawClose = await browserTabs("tabs-missing-index", { action: "close" });
-    expect(JSON.parse(rawClose).error).toMatch(/non-negative integer/);
+    browserTest.installFakeSessionWithPageAndContextForTest("tabs-missing-id", p0, context);
+    const rawSwitch = await browserTabs("tabs-missing-id", { action: "switch" });
+    expect(JSON.parse(rawSwitch).error).toMatch(/id.*tab handle/);
+    const rawClose = await browserTabs("tabs-missing-id", { action: "close" });
+    expect(JSON.parse(rawClose).error).toMatch(/id.*tab handle/);
   });
 });
 

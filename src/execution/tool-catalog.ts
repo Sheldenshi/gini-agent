@@ -282,7 +282,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "start_thread",
-      description: "Branch your reply into a thread off your previous message, keeping the main chat scannable. Call this as your FIRST action (before any text or other tool) when the user's message opens multi-turn work — research, brainstorming, debugging, planning, a comparison, anything you expect follow-ups about. Do nothing (reply in the main chat) for quick answers, confirmations, single facts, or one-shot actions. Never call it when you are already replying inside a thread.",
+      description: "Branch your reply into a thread off the user's message, keeping the main chat scannable. Call this as your FIRST action (before any text or other tool) when the user's message opens multi-turn work — research, brainstorming, debugging, planning, a comparison, anything you expect follow-ups about. Do nothing (reply in the main chat) for quick answers, confirmations, single facts, or one-shot actions. Never call it when you are already replying inside a thread.",
       parameters: {
         type: "object",
         properties: {
@@ -332,7 +332,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "browser_snapshot",
-      description: "Re-snapshot the current browser page. Default returns interactive elements with @eN refs; pass full=true for a richer tree including landmarks and headings.",
+      description: "Re-snapshot the current browser page. Always returns the full tree (action results may return diffs vs the previous snapshot). Default returns interactive elements with @eN refs; entries with role `clickable` are cursor-detected clickables (non-semantic elements styled cursor:pointer or carrying onclick/tabindex). Pass full=true for a richer tree including landmarks and headings.",
       parameters: {
         type: "object",
         properties: {
@@ -349,7 +349,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "browser_click",
-      description: "Click an element on the current page by its @eN ref from the latest snapshot. Returns a fresh snapshot.",
+      description: "Click an element on the current page by its @eN ref from the latest snapshot. Returns a fresh snapshot, possibly as a diff (call browser_snapshot for the full tree).",
       parameters: {
         type: "object",
         properties: {
@@ -367,7 +367,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "browser_type",
-      description: "Clear and type text into an input element identified by its @eN ref. Returns a fresh snapshot.",
+      description: "Clear and type text into an input element identified by its @eN ref. Returns a fresh snapshot, possibly as a diff (call browser_snapshot for the full tree).",
       parameters: {
         type: "object",
         properties: {
@@ -386,7 +386,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "browser_press",
-      description: "Press a keyboard key on the current page (e.g. 'Enter', 'Tab', 'Escape', 'ArrowDown'). Returns a fresh snapshot.",
+      description: "Press a keyboard key on the current page (e.g. 'Enter', 'Tab', 'Escape', 'ArrowDown'). Returns a fresh snapshot, possibly as a diff (call browser_snapshot for the full tree).",
       parameters: {
         type: "object",
         properties: {
@@ -404,7 +404,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "browser_scroll",
-      description: "Scroll the current page up or down by one viewport. Returns a fresh snapshot.",
+      description: "Scroll the current page up or down by one viewport. Returns a fresh snapshot, possibly as a diff (call browser_snapshot for the full tree).",
       parameters: {
         type: "object",
         properties: {
@@ -464,7 +464,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "browser_hover",
-      description: "Hover over an element on the current page by its @eN ref. Useful for revealing tooltips or :hover-only menus. Returns a fresh snapshot.",
+      description: "Hover over an element on the current page by its @eN ref. Useful for revealing tooltips or :hover-only menus. Returns a fresh snapshot, possibly as a diff (call browser_snapshot for the full tree).",
       parameters: {
         type: "object",
         properties: {
@@ -482,7 +482,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "browser_drag",
-      description: "Drag from one element to another by their @eN refs.",
+      description: "Drag from one element to another by their @eN refs. Returns a fresh snapshot, possibly as a diff (call browser_snapshot for the full tree).",
       parameters: {
         type: "object",
         properties: {
@@ -501,7 +501,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "browser_select_option",
-      description: "Select an option in a <select> element by its @eN ref. Pass `value` for single-select or `values` for multi-select. Exactly one of the two must be provided.",
+      description: "Select an option in a <select> element by its @eN ref. Pass `value` for single-select or `values` for multi-select. Exactly one of the two must be provided. Returns a fresh snapshot, possibly as a diff (call browser_snapshot for the full tree).",
       parameters: {
         type: "object",
         properties: {
@@ -521,7 +521,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "browser_wait_for",
-      description: "Wait for an element (by @eN ref) to reach a state, or for a substring to appear in the page text. Exactly one of `ref` or `text` must be supplied. Returns a fresh snapshot after the wait completes.",
+      description: "Wait for an element (by @eN ref) to reach a state, or for a substring to appear in the page text. Exactly one of `ref` or `text` must be supplied. Returns a fresh snapshot after the wait completes, possibly as a diff (call browser_snapshot for the full tree).",
       parameters: {
         type: "object",
         properties: {
@@ -545,7 +545,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "browser_tabs",
-      description: "Manage browser tabs: list current tabs, open a new tab, switch the active tab, or close a tab. `index` (zero-based) is required for switch and close. `url` is optional for `new` (the new tab is created blank if omitted).",
+      description: "Manage browser tabs: list current tabs, open a new tab, switch the active tab, or close a tab. Tabs are addressed by stable handles like 't2' (from `list` or the `id` returned by `new`); handles never change and are never reused, even after the tab closes. `id` is required for switch and close. `url` is optional for `new` (the new tab is created blank if omitted).",
       parameters: {
         type: "object",
         properties: {
@@ -555,7 +555,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
             description: "Tab operation to perform."
           },
           url: { type: "string", description: "Absolute http(s) URL to load when action='new'. Optional." },
-          index: { type: "number", description: "Zero-based tab index for action='switch' or action='close'." }
+          id: { type: "string", description: "Stable tab handle like 't2' for action='switch' or action='close'. Get handles from action='list' (or the id returned by action='new')." }
         },
         required: ["action"]
       }
@@ -610,7 +610,8 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
         type: "object",
         properties: {
           question: { type: "string", description: "Question to ask about the page screenshot." },
-          full: { type: "boolean", default: false, description: "If true, capture the full scrollable page; otherwise just the viewport." }
+          full: { type: "boolean", default: false, description: "If true, capture the full scrollable page; otherwise just the viewport." },
+          annotate: { type: "boolean", default: false, description: "If true, overlay numbered badges showing element refs (@eN from the latest snapshot) on the screenshot so the answer can cite specific elements. Secret-bearing elements are never badged." }
         },
         required: ["question"]
       }

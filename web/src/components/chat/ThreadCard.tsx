@@ -95,7 +95,9 @@ export function ThreadCard({
       {/* Original message (root preview) */}
       <button type="button" onClick={onOpen} className="flex flex-col gap-1.5 text-left">
         <div className="flex items-center gap-2">
-          <span className="text-[13px] font-bold text-foreground">{agentName}</span>
+          <span className="text-[13px] font-bold text-foreground">
+            {thread.rootAuthor === "user" ? "You" : agentName}
+          </span>
         </div>
         <p className="text-[13px] font-medium leading-relaxed text-foreground">
           {thread.rootPreview || thread.lastReplyPreview || "Thread"}

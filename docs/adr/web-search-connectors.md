@@ -30,9 +30,11 @@ A tool failure can carry two audiences. `web_search` with no connector must stee
 
 This is a general pattern: any tool may throw `ToolDisplayError` to split steering from the user-facing line. Plain `Error`s keep surfacing their message to both audiences (red).
 
-## Async resume after setup completion
+## Async resume after setup resolution
 
 `POST /api/setup-requests/<id>/complete` creates the connector, probes it, and — on a healthy probe — resumes the paused agent run. The resume is **detached** (`resolveSetupRequest({ awaitResume: false })`), mirroring `submitTask`'s fire-and-forget `runTask(...).catch(failTask)`. The HTTP response returns as soon as the connector is saved and verified, so the connect modal closes immediately instead of blocking for the whole resumed run; the agent then streams its continuation into the chat. The same flag applies to `browser.connect` completion.
+
+`POST /api/setup-requests/<id>/cancel` for `connector.request` follows the same detached response shape but resumes the paused run with a cancellation tool result instead of failing the task. That lets the agent continue without the connector when possible, or reply with the specific connector/input it still needs when the original request cannot be satisfied.
 
 ## Consequences
 
@@ -46,5 +48,6 @@ This is a general pattern: any tool may throw `ToolDisplayError` to split steeri
 - `bun test src/tools/web-search.test.ts`, `src/integrations/connectors/{brave-search,exa}.test.ts` cover backend mapping and probes.
 - `bun test src/execution/tool-dispatch.test.ts` covers the no-connector `ToolDisplayError` split (verbose model message + `"No search provider connected."` info line) and the provider-specific message when an explicit backend is absent while another is connected.
 - `bun test src/state/store.test.ts` covers the default-agent backfill of `web_search`.
-- `bun test src/execution/chat-task.test.ts` covers the `connector.request` reason rendering as an assistant bubble above the setup card.
+- `bun test src/execution/chat-task.test.ts` covers the `connector.request` reason rendering as an assistant bubble above the setup card and cancellation resuming the agent loop with a fallback result.
 - Live: asking to search the web on an instance with no search connector shows the muted "No search provider connected." line, a Gini explanation bubble, and a minimal Connect card; completing the connect closes the modal immediately and the agent continues.
+- Live: cancelling the Connect card marks the card cancelled, clears the in-flight chat state, and the agent either continues with another path or explains which connector/input is still needed.

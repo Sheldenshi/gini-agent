@@ -554,10 +554,16 @@ export interface ThreadSummary {
   threadId: string;
   sessionId: string;
   agentId?: string;
-  // The main-chat `assistant_text` block the thread branched from.
+  // The main-chat block the thread branched from: the human `user_text`
+  // message for an agent-started thread, or the `assistant_text` block the
+  // user clicked "Reply in thread" under.
   parentBlockId?: string;
-  // Text of the parent assistant block, truncated for chip previews.
+  // Text of the parent block, truncated for chip/root previews.
   rootPreview?: string;
+  // Author of the parent block, so surfaces that show the root preview can
+  // attribute it correctly. `user_text` ⇒ "user" (agent-started thread,
+  // rooted at the human message), otherwise "agent". Absent when no parent.
+  rootAuthor?: "user" | "agent";
   // Count of blocks tagged with this thread_id.
   replyCount: number;
   lastReplyAt: string;

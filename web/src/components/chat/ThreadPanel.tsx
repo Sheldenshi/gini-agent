@@ -107,7 +107,7 @@ export function ThreadPanel({
         <div className="flex min-w-0 flex-col gap-0.5">
           <span className="text-[15px] font-bold text-foreground">Thread</span>
           <span className="truncate text-[12px] font-medium text-muted-foreground">
-            {agentName}
+            {thread.rootAuthor === "user" ? "You" : agentName}
             {thread.rootPreview ? ` · ${thread.rootPreview}` : ""}
           </span>
         </div>
@@ -125,22 +125,32 @@ export function ThreadPanel({
         <div className="flex flex-col gap-4 p-[18px]">
           {/* Parent message — the thread's root, always shown at the top.
               Rendered through the same BlockRenderer as the main chat so it
-              looks like a real agent message (avatar + name + time + bubble).
-              Falls back to a minimal bubble while the session blocks load. */}
+              carries the real author (agent message, or the human's "You"
+              message for an agent-started thread). Falls back to a minimal
+              bubble — author-matched via rootAuthor — while blocks load. */}
           {parentBlock ? (
             <BlockRenderer block={parentBlock} agent={agent} />
           ) : thread.rootPreview ? (
-            <div className="flex items-start gap-2.5">
-              <AgentAvatar name={agentName} seed={agent?.id ?? agentName} size={24} className="mt-0.5" />
-              <div className="min-w-0 flex-1">
-                <div className="flex items-center gap-2 pl-1 pb-1 text-xs">
-                  <span className="font-semibold text-foreground">{agentName}</span>
-                </div>
-                <div className="max-w-[90%] rounded-xl bg-card px-3 py-2.5 text-[13px] text-foreground">
+            thread.rootAuthor === "user" ? (
+              <div className="flex flex-col items-end gap-1">
+                <span className="pr-1 text-xs font-semibold text-foreground">You</span>
+                <div className="ml-auto max-w-[80%] rounded-xl bg-secondary px-3 py-2.5 text-[13px] text-secondary-foreground dark:bg-primary dark:text-primary-foreground">
                   {thread.rootPreview}
                 </div>
               </div>
-            </div>
+            ) : (
+              <div className="flex items-start gap-2.5">
+                <AgentAvatar name={agentName} seed={agent?.id ?? agentName} size={24} className="mt-0.5" />
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2 pl-1 pb-1 text-xs">
+                    <span className="font-semibold text-foreground">{agentName}</span>
+                  </div>
+                  <div className="max-w-[90%] rounded-xl bg-card px-3 py-2.5 text-[13px] text-foreground">
+                    {thread.rootPreview}
+                  </div>
+                </div>
+              </div>
+            )
           ) : null}
 
           {/* Replies divider — frames the reply section even with 0 replies. */}

@@ -7,7 +7,7 @@ Split the legacy single-`Approval` concept into two first-class types differenti
 | Type | Actor at resolution | Resolution means |
 |---|---|---|
 | `Authorization` | Agent | User clicks approve/deny; the agent then performs the risk-classified action. |
-| `SetupRequest` | User | User performs a setup step (with optional input body); the agent waits, then resumes. |
+| `SetupRequest` | User | User performs a setup step (with optional input body); the agent waits, then the action-specific resolver either resumes or terminates the task. |
 
 `Approval` is retired as a named type. `state.approvals` is partitioned into `state.authorizations` and `state.setupRequests` on first read. Clients hit `/api/authorizations*` and `/api/setup-requests*` directly — no `/api/approvals*` alias is exposed.
 
@@ -67,7 +67,9 @@ No `/api/approvals*` alias is exposed; the legacy endpoint family is removed and
 
 `resolveAuthorization` keeps the executor pattern: mark approved, run the per-action side effect via `executeApprovedAction`, write the per-action audit row, resume the chat-task loop.
 
-`resolveSetupRequest` only flips status and resumes the chat loop. Per-action side effects (visible Chrome launch, connector creation, credential routing) run inside the `/complete` handler. The `browser.connect` flow uses `completeBrowserConnectSetup` in `src/capabilities/browser-connect.ts` so the HTTP path and the test path share one implementation.
+`resolveSetupRequest` flips status and owns the action-specific continuation policy. Per-action side effects (visible Chrome launch, connector creation, credential routing) run inside the `/complete` handler. The `browser.connect` flow uses `completeBrowserConnectSetup` in `src/capabilities/browser-connect.ts` so the HTTP path and the test path share one implementation.
+
+`connector.request` cancellation resumes the paused chat loop with a negative tool result so the agent can continue without that connector or explain what input is still required. Setup actions without an explicit continuation contract may mark the task failed on cancel rather than inventing a generic fallback.
 
 ## Consequences
 

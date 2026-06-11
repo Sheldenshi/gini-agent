@@ -1927,6 +1927,80 @@ describe("chat-task loop", () => {
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
 
+  test("connector.request cancel resumes the chat loop with a fallback result", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-blocks-connector-cancel");
+    const provider = normalizeProvider(config.provider);
+
+    const session = await mutateState(config.instance, (state) =>
+      createChatSession(state, "block-connector-cancel", undefined, "agent_z")
+    );
+
+    const reason = "I need Brave Search access to answer with current weather.";
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_c", type: "function", function: { name: "request_connector", arguments: JSON.stringify({ provider: "brave-search", reason }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    setEchoToolCallingResponse({
+      provider,
+      text: "I can't look up current weather without Brave Search access. Connect Brave Search or provide the weather details.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const { submitChatMessage } = await import("./chat");
+    const submitted = await submitChatMessage(config, session.id, { content: "what is the weather in sf today" });
+    const paused = await waitForTerminal(config, submitted.taskId);
+    expect(paused.status).toBe("waiting_approval");
+
+    const setup = readState(config.instance).setupRequests.find((s) => s.taskId === submitted.taskId);
+    expect(setup?.action).toBe("connector.request");
+
+    await resolveSetupRequest(config, setup!.id, "cancel", { actor: "user" });
+
+    let finished = readState(config.instance).tasks.find((t) => t.id === submitted.taskId);
+    const deadline = Date.now() + 5000;
+    while (finished?.status !== "completed" && Date.now() < deadline) {
+      await Bun.sleep(20);
+      finished = readState(config.instance).tasks.find((t) => t.id === submitted.taskId);
+    }
+    expect(finished?.status).toBe("completed");
+    expect(finished?.summary).toBe(
+      "I can't look up current weather without Brave Search access. Connect Brave Search or provide the weather details."
+    );
+
+    const { listChatBlocks } = await import("../state");
+    const blocks = listChatBlocks(config.instance, session.id);
+    let lastPhase = blocks[blocks.length - 1];
+    for (let i = blocks.length - 1; i >= 0; i--) {
+      if (blocks[i]?.kind === "phase") {
+        lastPhase = blocks[i];
+        break;
+      }
+    }
+    expect(lastPhase?.kind).toBe("phase");
+    if (lastPhase?.kind === "phase") {
+      expect(lastPhase.label).toBe("Completed");
+      expect(lastPhase.taskId).toBe(submitted.taskId);
+    }
+    const requestConnectorCall = blocks.find(
+      (b) => b.kind === "tool_call" && b.toolName === "request_connector"
+    );
+    expect(requestConnectorCall?.kind).toBe("tool_call");
+    if (requestConnectorCall?.kind === "tool_call") {
+      expect(requestConnectorCall.status).toBe("ok");
+    }
+    expect(blocks.some((b) => b.kind === "tool_result" && b.preview.includes("User canceled connector setup for brave-search"))).toBe(true);
+    expect(blocks.some((b) => b.kind === "assistant_text" && b.text === finished?.summary)).toBe(true);
+    expect(readState(config.instance).setupRequests.find((s) => s.id === setup!.id)?.status).toBe("cancelled");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
   test("emits parallel tool_calls with distinct callIds and ordinals", async () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
     writeFileSync(join(workspaceRoot, "a.md"), "alpha");

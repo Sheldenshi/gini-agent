@@ -104,5 +104,5 @@ The dispatch surface guard (`browserFillSecretsTool` in `src/execution/tool-disp
 - Calling `browser_vision` on a page with a `data-gini-secret`-stamped element blurs the element in the screenshot before sending to the vision model and additionally redacts any literal occurrence of the secret value from the model's answer.
 - The on-disk `state.json` and the task's trace JSONL never contain `"tomsmith"` or `"SuperSecretPassword!"` byte sequences.
 - Submitting the same setup request twice returns `410 Gone`.
-- Cancelling the setup request via `POST /api/setup-requests/<id>/cancel` returns the task to the agent loop with a cancellation tool result and never touches the browser.
+- Cancelling the setup request via `POST /api/setup-requests/<id>/cancel` resolves the setup row without touching the browser; the current runtime treats `browser.fill_secret` cancellation as terminal until this action gains its own continuation contract.
 - Calling `browser_fill_secrets` from a task whose chat session originates from Telegram or Discord (`session.source.kind === "telegram" | "discord"`) returns a synchronous `{ ok: false, error }` envelope from `dispatchToolCall` without creating any setup-request row, so the messaging mirror reaches `terminal` and relays the agent's plain-text fallback reply.

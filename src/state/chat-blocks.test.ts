@@ -26,7 +26,7 @@ import {
   updateToolCallBlock,
   upsertAssistantTextBlock
 } from "./index";
-import { listMainChatBlocks } from "./chat-blocks";
+import { getMainChatUserTextBlockForTask, listMainChatBlocks } from "./chat-blocks";
 import type { ChatBlock } from "../types";
 
 const ROOT = "/tmp/gini-chat-blocks-test";
@@ -597,6 +597,47 @@ describe("chat-blocks persistence", () => {
     expect(row?.run_id).toBe("run_meta");
   });
 
+  test("getMainChatUserTextBlockForTask returns the task's main-chat user message, ignoring threaded and other-task rows", () => {
+    const instance = "chat-blocks-user-anchor";
+    const sessionId = "chat_anchor";
+    // A user message for the target turn, plus noise: an assistant reply, a
+    // user message from a different task, and a threaded user message.
+    const target = insertChatBlock(instance, {
+      kind: "user_text",
+      sessionId,
+      text: "research this",
+      taskId: "task_target"
+    });
+    insertChatBlock(instance, {
+      kind: "assistant_text",
+      sessionId,
+      text: "an earlier answer",
+      taskId: "task_prior",
+      streaming: false
+    });
+    insertChatBlock(instance, {
+      kind: "user_text",
+      sessionId,
+      text: "different turn",
+      taskId: "task_other"
+    });
+    insertChatBlock(instance, {
+      kind: "user_text",
+      sessionId,
+      text: "threaded reply",
+      taskId: "task_target",
+      threadId: "thread_x",
+      parentBlockId: target.id
+    });
+
+    const found = getMainChatUserTextBlockForTask(instance, sessionId, "task_target");
+    expect(found?.id).toBe(target.id);
+
+    // No user message for the task → undefined, so an agent turn for that
+    // task does not thread (it stays in the channel/main timeline).
+    expect(getMainChatUserTextBlockForTask(instance, sessionId, "task_prior")).toBeUndefined();
+  });
+
   test("system_note round-trips authError metadata; plain notes omit it", () => {
     const instance = "chat-blocks-autherror";
 
@@ -845,9 +886,36 @@ describe("chat-blocks threading", () => {
     expect(b?.replyCount).toBe(1);
     expect(a?.parentBlockId).toBe(root.id);
     expect(a?.rootPreview).toBe("Here is a research plan you can branch on.");
+    // Rooted at an assistant_text block (user clicked "Reply in thread").
+    expect(a?.rootAuthor).toBe("agent");
     expect(a?.lastReplyPreview).toBe("Step one is done.");
     expect(b?.lastReplyPreview).toBe("Different tangent");
     expect(a?.sessionId).toBe(session);
+  });
+
+  test("summarizeThreads reports rootAuthor 'user' for an agent-started thread rooted at the human message", () => {
+    const instance = "chat-blocks-thread-root-author";
+    const session = "chat_rootauthor";
+    // Agent-started thread: the root is the HUMAN's user_text message.
+    const userMsg = insertChatBlock(instance, {
+      kind: "user_text",
+      sessionId: session,
+      text: "Research espresso machines under $500",
+      taskId: "task_r"
+    });
+    insertChatBlock(instance, {
+      kind: "assistant_text",
+      sessionId: session,
+      text: "Here are the tradeoffs.",
+      streaming: false,
+      threadId: "thread_r",
+      parentBlockId: userMsg.id
+    });
+
+    const [summary] = summarizeThreads(instance, session);
+    expect(summary?.parentBlockId).toBe(userMsg.id);
+    expect(summary?.rootAuthor).toBe("user");
+    expect(summary?.rootPreview).toBe("Research espresso machines under $500");
   });
 
   test("summarizeThreads reply count excludes phase and tool blocks", () => {

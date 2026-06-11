@@ -789,26 +789,27 @@ export function listMainChatBlocks(instance: Instance, sessionId: string): ChatB
     .map(rowToBlock);
 }
 
-// Returns the most recent main-chat (un-threaded) assistant_text block in a
-// session, or undefined when none exists. The per-turn routing decision
-// branches a new thread off this block: when the agent emits
-// `<route>thread</route>`, the thread roots at the assistant message it just
-// finished in the main chat. Returns undefined for the very first turn (no
-// prior assistant message to branch from), in which case the turn stays in
-// the main chat.
-export function getLastMainChatAssistantTextBlock(
+// Returns the main-chat (un-threaded) user_text block belonging to a task,
+// or undefined when the task has none (job/channel turns have no user
+// message). When the agent routes a turn into a thread, the thread roots at
+// the user message that started the turn so the reply chip renders right
+// where the user asked and the thread reads human → agent. A turn with no
+// such block does not thread. Latest-by-ordinal guards against a task ever
+// carrying more than one user_text row.
+export function getMainChatUserTextBlockForTask(
   instance: Instance,
-  sessionId: string
+  sessionId: string,
+  taskId: string
 ): ChatBlock | undefined {
   const db = getMemoryDb(instance);
   const row = db
-    .query<ChatBlockRow, [string]>(
+    .query<ChatBlockRow, [string, string]>(
       `SELECT * FROM chat_blocks
-       WHERE session_id = ? AND thread_id IS NULL AND kind = 'assistant_text'
+       WHERE session_id = ? AND thread_id IS NULL AND kind = 'user_text' AND task_id = ?
        ORDER BY ordinal DESC
        LIMIT 1`
     )
-    .get(sessionId);
+    .get(sessionId, taskId);
   return row ? rowToBlock(row) : undefined;
 }
 
@@ -871,14 +872,16 @@ interface ThreadAggRow {
 }
 
 // Builds ThreadSummary objects from aggregate rows, hydrating the parent
-// preview (text of the rooted main-chat assistant block) and the
-// last-reply preview (most recent text-bearing block in the thread).
+// preview + author (text/kind of the rooted main-chat block — a human
+// user_text for an agent-started thread, an assistant_text for a
+// user-started one) and the last-reply preview (most recent text-bearing
+// block in the thread).
 function buildThreadSummaries(db: ReturnType<typeof getMemoryDb>, rows: ThreadAggRow[]): ThreadSummary[] {
   return rows.map((row) => {
     const rootRow = row.parent_block_id
       ? db
-          .query<{ payload_json: string }, [string]>(
-            "SELECT payload_json FROM chat_blocks WHERE id = ?"
+          .query<{ payload_json: string; kind: string }, [string]>(
+            "SELECT payload_json, kind FROM chat_blocks WHERE id = ?"
           )
           .get(row.parent_block_id)
       : null;
@@ -891,6 +894,7 @@ function buildThreadSummaries(db: ReturnType<typeof getMemoryDb>, rows: ThreadAg
       )
       .get(row.session_id, row.thread_id);
     const rootPreview = rootRow ? truncatePreview(textFromPayload(rootRow.payload_json)) : "";
+    const rootAuthor = rootRow ? (rootRow.kind === "user_text" ? "user" : "agent") : undefined;
     const lastReplyPreview = lastReplyRow ? truncatePreview(textFromPayload(lastReplyRow.payload_json)) : "";
     const lastReplyAuthor = lastReplyRow
       ? lastReplyRow.kind === "user_text"
@@ -903,6 +907,7 @@ function buildThreadSummaries(db: ReturnType<typeof getMemoryDb>, rows: ThreadAg
       ...(row.agent_id != null ? { agentId: row.agent_id } : {}),
       ...(row.parent_block_id != null ? { parentBlockId: row.parent_block_id } : {}),
       ...(rootPreview.length > 0 ? { rootPreview } : {}),
+      ...(rootAuthor ? { rootAuthor } : {}),
       replyCount: row.reply_count,
       lastReplyAt: row.last_reply_at,
       ...(lastReplyPreview.length > 0 ? { lastReplyPreview } : {}),

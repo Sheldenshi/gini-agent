@@ -969,7 +969,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       return json({ error: `Setup request ${setupId} action not supported: ${setup.action}` }, 400);
     }],
     ["POST", /^\/api\/setup-requests\/([^/]+)\/cancel$/, async (_request, params) =>
-      json(await resolveSetupRequest(config, params[0], "cancel", { actor: "user" }))],
+      json(await resolveSetupRequest(config, params[0], "cancel", { actor: "user", awaitResume: false }))],
     // Stage 1 of the browser.connect two-stage flow. The chat UI's
     // "Connect" button POSTs here on a browser.connect SetupRequest:
     //   1. Validate the setup-request is browser.connect and pending.

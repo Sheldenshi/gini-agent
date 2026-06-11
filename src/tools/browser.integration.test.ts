@@ -98,7 +98,7 @@ interface ConsoleResult {
 
 interface TabsResult {
   success: boolean;
-  tabs?: Array<{ index: number; url: string; title: string; active: boolean }>;
+  tabs?: Array<{ id: string; url: string; title: string; active: boolean }>;
   url?: string;
   snapshot?: string;
   error?: string;
@@ -420,8 +420,10 @@ describe.skipIf(!ENABLED)("browser tools — real Chromium integration", () => {
     expect(activeAfterNew).toBeDefined();
     expect(activeAfterNew!.url).toContain("/tab-b");
 
-    // Switch back to tab A (index 0).
-    const switchRaw = await browserTabs(taskId, { action: "switch", index: 0 });
+    // Switch back to tab A by its stable handle.
+    const tabA = list1.tabs!.find((t) => t.url.includes("/tab-a"));
+    expect(tabA).toBeDefined();
+    const switchRaw = await browserTabs(taskId, { action: "switch", id: tabA!.id });
     const switched = JSON.parse(switchRaw) as TabsResult;
     if (!switched.success) throw new Error(`tabs switch failed: ${switched.error}`);
     const list2Raw = await browserTabs(taskId, { action: "list" });
@@ -431,7 +433,9 @@ describe.skipIf(!ENABLED)("browser tools — real Chromium integration", () => {
     expect(activeAfterSwitch).toBeDefined();
     expect(activeAfterSwitch!.url).toContain("/tab-a");
 
-    const closeRaw = await browserTabs(taskId, { action: "close", index: 1 });
+    const tabB = list2.tabs!.find((t) => t.url.includes("/tab-b"));
+    expect(tabB).toBeDefined();
+    const closeRaw = await browserTabs(taskId, { action: "close", id: tabB!.id });
     const closed = JSON.parse(closeRaw) as TabsResult;
     if (!closed.success) throw new Error(`tabs close failed: ${closed.error}`);
 

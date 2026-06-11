@@ -123,7 +123,18 @@ const COMPLETE_RELOAD_DELAY_MS = 1_500;
 // normally tear the gate down long before this fires.
 const STALL_TIMEOUT_MS = 120_000;
 
-export function UpdateGateProvider({ children }: { children: ReactNode }) {
+export function UpdateGateProvider({
+  children,
+  // The whole-gate deadline is injectable so tests can drive the stall release
+  // without advancing fake time across the 120s default — a single advance that
+  // long fires the 1.5s status/healthz poll intervals 80 times each (120000 /
+  // 1500) and wedges the worker under `bun test --isolate`. Production always
+  // uses the constant default.
+  stallTimeoutMs = STALL_TIMEOUT_MS
+}: {
+  children: ReactNode;
+  stallTimeoutMs?: number;
+}) {
   const qc = useQueryClient();
   const [phase, setPhase] = useState<UpdatePhase>("idle");
   const [targetSha, setTargetSha] = useState<string | null>(null);
@@ -398,7 +409,7 @@ export function UpdateGateProvider({ children }: { children: ReactNode }) {
       stallDeadlineRef.current = null;
       return;
     }
-    stallDeadlineRef.current ??= Date.now() + STALL_TIMEOUT_MS;
+    stallDeadlineRef.current ??= Date.now() + stallTimeoutMs;
     const timer = setTimeout(() => {
       reset();
       toast.error("Update is taking longer than expected. Reload to check on it.");
@@ -406,7 +417,7 @@ export function UpdateGateProvider({ children }: { children: ReactNode }) {
       qc.invalidateQueries({ queryKey: ["version", "check"] });
     }, stallDeadlineRef.current - Date.now());
     return () => clearTimeout(timer);
-  }, [phase, reset, qc]);
+  }, [phase, reset, qc, stallTimeoutMs]);
 
   const value = useMemo<UpdateGateValue>(
     () => ({ version, updateSupported, updateAvailable, phase, start }),

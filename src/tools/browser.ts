@@ -63,10 +63,25 @@ const SNAPSHOT_CHAR_BUDGET = 32_000;
 const IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 const SWEEP_INTERVAL_MS = 30_000;
 
+// Per-ref target recorded at snapshot time. `locator` is the stamped
+// [data-gini-ref] fast path; role/name/nth describe the element as the
+// walker emitted it so action tools can self-heal a lost stamp (an SPA
+// re-render replacing the stamped node) by re-querying — see
+// resolveRefForAction. `nth` is the element's index among entries
+// sharing the same role+name in the walk that emitted the ref; it
+// disambiguates repeated controls (three "Delete" buttons). See ADR
+// browser-automation-engine.md.
+interface RefTarget {
+  locator: Locator;
+  role: string;
+  name: string;
+  nth: number;
+}
+
 interface Session {
   context: BrowserContext;
   page: Page;
-  refs: Map<string, Locator>;
+  refs: Map<string, RefTarget>;
   lastActivity: number;
   // In-flight call counter. Incremented by withSession around each tool
   // invocation so the idle sweeper can skip sessions that are mid-call
@@ -79,6 +94,31 @@ interface Session {
   // page and stays out of the set) and by browser_tabs action:"new".
   // Pages closed via browser_tabs action:"close" are removed.
   ownedPageIds: Set<Page>;
+  // Monotonic allocator for @eN snapshot refs. Refs are STABLE within a
+  // page lifetime: the walker reuses an element's existing data-gini-ref
+  // stamp and only allocates new ids for unstamped elements, so the
+  // counter never hands a removed element's id to a different element.
+  // Reset to 1 when snapshot() detects a navigation (which also clears
+  // all stamps). See ADR browser-automation-engine.md.
+  nextRefId: number;
+  // Redacted text of the most recent snapshot — the diff base for
+  // post-action snapshots — plus the URL it was taken at. A URL change
+  // between snapshots means navigation: stamps cleared, numbering reset,
+  // diff base dropped. browser_navigate / browser_back / browser_tabs
+  // page swaps clear lastSnapshotUrl explicitly so even a same-URL
+  // navigation (reload) resets refs.
+  lastSnapshotText?: string;
+  lastSnapshotUrl?: string;
+  // Stable tab handles. Each Page gets a permanent session-scoped handle
+  // ("t1", "t2", …) the first time browser_tabs sees it — on open for
+  // agent-created tabs, lazily on list for user-opened tabs and
+  // window.open popups. The counter is monotonic and a handle is NEVER
+  // reused, so a stale plan addressing a closed tab's handle fails
+  // loudly instead of acting on whichever tab inherited its position
+  // (the failure mode of positional indexes). Entries are pruned when
+  // the page closes. See ADR browser-automation-engine.md.
+  tabHandles: Map<string, Page>;
+  nextTabHandleId: number;
 }
 
 // Discriminated union describing the currently-installed shared handle.
@@ -643,7 +683,10 @@ async function getOrCreate(taskId: string): Promise<Session> {
       refs: new Map(),
       lastActivity: Date.now(),
       inFlight: 0,
-      ownedPageIds
+      ownedPageIds,
+      nextRefId: 1,
+      tabHandles: new Map(),
+      nextTabHandleId: 1
     };
     sessions.set(taskId, session);
     // Attach console capture eagerly so page.goto errors before the
@@ -1163,11 +1206,24 @@ interface SnapEntry {
 // snapshot. Visible entries are budgeted separately via SNAPSHOT_CHAR_BUDGET.
 const SNAPSHOT_HIDDEN_BUDGET = 50;
 
+// Cap on cursor-interactive ("clickable") emissions per snapshot. Div-soup
+// pages style every card/row cursor:pointer; without a cap those rows would
+// crowd real controls out of the 32KB char budget. Capped separately from
+// the hidden budget for the same reason hidden entries are: a marker line
+// tells the model more clickables exist. Ported from agent-browser's
+// cursor-interactivity pass; see ADR browser-automation-engine.md.
+const SNAPSHOT_CLICKABLE_BUDGET = 75;
+
 interface SnapshotResult {
   text: string;
-  refs: Map<string, Locator>;
+  refs: Map<string, RefTarget>;
   elementCount: number;
   truncated: boolean;
+  // True when this snapshot detected a navigation (URL change since the
+  // session's last snapshot, or an explicit navigate/back/tab swap that
+  // dropped lastSnapshotUrl). Stamps were cleared and numbering reset;
+  // callers must NOT diff this snapshot against the pre-navigation one.
+  navigated: boolean;
 }
 
 // Marker attribute stamped on snapshot-rendered elements so the
@@ -1202,11 +1258,27 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
     throw new Error(`${loopbackBlock} (page settled on disallowed URL after a navigation; agent must not inspect this surface)`);
   }
   const REF_ATTR = REF_ATTR_GLOBAL;
-  // First, clear stale refs from prior snapshots so id allocation stays
-  // stable across calls.
-  await page.evaluate((attr) => {
-    for (const el of document.querySelectorAll(`[${attr}]`)) el.removeAttribute(attr);
-  }, REF_ATTR).catch(() => undefined);
+  // Refs are STABLE within a page lifetime: the walker below reuses an
+  // element's existing data-gini-ref stamp and allocates new ids only
+  // for unstamped elements, so refs the model holds from earlier
+  // snapshots keep resolving and post-action diffs line up. Stamps are
+  // cleared and numbering restarts at @e1 ONLY on navigation — detected
+  // here as a URL change since the session's last snapshot (navigate /
+  // back / tab swaps force it by dropping lastSnapshotUrl). The clear
+  // pass actively strips stamps rather than trusting the new document
+  // to be clean, because a bfcache-restored history entry can resurrect
+  // a stamped DOM. See ADR browser-automation-engine.md.
+  const session = taskId !== undefined ? sessions.get(taskId) : undefined;
+  const currentUrl = typeof page.url === "function" ? page.url() : "";
+  const navigated = session !== undefined && session.lastSnapshotUrl !== currentUrl;
+  if (navigated && session) {
+    await page.evaluate((attr) => {
+      for (const el of document.querySelectorAll(`[${attr}]`)) el.removeAttribute(attr);
+    }, REF_ATTR).catch(() => undefined);
+    session.nextRefId = 1;
+    session.lastSnapshotText = undefined;
+  }
+  const startId = session?.nextRefId ?? 1;
 
   type Raw = {
     ref: string;
@@ -1220,7 +1292,7 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
   };
 
   const raw = await page.evaluate(
-    ({ attr, fullMode, hiddenBudget }: { attr: string; fullMode: boolean; hiddenBudget: number }) => {
+    ({ attr, fullMode, hiddenBudget, clickableBudget, startId }: { attr: string; fullMode: boolean; hiddenBudget: number; clickableBudget: number; startId: number }) => {
       const INTERACTIVE_TAGS = new Set([
         "A",
         "BUTTON",
@@ -1311,25 +1383,94 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
       };
 
       const out: Raw[] = [];
-      let nextId = 1;
+      // Allocation starts above BOTH the session counter and any id
+      // already stamped in the document. The session counter guards
+      // against reusing a removed element's id for a different element;
+      // the stamp scan guards against collisions when the counter and
+      // the DOM disagree (bfcache restore carrying stamps the counter
+      // never saw, or a unit-test walk with no session).
+      let nextId = startId;
+      // Ids are bounded to 9 digits: beyond that a page-planted stamp
+      // could push the counter into float-imprecision territory (2^53)
+      // where ++ stops incrementing and every fresh allocation collides.
+      for (const el of Array.from(document.querySelectorAll(`[${attr}]`))) {
+        const m = /^e(\d{1,9})$/.exec(el.getAttribute(attr) ?? "");
+        if (m) nextId = Math.max(nextId, Number(m[1]) + 1);
+      }
+      // Reuse an existing stamp (refs are stable within a page lifetime);
+      // only unstamped elements get a freshly-allocated id. Two stamps are
+      // NOT trusted: a value that doesn't match our e<N> format (the page
+      // set the attribute itself — honoring it would let page content pick
+      // its own ref), and a value already reused this walk (cloneNode
+      // copies attributes, so a cloned subtree carries duplicate stamps;
+      // two elements sharing a ref breaks strict-mode resolution). Both
+      // get restamped with a fresh id.
+      const stampsThisWalk = new Set<string>();
+      const refFor = (el: Element): string => {
+        const existing = el.getAttribute(attr);
+        if (existing && /^e\d{1,9}$/.test(existing) && !stampsThisWalk.has(existing)) {
+          stampsThisWalk.add(existing);
+          return `@${existing}`;
+        }
+        const id = `e${nextId++}`;
+        el.setAttribute(attr, id);
+        stampsThisWalk.add(id);
+        return `@${id}`;
+      };
       let hiddenEmitted = 0;
       let hiddenTotal = 0;
+      let clickableEmitted = 0;
+      let clickableTotal = 0;
+      // Elements already surfaced in THIS walk. The <select> branch
+      // enumerates its <option> children eagerly (they have zero-size
+      // rects, so the bare walk would only see them as hidden); when the
+      // walk then recurses into those same options, this set stops a
+      // second [hidden] row from being emitted for the same element —
+      // with stable stamps the duplicate would even carry the same ref.
+      const emittedThisWalk = new Set<Element>();
       const isFileInput = (el: Element): boolean =>
         el.tagName === "INPUT" && ((el as HTMLInputElement).type?.toLowerCase() ?? "text") === "file";
-      const walk = (el: Element, depth: number): void => {
+      // A radio/checkbox that fails isVisible but has an associated visible
+      // <label> (wrapping it, or pointing at it via label[for]) is a styled
+      // toggle: the page hides the native input and renders the label as
+      // the control. Without a ref the agent can't toggle it at all, so it
+      // is force-emitted with a [hidden] annotation — same treatment as the
+      // file-input rule below, and exempt from the hidden budget for the
+      // same reason. See ADR browser-automation-engine.md.
+      const isHiddenToggleWithVisibleLabel = (el: Element): boolean => {
+        if (el.tagName !== "INPUT") return false;
+        const type = (el as HTMLInputElement).type?.toLowerCase() ?? "text";
+        if (type !== "radio" && type !== "checkbox") return false;
+        for (let p: Element | null = el.parentElement; p; p = p.parentElement) {
+          if (p.tagName === "LABEL") return isVisible(p);
+        }
+        const id = el.getAttribute("id");
+        if (id) {
+          const lbl = document.querySelector(`label[for="${CSS.escape(id)}"]`);
+          if (lbl && isVisible(lbl)) return true;
+        }
+        return false;
+      };
+      const walk = (el: Element, depth: number, underCursorClickable: boolean): void => {
         const tag = el.tagName;
         const role = roleOf(el);
         const interactive = role !== undefined && (INTERACTIVE_TAGS.has(tag) || el.getAttribute("role"));
         const visible = isVisible(el);
+        // When this element qualifies as a cursor-clickable via
+        // cursor:pointer, descendants inherit that computed cursor and must
+        // not each re-qualify on it (see the dedupe note below).
+        let childUnderCursorClickable = underCursorClickable;
         // <input type="file"> always gets a ref — most real upload widgets
         // hide the actual input behind a styled button, and without a ref
         // browser_upload_file can't target it. Counted in the visible
         // budget regardless of visibility; the `[hidden]` annotation tells
         // the model the input isn't directly clickable.
-        const forceEmit = interactive && isFileInput(el);
-        if (interactive && (visible || forceEmit)) {
-          const ref = `@e${nextId++}`;
-          el.setAttribute(attr, ref.slice(1));
+        const forceEmit = interactive && (isFileInput(el) || (!visible && isHiddenToggleWithVisibleLabel(el)));
+        if (emittedThisWalk.has(el)) {
+          // Already surfaced (a <select>'s eager option enumeration) —
+          // skip the emission branches, nothing below applies twice.
+        } else if (interactive && (visible || forceEmit)) {
+          const ref = refFor(el);
           let value = "";
           if (el.tagName === "INPUT" || el.tagName === "TEXTAREA") {
             // Suppress sensitive input values so a user-typed
@@ -1386,8 +1527,8 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
             const options = (el as HTMLSelectElement).querySelectorAll("option");
             for (const opt of Array.from(options)) {
               if (opt.disabled || opt.hidden) continue;
-              const optRef = `@e${nextId++}`;
-              opt.setAttribute(attr, optRef.slice(1));
+              emittedThisWalk.add(opt);
+              const optRef = refFor(opt);
               const labelOrText = (opt.label || opt.text || "").trim().slice(0, 120);
               out.push({
                 ref: optRef,
@@ -1409,8 +1550,7 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
           // with thousands of prerendered rows doesn't blow up the snapshot.
           hiddenTotal++;
           if (hiddenEmitted < hiddenBudget) {
-            const ref = `@e${nextId++}`;
-            el.setAttribute(attr, ref.slice(1));
+            const ref = refFor(el);
             out.push({
               ref,
               role: role!,
@@ -1423,39 +1563,78 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
             });
             hiddenEmitted++;
           }
-        } else if (fullMode && visible) {
-          // In full mode, also record landmark/heading text so the snapshot
-          // captures structural cues the model can use for orientation.
-          const landmarkRoles = ["heading", "main", "navigation", "banner", "contentinfo", "region"];
-          const tagToRole: Record<string, string> = {
-            H1: "heading",
-            H2: "heading",
-            H3: "heading",
-            H4: "heading",
-            MAIN: "main",
-            NAV: "navigation",
-            HEADER: "banner",
-            FOOTER: "contentinfo",
-            ARTICLE: "article",
-            SECTION: "region"
-          };
-          const fallbackRole = role ?? tagToRole[tag];
-          if (fallbackRole && landmarkRoles.includes(fallbackRole)) {
-            const text = (el.textContent ?? "").replace(/\s+/g, " ").trim().slice(0, 200);
-            if (text) {
-              out.push({ ref: "", role: fallbackRole, name: text, value: "", url: "", depth, full: true, hidden: false });
+        } else if (visible) {
+          // Reaching here means the element is NOT semantically interactive
+          // (no interactive tag, no explicit role — those were consumed by
+          // the branches above). Cursor-interactivity augmentation: div-soup
+          // UIs signal clickability through styling and handlers instead of
+          // semantics, so a visible element with computed cursor:pointer, an
+          // onclick attribute, or tabindex >= 0 still earns a ref, under the
+          // synthetic role "clickable". Ported from agent-browser's
+          // cursor-interactivity pass; see ADR browser-automation-engine.md.
+          // BODY is excluded: a page styling `body { cursor: pointer }`
+          // would otherwise emit the entire page text as one name AND
+          // dedupe-suppress every real clickable underneath it.
+          const cursorPointer = tag !== "BODY" && window.getComputedStyle(el as HTMLElement).cursor === "pointer";
+          const tabindexAttr = el.getAttribute("tabindex");
+          const selfQualified = el.getAttribute("onclick") !== null
+            || (tabindexAttr !== null && Number.parseInt(tabindexAttr, 10) >= 0);
+          // The computed cursor is inherited, so inside a cursor-pointer
+          // clickable every descendant reports cursor:pointer too. Dedupe:
+          // pointer alone does not re-qualify a descendant (otherwise a
+          // cursor:pointer card would emit every child); an element's OWN
+          // onclick/tabindex always does.
+          const qualifies = selfQualified || (cursorPointer && !underCursorClickable);
+          // Empty-name clickables are un-targetable noise — skipped, and a
+          // skipped element does not suppress its descendants (a child may
+          // carry the only usable name, e.g. an aria-label inside an
+          // icon-only wrapper).
+          const name = qualifies ? nameOf(el) : "";
+          if (qualifies && name) {
+            clickableTotal++;
+            if (clickableEmitted < clickableBudget) {
+              const ref = refFor(el);
+              out.push({ ref, role: "clickable", name, value: "", url: "", depth, full: false, hidden: false });
+              clickableEmitted++;
+            }
+            if (cursorPointer) childUnderCursorClickable = true;
+          } else if (fullMode) {
+            // In full mode, also record landmark/heading text so the snapshot
+            // captures structural cues the model can use for orientation.
+            const landmarkRoles = ["heading", "main", "navigation", "banner", "contentinfo", "region"];
+            const tagToRole: Record<string, string> = {
+              H1: "heading",
+              H2: "heading",
+              H3: "heading",
+              H4: "heading",
+              MAIN: "main",
+              NAV: "navigation",
+              HEADER: "banner",
+              FOOTER: "contentinfo",
+              ARTICLE: "article",
+              SECTION: "region"
+            };
+            const fallbackRole = role ?? tagToRole[tag];
+            if (fallbackRole && landmarkRoles.includes(fallbackRole)) {
+              const text = (el.textContent ?? "").replace(/\s+/g, " ").trim().slice(0, 200);
+              if (text) {
+                out.push({ ref: "", role: fallbackRole, name: text, value: "", url: "", depth, full: true, hidden: false });
+              }
             }
           }
         }
-        for (const child of Array.from(el.children)) walk(child, depth + 1);
+        for (const child of Array.from(el.children)) walk(child, depth + 1, childUnderCursorClickable);
       };
-      walk(document.body, 0);
-      return { entries: out, hiddenEmitted, hiddenTotal, hiddenBudget };
+      walk(document.body, 0, false);
+      return { entries: out, hiddenEmitted, hiddenTotal, hiddenBudget, clickableEmitted, clickableTotal, nextId };
     },
-    { attr: REF_ATTR, fullMode: full, hiddenBudget: SNAPSHOT_HIDDEN_BUDGET }
+    { attr: REF_ATTR, fullMode: full, hiddenBudget: SNAPSHOT_HIDDEN_BUDGET, clickableBudget: SNAPSHOT_CLICKABLE_BUDGET, startId }
   );
 
-  const refs = new Map<string, Locator>();
+  const refs = new Map<string, RefTarget>();
+  // nth assignment for stale-ref healing: an element's index among
+  // entries sharing its role+name in THIS walk, in emission (DOM) order.
+  const nthByRoleName = new Map<string, number>();
   const lines: string[] = [];
   let charCount = 0;
   let truncated = false;
@@ -1463,6 +1642,15 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
   const entries = (raw as { entries: SnapEntry[] }).entries;
   const hiddenEmitted = (raw as { hiddenEmitted: number }).hiddenEmitted;
   const hiddenTotal = (raw as { hiddenTotal: number }).hiddenTotal;
+  const clickableEmitted = (raw as { clickableEmitted: number }).clickableEmitted;
+  const clickableTotal = (raw as { clickableTotal: number }).clickableTotal;
+  // Persist the advanced allocator so the next snapshot in this session
+  // never reuses an id. Test mocks return minimal walker shapes without
+  // nextId — fall back to the unchanged startId for those.
+  if (session) {
+    const advanced = (raw as { nextId?: number }).nextId;
+    session.nextRefId = typeof advanced === "number" ? advanced : startId;
+  }
   for (const entry of entries) {
     const indent = "  ".repeat(entry.depth);
     let line: string;
@@ -1488,7 +1676,15 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
     lines.push(line);
     charCount += line.length + 1;
     if (entry.ref) {
-      refs.set(entry.ref, page.locator(`[${REF_ATTR}="${entry.ref.slice(1)}"]`));
+      const nthKey = `${entry.role}\u0000${entry.name}`;
+      const nth = nthByRoleName.get(nthKey) ?? 0;
+      nthByRoleName.set(nthKey, nth + 1);
+      refs.set(entry.ref, {
+        locator: page.locator(`[${REF_ATTR}="${entry.ref.slice(1)}"]`),
+        role: entry.role,
+        name: entry.name,
+        nth
+      });
       elementCount++;
     }
   }
@@ -1498,6 +1694,10 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
   // "more interactive elements exist on the page, just hidden" apart
   // from "snapshot text was clipped at the char budget".
   if (hiddenTotal > hiddenEmitted) text += "\n[...hidden truncated]";
+  // Same idea for the clickable cap: tells the model more cursor-detected
+  // clickables exist beyond SNAPSHOT_CLICKABLE_BUDGET, distinct from
+  // char-budget clipping.
+  if (clickableTotal > clickableEmitted) text += "\n[...clickable truncated]";
   // Defense in depth: redact any literal occurrence of a known
   // data-gini-secret value from the assembled snapshot text. The
   // walker's element-local redaction only catches the stamped
@@ -1512,7 +1712,275 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
   if (secretValues.length > 0) {
     text = redactSecretValuesFromString(text, secretValues);
   }
-  return { text, refs, elementCount, truncated };
+  // Store the REDACTED text as the diff base for the next post-action
+  // snapshot — diffing always compares redacted text against redacted
+  // text, so the diff path cannot bypass secret suppression. Only
+  // full=false walks set the base: post-action snapshots are always
+  // full=false, and diffing one against a full=true tree (with its extra
+  // landmark/heading rows) would render every landmark as a spurious
+  // removal. The URL marker updates on EVERY walk regardless — it feeds
+  // the navigation detector above, and skipping it after a full=true
+  // snapshot would make the next walk strip every stamp on the page.
+  if (session) {
+    if (!full) session.lastSnapshotText = text;
+    session.lastSnapshotUrl = currentUrl;
+  }
+  return { text, refs, elementCount, truncated, navigated };
+}
+
+// Post-action snapshots return a line diff instead of the full tree when
+// the diff body is smaller than this fraction of the full text. Above the
+// threshold a diff stops paying for itself (the reader still has to
+// reconstruct most of the page) so we return the full snapshot.
+const SNAPSHOT_DIFF_MAX_RATIO = 0.6;
+// Unchanged lines kept around each +/- run so the model can locate the
+// change inside the tree without the full snapshot.
+const SNAPSHOT_DIFF_CONTEXT_LINES = 1;
+const SNAPSHOT_DIFF_HEADER =
+  "[diff vs previous snapshot — + added, - removed; unchanged omitted. Call browser_snapshot for the full tree.]";
+
+// Line-based diff of two snapshot texts, rendered unified-diff style
+// (header + removed/added lines with SNAPSHOT_DIFF_CONTEXT_LINES of
+// context). Implemented inline as a common-prefix/suffix trim plus an
+// LCS over the changed middle — post-action changes are usually local,
+// so the quadratic LCS only ever sees a small window. No dependency,
+// no regex over page-controlled text. Returns undefined when the trimmed
+// middle is too large to diff (see the cell cap below); the caller falls
+// back to the full snapshot. See ADR browser-automation-engine.md.
+function renderSnapshotDiff(prevText: string, currText: string): string | undefined {
+  const prev = prevText.split("\n");
+  const curr = currText.split("\n");
+  let start = 0;
+  while (start < prev.length && start < curr.length && prev[start] === curr[start]) start++;
+  let prevEnd = prev.length;
+  let currEnd = curr.length;
+  while (prevEnd > start && currEnd > start && prev[prevEnd - 1] === curr[currEnd - 1]) {
+    prevEnd--;
+    currEnd--;
+  }
+  const a = prev.slice(start, prevEnd);
+  const b = curr.slice(start, currEnd);
+  // A change this widespread won't render as a useful diff anyway, and
+  // the quadratic LCS table below would allocate (and fill) one cell per
+  // line pair — cap the work and let the caller return the full tree.
+  if (a.length * b.length > 1_000_000) return undefined;
+  // LCS table over the trimmed middle; backtrack into an op list.
+  const rows = a.length + 1;
+  const cols = b.length + 1;
+  const table: Uint32Array[] = [];
+  for (let i = 0; i < rows; i++) table.push(new Uint32Array(cols));
+  for (let i = a.length - 1; i >= 0; i--) {
+    for (let j = b.length - 1; j >= 0; j--) {
+      table[i]![j] = a[i] === b[j]
+        ? table[i + 1]![j + 1]! + 1
+        : Math.max(table[i + 1]![j]!, table[i]![j + 1]!);
+    }
+  }
+  const ops: Array<{ kind: "same" | "del" | "add"; line: string }> = [];
+  for (let i = 0; i < start; i++) ops.push({ kind: "same", line: prev[i]! });
+  let ai = 0;
+  let bi = 0;
+  while (ai < a.length && bi < b.length) {
+    if (a[ai] === b[bi]) {
+      ops.push({ kind: "same", line: a[ai]! });
+      ai++;
+      bi++;
+    } else if (table[ai + 1]![bi]! >= table[ai]![bi + 1]!) {
+      ops.push({ kind: "del", line: a[ai]! });
+      ai++;
+    } else {
+      ops.push({ kind: "add", line: b[bi]! });
+      bi++;
+    }
+  }
+  while (ai < a.length) ops.push({ kind: "del", line: a[ai++]! });
+  while (bi < b.length) ops.push({ kind: "add", line: b[bi++]! });
+  for (let i = prevEnd; i < prev.length; i++) ops.push({ kind: "same", line: prev[i]! });
+  // Render only changed lines plus nearby context.
+  const keep = new Array<boolean>(ops.length).fill(false);
+  let changed = false;
+  for (let i = 0; i < ops.length; i++) {
+    if (ops[i]!.kind === "same") continue;
+    changed = true;
+    const lo = Math.max(0, i - SNAPSHOT_DIFF_CONTEXT_LINES);
+    const hi = Math.min(ops.length - 1, i + SNAPSHOT_DIFF_CONTEXT_LINES);
+    for (let j = lo; j <= hi; j++) keep[j] = true;
+  }
+  // A header with no body reads like an empty page, not an unchanged
+  // one — say so explicitly.
+  if (!changed) return `${SNAPSHOT_DIFF_HEADER}\n(no changes)`;
+  const lines: string[] = [SNAPSHOT_DIFF_HEADER];
+  let prevKept = -1;
+  for (let i = 0; i < ops.length; i++) {
+    if (!keep[i]) continue;
+    // Mark the gap between non-adjacent hunks — without it two distant
+    // changes read as neighboring lines of the tree.
+    if (prevKept !== -1 && i > prevKept + 1) lines.push("  ⋯");
+    prevKept = i;
+    const op = ops[i]!;
+    lines.push(op.kind === "del" ? `- ${op.line}` : op.kind === "add" ? `+ ${op.line}` : `  ${op.line}`);
+  }
+  return lines.join("\n");
+}
+
+// Shared post-action snapshot: re-snapshot, refresh the session's refs,
+// and return either the full tree or a line diff vs the previous snapshot
+// when the change is small. Used by the action tools (click / type /
+// press / scroll / hover / drag / select_option / wait_for) — NOT by
+// browser_navigate, browser_back, browser_tabs, or explicit
+// browser_snapshot, which always return the full tree. That asymmetry is
+// the model's recovery path: when a diff isn't enough, browser_snapshot
+// gets the whole page. Diffing compares the redacted previous text with
+// the redacted current text (snapshot() redacts before returning and
+// before storing the base), so the diff path cannot leak what redaction
+// suppressed. See ADR browser-automation-engine.md.
+async function snapshotAfterAction(
+  session: Session,
+  taskId: string
+): Promise<{ snapshot: string; snapshotMode: "full" | "diff"; elementCount: number; truncated: boolean }> {
+  const prev = session.lastSnapshotText;
+  const snap = await snapshot(session.page, false, taskId);
+  session.refs = snap.refs;
+  if (!snap.navigated && prev !== undefined) {
+    const diff = renderSnapshotDiff(prev, snap.text);
+    if (diff !== undefined && diff.length < snap.text.length * SNAPSHOT_DIFF_MAX_RATIO) {
+      return { snapshot: diff, snapshotMode: "diff", elementCount: snap.elementCount, truncated: snap.truncated };
+    }
+  }
+  return { snapshot: snap.text, snapshotMode: "full", elementCount: snap.elementCount, truncated: snap.truncated };
+}
+
+// Resolve a ref for an action tool (click / type / hover / drag /
+// select_option / wait_for), self-healing a lost stamp. The fast path is
+// the stamped [data-gini-ref] locator recorded at snapshot time; when it
+// no longer matches anything (an SPA re-render destroyed the stamped
+// node), re-query by the recorded role/name/nth, restamp the survivor
+// with the SAME ref id, and report healed: true so the caller can flag
+// `healedRef` in its result. See ADR browser-automation-engine.md.
+//
+// Deliberately NOT used by browser_fill_secrets or the upload paths:
+// those act only on the exact stamped element and fail loudly on stamp
+// loss — mis-resolution there is a credential-leak / approval-bypass
+// hazard (trust boundary; see ADR browser-fill-secret.md and the
+// comments at those call sites).
+//
+// Returns undefined when the ref was never issued or healing found no
+// candidate; callers emit the standard "Unknown ref" error.
+async function resolveRefForAction(
+  session: Session,
+  ref: string
+): Promise<{ locator: Locator; healed: boolean } | undefined> {
+  const target = session.refs.get(ref);
+  if (!target) return undefined;
+  // Unit tests plant minimal locator stubs without count(); treat those
+  // as live (same typeof-guard pattern snapshot() uses for page.url).
+  if (typeof target.locator.count !== "function") {
+    return { locator: target.locator, healed: false };
+  }
+  let stampedCount = 0;
+  try {
+    stampedCount = await target.locator.count();
+  } catch {
+    // A failing count (page navigating mid-call, context churn) is
+    // handled like a lost stamp: healing below either re-finds the
+    // element or the action fails with the standard message.
+  }
+  if (stampedCount > 0) return { locator: target.locator, healed: false };
+  const healed = await healLostRef(session, target, ref);
+  return healed ? { locator: healed, healed: true } : undefined;
+}
+
+// Re-find an element whose data-gini-ref stamp was destroyed. ARIA-role
+// entries re-query the accessibility tree via getByRole(role, { name,
+// exact: true }) and take the recorded nth match; role "clickable" is
+// synthetic (cursor-detected, not a real ARIA role — see the walker) so
+// it falls back to exact-text matching, as does any role Playwright's
+// role engine rejects. A found candidate is restamped with the SAME id
+// so later resolutions take the stamped fast path and the next snapshot
+// keeps the ref stable.
+async function healLostRef(session: Session, target: RefTarget, ref: string): Promise<Locator | undefined> {
+  // Nothing to re-query by: hidden-budget entries are emitted nameless.
+  if (!target.name) return undefined;
+  const page = session.page;
+  if (typeof page.getByRole !== "function" || typeof page.getByText !== "function") return undefined;
+  let candidate: Locator | undefined;
+  if (target.role !== "clickable") {
+    const byRole = page
+      .getByRole(target.role as Parameters<Page["getByRole"]>[0], { name: target.name, exact: true })
+      .nth(target.nth);
+    try {
+      if ((await byRole.count()) > 0) {
+        candidate = byRole;
+      } else {
+        // A role Playwright supports that matches nothing means the
+        // element is genuinely gone — fail rather than guess by text.
+        return undefined;
+      }
+    } catch {
+      // The role engine rejected the role string (the walker emits some
+      // non-ARIA roles) — fall through to the text strategy.
+    }
+  }
+  let viaText = false;
+  if (!candidate) {
+    const byText = page.getByText(target.name, { exact: true }).nth(target.nth);
+    try {
+      if ((await byText.count()) === 0) return undefined;
+    } catch {
+      return undefined;
+    }
+    candidate = byText;
+    viaText = true;
+  }
+  // Two guards before the candidate is trusted (mis-heal containment —
+  // see ADR browser-automation-engine.md). First, a candidate already
+  // carrying a different stamp is a live element addressed by some OTHER
+  // ref; restamping it would silently fold two refs onto one node and
+  // the action would land on the wrong element. Second, a text-strategy
+  // candidate must itself qualify as cursor-interactive the way the
+  // walker's synthetic "clickable" entries do — getByText also matches
+  // same-text bystanders (headings, plain spans) the walker never
+  // emitted. Both cases bail to the standard Unknown-ref failure.
+  //
+  // The checks and the restamp run in ONE evaluate: a candidate locator
+  // re-resolves on every call, so checking in one round trip and writing
+  // in another would let a racing re-render shift the nth match between
+  // them — the element that passed the checks must be the element that
+  // gets the stamp. The short timeout keeps a candidate that detached
+  // after count() from auto-waiting the action's whole budget here.
+  let restamped = false;
+  try {
+    const verdict = await candidate.evaluate(
+      (el: Element, arg: { attr: string; id: string; requireInteractive: boolean }) => {
+        const stamp = el.getAttribute(arg.attr);
+        const tabindexAttr = el.getAttribute("tabindex");
+        const foreignStamp = stamp !== null && stamp !== arg.id;
+        const cursorInteractive =
+          window.getComputedStyle(el as HTMLElement).cursor === "pointer" ||
+          el.getAttribute("onclick") !== null ||
+          (tabindexAttr !== null && Number.parseInt(tabindexAttr, 10) >= 0);
+        const accepted = !foreignStamp && (!arg.requireInteractive || cursorInteractive);
+        if (accepted) el.setAttribute(arg.attr, arg.id);
+        return accepted;
+      },
+      { attr: REF_ATTR_GLOBAL, id: ref.slice(1), requireInteractive: viaText },
+      { timeout: 2_000 }
+    );
+    if (!verdict) return undefined;
+    restamped = true;
+  } catch {
+    return undefined;
+  }
+  // The verified element now carries the SAME id, so the ref stays
+  // stable for future actions and snapshots — and acting through the
+  // stamped selector (instead of the re-resolving role/text candidate)
+  // pins this action to exactly the element that passed the checks.
+  if (restamped && typeof page.locator === "function") {
+    const stampedLocator = page.locator(`[${REF_ATTR_GLOBAL}="${ref.slice(1)}"]`);
+    session.refs.set(ref, { ...target, locator: stampedLocator });
+    return stampedLocator;
+  }
+  return candidate;
 }
 
 // Build a browser tool response, applying a redaction pass over
@@ -1646,6 +2114,11 @@ export async function browserNavigate(taskId: string, args: Record<string, unkno
         }
         return fail(`${postBlock} (final URL after redirect from ${url})`);
       }
+      // Explicit navigation: even a same-URL goto produced a fresh
+      // document, so drop the snapshot baseline — snapshot() then clears
+      // any stale stamps, restarts ref numbering at @e1, and returns the
+      // full tree (never a diff).
+      session.lastSnapshotUrl = undefined;
       const snap = await snapshot(session.page, false, taskId);
       session.refs = snap.refs;
       return ok({
@@ -1686,18 +2159,16 @@ export async function browserClick(taskId: string, args: Record<string, unknown>
   if (!ref) return fail("Missing required string argument: ref");
   try {
     return await withSession(taskId, async (session) => {
-      const locator = session.refs.get(ref);
-      if (!locator) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
-      await locator.click({ timeout: 10_000 });
+      const resolved = await resolveRefForAction(session, ref);
+      if (!resolved) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
+      await resolved.locator.click({ timeout: 10_000 });
       await session.page.waitForLoadState("domcontentloaded").catch(() => undefined);
-      const snap = await snapshot(session.page, false, taskId);
-      session.refs = snap.refs;
+      const snapFields = await snapshotAfterAction(session, taskId);
       return ok({
         url: session.page.url(),
         title: await session.page.title(),
-        snapshot: snap.text,
-        elementCount: snap.elementCount,
-        truncated: snap.truncated
+        ...snapFields,
+        ...(resolved.healed ? { healedRef: true } : {})
       }, taskId);
     });
   } catch (error) {
@@ -1712,16 +2183,14 @@ export async function browserType(taskId: string, args: Record<string, unknown>)
   if (text === undefined) return fail("Missing required string argument: text");
   try {
     return await withSession(taskId, async (session) => {
-      const locator = session.refs.get(ref);
-      if (!locator) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
-      await locator.fill(text, { timeout: 10_000 });
-      const snap = await snapshot(session.page, false, taskId);
-      session.refs = snap.refs;
+      const resolved = await resolveRefForAction(session, ref);
+      if (!resolved) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
+      await resolved.locator.fill(text, { timeout: 10_000 });
+      const snapFields = await snapshotAfterAction(session, taskId);
       return ok({
         url: session.page.url(),
-        snapshot: snap.text,
-        elementCount: snap.elementCount,
-        truncated: snap.truncated
+        ...snapFields,
+        ...(resolved.healed ? { healedRef: true } : {})
       }, taskId);
     });
   } catch (error) {
@@ -1921,6 +2390,11 @@ export async function browserFillByLocator(
           } as const;
         }
       }
+      // Trust boundary: @-refs resolve ONLY via the literal stamped
+      // [data-gini-ref] selector — never resolveRefForAction's stale-ref
+      // self-healing. Mis-resolution here would type a credential into
+      // the wrong element, so a lost stamp must fail loudly instead
+      // (see ADR browser-fill-secret.md).
       const selector = args.locator.startsWith("@")
         ? `[${REF_ATTR_GLOBAL}="${args.locator.slice(1)}"]`
         : args.locator;
@@ -2014,13 +2488,10 @@ export async function browserPress(taskId: string, args: Record<string, unknown>
     return await withSession(taskId, async (session) => {
       await session.page.keyboard.press(key);
       await session.page.waitForLoadState("domcontentloaded").catch(() => undefined);
-      const snap = await snapshot(session.page, false, taskId);
-      session.refs = snap.refs;
+      const snapFields = await snapshotAfterAction(session, taskId);
       return ok({
         url: session.page.url(),
-        snapshot: snap.text,
-        elementCount: snap.elementCount,
-        truncated: snap.truncated
+        ...snapFields
       }, taskId);
     });
   } catch (error) {
@@ -2037,13 +2508,10 @@ export async function browserScroll(taskId: string, args: Record<string, unknown
     return await withSession(taskId, async (session) => {
       const dy = direction === "down" ? 600 : -600;
       await session.page.evaluate((delta) => window.scrollBy(0, delta), dy);
-      const snap = await snapshot(session.page, false, taskId);
-      session.refs = snap.refs;
+      const snapFields = await snapshotAfterAction(session, taskId);
       return ok({
         url: session.page.url(),
-        snapshot: snap.text,
-        elementCount: snap.elementCount,
-        truncated: snap.truncated
+        ...snapFields
       }, taskId);
     });
   } catch (error) {
@@ -2055,6 +2523,9 @@ export async function browserBack(taskId: string, _args: Record<string, unknown>
   try {
     return await withSession(taskId, async (session) => {
       const response = await session.page.goBack({ waitUntil: "domcontentloaded" });
+      // History navigation, same contract as browser_navigate: drop the
+      // baseline so refs reset and the response carries the full tree.
+      session.lastSnapshotUrl = undefined;
       const snap = await snapshot(session.page, false, taskId);
       session.refs = snap.refs;
       return ok({
@@ -2214,17 +2685,15 @@ export async function browserHover(taskId: string, args: Record<string, unknown>
   if (!ref) return fail("Missing required string argument: ref");
   try {
     return await withSession(taskId, async (session) => {
-      const locator = session.refs.get(ref);
-      if (!locator) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
-      await locator.hover({ timeout: 10_000 });
-      const snap = await snapshot(session.page, false, taskId);
-      session.refs = snap.refs;
+      const resolved = await resolveRefForAction(session, ref);
+      if (!resolved) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
+      await resolved.locator.hover({ timeout: 10_000 });
+      const snapFields = await snapshotAfterAction(session, taskId);
       return ok({
         url: session.page.url(),
         title: await session.page.title(),
-        snapshot: snap.text,
-        elementCount: snap.elementCount,
-        truncated: snap.truncated
+        ...snapFields,
+        ...(resolved.healed ? { healedRef: true } : {})
       }, taskId);
     });
   } catch (error) {
@@ -2242,20 +2711,18 @@ export async function browserDrag(taskId: string, args: Record<string, unknown>)
   if (!toRef) return fail("Missing required string argument: toRef");
   try {
     return await withSession(taskId, async (session) => {
-      const fromLoc = session.refs.get(fromRef);
-      if (!fromLoc) return fail(`Unknown ref ${fromRef}. Take a fresh snapshot first.`);
-      const toLoc = session.refs.get(toRef);
-      if (!toLoc) return fail(`Unknown ref ${toRef}. Take a fresh snapshot first.`);
-      await fromLoc.dragTo(toLoc, { timeout: 10_000 });
+      const from = await resolveRefForAction(session, fromRef);
+      if (!from) return fail(`Unknown ref ${fromRef}. Take a fresh snapshot first.`);
+      const to = await resolveRefForAction(session, toRef);
+      if (!to) return fail(`Unknown ref ${toRef}. Take a fresh snapshot first.`);
+      await from.locator.dragTo(to.locator, { timeout: 10_000 });
       await session.page.waitForLoadState("domcontentloaded").catch(() => undefined);
-      const snap = await snapshot(session.page, false, taskId);
-      session.refs = snap.refs;
+      const snapFields = await snapshotAfterAction(session, taskId);
       return ok({
         url: session.page.url(),
         title: await session.page.title(),
-        snapshot: snap.text,
-        elementCount: snap.elementCount,
-        truncated: snap.truncated
+        ...snapFields,
+        ...(from.healed || to.healed ? { healedRef: true } : {})
       }, taskId);
     });
   } catch (error) {
@@ -2292,8 +2759,9 @@ export async function browserSelectOption(taskId: string, args: Record<string, u
   }
   try {
     return await withSession(taskId, async (session) => {
-      let locator = session.refs.get(ref);
-      if (!locator) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
+      const resolved = await resolveRefForAction(session, ref);
+      if (!resolved) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
+      let locator = resolved.locator;
 
       // Detect whether the resolved element is an <option>. If so, walk
       // up to the containing <select> and (when no explicit value/values
@@ -2333,14 +2801,12 @@ export async function browserSelectOption(taskId: string, args: Record<string, u
         return fail("Missing required argument: provide either 'value' (string) or 'values' (string[]).");
       }
       await locator.selectOption(selection, { timeout: 10_000 });
-      const snap = await snapshot(session.page, false, taskId);
-      session.refs = snap.refs;
+      const snapFields = await snapshotAfterAction(session, taskId);
       return ok({
         url: session.page.url(),
-        snapshot: snap.text,
-        elementCount: snap.elementCount,
-        truncated: snap.truncated,
-        selected: selection
+        ...snapFields,
+        selected: selection,
+        ...(resolved.healed ? { healedRef: true } : {})
       }, taskId);
     });
   } catch (error) {
@@ -2380,11 +2846,34 @@ export async function browserWaitFor(taskId: string, args: Record<string, unknow
   }
   try {
     return await withSession(taskId, async (session) => {
+      let healedRef = false;
       try {
         if (ref) {
-          const locator = session.refs.get(ref);
-          if (!locator) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
-          await locator.waitFor({ state: waitState, timeout: timeoutMs });
+          if (waitState === "visible" || waitState === "attached") {
+            // Self-heal only the "element should be present" states. For
+            // hidden/detached, a lost stamp often IS the disappearance
+            // being awaited — healing onto a re-rendered replacement
+            // would invert the wait's meaning — so those keep the raw
+            // stamped locator.
+            const resolved = await resolveRefForAction(session, ref);
+            if (resolved) {
+              healedRef = resolved.healed;
+              await resolved.locator.waitFor({ state: waitState, timeout: timeoutMs });
+            } else {
+              // Resolution failing right now is not "unknown ref" for the
+              // presence states — waiting for an element that isn't there
+              // YET is exactly what this tool is for. Fall back to polling
+              // the stamped locator so a node that (re)appears with its
+              // stamp intact satisfies the wait.
+              const target = session.refs.get(ref);
+              if (!target) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
+              await target.locator.waitFor({ state: waitState, timeout: timeoutMs });
+            }
+          } else {
+            const target = session.refs.get(ref);
+            if (!target) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
+            await target.locator.waitFor({ state: waitState, timeout: timeoutMs });
+          }
         } else {
           // text-mode: poll the page for the substring. Playwright's
           // waitForFunction handles the timing for us; we pass the needle in
@@ -2402,14 +2891,12 @@ export async function browserWaitFor(taskId: string, args: Record<string, unknow
         }
         return fail(message);
       }
-      const snap = await snapshot(session.page, false, taskId);
-      session.refs = snap.refs;
+      const snapFields = await snapshotAfterAction(session, taskId);
       return ok({
         url: session.page.url(),
         title: await session.page.title(),
-        snapshot: snap.text,
-        elementCount: snap.elementCount,
-        truncated: snap.truncated
+        ...snapFields,
+        ...(healedRef ? { healedRef: true } : {})
       }, taskId);
     });
   } catch (error) {
@@ -2417,11 +2904,38 @@ export async function browserWaitFor(taskId: string, args: Record<string, unknow
   }
 }
 
+// Return the stable handle for `page`, assigning the next "tN" id when the
+// page hasn't been seen before — this is how user-opened tabs and
+// window.open popups get handles lazily on their first list.
+function tabHandleFor(session: Session, page: Page): string {
+  for (const [handle, existing] of session.tabHandles) {
+    if (existing === page) return handle;
+  }
+  const handle = `t${session.nextTabHandleId++}`;
+  session.tabHandles.set(handle, page);
+  return handle;
+}
+
+// Resolve a tN handle to its live Page. Returns undefined for an unknown
+// handle AND for a handle whose page has closed since it was listed
+// (pruning the dead entry on the way out) — both mean the model is acting
+// on a stale tab list and must re-list.
+function resolveTabHandle(session: Session, id: string): Page | undefined {
+  const page = session.tabHandles.get(id);
+  if (!page) return undefined;
+  if (!session.context.pages().includes(page)) {
+    session.tabHandles.delete(id);
+    return undefined;
+  }
+  return page;
+}
+
 // Multi-tab management. Drives BrowserContext.pages() and context.newPage()
-// for list / new / switch / close. Critically, every action that swaps the
-// active page clears `session.refs` BEFORE assigning `session.page` so any
-// concurrent stale ref lookup fails fast against the old refs map rather
-// than silently resolving against the new page.
+// for list / new / switch / close. Tabs are addressed by stable tN handles
+// (see Session.tabHandles), never by position. Critically, every action that
+// swaps the active page clears `session.refs` BEFORE assigning
+// `session.page` so any concurrent stale ref lookup fails fast against the
+// old refs map rather than silently resolving against the new page.
 export async function browserTabs(taskId: string, args: Record<string, unknown>): Promise<string> {
   const action = str(args.action);
   if (!action) return fail("Missing required string argument: action");
@@ -2432,9 +2946,16 @@ export async function browserTabs(taskId: string, args: Record<string, unknown>)
     return await withSession(taskId, async (session) => {
       if (action === "list") {
         const pages = session.context.pages();
+        // Prune handles whose page has closed (user-closed tabs, crashed
+        // renderers) so the map doesn't accumulate dead Page references.
+        // The handle itself stays retired — the counter only moves forward.
+        const open = new Set(pages);
+        for (const [handle, p] of session.tabHandles) {
+          if (!open.has(p)) session.tabHandles.delete(handle);
+        }
         const tabs = await Promise.all(
-          pages.map(async (p, i) => ({
-            index: i,
+          pages.map(async (p) => ({
+            id: tabHandleFor(session, p),
             url: p.url(),
             title: await p.title().catch(() => ""),
             active: p === session.page
@@ -2458,6 +2979,9 @@ export async function browserTabs(taskId: string, args: Record<string, unknown>)
         // awaits) still leaves the tab tracked for closeSession to reap.
         // Without this, an orphan tab survives task teardown.
         session.ownedPageIds.add(page);
+        // Assign the stable handle up front so the response can tell the
+        // model how to address the tab it just opened without re-listing.
+        const id = tabHandleFor(session, page);
         attachConsole(taskId, page);
         if (url) {
           await page.goto(url, { waitUntil: "domcontentloaded" });
@@ -2465,13 +2989,17 @@ export async function browserTabs(taskId: string, args: Record<string, unknown>)
         // Clear refs BEFORE swapping the page so any concurrent stale ref
         // lookup hitting session.refs while session.page is the new tab
         // fails fast against an empty map rather than silently resolving
-        // against a locator that points at the old page.
+        // against a locator that points at the old page. Dropping the
+        // snapshot baseline marks the page swap as a navigation: refs
+        // renumber from @e1 and the response carries the full tree.
         session.refs = new Map();
+        session.lastSnapshotUrl = undefined;
         session.page = page;
         await page.bringToFront().catch(() => undefined);
         const snap = await snapshot(session.page, false, taskId);
         session.refs = snap.refs;
         return ok({
+          id,
           url: session.page.url(),
           title: await session.page.title(),
           snapshot: snap.text,
@@ -2480,12 +3008,14 @@ export async function browserTabs(taskId: string, args: Record<string, unknown>)
         }, taskId);
       }
       if (action === "switch") {
-        if (typeof args.index !== "number" || !Number.isInteger(args.index) || args.index < 0) {
-          return fail("Argument 'index' must be a non-negative integer.");
-        }
-        const target = session.context.pages()[args.index];
-        if (!target) return fail(`No tab at index ${args.index}.`);
+        const id = str(args.id);
+        if (!id) return fail("Missing required string argument: id (a tab handle like \"t2\" from browser_tabs list).");
+        const target = resolveTabHandle(session, id);
+        if (!target) return fail(`No tab with id ${id}. Tab handles are never reused; call browser_tabs action:"list" for the current tabs.`);
+        // Page swap = navigation for ref purposes (the target tab may
+        // carry stamps from an earlier visit — clear and renumber).
         session.refs = new Map();
+        session.lastSnapshotUrl = undefined;
         session.page = target;
         await target.bringToFront().catch(() => undefined);
         const snap = await snapshot(session.page, false, taskId);
@@ -2499,17 +3029,18 @@ export async function browserTabs(taskId: string, args: Record<string, unknown>)
         }, taskId);
       }
       // close
-      if (typeof args.index !== "number" || !Number.isInteger(args.index) || args.index < 0) {
-        return fail("Argument 'index' must be a non-negative integer.");
-      }
-      const target = session.context.pages()[args.index];
-      if (!target) return fail(`No tab at index ${args.index}.`);
+      const id = str(args.id);
+      if (!id) return fail("Missing required string argument: id (a tab handle like \"t2\" from browser_tabs list).");
+      const target = resolveTabHandle(session, id);
+      if (!target) return fail(`No tab with id ${id}. Tab handles are never reused; call browser_tabs action:"list" for the current tabs.`);
       const wasActive = target === session.page;
       await target.close();
-      // Drop the closed page from agent ownership if we had it. If the
+      // Retire the handle (never reassigned — the counter is monotonic)
+      // and drop the closed page from agent ownership if we had it. If the
       // page wasn't agent-owned (rare in practice — the agent normally
       // only addresses tabs it can see, and it opens new ones via
       // browser_tabs:new), the delete is a harmless no-op.
+      session.tabHandles.delete(id);
       session.ownedPageIds.delete(target);
       if (wasActive) {
         // Match the invariant the new/switch branches follow: clear refs
@@ -2519,6 +3050,7 @@ export async function browserTabs(taskId: string, args: Record<string, unknown>)
         // left pointing at a closed handle. A freshly-opened fallback page
         // counts as agent-owned (we just created it).
         session.refs = new Map();
+        session.lastSnapshotUrl = undefined;
         const remaining = session.context.pages();
         if (remaining[0]) {
           session.page = remaining[0];
@@ -2566,6 +3098,12 @@ export async function browserClose(taskId: string, _args: Record<string, unknown
 // clear retry instruction.
 const MAX_SCREENSHOT_BYTES = 5 * 1024 * 1024;
 
+// Cap on numbered ref badges injected for an annotated browser_vision
+// screenshot. Fifty is plenty for the model to anchor an answer to
+// specific elements; an unbounded overlay on a ref-dense page would bury
+// the very content the screenshot is meant to show.
+const VISION_ANNOTATE_BADGE_CAP = 50;
+
 // Screenshot the current page and ask the configured vision model a question
 // about it. Returns the model's text answer. The agent never sees the
 // screenshot bytes — vision is a side call mediated by the provider layer so
@@ -2582,6 +3120,7 @@ export async function browserVision(
   const question = str(args.question);
   if (!question) return fail("Missing required string argument: question");
   const full = bool(args.full, false);
+  const annotate = bool(args.annotate, false);
   try {
     return await withSession(taskId, async (session) => {
       // Refuse to screenshot a page on a refused origin (loopback
@@ -2628,6 +3167,60 @@ export async function browserVision(
           });
         }
       } catch { /* best-effort blur */ }
+      // When annotating, overlay numbered badges on viewport-visible
+      // stamped elements so the vision model can anchor its answer to
+      // snapshot refs. Badge text is ONLY the ref id ("e12") — never page
+      // text — so the overlay adds no new redaction surface; the
+      // [data-gini-secret] pre-blur above and the post-OCR redaction
+      // below stay untouched, and secret-stamped elements are never
+      // badged at all. See ADR browser-automation-engine.md.
+      if (annotate) {
+        try {
+          if (typeof session.page.evaluate === "function") {
+            // Only refs the session actually holds get a badge — a stamp
+            // alone isn't enough (the walker stamps elements the char
+            // budget then drops, and a page could plant the attribute
+            // itself); a badge citing a ref the agent can't act on would
+            // send it chasing Unknown-ref failures.
+            const knownIds = Array.from(session.refs.keys()).map((r) => r.slice(1));
+            await session.page.evaluate((arg: { cap: number; ids: string[]; fullPage: boolean }) => {
+              const known = new Set(arg.ids);
+              const stamped = Array.from(document.querySelectorAll("[data-gini-ref]"));
+              let placed = 0;
+              for (const el of stamped) {
+                if (placed >= arg.cap) break;
+                if (!known.has(el.getAttribute("data-gini-ref") ?? "")) continue;
+                if (el.getAttribute("data-gini-secret") !== null) continue;
+                const rect = el.getBoundingClientRect();
+                if (rect.width <= 0 || rect.height <= 0) continue;
+                // A fullPage capture includes below-fold content, so the
+                // viewport filter only applies to viewport captures.
+                if (
+                  !arg.fullPage
+                  && (rect.bottom <= 0 || rect.right <= 0
+                    || rect.top >= window.innerHeight || rect.left >= window.innerWidth)
+                ) {
+                  continue;
+                }
+                const badge = document.createElement("div");
+                badge.setAttribute("data-gini-vision-badge", "true");
+                badge.textContent = el.getAttribute("data-gini-ref") ?? "";
+                // Document-absolute placement (viewport rect + scroll
+                // offset) rather than position:fixed, so badges land on
+                // their elements in fullPage captures too — fixed boxes
+                // would all pile up in the scrolled-to viewport.
+                badge.style.cssText =
+                  `position:absolute;left:${Math.max(0, rect.left + window.scrollX)}px;`
+                  + `top:${Math.max(0, rect.top + window.scrollY)}px;`
+                  + "z-index:2147483647;background:#1a73e8;color:#fff;"
+                  + "font:10px/1.4 monospace;padding:0 3px;border-radius:3px;pointer-events:none;";
+                document.documentElement.appendChild(badge);
+                placed++;
+              }
+            }, { cap: VISION_ANNOTATE_BADGE_CAP, ids: knownIds, fullPage: full });
+          }
+        } catch { /* best-effort overlay — an unannotated screenshot is still useful */ }
+      }
       let buf: Buffer;
       try {
         buf = await session.page.screenshot({ type: "png", fullPage: full });
@@ -2646,6 +3239,19 @@ export async function browserVision(
             });
           }
         } catch { /* best-effort restore */ }
+        // Strip the annotation overlay by its dedicated attribute, even
+        // when the screenshot threw — a surviving badge would leak into
+        // later snapshots and screenshots as a phantom page element.
+        if (annotate) {
+          try {
+            if (typeof session.page.evaluate === "function") {
+              await session.page.evaluate(() => {
+                const badges = document.querySelectorAll("[data-gini-vision-badge]");
+                for (const badge of Array.from(badges)) badge.remove();
+              });
+            }
+          } catch { /* best-effort removal */ }
+        }
       }
       if (buf.length > MAX_SCREENSHOT_BYTES) {
         return fail(
@@ -2660,8 +3266,13 @@ export async function browserVision(
         return fail(`${postShotBlock} (page navigated to a disallowed origin during capture; discarding screenshot)`);
       }
       const imageBase64 = Buffer.from(buf).toString("base64");
+      // With badges in the shot, tell the vision model what they mean so
+      // its answer cites refs the agent can act on directly.
+      const prompt = annotate
+        ? `${question}\n\nThe numbered badges overlaid on the screenshot are element refs (badge "e12" = @e12 in the page snapshot); cite them when referring to specific elements.`
+        : question;
       const result = await generateVisionAnalysis(config, {
-        prompt: question,
+        prompt,
         imageBase64,
         mimeType: "image/png",
         maxTokens: 512
@@ -2780,9 +3391,15 @@ export async function browserUploadFile(
   }
   try {
     return await withSession(taskId, async (session) => {
-      const locator = session.refs.get(ref);
-      if (!locator) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
-      await locator.setInputFiles(resolved.absolute, { timeout: 10_000 });
+      // Trust boundary: uploads act ONLY on the exact stamped element —
+      // no resolveRefForAction self-healing here. The user's approval
+      // names this specific target; re-resolving by role/name could hand
+      // the file to a different input. A lost stamp fails loudly instead
+      // (same stance as browser_fill_secrets; see ADR
+      // browser-fill-secret.md).
+      const target = session.refs.get(ref);
+      if (!target) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
+      await target.locator.setInputFiles(resolved.absolute, { timeout: 10_000 });
       const snap = await snapshot(session.page, false, taskId);
       session.refs = snap.refs;
       return ok({
@@ -2825,9 +3442,12 @@ export async function browserUploadFileApproved(
   }
   try {
     return await withSession(taskId, async (session) => {
-      const locator = session.refs.get(ref);
-      if (!locator) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
-      await locator.setInputFiles(resolved.absolute, { timeout: 10_000 });
+      // Trust boundary: the approval was granted for the exact stamped
+      // element — no resolveRefForAction self-healing here; a lost stamp
+      // fails loudly (see ADR browser-fill-secret.md).
+      const target = session.refs.get(ref);
+      if (!target) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
+      await target.locator.setInputFiles(resolved.absolute, { timeout: 10_000 });
       const snap = await snapshot(session.page, false, taskId);
       session.refs = snap.refs;
       return ok({
@@ -2943,7 +3563,10 @@ export const __test = {
       refs: new Map(),
       lastActivity: Date.now(),
       inFlight,
-      ownedPageIds: new Set<Page>([fakePage])
+      ownedPageIds: new Set<Page>([fakePage]),
+      nextRefId: 1,
+      tabHandles: new Map(),
+      nextTabHandleId: 1
     });
   },
   // Install a synthetic session with a caller-provided `page` so tool
@@ -2957,7 +3580,10 @@ export const __test = {
       refs: new Map(),
       lastActivity: Date.now(),
       inFlight: 0,
-      ownedPageIds: new Set<Page>([realPage])
+      ownedPageIds: new Set<Page>([realPage]),
+      nextRefId: 1,
+      tabHandles: new Map(),
+      nextTabHandleId: 1
     });
   },
   // Install a synthetic session with both a `page` and `context` so tab-
@@ -2975,7 +3601,10 @@ export const __test = {
       refs: new Map(),
       lastActivity: Date.now(),
       inFlight: 0,
-      ownedPageIds: new Set<Page>([realPage])
+      ownedPageIds: new Set<Page>([realPage]),
+      nextRefId: 1,
+      tabHandles: new Map(),
+      nextTabHandleId: 1
     });
   },
   // Read the currently-installed page on a fake session so tests can
@@ -2996,14 +3625,36 @@ export const __test = {
   },
   // Read the currently-installed refs map so tests can assert it was
   // cleared (e.g. tab switch / new / close should clear the refs).
-  getFakeSessionRefsForTest(taskId: string): Map<string, Locator> | undefined {
+  getFakeSessionRefsForTest(taskId: string): Map<string, RefTarget> | undefined {
     return sessions.get(taskId)?.refs;
   },
   // Set the refs map on a fake session so tests can plant a fake locator
   // keyed by `@eN` before invoking a tool that needs to resolve it.
+  // Values are either RefTarget-shaped objects (locator is an OBJECT —
+  // tests exercising stale-ref healing pass role/name/nth metadata) or
+  // bare locator stubs, which get wrapped with empty healing metadata.
+  // The discrimination key is `typeof value.locator`: a real Locator's
+  // own `.locator` property is a sub-locator FACTORY (function), so a
+  // bare stub that happens to expose `.locator(sel)` still normalizes
+  // as a locator, not a RefTarget.
   setFakeSessionRefsForTest(taskId: string, refs: Map<string, unknown>): void {
     const session = sessions.get(taskId);
-    if (session) session.refs = refs as Map<string, Locator>;
+    if (!session) return;
+    const normalized = new Map<string, RefTarget>();
+    for (const [key, value] of refs) {
+      const maybe = value as { locator?: unknown; role?: unknown; name?: unknown; nth?: unknown };
+      if (maybe !== null && typeof maybe === "object" && typeof maybe.locator === "object" && maybe.locator !== null) {
+        normalized.set(key, {
+          locator: maybe.locator as Locator,
+          role: typeof maybe.role === "string" ? maybe.role : "",
+          name: typeof maybe.name === "string" ? maybe.name : "",
+          nth: typeof maybe.nth === "number" ? maybe.nth : 0
+        });
+      } else {
+        normalized.set(key, { locator: value as Locator, role: "", name: "", nth: 0 });
+      }
+    }
+    session.refs = normalized;
   },
   setFakeSessionInFlight(taskId: string, inFlight: number): void {
     const session = sessions.get(taskId);
@@ -3033,8 +3684,16 @@ export const __test = {
   // Expose the in-page walker for direct unit testing. Callers supply a
   // fake Page whose `evaluate(fn, arg)` runs `fn(arg)` locally against
   // a pre-populated `globalThis.document` (and friends) — that lets
-  // browser walk semantics be asserted without spawning Chromium.
-  snapshotForTest(page: Page, full: boolean): Promise<SnapshotResult> {
-    return snapshot(page, full);
+  // browser walk semantics be asserted without spawning Chromium. Pass
+  // taskId (with a fake session installed) to exercise the session-scoped
+  // ref-stability / navigation-reset behavior.
+  snapshotForTest(page: Page, full: boolean, taskId?: string): Promise<SnapshotResult> {
+    return snapshot(page, full, taskId);
+  },
+  // Direct access to the diff renderer so its formatting rules — the
+  // "(no changes)" body, hunk separators, the LCS cell cap — can be
+  // asserted without driving a full page walk.
+  renderSnapshotDiffForTest(prevText: string, currText: string): string | undefined {
+    return renderSnapshotDiff(prevText, currText);
   }
 };
