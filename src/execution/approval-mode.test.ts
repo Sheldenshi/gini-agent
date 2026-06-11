@@ -210,6 +210,41 @@ describe("approvalMode dispatch matrix", () => {
 
       rmSync(workspaceRoot, { recursive: true, force: true });
     });
+
+    test("browser_download pauses for approval", async () => {
+      const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-approval-mode-ws-"));
+      const config = buildConfig(workspaceRoot, "strict-download", { approvalMode: "strict" });
+      const provider = normalizeProvider(config.provider);
+
+      // Same deferred-tool dance as browser_upload_file: load it first.
+      setEchoToolCallingResponse({
+        provider,
+        text: "",
+        toolCalls: [
+          { id: "call_load", type: "function", function: { name: "load_tools", arguments: JSON.stringify({ names: ["browser_download"] }) } }
+        ],
+        finishReason: "tool_calls"
+      });
+      setEchoToolCallingResponse({
+        provider,
+        text: "",
+        toolCalls: [
+          { id: "call_d", type: "function", function: { name: "browser_download", arguments: JSON.stringify({ ref: "@e1" }) } }
+        ],
+        finishReason: "tool_calls"
+      });
+
+      const task = await submitTask(config, "download", { mode: "chat" });
+      const paused = await waitForTerminal(config, task.id);
+      expect(paused.status).toBe("waiting_approval");
+
+      const state = readState(config.instance);
+      const approval = state.authorizations.find((a) => a.taskId === task.id);
+      expect(approval?.action).toBe("browser.download");
+      expect(approval?.payload.ref).toBe("@e1");
+
+      rmSync(workspaceRoot, { recursive: true, force: true });
+    });
   });
 
   // ---------------- auto ----------------

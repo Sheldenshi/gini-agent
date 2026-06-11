@@ -19,6 +19,7 @@ import { join } from "node:path";
 import {
   clearEchoToolCallingResponses,
   normalizeProvider,
+  setEchoToolCallingFailure,
   setEchoToolCallingResponse
 } from "../provider";
 import {
@@ -470,5 +471,49 @@ describe("chat-task route directive", () => {
     expect(blocks.length).toBe(1);
     expect(blocks[0]!.threadId).toBe(seededThreadId);
     expect(blocks[0]!.parentBlockId).toBe(parentBlockId);
+  });
+
+  // Mixed-streaming overflow retry: attempt 1 STREAMS the directive (the
+  // thread switch fires and the prefix is stripped mid-stream), the attempt
+  // fails with a context overflow, and the per-attempt reset clears the
+  // route state. A successful NON-streaming retry then repeats the
+  // directive — finalizeTurnRoute must still strip it (detection reads
+  // "already threaded", so without the first-call re-parse the raw
+  // directive lands in the summary and the settled block).
+  test("a non-streaming retry after a streamed directive still strips the directive", async () => {
+    const OVERFLOW_MESSAGE = "prompt is too long: 250000 tokens > 200000 maximum";
+    const config = buildConfig(workspaceRoot, "chat-route-retry-strip");
+    const provider = normalizeProvider(config.provider);
+    const { sessionId } = await seedFirstTurn(config, provider);
+
+    setEchoToolCallingFailure(OVERFLOW_MESSAGE, {
+      streamTextBeforeFailure: "<route>thread</route>Partial thread answer"
+    });
+    setEchoToolCallingResponse(
+      {
+        provider,
+        text: "<route>thread</route>Final thread answer.",
+        toolCalls: [],
+        finishReason: "stop"
+      },
+      undefined,
+      { nonStreaming: true }
+    );
+
+    const second = await submitChatMessage(config, sessionId, { content: "dig into this" });
+    const finished = await waitForTerminal(config, second.taskId);
+
+    expect(finished.status).toBe("completed");
+    expect(finished.summary).toBe("Final thread answer.");
+    expect(finished.summary).not.toContain("<route>");
+    // The streamed attempt's switch stands: the turn is threaded.
+    expect(finished.threadId).toBeDefined();
+
+    const blocks = listChatBlocks(config.instance, sessionId)
+      .filter((b) => b.kind === "assistant_text" && b.taskId === second.taskId);
+    expect(blocks.length).toBe(1);
+    expect(assistantText(blocks[0]!)).toBe("Final thread answer.");
+    expect(assistantText(blocks[0]!)).not.toContain("<route>");
+    expect(blocks[0]!.threadId).toBe(finished.threadId);
   });
 });

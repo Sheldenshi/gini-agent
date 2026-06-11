@@ -54,6 +54,10 @@ describe("resolveApprovalPolicy - strict mode", () => {
   test("gates browser.upload_file", () => {
     expect(resolveApprovalPolicy(config, "browser.upload_file")).toEqual({ mode: "gate" });
   });
+
+  test("gates browser.download", () => {
+    expect(resolveApprovalPolicy(config, "browser.download")).toEqual({ mode: "gate" });
+  });
 });
 
 describe("resolveApprovalPolicy - yolo mode", () => {
@@ -85,6 +89,13 @@ describe("resolveApprovalPolicy - yolo mode", () => {
     });
   });
 
+  test("auto-approves browser.download", () => {
+    expect(resolveApprovalPolicy(config, "browser.download")).toEqual({
+      mode: "auto",
+      reason: "approval-mode-yolo"
+    });
+  });
+
   // (Removed) browser.fill_secret no longer flows through resolveApprovalPolicy:
   // it's a SetupRequest action (user-actor) and never auto-resolves. See
   // docs/adr/authorization-vs-setup-request.md.
@@ -103,6 +114,13 @@ describe("resolveApprovalPolicy - auto mode (default)", () => {
 
   test("auto-approves browser.upload_file", () => {
     expect(resolveApprovalPolicy(config, "browser.upload_file")).toEqual({
+      mode: "auto",
+      reason: "approval-mode-auto"
+    });
+  });
+
+  test("auto-approves browser.download", () => {
+    expect(resolveApprovalPolicy(config, "browser.download")).toEqual({
       mode: "auto",
       reason: "approval-mode-auto"
     });

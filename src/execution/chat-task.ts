@@ -18,6 +18,7 @@ import {
   appendTrace,
   clearProviderAuthFailureIfPresent,
   createChatMessage,
+  findInFlightAssistantTextForTask,
   getMainChatUserTextBlockForTask,
   isTerminalTaskStatus,
   mutateState,
@@ -32,8 +33,10 @@ import { ApprovedActionFailedError, findTask, scheduleAutoRetain } from "../agen
 import { recall } from "../memory";
 import {
   ProviderAuthError,
+  generateAuxText,
   generateToolCallingResponse,
   isAuthExpiredError,
+  isContextOverflowError,
   providerAuthNote,
   redactSecrets,
   type ToolCallingMessage,
@@ -128,6 +131,13 @@ import {
 // to be a meaningful budget for normal work. Power users can override this
 // per-instance via `config.agent.maxIterations` in `~/.gini/instances/<inst>/config.json`.
 const MAX_LOOP_ITERATIONS = 90;
+// Reactive recovery for provider context-overflow errors. When the provider
+// rejects a call because the prompt no longer fits its window (the chars/4
+// estimate — even calibrated — can miss), the loop compacts the transcript
+// harder and retries instead of failing the task. Total attempts per model
+// call, including the first; after exhaustion the task exits gracefully
+// with a partial result.
+const MAX_CONTEXT_OVERFLOW_ATTEMPTS = 3;
 const PRIOR_CONTEXT_RESPONSE_RESERVE_FRACTION = 0.05;
 const MIN_PRIOR_CONTEXT_RESPONSE_RESERVE_TOKENS = 1_024;
 const MAX_INLINE_SKILL_ROWS = 40;
@@ -144,26 +154,42 @@ const MAX_INLINE_SKILL_SCRIPT_ROWS = 40;
 //      element refs) so the exact-match guard never fires. Repeating the same
 //      action with no progress is itself the stuck signal, so this coarser
 //      threshold is higher.
-//   3. Navigation without action: navigate/reload pages many times with zero
-//      intervening page-action (click/type/etc). Catches oscillation between
-//      a few URLs (action signature flips so guard 2 resets) and "navigate,
-//      never interact" — both have zero page-actions.
+//   3. Navigation without progress: navigate/reload to the SAME (or a small
+//      oscillating set of) URL(s) many times with zero intervening progress.
+//      Catches reload loops and oscillation between a few URLs — the degenerate
+//      pattern behind the original context-overflow incident. A navigation to a
+//      URL NOT in the recent navigation window is treated as progress (research
+//      across distinct pages), so it resets rather than climbs: that keeps the
+//      guard from false-positiving on legitimate sequential browsing.
 const MAX_IDENTICAL_TOOL_REPEATS = 3;
 const MAX_SAME_ACTION_REPEATS = 6;
 const MAX_NAVIGATION_WITHOUT_ACTION = 8;
+// How many recent navigation targets the guard remembers. A navigation to a URL
+// inside this window is a repeat/oscillation (climb); a navigation to a URL
+// outside it is fresh progress (reset). Sized to catch ping-ponging between a
+// handful of URLs without ever flagging a long run of distinct pages.
+const NAVIGATION_RECENT_URL_WINDOW = 4;
 // Navigation advances/reloads a page; a page-action commits an interaction.
-// Everything else (snapshot, scroll, hover, console, vision, wait_for, tabs,
-// connect, close) is neutral — it neither increments nor resets the counter.
 const NAVIGATION_TOOLS = new Set(["browser_navigate", "browser_back"]);
 const PAGE_ACTION_TOOLS = new Set([
   "browser_click",
   "browser_type",
+  "browser_fill_form",
   "browser_press",
   "browser_select_option",
   "browser_upload_file",
+  "browser_download",
   "browser_fill_secrets",
   "browser_drag"
 ]);
+// Tools that count as genuine progress and reset the navigation counter, beyond
+// the page-actions above. A browser_console that ran after a navigation is the
+// model extracting data from the freshly-loaded page — the navigate -> extract
+// -> navigate research pattern — so it clears the stall counter. NOTE: this is
+// DELIBERATELY narrow. browser_snapshot is NOT here: re-snapshotting the same
+// page is exactly the degenerate overflow incident the guard (with bot-wall
+// detection) defends against, so a snapshot must stay neutral and never reset.
+const NAVIGATION_PROGRESS_TOOLS = new Set(["browser_console"]);
 
 // Protect the most-recent tool results from in-loop content elision: the model
 // needs fresh page state to act on. Older results are shrunk (not dropped) once
@@ -172,26 +198,126 @@ const KEEP_RECENT_TOOL_RESULTS = 6;
 const ELIDED_TOOL_RESULT_MARKER =
   "[Earlier tool result elided to fit the context window. Re-run the tool if you still need its output.]";
 
-// Pure step for the navigation-without-action counter. Given the prior count
-// and the tool names emitted this iteration (in order), returns the next count:
-// a navigation tool increments, a page-action resets to 0, anything neutral
-// leaves it unchanged. Exported for direct unit testing.
-export function nextNavWithoutAction(prev: number, toolNames: string[]): number {
-  let count = prev;
-  for (const name of toolNames) {
-    if (NAVIGATION_TOOLS.has(name)) count += 1;
-    else if (PAGE_ACTION_TOOLS.has(name)) count = 0;
+// In-turn summarize-and-continue compaction. packPriorContext trims once at
+// turn start and the cheap pre-call elision shrinks OLD tool results, but a
+// long tool loop whose recent results are themselves large can still crowd
+// the window mid-turn. When the calibrated projection for the next call
+// crosses the high-water mark even after elision, the loop summarizes the
+// MIDDLE of the in-turn transcript with an aux model call and replaces it
+// with one synthetic, clearly-marked message. The head (every message present
+// at loop entry plus the first in-turn exchange — the model's original plan)
+// and the recent tail stay verbatim.
+const COMPACTION_HIGH_WATER_FRACTION = 0.85;
+// Tail kept verbatim, in EXCHANGES (an assistant message plus its paired tool
+// results). Deliberately smaller than the elision layer's
+// KEEP_RECENT_TOOL_RESULTS (6): elision is the cheap first pass and protects
+// more; compaction is the harder fallback and must reclaim real space, so
+// only the freshest exchanges the model still needs to act on survive.
+const COMPACTION_KEEP_RECENT_EXCHANGES = 2;
+// Anti-thrash guards: at most this many compactions per turn; bail to the
+// graceful partial exit when a compaction reclaims less than the minimum
+// fraction of the projected size, or when the window refills (re-trigger)
+// within this many iterations of the previous compaction.
+const MAX_COMPACTIONS_PER_TURN = 2;
+const COMPACTION_MIN_SAVINGS_FRACTION = 0.1;
+const COMPACTION_REFILL_ITERATIONS = 2;
+// Bounds for the aux summarization side-call: the rendered middle span is
+// char-capped before it reaches the aux model; the summary is token-capped.
+const COMPACTION_SUMMARY_INPUT_CAP_CHARS = 64_000;
+const COMPACTION_SUMMARY_MESSAGE_CAP_CHARS = 4_000;
+const COMPACTION_SUMMARY_MAX_TOKENS = 1024;
+const COMPACTION_SUMMARY_SYSTEM =
+  "You compress an AI agent's in-progress tool activity. Summarize the " +
+  "following tool calls and results into a compact plain-text brief that " +
+  "preserves: what was attempted, key facts and values discovered, errors " +
+  "hit, and any identifiers (URLs, ids, file paths, element refs) needed to " +
+  "continue the task. No preamble.";
+// Marks the synthetic replacement message so transcript readers know the
+// span was summarized, not authored by the user. The message lives only in
+// the in-memory workingMessages (and the toolCallState snapshot if the turn
+// pauses for approval) — mirroring PRIOR_HISTORY_ELISION_NOTE, which is also
+// a per-turn artifact. The durable chat transcript keeps the original
+// tool_transcript rows, so next-turn replay is unaffected.
+export const IN_TURN_COMPACTION_NOTE_PREFIX = "[Context compacted]";
+
+// Extract the provider-reported prompt token count from a model-call usage
+// record. Anthropic reports `input_tokens` (Bedrock Converse usage is
+// normalized to the same key in provider.ts); OpenAI-compatible providers
+// report `prompt_tokens`. Returns undefined when the provider sent no usable
+// count (e.g. the echo provider, or an OpenAI-compatible endpoint that omits
+// usage). Exported for unit testing.
+export function promptTokensFromUsage(usage: Record<string, unknown> | undefined): number | undefined {
+  const raw = usage?.input_tokens ?? usage?.prompt_tokens;
+  return typeof raw === "number" && Number.isFinite(raw) && raw >= 0 ? raw : undefined;
+}
+
+// Mutable state for the navigation-without-progress guard: the running stall
+// count plus a bounded window of the most recently navigated-to URLs.
+export type NavStallState = { count: number; recentUrls: string[] };
+
+export function initialNavStallState(): NavStallState {
+  return { count: 0, recentUrls: [] };
+}
+
+// Sentinel target for browser_back (its destination URL is the prior history
+// entry, not in the arguments) so repeated back-back oscillation still counts
+// as navigating the same target.
+const NAV_BACK_TARGET = "gini-nav-back:";
+
+// Pure step for the navigation-without-progress counter. Given the prior state
+// and the (tool-name, navigation-URL) pairs emitted this iteration in order,
+// returns the next state. Semantics:
+//   - A page-action (PAGE_ACTION_TOOLS) or a progress tool
+//     (NAVIGATION_PROGRESS_TOOLS, e.g. a browser_console data extraction) resets
+//     the count to 0 — the model is making real progress.
+//   - A navigation to a URL already in the recent-URL window is a repeat /
+//     oscillation: the count climbs. A navigation to a URL OUTSIDE the window is
+//     fresh progress: the count resets to 0. Either way the URL enters the
+//     window. This is what stops 8 distinct-URL navigations from tripping the
+//     guard while a reload or 2-3-URL oscillation loop still does.
+//   - Anything neutral (snapshot, scroll, hover, vision, wait_for, tabs, close)
+//     leaves the state unchanged.
+// Exported for direct unit testing.
+export function nextNavStallState(
+  prev: NavStallState,
+  calls: { name: string; url?: string }[]
+): NavStallState {
+  let count = prev.count;
+  let recentUrls = prev.recentUrls;
+  for (const call of calls) {
+    if (PAGE_ACTION_TOOLS.has(call.name) || NAVIGATION_PROGRESS_TOOLS.has(call.name)) {
+      count = 0;
+      continue;
+    }
+    if (!NAVIGATION_TOOLS.has(call.name)) continue;
+    const target = call.name === "browser_back" ? NAV_BACK_TARGET : (call.url ?? "");
+    if (recentUrls.includes(target)) {
+      count += 1;
+    } else {
+      // Navigating somewhere new is progress, not a stall.
+      count = 0;
+    }
+    recentUrls = [target, ...recentUrls.filter((u) => u !== target)].slice(
+      0,
+      NAVIGATION_RECENT_URL_WINDOW
+    );
   }
-  return count;
+  return { count, recentUrls };
 }
 
 // Shrink the CONTENT of older `role:"tool"` messages until the estimated token
 // count fits `budget`. Never drops a message (that would orphan a codex
 // function_call/function_call_output pair); only replaces oversized string
 // content with a short marker, preserving role + tool_call_id. The most-recent
-// KEEP_RECENT_TOOL_RESULTS tool results are protected. Mutates `messages` in
-// place and returns the number of messages elided. Exported for unit testing.
-export function elideOldToolResultsToBudget(messages: ToolCallingMessage[], budget: number): number {
+// `keepRecent` tool results (default KEEP_RECENT_TOOL_RESULTS) are protected;
+// the context-overflow retry path lowers the protection on its last attempt
+// so even the freshest oversized results shrink. Mutates `messages` in place
+// and returns the number of messages elided. Exported for unit testing.
+export function elideOldToolResultsToBudget(
+  messages: ToolCallingMessage[],
+  budget: number,
+  keepRecent: number = KEEP_RECENT_TOOL_RESULTS
+): number {
   if (estimateToolCallingMessagesTokens(messages) <= budget) return 0;
   // Indices of elidable tool results: string content, not already elided,
   // longer than a small floor (tiny results aren't worth shrinking).
@@ -205,9 +331,9 @@ export function elideOldToolResultsToBudget(messages: ToolCallingMessage[], budg
         m.content.length > 200
     )
     .map(({ i }) => i);
-  // Protect the most-recent KEEP_RECENT_TOOL_RESULTS by trimming them off the
-  // tail; walk the rest oldest→newest, shrinking until we fit.
-  const candidates = elidable.slice(0, Math.max(0, elidable.length - KEEP_RECENT_TOOL_RESULTS));
+  // Protect the most-recent `keepRecent` by trimming them off the tail; walk
+  // the rest oldest→newest, shrinking until we fit.
+  const candidates = elidable.slice(0, Math.max(0, elidable.length - keepRecent));
   let elided = 0;
   for (const i of candidates) {
     messages[i]!.content = ELIDED_TOOL_RESULT_MARKER;
@@ -215,6 +341,57 @@ export function elideOldToolResultsToBudget(messages: ToolCallingMessage[], budg
     if (estimateToolCallingMessagesTokens(messages) <= budget) break;
   }
   return elided;
+}
+
+// Group-aligned middle span of the in-turn transcript eligible for
+// summarization: messages[start..end). A group is an assistant message plus
+// its trailing role:"tool" results — they must travel together, since
+// splitting them would orphan tool_call ids and 400 the provider; any other
+// message is its own group. Protected and therefore OUTSIDE the span:
+// everything before `initialCount` (the head packed at loop entry), the
+// first in-turn group (the model's original plan and its first results), and
+// the last `keepRecentExchanges` groups. Returns undefined when nothing is
+// summarizable. Exported for unit testing.
+export function compactionMiddleSpan(
+  messages: ToolCallingMessage[],
+  initialCount: number,
+  keepRecentExchanges: number
+): { start: number; end: number } | undefined {
+  const groupStarts: number[] = [];
+  for (let i = Math.max(0, initialCount); i < messages.length; i++) {
+    if (messages[i]!.role === "tool") continue; // rides with the preceding assistant group
+    groupStarts.push(i);
+  }
+  if (groupStarts.length <= 1 + keepRecentExchanges) return undefined;
+  const start = groupStarts[1]!;
+  const end = groupStarts[groupStarts.length - keepRecentExchanges]!;
+  return end > start ? { start, end } : undefined;
+}
+
+// Render a middle-span slice into bounded plain text for the aux summarizer.
+// Per-message and total caps keep the side-call input from blowing the aux
+// model's own window. Exported for unit testing.
+export function renderMessagesForCompaction(messages: ToolCallingMessage[]): string {
+  const parts: string[] = [];
+  let total = 0;
+  for (const message of messages) {
+    const calls = (message.tool_calls ?? [])
+      .map((call) => `${call.function.name}(${call.function.arguments ?? ""})`)
+      .join("; ");
+    const content =
+      typeof message.content === "string" ? message.content : JSON.stringify(message.content ?? "");
+    let line = `${message.role}${calls ? ` -> ${calls}` : ""}: ${content}`;
+    if (line.length > COMPACTION_SUMMARY_MESSAGE_CAP_CHARS) {
+      line = `${line.slice(0, COMPACTION_SUMMARY_MESSAGE_CAP_CHARS)} [truncated]`;
+    }
+    if (total + line.length > COMPACTION_SUMMARY_INPUT_CAP_CHARS) {
+      parts.push("[remaining messages omitted from summary input]");
+      break;
+    }
+    parts.push(line);
+    total += line.length;
+  }
+  return parts.join("\n");
 }
 
 // Resolve the effective iteration cap from config, falling back to the
@@ -1528,6 +1705,20 @@ async function runLoop(
   );
   // One elision warning trace per turn (not per iteration).
   let elisionTraced = false;
+  // Calibration for the in-turn trim budget. The chars/4 estimate can
+  // undercount what the provider actually tokenizes (tokenizer overhead,
+  // non-Latin text, JSON envelopes, image parts), so after every provider
+  // call that reports real usage we record the gap between the reported
+  // prompt size and our estimate of the exact payload we sent (messages +
+  // tool schemas):
+  //   gap = max(0, observedPromptTokens − estimatedPromptTokens)
+  // The next iteration's elision budget is tightened by this gap, so the
+  // trim threshold is driven by real provider-reported prompt tokens
+  // whenever they exist. Clamped at 0 so a provider reporting FEWER tokens
+  // than the estimate never loosens the budget. Providers that report no
+  // usage (echo, some OpenAI-compatible endpoints) leave the gap at 0 —
+  // identical to the plain chars/4 behavior.
+  let promptTokenEstimateGap = 0;
 
   const { cap, warnReason } = resolveIterationCap(config);
   if (warnReason) {
@@ -1553,6 +1744,14 @@ async function runLoop(
 
   let iterations = iterationsSoFar;
   let workingMessages = messages.slice();
+  // In-turn compaction bookkeeping. `initialMessageCount` marks the head
+  // packed at loop entry (system + prior context + the user ask; on an
+  // approval resume it also covers everything before the pause — protecting
+  // more than strictly required, never less). The counters drive the
+  // anti-thrash guards.
+  const initialMessageCount = workingMessages.length;
+  let compactionsThisTurn = 0;
+  let lastCompactionIteration: number | undefined;
   // Carry the running cost across approval resumes by seeding from the
   // task's existing cost row (set by a prior runLoop entry). Each model
   // call adds into this accumulator and we write it back on every
@@ -1645,7 +1844,14 @@ async function runLoop(
   const finalizeTurnRoute = async (text: string): Promise<string> => {
     const detect = !routeResolved && isFirstModelCall && threadDetectionEnabled();
     const alreadyStrippedThisTurn = routeResolved && routeStrippedPrefix > 0;
-    if (!detect && !alreadyStrippedThisTurn) return text;
+    // Any first model call can still carry the directive even when detection
+    // is off — e.g. an overflow retry after the failed attempt's stream
+    // already switched the turn to a thread (detection now reads "already
+    // threaded") and the per-attempt reset cleared the strip state. Strip
+    // it regardless: only `detect` may ROUTE (the switch, when one applied,
+    // already happened), but the directive must never reach task.summary or
+    // a block.
+    if (!detect && !alreadyStrippedThisTurn && !isFirstModelCall) return text;
     const parsed = parseLeadingRouteDirective(text);
     if (parsed.status === "directive") {
       if (detect && parsed.route === "thread") await switchTurnToThread();
@@ -1669,8 +1875,94 @@ async function runLoop(
   let identicalRunLength = 0;
   let lastActionSignature: string | undefined;
   let sameActionRunLength = 0;
-  let navWithoutAction = 0;
+  let navStall = initialNavStallState();
   let loopStallReason: "repeat" | "navigation" | undefined;
+
+  // The current turn's most recent pre-tool-call narration, CLEANED of any
+  // leading `<route>` directive. This — never a re-scan of workingMessages —
+  // is what the partial-result exit below surfaces: workingMessages includes
+  // the packed prior context, so scanning it for "the last assistant text"
+  // could resurrect a PRIOR turn's answer as this turn's partial result, and
+  // raw assistant content can still carry the route directive that must
+  // never reach task.summary.
+  let lastTurnNarration = "";
+  // Whether lastTurnNarration reached the chat as a settled assistant_text
+  // block. Streamed narration always does (the tool-call path finalizes the
+  // in-flight block); a non-streaming provider's whole-string narration
+  // never opens a block, so the partial-result exit must emit it one-shot
+  // or the timeline shows only the note while task.summary carries the
+  // narration.
+  let lastTurnNarrationSettled = false;
+
+  // Graceful partial exit for unrecoverable context exhaustion: the provider
+  // call kept overflowing even after compaction (overflow retry below), or
+  // in-turn compaction bailed out. Completes the task with the latest
+  // assistant text plus an explicit partial-result note — mirroring the
+  // iteration-cap exit's summary-rather-than-failure contract — WITHOUT
+  // another model call: the transcript provably no longer fits the provider
+  // window, so the tool-less summary turn the iteration-cap path makes would
+  // itself overflow.
+  const completeWithPartialResult = async (note: string): Promise<Task> => {
+    const finalText = lastTurnNarration ? `${lastTurnNarration}\n\n${note}` : note;
+    const exhausted = await mutateState(config.instance, (state) => {
+      const item = findTask(state, taskId);
+      // Respect a prior terminal status (a cancel may have raced this exit).
+      if (isTerminalTaskStatus(item.status)) return item;
+      item.status = "completed";
+      item.currentStep = "Completed (stopped: context window exhausted)";
+      item.summary = finalText;
+      item.cost = accumulatedCost;
+      item.partialSummary = undefined;
+      item.toolCallState = undefined;
+      item.loadedTools = undefined;
+      item.updatedAt = now();
+      return item;
+    });
+    if (exhausted.status === "completed") {
+      // A failed overflow attempt can leave its partial stream's block
+      // in-flight. Settle it — `streaming: false`, text preserved, the same
+      // contract as the cancellation path (ADR chat-block-protocol.md risks
+      // §4) — so a completed task never carries a streaming row.
+      const inFlight = findInFlightAssistantTextForTask(config.instance, taskId);
+      if (inFlight && emitCtx) {
+        finalizeAssistantText(emitCtx, inFlight.blockId, inFlight.text);
+      }
+      // Streamed narration already reached the chat as a settled
+      // assistant_text block in the iteration that produced it; narration
+      // from a non-streaming provider never became a block, so emit it
+      // one-shot here — otherwise the timeline shows only the note while
+      // task.summary carries the narration. The note itself is emitted
+      // exactly once, as a system note: re-emitting finalText as a block
+      // would duplicate settled narration and render the note twice.
+      if (lastTurnNarration && !lastTurnNarrationSettled) {
+        const block = emitAssistantTextStart(emitCtx, lastTurnNarration);
+        if (block?.id) finalizeAssistantText(emitCtx, block.id, lastTurnNarration);
+      }
+      emitSystemNote(emitCtx, note);
+      emitPhase(emitCtx, "Completed");
+    }
+    appendTrace(config.instance, taskId, {
+      type: "warning",
+      message: "Context window exhausted; completed with partial result.",
+      data: { iterations, note }
+    });
+    await updateRunFromTask(config, exhausted);
+    await syncSubagentFromTask(config, exhausted);
+    if (exhausted.jobId) await finalizeJobRunFromTask(config, exhausted);
+    if (exhausted.status === "completed") {
+      void scheduleAutoRetain(config, exhausted);
+      if (exhausted.chatSessionId) {
+        void autoRenameChatAfterTurn(config, exhausted.chatSessionId).catch((error) => {
+          appendLog(config.instance, "chat.auto_title.failed", {
+            sessionId: exhausted.chatSessionId,
+            taskId: exhausted.id,
+            error: error instanceof Error ? error.message : String(error)
+          });
+        });
+      }
+    }
+    return exhausted;
+  };
 
   while (iterations < cap) {
     iterations += 1;
@@ -1826,42 +2118,233 @@ async function runLoop(
 
     // Trim accumulated tool-result content to fit the live context window before
     // the call. `providerTools` is recomputed by recompute(), so re-estimate the
-    // schema cost each iteration. Elision mutates `workingMessages` in place, so
-    // an old result stays elided once shrunk — bounding growth across the loop.
+    // schema cost each iteration. The budget is tightened by the calibration gap
+    // observed on the previous provider call (see promptTokenEstimateGap above),
+    // so real provider-reported prompt tokens drive the trim trigger when
+    // available. Elision mutates `workingMessages` in place, so an old result
+    // stays elided once shrunk — bounding growth across the loop.
     const toolSchemaTokens = estimateTextTokens(JSON.stringify(providerTools));
-    const liveMessageBudget = Math.max(0, contextWindowTokens - responseReserveTokens - toolSchemaTokens);
+    const liveMessageBudget = Math.max(
+      0,
+      contextWindowTokens - responseReserveTokens - toolSchemaTokens - promptTokenEstimateGap
+    );
     const elided = elideOldToolResultsToBudget(workingMessages, liveMessageBudget);
     if (elided > 0 && !elisionTraced) {
       elisionTraced = true;
       appendTrace(config.instance, taskId, {
         type: "warning",
         message: `Elided ${elided} earlier tool result(s) to fit the context window.`,
-        data: { iterations, elided, liveMessageBudget }
+        data: { iterations, elided, liveMessageBudget, promptTokenEstimateGap }
       });
     }
+    // Estimate of the exact payload going to the provider (post-elision
+    // messages + tool schemas) — the comparison base for the calibration gap
+    // updated from this call's reported usage below. `let`: in-turn
+    // compaction below replaces messages and re-estimates.
+    let estimatedPromptTokens = estimateToolCallingMessagesTokens(workingMessages) + toolSchemaTokens;
 
-    // Captured before the call so the success-triggered clear below can
-    // prove its evidence predates any failure recorded while this call was
-    // in flight (long streams authenticate at start and survive an expiry).
-    const callStartedAt = now();
-    let result: Awaited<ReturnType<typeof generateToolCallingResponse>>;
-    try {
-      result = await generateToolCallingResponse(
-        config,
-        workingMessages,
-        providerTools,
-        onDelta,
-        effective.providerSource === "agent" ? effective.provider : undefined
-      );
-    } catch (error) {
-      // Tag a provider auth failure with the provider that actually served
-      // this turn, so failTask names the right credential even if the active
-      // agent switched while the call was in flight (issue #205).
-      const message = error instanceof Error ? error.message : String(error);
-      if (!(error instanceof ProviderAuthError) && isAuthExpiredError(message)) {
-        throw new ProviderAuthError(effective.provider.name, message);
+    // In-turn summarize-and-continue compaction. When the calibrated
+    // projection for THIS call crosses the high-water mark, prune cheap
+    // first (a harder elision pass targeting the high-water line); only if
+    // that cannot bring the projection under the mark is the middle of the
+    // in-turn transcript summarized via an aux model call. Anti-thrash
+    // guards bail to the graceful partial exit rather than grinding:
+    // re-trigger right after a compaction, a compaction that reclaims
+    // almost nothing, or no aux model available. When the per-turn
+    // compaction cap is reached (or nothing is summarizable) the call
+    // proceeds anyway — the reactive overflow retry below is the backstop.
+    {
+      const compactionHighWaterTokens = Math.floor(contextWindowTokens * COMPACTION_HIGH_WATER_FRACTION);
+      if (estimatedPromptTokens + promptTokenEstimateGap > compactionHighWaterTokens) {
+        // Cheap pruning first. The regular pre-call elision above only
+        // targets the (looser) live-message budget, so ask it to prune down
+        // to the high-water line before resorting to summarization. When
+        // enough old results are elidable this resolves the trigger with no
+        // aux call at all.
+        const highWaterMessageBudget = Math.max(
+          0,
+          compactionHighWaterTokens - toolSchemaTokens - promptTokenEstimateGap
+        );
+        elideOldToolResultsToBudget(workingMessages, highWaterMessageBudget);
+        estimatedPromptTokens = estimateToolCallingMessagesTokens(workingMessages) + toolSchemaTokens;
       }
-      throw error;
+      const projectedPromptTokens = estimatedPromptTokens + promptTokenEstimateGap;
+      if (projectedPromptTokens > compactionHighWaterTokens) {
+        if (
+          lastCompactionIteration !== undefined &&
+          iterations - lastCompactionIteration <= COMPACTION_REFILL_ITERATIONS
+        ) {
+          appendTrace(config.instance, taskId, {
+            type: "warning",
+            message: "Context window refilled immediately after in-turn compaction; exiting with partial result.",
+            data: { iterations, lastCompactionIteration, projectedPromptTokens, compactionHighWaterTokens }
+          });
+          return completeWithPartialResult(
+            "Stopped early: the context window refilled immediately after compaction. This is a partial result."
+          );
+        }
+        const span =
+          compactionsThisTurn < MAX_COMPACTIONS_PER_TURN
+            ? compactionMiddleSpan(workingMessages, initialMessageCount, COMPACTION_KEEP_RECENT_EXCHANGES)
+            : undefined;
+        if (span) {
+          let summaryText: string;
+          try {
+            // Same per-agent provider override as the main model call: the
+            // rendered middle span is transcript content, so it goes to the
+            // provider serving this agent, not the global config provider.
+            const aux = await generateAuxText(
+              config,
+              {
+                system: COMPACTION_SUMMARY_SYSTEM,
+                user: renderMessagesForCompaction(workingMessages.slice(span.start, span.end)),
+                maxTokens: COMPACTION_SUMMARY_MAX_TOKENS
+              },
+              effective.providerSource === "agent" ? effective.provider : undefined
+            );
+            accumulatedCost = addCost(accumulatedCost, aux.cost);
+            summaryText = aux.text.trim();
+          } catch (error) {
+            // No usable aux model — compaction is impossible, and pruning
+            // already failed to bring the projection under the mark.
+            appendTrace(config.instance, taskId, {
+              type: "warning",
+              message: "In-turn compaction summarization failed; exiting with partial result.",
+              data: { iterations, error: error instanceof Error ? error.message : String(error) }
+            });
+            return completeWithPartialResult(
+              "Stopped early: the conversation outgrew the model's context window and no summarization model was available. This is a partial result."
+            );
+          }
+          const summaryMessage: ToolCallingMessage = {
+            role: "user",
+            content:
+              `${IN_TURN_COMPACTION_NOTE_PREFIX} Earlier tool calls and results from this turn were ` +
+              `replaced by this summary to fit the context window (the full transcript is still stored):\n` +
+              summaryText
+          };
+          workingMessages.splice(span.start, span.end - span.start, summaryMessage);
+          compactionsThisTurn += 1;
+          lastCompactionIteration = iterations;
+          estimatedPromptTokens = estimateToolCallingMessagesTokens(workingMessages) + toolSchemaTokens;
+          const afterTokens = estimatedPromptTokens + promptTokenEstimateGap;
+          const savedTokens = projectedPromptTokens - afterTokens;
+          appendTrace(config.instance, taskId, {
+            type: "warning",
+            message: `In-turn compaction replaced ${span.end - span.start} message(s) with a summary.`,
+            data: { iterations, compactionsThisTurn, projectedPromptTokens, afterTokens, savedTokens }
+          });
+          if (
+            afterTokens > compactionHighWaterTokens &&
+            savedTokens < projectedPromptTokens * COMPACTION_MIN_SAVINGS_FRACTION
+          ) {
+            // The protected head/tail is what fills the window — further
+            // compactions cannot help. Small savings that nonetheless got
+            // the projection back under the high-water mark are fine: the
+            // next call fits, so the turn proceeds.
+            return completeWithPartialResult(
+              "Stopped early: compacting the conversation could not reclaim enough context window space. This is a partial result."
+            );
+          }
+        }
+      }
+    }
+
+    // Provider call with bounded compact-and-retry on context overflow. A
+    // prompt the provider rejects as too long is recoverable: shrink the
+    // transcript (tighter elision budget per failed attempt; the last retry
+    // also drops the recent-result protection) and call again. Non-overflow
+    // errors keep their existing behavior (auth tagging + propagation).
+    // After MAX_CONTEXT_OVERFLOW_ATTEMPTS total attempts the task exits
+    // gracefully with a partial result — the transcript provably cannot
+    // reach the model, so failing the whole task would discard real work.
+    //
+    // `callStartedAt` is captured before the first attempt so the
+    // success-triggered clear below can prove its evidence predates any
+    // failure recorded while this call was in flight (long streams
+    // authenticate at start and survive an expiry).
+    const callStartedAt = now();
+    let result: Awaited<ReturnType<typeof generateToolCallingResponse>> | undefined;
+    for (let attempt = 1; result === undefined; attempt++) {
+      try {
+        result = await generateToolCallingResponse(
+          config,
+          workingMessages,
+          providerTools,
+          onDelta,
+          effective.providerSource === "agent" ? effective.provider : undefined
+        );
+      } catch (error) {
+        // Tag a provider auth failure with the provider that actually served
+        // this turn, so failTask names the right credential even if the active
+        // agent switched while the call was in flight (issue #205).
+        const message = error instanceof Error ? error.message : String(error);
+        if (!(error instanceof ProviderAuthError) && isAuthExpiredError(message)) {
+          throw new ProviderAuthError(effective.provider.name, message);
+        }
+        if (!isContextOverflowError(message)) throw error;
+        if (attempt >= MAX_CONTEXT_OVERFLOW_ATTEMPTS) {
+          // Drain queued flushes before the partial exit, same as the retry
+          // path below: a still-running flush would otherwise append the
+          // failed attempt's text to partialSummary AFTER
+          // completeWithPartialResult cleared it (and keep mutating the
+          // in-flight block it settles).
+          await flushChain;
+          appendTrace(config.instance, taskId, {
+            type: "warning",
+            message: `Provider context overflow persisted after ${attempt} attempts; exiting with partial result.`,
+            data: { iterations, attempt }
+          });
+          return completeWithPartialResult(
+            "Stopped early: the conversation no longer fits the model's context window even after compaction. This is a partial result."
+          );
+        }
+        // Compact harder than the proactive pass above: halve the budget per
+        // failed attempt, and drop the recent-result protection on the final
+        // retry so even the freshest oversized results shrink.
+        const tighterBudget = Math.max(0, Math.floor(liveMessageBudget / 2 ** attempt));
+        const keepRecent = attempt >= MAX_CONTEXT_OVERFLOW_ATTEMPTS - 1 ? 0 : KEEP_RECENT_TOOL_RESULTS;
+        const compacted = elideOldToolResultsToBudget(workingMessages, tighterBudget, keepRecent);
+        // The calibration base must describe the payload the NEXT attempt
+        // actually sends. Without this recompute, the gap below would
+        // compare the retry's reported usage against the stale pre-elision
+        // estimate, clamp to 0, and loosen the budget for the following
+        // iteration — re-triggering the very overflow this retry recovered
+        // from.
+        estimatedPromptTokens = estimateToolCallingMessagesTokens(workingMessages) + toolSchemaTokens;
+        appendTrace(config.instance, taskId, {
+          type: "warning",
+          message: `Provider rejected the prompt as too long; compacted ${compacted} tool result(s) and retrying.`,
+          data: { iterations, attempt, tighterBudget, keepRecent, compacted }
+        });
+        // Discard the failed attempt's partial stream. A provider can
+        // stream text before throwing the overflow; without a reset the
+        // retry's text would accrete onto the failed attempt's in the
+        // route buffer, the task partial, and the in-flight assistant
+        // block. Drain the flush chain first so routeSurfacedLen reflects
+        // everything the failed attempt surfaced, then trim exactly that
+        // much off partialSummary. The in-flight block id is kept: the
+        // retry's first flush overwrites the block with its own full text.
+        await flushChain;
+        if (routeSurfacedLen > 0) {
+          const surfaced = routeSurfacedLen;
+          await mutateState(config.instance, (state) => {
+            const item = state.tasks.find((t) => t.id === taskId);
+            if (item?.partialSummary) {
+              item.partialSummary = item.partialSummary.slice(0, Math.max(0, item.partialSummary.length - surfaced));
+            }
+          });
+        }
+        pending = "";
+        routeRawText = "";
+        routeStrippedPrefix = 0;
+        routeSurfacedLen = 0;
+        inFlightAssistantText = "";
+        // Re-arm route detection on a first-call retry: the retry's stream
+        // may repeat the leading directive, which must be stripped again
+        // (switchTurnToThread is idempotent for an already-switched turn).
+        routeResolved = !isFirstModelCall;
+      }
     }
     // Drain any in-flight streamed flush, then flush the remaining buffer so
     // routing is fully resolved before we strip the directive from the final
@@ -1869,6 +2352,15 @@ async function runLoop(
     await flushChain;
     await enqueueFlush();
     accumulatedCost = addCost(accumulatedCost, result.cost);
+    // Recalibrate the trim budget from the provider's real prompt-token
+    // count for this call (when reported). Applies from the NEXT iteration's
+    // elision pass onward.
+    {
+      const observedPromptTokens = promptTokensFromUsage(result.usage);
+      if (observedPromptTokens !== undefined) {
+        promptTokenEstimateGap = Math.max(0, observedPromptTokens - estimatedPromptTokens);
+      }
+    }
 
     // A successful call proves this provider's credential works — drop any
     // persistent needs-reauth record for it (issue #233). The helper checks
@@ -2020,6 +2512,17 @@ async function runLoop(
         const stale = readState(config.instance).tasks.find((t) => t.id === taskId);
         return stale ?? ({ id: taskId, status: "cancelled" } as unknown as Task);
       }
+    }
+
+    // Track this turn's latest narration for the partial-result exit (see
+    // lastTurnNarration above). Only non-empty cleaned text advances it, so
+    // a narration-less tool iteration keeps the most recent narration.
+    // Streamed narration has an in-flight block (finalized just below);
+    // a whole-string (non-streaming) response never opened one, which the
+    // partial exit compensates for with a one-shot block.
+    if (cleanedTurnText.trim()) {
+      lastTurnNarration = cleanedTurnText.trim();
+      lastTurnNarrationSettled = Boolean(inFlightAssistantBlockId);
     }
 
     // Tool-call path: append the assistant message (with tool_calls), then
@@ -2428,8 +2931,9 @@ async function runLoop(
     // the same input; the action-only guard (name+args, ignoring the result)
     // catches a call whose result jitters every iteration (e.g. browser_navigate
     // re-fetching a live page) so the exact-match guard never fires; the
-    // navigation guard catches repeated page navigations with no intervening
-    // page-action (covers oscillation between URLs the action-only guard misses).
+    // navigation guard catches repeated navigations to the SAME (or a small
+    // oscillating set of) URL(s) with no intervening progress — navigating to
+    // genuinely new URLs resets it, so distinct-page research never trips it.
     const resultById = new Map(toolResultMessages.map((m) => [m.tool_call_id, m.content]));
     const iterationSignature = JSON.stringify(
       result.toolCalls.map((c) => [c.function.name, c.function.arguments, resultById.get(c.id) ?? null])
@@ -2449,20 +2953,23 @@ async function runLoop(
       sameActionRunLength = 1;
       lastActionSignature = actionSignature;
     }
-    navWithoutAction = nextNavWithoutAction(
-      navWithoutAction,
-      result.toolCalls.map((c) => c.function.name)
+    navStall = nextNavStallState(
+      navStall,
+      result.toolCalls.map((c) => {
+        const url = parseToolArgsLenient(c.function.arguments)?.url;
+        return { name: c.function.name, url: typeof url === "string" ? url : undefined };
+      })
     );
     const trippedRepeat =
       identicalRunLength >= MAX_IDENTICAL_TOOL_REPEATS || sameActionRunLength >= MAX_SAME_ACTION_REPEATS;
-    const trippedNavigation = navWithoutAction >= MAX_NAVIGATION_WITHOUT_ACTION;
+    const trippedNavigation = navStall.count >= MAX_NAVIGATION_WITHOUT_ACTION;
     if (trippedRepeat || trippedNavigation) {
       loopStallReason = trippedRepeat ? "repeat" : "navigation";
       const tripped = trippedRepeat
         ? identicalRunLength >= MAX_IDENTICAL_TOOL_REPEATS
           ? `${identicalRunLength} iterations with the identical tool call(s) and result(s)`
           : `${sameActionRunLength} iterations repeating the same tool call(s) with identical arguments`
-        : `${navWithoutAction} navigations with no intervening page-action`;
+        : `${navStall.count} navigations to recently-visited URLs with no intervening progress`;
       appendTrace(config.instance, taskId, {
         type: "warning",
         message: `Stopped after ${tripped} (loop-breaker).`,
@@ -2470,7 +2977,7 @@ async function runLoop(
           iterations,
           identicalRunLength,
           sameActionRunLength,
-          navWithoutAction,
+          navWithoutAction: navStall.count,
           toolNames: result.toolCalls.map((c) => c.function.name)
         }
       });
@@ -2496,11 +3003,12 @@ async function runLoop(
         `explain what you were able to determine, what is blocking you (e.g. a ` +
         `sign-in or tool that keeps refusing), and what they could do next.`
       : loopStallReason === "navigation"
-        ? `You navigated or reloaded pages several times without clicking, ` +
-          `typing, or otherwise acting on them — that usually means a sign-in, ` +
-          `address/zip, or page state is blocking you. No further tools are ` +
-          `available now. Write a final answer: what you determined, what's ` +
-          `blocking you, and what the user could do next.`
+        ? `Repeated navigation to the same pages wasn't making progress. No ` +
+          `further tools are available now. Write a final answer with whatever ` +
+          `you were able to determine. If you expected to be further along, a ` +
+          `blocker such as a sign-in or a required input (address, zip, etc.) ` +
+          `may be involved — mention that only as a possibility, do not assert ` +
+          `it as the cause. Tell the user what they could do next.`
         : `You have reached the maximum number of tool-calling iterations (${cap}). ` +
           `No further tools are available. Please write a final answer summarizing ` +
           `what you have learned so far and what you were unable to complete.`;

@@ -131,10 +131,16 @@ function loadXlsx(): Promise<XlsxModule> {
 
 async function extractPdf(bytes: Uint8Array): Promise<string> {
   const pdfjs = await loadPdfjs();
+  // pdfjs rejects Uint8Array subclasses (e.g. a Node Buffer from Playwright
+  // response bodies) via a constructor check, so re-view as plain Uint8Array.
+  const data =
+    bytes.constructor === Uint8Array
+      ? bytes
+      : new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   // Text layer only in v1. A scanned-PDF page-image render fallback would slot
   // in here, returning `{ text, images }` to the caller — see the delivery
   // design's deferred render note.
-  const doc = await pdfjs.getDocument({ data: bytes, disableWorker: true }).promise;
+  const doc = await pdfjs.getDocument({ data, disableWorker: true }).promise;
   const pages: string[] = [];
   for (let n = 1; n <= doc.numPages; n++) {
     const page = await doc.getPage(n);

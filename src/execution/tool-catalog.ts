@@ -31,7 +31,17 @@ import type { RuntimeState } from "../types";
 // tools) while preserving access to the whole catalog. `indexSummary` is the
 // one-line description used in that index (falls back to the description's
 // first sentence when omitted).
-const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: string; deferred?: boolean; indexSummary?: string }> = [
+//
+// `crossToolsetHint` is a routing sentence that points the model at a
+// sibling toolset (e.g. browser_navigate → web_search for plain content
+// retrieval). buildToolCatalog appends it to the description only when the
+// referenced toolset is reachable in the assembled catalog — same gate the
+// referenced tools themselves pass — so the model is never steered toward
+// tools it doesn't have. The hint text must name only tools that toolset
+// actually guarantees; steers toward ALWAYS-ON tools (web_fetch bypasses
+// toolset gating entirely) belong in the base description instead, where
+// no gate can drop them while the tool exists.
+const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: string; deferred?: boolean; indexSummary?: string; crossToolsetHint?: { toolset: string; text: string } }> = [
   {
     toolset: "file",
     displayLabel: "Read file",
@@ -123,6 +133,10 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     // to `count` ranked results as compact text the model can cite.
     toolset: "web_search",
     displayLabel: "Web search",
+    crossToolsetHint: {
+      toolset: "browser",
+      text: "For interacting with pages — clicking, typing, authenticated sessions — use the browser tools (browser_navigate) instead."
+    },
     type: "function",
     function: {
       name: "web_search",
@@ -145,6 +159,10 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   {
     toolset: "messaging",
     displayLabel: "Fetch URL",
+    crossToolsetHint: {
+      toolset: "browser",
+      text: "For interacting with pages — clicking, typing, authenticated sessions — use the browser tools (browser_navigate) instead."
+    },
     type: "function",
     function: {
       name: "web_fetch",
@@ -311,10 +329,17 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   {
     toolset: "browser",
     displayLabel: "Open page",
+    // The web_fetch steer lives in the base description because web_fetch is
+    // always-on (it bypasses toolset gating in toolsForState), so it is
+    // unconditionally reachable; only the web_search half needs the gate.
+    crossToolsetHint: {
+      toolset: "web_search",
+      text: "To discover pages or fresh information, prefer web_search over guessing URLs."
+    },
     type: "function",
     function: {
       name: "browser_navigate",
-      description: "Open a URL in a headless browser session and return a compact accessibility snapshot with @eN refs the agent can click or type into.",
+      description: "Open a URL in a headless browser session and return a compact accessibility snapshot with @eN refs the agent can click or type into. URLs that serve a PDF return the document's extracted text (`pdfText`) instead of a snapshot — there is no DOM to act on. The browser is for interacting with pages (clicking, typing, authenticated sessions); for plain content retrieval from a known URL prefer web_fetch.",
       parameters: {
         type: "object",
         properties: {
@@ -332,7 +357,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "browser_snapshot",
-      description: "Re-snapshot the current browser page. Always returns the full tree (action results may return diffs vs the previous snapshot). Default returns interactive elements with @eN refs; entries with role `clickable` are cursor-detected clickables (non-semantic elements styled cursor:pointer or carrying onclick/tabindex). Pass full=true for a richer tree including landmarks and headings.",
+      description: "Re-snapshot the current browser page. Always returns the full tree (action results may return diffs vs the previous snapshot). Default returns interactive elements with @eN refs; entries with role `clickable` are cursor-detected clickables (non-semantic elements styled cursor:pointer or carrying onclick/tabindex). Same-origin iframes are walked inline (their elements get actionable @eN refs under an `iframe` row); cross-origin or blocked iframes show an opaque placeholder row. Pass full=true for a richer tree including landmarks and headings.",
       parameters: {
         type: "object",
         properties: {
@@ -375,6 +400,35 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
           text: { type: "string", description: "Text to type into the input." }
         },
         required: ["ref", "text"]
+      }
+    }
+  },
+  {
+    toolset: "browser",
+    displayLabel: "Fill form",
+    deferred: true,
+    indexSummary: "Fill multiple non-secret form fields in one call, each by its @eN ref.",
+    type: "function",
+    function: {
+      name: "browser_fill_form",
+      description: "Fill MULTIPLE non-secret form fields in one call. Each {ref, text} entry is filled in order with the same clear-and-type semantics as browser_type, then ONE snapshot is returned after all fills (possibly a diff — call browser_snapshot for the full tree). Stops at the FIRST failing field and reports which fields were filled and which were not attempted, so you can re-snapshot and retry the remainder. NEVER use this for passwords, credentials, or other secrets — use browser_fill_secrets for those; field values containing a registered secret are rejected.",
+      parameters: {
+        type: "object",
+        properties: {
+          fields: {
+            type: "array",
+            description: "Fields to fill, in order.",
+            items: {
+              type: "object",
+              properties: {
+                ref: { type: "string", description: "Input ref like '@e3' from the latest snapshot." },
+                text: { type: "string", description: "Text to type into the input." }
+              },
+              required: ["ref", "text"]
+            }
+          }
+        },
+        required: ["fields"]
       }
     }
   },
@@ -442,6 +496,73 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
           clear: { type: "boolean", description: "If true, clear the captured console buffer before returning.", default: false }
         }
       }
+    }
+  },
+  {
+    toolset: "browser",
+    displayLabel: "Respond to dialog",
+    deferred: true,
+    indexSummary: "Arm an accept/dismiss response for the next JavaScript dialog (alert/confirm/prompt).",
+    type: "function",
+    function: {
+      name: "browser_dialog",
+      description: "Respond to JavaScript dialogs (alert/confirm/prompt/beforeunload). Dialogs are auto-DISMISSED the moment they fire so the page never hangs; each one is then reported once in a `dialogs` field on your next browser tool result. To accept a dialog deliberately (e.g. a confirm() asking 'Are you sure?'), call this FIRST to arm a one-shot response, then perform the action that triggers the dialog (e.g. browser_click) — the armed response is consumed by the next dialog that fires and the outcome appears in that tool result's `dialogs` field. For prompt() dialogs use action 'accept' with promptText.",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["accept", "dismiss"], description: "How to answer the next dialog. Unarmed dialogs are dismissed by default; arm 'dismiss' explicitly only to override a previously armed accept." },
+          promptText: { type: "string", description: "Text to enter when accepting a prompt() dialog. Ignored for other dialog types." }
+        },
+        required: ["action"]
+      }
+    }
+  },
+  {
+    toolset: "browser",
+    displayLabel: "List network requests",
+    deferred: true,
+    indexSummary: "List recent network requests from the current browser session (method, URL, status; no bodies).",
+    type: "function",
+    function: {
+      name: "browser_requests",
+      description: "List the most recent network requests observed on the task's browser pages (up to the last 100): method, URL, status, resourceType, and failure text for requests that never completed. Read-only — no request/response bodies, no headers, no interception. Useful for spotting failed API calls, redirects, or what a page is talking to.",
+      parameters: {
+        type: "object",
+        properties: {
+          filter: { type: "string", description: "Optional substring; only requests whose URL contains it are returned." }
+        }
+      }
+    }
+  },
+  {
+    toolset: "browser",
+    displayLabel: "Resize viewport",
+    deferred: true,
+    indexSummary: "Resize the browser viewport (clamped to 320–3840 × 240–2160).",
+    type: "function",
+    function: {
+      name: "browser_resize",
+      description: "Resize the browser viewport. Width is clamped to 320–3840 and height to 240–2160. Useful for exercising responsive layouts or revealing elements hidden at the default size. Returns the applied (possibly clamped) dimensions.",
+      parameters: {
+        type: "object",
+        properties: {
+          width: { type: "number", description: "Viewport width in CSS pixels (clamped to 320–3840)." },
+          height: { type: "number", description: "Viewport height in CSS pixels (clamped to 240–2160)." }
+        },
+        required: ["width", "height"]
+      }
+    }
+  },
+  {
+    toolset: "browser",
+    displayLabel: "List cookies",
+    deferred: true,
+    indexSummary: "List cookies for the current page (values always redacted; read-only).",
+    type: "function",
+    function: {
+      name: "browser_cookies",
+      description: "List cookies that apply to the current page (or the whole browser context when no page is open). READ-ONLY, and cookie VALUES are always redacted — only name, domain, path, expiry, and the httpOnly/secure/sameSite flags are returned. Useful for checking whether a session/auth cookie exists without exposing it.",
+      parameters: { type: "object", properties: {} }
     }
   },
   {
@@ -582,6 +703,24 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   },
   {
     toolset: "browser",
+    displayLabel: "Download file",
+    deferred: true,
+    indexSummary: "Download a file by clicking an element; saves under the instance downloads dir (approval-gated).",
+    type: "function",
+    function: {
+      name: "browser_download",
+      description: "Click an element (by its @eN ref) that triggers a file download and save the file under the agent's downloads directory. Use for 'download the invoice PDF' style tasks where a link or button serves a file. Only works when the click actually fires a download (attachment responses or links with a download attribute) — content the browser renders inline, like most PDF links, never does; use browser_navigate for those (PDF text is extracted on navigation). Approval-gated: the user confirms before the click runs. The result reports the saved path, file size, and the server's suggested filename. Downloads larger than the size cap are rejected and deleted.",
+      parameters: {
+        type: "object",
+        properties: {
+          ref: { type: "string", description: "Element ref like '@e3' from the latest snapshot whose click triggers the download." }
+        },
+        required: ["ref"]
+      }
+    }
+  },
+  {
+    toolset: "browser",
     displayLabel: "Connect browser to sign in",
     type: "function",
     function: {
@@ -693,11 +832,11 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     // persisted, never enter the LLM context, never reach the
     // transcript or audit payload — see ADR browser-fill-secret.md.
     toolset: "browser",
-    displayLabel: "Ask user for browser input",
+    displayLabel: "Ask user for credentials",
     type: "function",
     function: {
       name: "browser_fill_secrets",
-      description: "Ask the user to fill one or more input fields on the active browser page. Use this for credentials, OTPs, account ids, or any value the user must type — NEVER attempt to fill these fields yourself with browser_type. The user sees a single card in chat with one input per slot; once they submit, the gateway fills each locator on the page with the user's value via playwright. Requires an active browser session — call browser_navigate first if needed. Your tool result is a plain-text summary naming which slots filled (by slot.name, never values), which errored, and any abort condition (cancel, origin drift); you never see the values themselves. Re-snapshot the page after this returns to see the post-fill state. If more fields need filling (e.g. an MFA code on the next page), call this tool again.",
+      description: "Ask the user to fill one or more input fields on the active browser page. ONLY for credentials and other secret values the user must supply (passwords, OTPs, account ids, MFA codes) — NEVER for ordinary text like search queries or form content you already know; type that yourself with browser_type. Every call here interrupts the user with an approval card, and conversely NEVER attempt to fill credential fields yourself with browser_type. The user sees a single card in chat with one input per slot; once they submit, the gateway fills each locator on the page with the user's value via playwright. Requires an active browser session — call browser_navigate first if needed. Your tool result is a plain-text summary naming which slots filled (by slot.name, never values), which errored, and any abort condition (cancel, origin drift); you never see the values themselves. Re-snapshot the page after this returns to see the post-fill state. If more fields need filling (e.g. an MFA code on the next page), call this tool again.",
       parameters: {
         type: "object",
         properties: {
@@ -1918,6 +2057,7 @@ export type ToolCatalogTool = ToolFunctionSpec & {
   displayLabel?: string;
   deferred?: boolean;
   indexSummary?: string;
+  crossToolsetHint?: { toolset: string; text: string };
 };
 
 // Public read-only copy. Returned ordering is stable so the toolsHash is
@@ -2099,6 +2239,20 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     if (!enabled.has(tool.toolset)) return false;
     if (agentToolsetFilter && !agentToolsetFilter.has(tool.toolset)) return false;
     return true;
+  }).map((tool) => {
+    // Apply or strip cross-toolset routing hints (see the TOOL_DEFS doc
+    // comment). The hint joins the description only when its referenced
+    // toolset passes the same enabled + agent-whitelist gate the referenced
+    // tools pass; otherwise it's dropped so the model never chases tools
+    // that aren't in the catalog. The annotation itself never survives
+    // assembly — toProviderTools must not see it.
+    const hint = tool.crossToolsetHint;
+    if (!hint) return tool;
+    const { crossToolsetHint: _hint, ...rest } = tool;
+    const reachable = enabled.has(hint.toolset)
+      && (!agentToolsetFilter || agentToolsetFilter.has(hint.toolset));
+    if (!reachable) return rest;
+    return { ...rest, function: { ...rest.function, description: `${rest.function.description} ${hint.text}` } };
   });
 }
 
@@ -2112,12 +2266,12 @@ export function hashCatalog(tools: ToolCatalogTool[]): string {
 }
 
 // Return the OpenAI tool spec without the `toolset` / `displayLabel` /
-// `deferred` / `indexSummary` annotations we use for filtering, chat
-// rendering, and the deferred-tools index. The provider only knows the
-// `type/function` shape.
+// `deferred` / `indexSummary` / `crossToolsetHint` annotations we use for
+// filtering, chat rendering, and the deferred-tools index. The provider
+// only knows the `type/function` shape.
 export function toProviderTools(tools: ToolCatalogTool[]): ToolFunctionSpec[] {
   return tools.map(
-    ({ toolset: _toolset, displayLabel: _displayLabel, deferred: _deferred, indexSummary: _indexSummary, ...rest }) => rest
+    ({ toolset: _toolset, displayLabel: _displayLabel, deferred: _deferred, indexSummary: _indexSummary, crossToolsetHint: _crossToolsetHint, ...rest }) => rest
   );
 }
 
@@ -2348,14 +2502,29 @@ export function chatBlockArgsPreviewFor(
     case "browser_hover":
     case "browser_select_option":
     case "browser_upload_file":
+    case "browser_download":
       return truncatePreview(previewValue(safe.ref));
     case "browser_press":
       return truncatePreview(previewValue(safe.key));
+    case "browser_resize":
+      return truncatePreview(`${previewValue(safe.width)}x${previewValue(safe.height)}`);
     case "browser_scroll":
       return truncatePreview(previewValue(safe.direction));
     case "browser_wait_for":
       return truncatePreview(previewValue(safe.ref) || previewValue(safe.text));
+    case "browser_fill_form":
+      // Preview the refs only — field text is page content the card
+      // doesn't need, and the ref list tells the user what's touched.
+      return truncatePreview(
+        Array.isArray(safe.fields)
+          ? safe.fields
+              .map((f) => (f !== null && typeof f === "object" ? previewValue((f as Record<string, unknown>).ref) : ""))
+              .filter(Boolean)
+              .join(", ")
+          : ""
+      );
     case "browser_tabs":
+    case "browser_dialog":
       return truncatePreview(previewValue(safe.action));
     case "browser_vision":
       return truncatePreview(previewValue(safe.question));
@@ -2363,6 +2532,8 @@ export function chatBlockArgsPreviewFor(
       return truncatePreview(
         `${previewValue(safe.fromRef)} → ${previewValue(safe.toRef)}`
       );
+    case "browser_requests":
+      return truncatePreview(previewValue(safe.filter));
     case "browser_snapshot":
     case "browser_back":
     case "browser_close":

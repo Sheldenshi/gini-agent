@@ -51,6 +51,7 @@ export type PolicyAction =
   | "terminal.exec"
   | "code.exec"
   | "browser.upload_file"
+  | "browser.download"
   | "messaging.send"
   | "self.config";
 
@@ -107,7 +108,7 @@ export function resolveApprovalPolicy(
   }
 
   // mode === "auto"
-  if (action === "file.write" || action === "file.patch" || action === "browser.upload_file") {
+  if (action === "file.write" || action === "file.patch" || action === "browser.upload_file" || action === "browser.download") {
     return { mode: "auto", reason: "approval-mode-auto" };
   }
 

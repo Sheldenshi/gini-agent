@@ -95,7 +95,7 @@ import { findSelfOperation } from "./execution/self-registry";
 import { redactSensitiveToolArgs } from "./execution/tool-args-redact";
 import { resolveApprovalPolicy, type PolicyAction } from "./execution/policy";
 import { resolveEffectiveContext } from "./execution/effective-context";
-import { browserUploadFileApproved } from "./tools/browser";
+import { browserDownloadApproved, browserUploadFileApproved } from "./tools/browser";
 import { connectBrowser } from "./capabilities/browser-connect";
 import {
   abortApprovalsForTask,
@@ -1197,7 +1197,7 @@ export function mapApprovalToPolicyAction(
     if (payload && typeof payload.source === "string") return "code.exec";
     return "terminal.exec";
   }
-  if (action === "file.write" || action === "file.patch" || action === "browser.upload_file") {
+  if (action === "file.write" || action === "file.patch" || action === "browser.upload_file" || action === "browser.download") {
     return action;
   }
   if (action === "messaging.send") {
@@ -2067,12 +2067,13 @@ async function runApprovedAction(
       // effect to observe and no `_late_completion` row should be
       // emitted.
       if (outcome.started) {
-        observeBrowserUploadLateCompletion({
+        observeBrowserActionLateCompletion({
           config,
           outcome,
           approval,
-          ref,
-          displayPath,
+          action: "browser.upload_file_late_completion",
+          target: displayPath,
+          evidenceBase: { ref, path: displayPath },
           extraEvidence
         });
       }
@@ -2123,6 +2124,144 @@ async function runApprovedAction(
         type: parsed.success === false ? "error" : "tool",
         message: `Browser tool browser.upload_file`,
         data: { ref, path: displayPath, success: parsed.success !== false, error: parsed.error ?? null }
+      });
+    }
+    if (task) await updateRunFromTask(config, task);
+    if (shouldResumeChat && chatToolCallId && approval.taskId) {
+      await resumeChatTask(config, approval.taskId, chatToolCallId, result);
+    }
+    return result;
+  }
+
+  if (approval.action === "browser.download") {
+    const ref = String(approval.payload.ref);
+    const sourceUrl = typeof approval.payload.currentUrl === "string" ? approval.payload.currentUrl : "";
+    const target = sourceUrl || ref;
+    if (!approval.taskId) {
+      const result = JSON.stringify({ success: false, error: "Browser download approval missing taskId." });
+      await mutateState(config.instance, (state) => {
+        addAudit(
+          state,
+          {
+            actor: "runtime",
+            action: "browser.download",
+            target,
+            risk: "high",
+            taskId: undefined,
+            runId: undefined,
+            approvalId: approval.id,
+            evidence: { ...extraEvidence, ref, source: sourceUrl || null, success: false, error: "Browser download approval missing taskId." }
+          },
+          approvalAgentContext(approval)
+        );
+      });
+      return result;
+    }
+    // Same lazy-factory abort contract as browser.upload_file: the
+    // Playwright click + download capture cannot take an AbortSignal, so
+    // raceWithAbort only starts it when the signal is not already
+    // aborted, and a mid-flight abort detaches the promise (observed
+    // below for the late-completion audit row).
+    const taskId = approval.taskId;
+    const outcome = await raceWithAbort(
+      () => browserDownloadApproved(taskId, ref, config.instance),
+      signal
+    );
+    if (outcome.kind === "aborted") {
+      const reason = readSignalReason(signal) ?? "task.cancelled";
+      const abortedResult = JSON.stringify({ success: false, aborted: true, error: "Browser download aborted: task was cancelled." });
+      const task = await mutateState(config.instance, (state) => {
+        addAudit(
+          state,
+          {
+            actor: "runtime",
+            action: "browser.download_aborted",
+            target,
+            risk: "high",
+            taskId: approval.taskId,
+            runId: state.tasks.find((t) => t.id === approval.taskId)?.runId,
+            approvalId: approval.id,
+            // The audit acknowledges what the runtime knew at abort
+            // time. The browser may still commit the download as a
+            // background side effect; the followup audit row written
+            // by the `outcome.detached` observer below records the
+            // ACTUAL outcome once the detached promise settles.
+            evidence: { ...extraEvidence, ref, source: sourceUrl || null, aborted: true, abortReason: reason }
+          },
+          approvalAgentContext(approval)
+        );
+        return approval.taskId ? state.tasks.find((item) => item.id === approval.taskId) : undefined;
+      });
+      if (outcome.started) {
+        observeBrowserActionLateCompletion({
+          config,
+          outcome,
+          approval,
+          action: "browser.download_late_completion",
+          target,
+          evidenceBase: { ref, source: sourceUrl || null },
+          extraEvidence
+        });
+      }
+      if (approval.taskId) {
+        appendTrace(config.instance, approval.taskId, {
+          type: "tool",
+          message: "Browser download aborted by task cancellation",
+          data: { ref, source: sourceUrl || null, aborted: true }
+        });
+      }
+      if (task) await updateRunFromTask(config, task);
+      return abortedResult;
+    }
+    const result = outcome.value;
+    let parsed: { success?: boolean; error?: string; path?: string; size?: number; downloadUrl?: string | null } = {};
+    try {
+      parsed = JSON.parse(result) as { success?: boolean; error?: string; path?: string; size?: number; downloadUrl?: string | null };
+    } catch {
+      parsed = { success: true };
+    }
+    const task = await mutateState(config.instance, (state) => {
+      addAudit(
+        state,
+        {
+          actor: "runtime",
+          action: "browser.download",
+          target,
+          risk: "high",
+          taskId: approval.taskId,
+          runId: approval.taskId ? state.tasks.find((t) => t.id === approval.taskId)?.runId : undefined,
+          approvalId: approval.id,
+          evidence: {
+            ...extraEvidence,
+            ref,
+            source: sourceUrl || null,
+            // The URL the bytes actually came from (page-URL `source` is
+            // only where the click happened) — reported by the gated
+            // download path in browser.ts.
+            downloadUrl: parsed.downloadUrl ?? null,
+            savedPath: parsed.path ?? null,
+            size: parsed.size ?? null,
+            success: parsed.success !== false,
+            error: parsed.error ?? null
+          }
+        },
+        approvalAgentContext(approval)
+      );
+      if (approval.taskId && !chatToolCallId) {
+        completeApprovedTask(
+          state,
+          approval.taskId,
+          parsed.success === false ? "Browser download failed." : "Browser download completed.",
+          parsed.success === false ? parsed.error ?? undefined : undefined
+        );
+      }
+      return approval.taskId ? state.tasks.find((item) => item.id === approval.taskId) : undefined;
+    });
+    if (approval.taskId) {
+      appendTrace(config.instance, approval.taskId, {
+        type: parsed.success === false ? "error" : "tool",
+        message: `Browser tool browser.download`,
+        data: { ref, source: sourceUrl || null, savedPath: parsed.path ?? null, size: parsed.size ?? null, success: parsed.success !== false, error: parsed.error ?? null }
       });
     }
     if (task) await updateRunFromTask(config, task);
@@ -2291,11 +2430,11 @@ function readSignalReason(signal: AbortSignal): string | undefined {
   return undefined;
 }
 
-// Observe the detached Playwright upload promise after the runtime
-// acknowledged the cancel. Emits a
-// `browser.upload_file_late_completion` audit row when the upload
+// Observe a detached Playwright side-effect promise (upload or download)
+// after the runtime acknowledged the cancel. Emits a
+// `browser.<action>_late_completion` audit row when the side effect
 // eventually settles so the trail records whether the browser
-// actually committed the file. Short-circuits when the instance
+// actually committed it. Short-circuits when the instance
 // state file has been removed between cancel and late settlement
 // (uninstall / reset path), so the helper doesn't recreate a fresh
 // state directory just to write a stale audit row. Late write
@@ -2304,17 +2443,21 @@ interface ObserveLateCompletionInput {
   config: RuntimeConfig;
   outcome: { kind: "aborted"; started: true; detached: Promise<{ resolved: true; value: string } | { resolved: false; error: unknown }> };
   approval: Authorization;
-  ref: string;
-  displayPath: string;
+  action: "browser.upload_file_late_completion" | "browser.download_late_completion";
+  target: string;
+  // Action-specific evidence fields ({ ref, path } for upload,
+  // { ref, source } for download). Merged before the runtime-owned
+  // late-settlement markers so those can't be overridden.
+  evidenceBase: Record<string, unknown>;
   extraEvidence: AutoApproveMarkers;
 }
 
-function observeBrowserUploadLateCompletion(input: ObserveLateCompletionInput): void {
-  const { config, outcome, approval, ref, displayPath, extraEvidence } = input;
+function observeBrowserActionLateCompletion(input: ObserveLateCompletionInput): void {
+  const { config, outcome, approval, action, target, evidenceBase, extraEvidence } = input;
   const observedTaskId = approval.taskId;
   void outcome.detached.then(async (settled) => {
     // Defensive: if the instance state file disappeared between
-    // cancel and the upload settling, skip the write. Otherwise
+    // cancel and the side effect settling, skip the write. Otherwise
     // mutateState's readState would silently create a fresh empty
     // state file under the removed instance directory and stamp a
     // stale `_late_completion` row into it.
@@ -2329,16 +2472,15 @@ function observeBrowserUploadLateCompletion(input: ObserveLateCompletionInput): 
           state,
           {
             actor: "runtime",
-            action: "browser.upload_file_late_completion",
-            target: displayPath,
+            action,
+            target,
             risk: "high",
             taskId: observedTaskId,
             runId: state.tasks.find((t) => t.id === observedTaskId)?.runId,
             approvalId: approval.id,
             evidence: {
               ...extraEvidence,
-              ref,
-              path: displayPath,
+              ...evidenceBase,
               afterAbort: true,
               detachedSettled: settled.resolved,
               success: settled.resolved ? parsedLate.success !== false : false,

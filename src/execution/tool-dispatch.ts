@@ -73,10 +73,15 @@ import {
   browserClick,
   browserClose,
   browserConsole,
+  browserCookies,
+  browserDialog,
   browserDrag,
+  browserFillForm,
   browserHover,
   browserNavigate,
   browserPress,
+  browserRequests,
+  browserResize,
   browserScroll,
   browserSelectOption,
   browserSnapshot,
@@ -277,13 +282,15 @@ async function dispatchToolCallInner(
     case "request_remove_messaging_bridge":
       return await requestRemoveMessagingBridgeTool(config, taskId, toolCallId, args);
     case "browser_navigate":
-      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.navigate", () => browserNavigate(taskId, args), args) };
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.navigate", () => browserNavigate(taskId, args, config), args) };
     case "browser_snapshot":
-      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.snapshot", () => browserSnapshot(taskId, args), args) };
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.snapshot", () => browserSnapshot(taskId, args, config), args) };
     case "browser_click":
       return { kind: "sync", result: await browserDispatch(config, taskId, "browser.click", () => browserClick(taskId, args), args) };
     case "browser_type":
       return { kind: "sync", result: await browserDispatch(config, taskId, "browser.type", () => browserType(taskId, args), args) };
+    case "browser_fill_form":
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.fill_form", () => browserFillForm(taskId, args), args) };
     case "browser_press":
       return { kind: "sync", result: await browserDispatch(config, taskId, "browser.press", () => browserPress(taskId, args), args) };
     case "browser_scroll":
@@ -292,6 +299,14 @@ async function dispatchToolCallInner(
       return { kind: "sync", result: await browserDispatch(config, taskId, "browser.back", () => browserBack(taskId, args), args) };
     case "browser_console":
       return { kind: "sync", result: await browserDispatch(config, taskId, "browser.console", () => browserConsole(taskId, args), args) };
+    case "browser_dialog":
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.dialog", () => browserDialog(taskId, args), args) };
+    case "browser_requests":
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.requests", () => browserRequests(taskId, args), args) };
+    case "browser_resize":
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.resize", () => browserResize(taskId, args), args) };
+    case "browser_cookies":
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.cookies", () => browserCookies(taskId, args), args) };
     case "browser_close":
       return { kind: "sync", result: await browserDispatch(config, taskId, "browser.close", () => browserClose(taskId, args), args) };
     case "browser_hover":
@@ -330,6 +345,12 @@ async function dispatchToolCallInner(
       // explicit, side-effecting, irreversible from the user's
       // perspective. Route through the approval gate like file.write.
       return pendingOrAuto(config, "browser.upload_file", undefined, (reason) => requestBrowserUpload(config, taskId, toolCallId, args, reason));
+    case "browser_download":
+      // Downloading writes remote bytes onto the local disk (the
+      // instance-scoped downloads dir). Route through the approval gate
+      // the same way browser_upload_file does; the approved click runs
+      // in agent.executeApprovedAction's "browser.download" branch.
+      return pendingOrAuto(config, "browser.download", undefined, (reason) => requestBrowserDownload(config, taskId, toolCallId, args, reason));
     // Self-config / self-introspection direct tools. Each maps to a
     // SelfOperation; query tools resolve sync, mutate tools route through the
     // generic self.config approval branch. The tool name IS the op name and
@@ -570,9 +591,9 @@ async function fileSearch(config: RuntimeConfig, taskId: string, args: Record<st
 // the dispatch and pass it through. Audit risk is derived from the single
 // source of truth in src/execution/tool-risk.ts:
 //   - read-only paths (navigate/snapshot/hover/scroll/back/press/console/
-//     close/wait_for/tabs.list/vision) are "low"
-//   - side-effecting calls (click/type/drag/select_option/tabs.{new,switch,
-//     close}) are "medium"
+//     requests/resize/cookies/close/wait_for/tabs.list/vision) are "low"
+//   - side-effecting calls (click/type/fill_form/drag/select_option/
+//     dialog/tabs.{new,switch,close}) are "medium"
 // browser.upload_file is classified "high" in the registry but never
 // reaches this dispatcher: it's intercepted as an approval request in
 // requestBrowserUpload and executed via agent.executeApprovedAction after
@@ -3015,6 +3036,44 @@ async function requestBrowserUpload(
       type: "approval",
       message: "Approval requested for browser upload (chat-task)",
       data: { approvalId: approval.id, target: resolved.displayPath, ref, toolCallId, destination: currentUrl }
+    });
+    return approval.id;
+  });
+}
+
+// Approval-gated browser_download. Captures the ref the agent wants to
+// click plus the page it is sitting on, so the approval card shows the
+// user where the download will come from. The actual click + download
+// capture runs in agent.executeApprovedAction's "browser.download"
+// branch, which calls browserDownloadApproved with the captured ref.
+async function requestBrowserDownload(
+  config: RuntimeConfig,
+  taskId: string,
+  toolCallId: string,
+  args: Record<string, unknown>,
+  reasonOverride?: string
+): Promise<string> {
+  const ref = requireString(args, "ref");
+  const currentUrl = peekCurrentBrowserUrl(taskId) ?? null;
+  return mutateState(config.instance, (state: RuntimeState) => {
+    const item = findTask(state, taskId);
+    if (isTerminalTaskStatus(item.status)) {
+      throw new TaskAlreadyTerminalError(taskId, item.status);
+    }
+    const approval = createAuthorization(state, {
+      taskId: item.id,
+      action: "browser.download",
+      target: currentUrl ?? ref,
+      risk: "high",
+      reason: reasonOverride ?? "Downloading a file from a remote site onto this machine is a side effect and requires explicit approval.",
+      payload: { ref, currentUrl, toolCallId }
+    });
+    item.approvalIds.push(approval.id);
+    item.updatedAt = now();
+    appendTrace(config.instance, item.id, {
+      type: "approval",
+      message: "Approval requested for browser download (chat-task)",
+      data: { approvalId: approval.id, ref, toolCallId, source: currentUrl }
     });
     return approval.id;
   });

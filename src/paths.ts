@@ -234,6 +234,21 @@ export function uploadsDir(instance: Instance): string {
   return join(instanceRoot(instance), "uploads");
 }
 
+// Files the agent's browser saves via the approval-gated browser_download
+// tool. Instance-scoped (like uploads/) so removing the instance dir removes
+// every downloaded artifact with it. See ADR browser-automation-engine.md.
+export function downloadsDir(instance: Instance): string {
+  return join(instanceRoot(instance), "downloads");
+}
+
+// Playwright trace archives written by the opt-in browser session
+// recording (RuntimeConfig.browserRecording). Instance-scoped like
+// downloads/; bounded retention is enforced by the writer in
+// src/tools/browser.ts.
+export function browserTracesDir(instance: Instance): string {
+  return join(instanceRoot(instance), "browser-traces");
+}
+
 export function defaultConfig(instance: Instance): RuntimeConfig {
   // Platform default fallback is codex/gpt-5.5. Users without `codex` CLI
   // auth will hit a runtime error on first prompt — that's the accepted

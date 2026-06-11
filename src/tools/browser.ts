@@ -21,20 +21,22 @@
 // Tasks are keyed by taskId and idle-swept after 5 minutes. Side-effecting
 // actions (click/type/drag/select_option/tabs:new/tabs:switch/tabs:close)
 // skip the approval gate; the snapshot itself is the trace evidence.
-// browser_upload_file is the lone exception — it's approval-gated (high
-// risk) because it can exfiltrate workspace files to a remote site.
+// browser_upload_file and browser_download are the exceptions — both are
+// approval-gated (high risk): upload can exfiltrate workspace files to a
+// remote site, download writes remote bytes onto the local disk.
 import type { Browser, BrowserContext, Locator, Page } from "playwright-core";
-import { existsSync, realpathSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, realpathSync, statSync, unlinkSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { isIP } from "node:net";
 import { lookup } from "node:dns/promises";
-import { instanceRoot } from "../paths";
+import { browserTracesDir, downloadsDir, instanceRoot } from "../paths";
 import { launchPersistentChrome } from "./chrome-discovery";
-import { generateVisionAnalysis } from "../provider";
-import { assertInsideWorkspace, readState } from "../state";
+import { generateAuxText, generateVisionAnalysis } from "../provider";
+import { resolveProviderModality } from "../provider-capabilities";
+import { addAudit, assertInsideWorkspace, mutateState, readState } from "../state";
 import { sanitizeUrlForAuditTarget } from "../execution/browser-fill-secrets-types";
-import type { BrowserConnectionRecord, Instance, RuntimeConfig } from "../types";
+import type { BrowserConnectionRecord, BrowserDomainPolicy, Instance, RuntimeConfig } from "../types";
 
 // Per-instance Chrome profile directory. The agent persists ALL sign-ins
 // and cookies here; the directory survives Connect/Disconnect cycles and
@@ -76,6 +78,11 @@ interface RefTarget {
   role: string;
   name: string;
   nth: number;
+  // True when the element lives inside a same-origin iframe and the
+  // locator chains through page.frameLocator. Framed refs never
+  // self-heal: healing re-queries the MAIN frame's tree and could
+  // restamp a same-name bystander outside the frame the model targeted.
+  framed?: boolean;
 }
 
 interface Session {
@@ -316,6 +323,157 @@ function modeFromRecord(record: BrowserConnectionRecord | undefined): Mode {
   return record.mode === "managed" ? "persistent" : "cdp";
 }
 
+// ---------------- Session providers ----------------
+//
+// Seam for WHERE the browser the agent drives comes from. A provider owns
+// exactly one transport concern: acquire a live BrowserContext
+// (`connect`) and release it (`disconnect`). Everything above this seam —
+// snapshot walking, secret redaction, SSRF/domain-policy gating,
+// approvals, audit, traces — runs IN-PROCESS against the Playwright
+// client regardless of which provider supplied the browser; swapping the
+// provider only changes where the launch/CDP endpoint points. That is the
+// property that ruled out subprocess engines (see ADR
+// browser-automation-engine.md, "Remote session provider seam") and it
+// must hold for any future provider.
+//
+// Today's providers are the two modes that always existed: a persistent
+// local launch and a CDP attach to an external Chrome. The one capability
+// the local engine cannot fake is IP reputation (datacenter-IP blocks,
+// geo walls); a future remote/cloud-browser provider slots in as a third
+// entry that resolves its remote endpoint (provision a cloud session,
+// then attach over CDP/WebSocket) and returns a cdp-shaped SharedHandle —
+// or adds its own SharedHandle variant when its teardown needs extra
+// release work (e.g. an API call ending the cloud session). The
+// disconnect-generation choreography stays in ensureShared / teardown
+// call sites; it is transport-agnostic.
+interface BrowserSessionProvider {
+  kind: Mode;
+  // Establish the transport and return the live handle. Called by
+  // ensureShared under the single-flight pendingShared promise.
+  connect(record: BrowserConnectionRecord | undefined): Promise<SharedHandle>;
+  // Release the handle this provider built. Must never throw — teardown
+  // runs on paths (disconnect, exit hooks) that cannot surface errors.
+  disconnect(handle: SharedHandle): Promise<void>;
+}
+
+const persistentSessionProvider: BrowserSessionProvider = {
+  kind: "persistent",
+  async connect(record) {
+    const chromium = await loadChromium();
+    // Persistent mode is used for BOTH the headless default and the
+    // visible "managed" connect. The profile dir is per-instance, so
+    // sign-ins stored during a headed session remain available the next
+    // time the agent relaunches headless against the same dir.
+    const headed = record?.mode === "managed";
+    // Determine the data dir:
+    //   - When a managed record exists and supplies dataDir, prefer that
+    //     (covers explicit Connect flows that already materialized a
+    //     specific dir).
+    //   - Otherwise, derive from the active instance — this is the
+    //     normal path the agent takes when no Connect record exists.
+    //   - If no instance has been registered (raw test imports), refuse
+    //     to launch. Tests should install a fake handle via the __test
+    //     helpers; production callers always set the instance via
+    //     setBrowserInstance() during server boot.
+    let dataDir: string | undefined;
+    if (record?.dataDir) {
+      dataDir = record.dataDir;
+    } else if (runtimeInstance) {
+      dataDir = chromeProfileDirFor(runtimeInstance);
+    }
+    if (!dataDir) {
+      throw new Error(
+        "No instance registered for the browser session manager; call setBrowserInstance() before triggering a browser tool."
+      );
+    }
+    const { context: ctx } = await launchPersistentChrome(chromium, dataDir, {
+      headless: !headed
+    });
+    return { kind: "persistent", context: ctx as BrowserContext, headed };
+  },
+  async disconnect(handle) {
+    // Close the BrowserContext, which also terminates the Chromium child
+    // Playwright launched. The profile dir on disk stays put (sign-ins
+    // persist). Bound the close so a wedged Chromium can't hang teardown
+    // forever; on timeout, force-kill the underlying child to release the
+    // profile-dir lock that the next launchPersistentContext needs.
+    const settled = await settledWithin(handle.context.close(), teardownCloseTimeoutMs);
+    if (!settled && runtimeInstance) {
+      // The close() wedged. Reap the Chromium child by its profile-dir
+      // pid so the lock frees for the relaunch. Best-effort — a kill
+      // failure must never throw out of teardown.
+      try {
+        const killed = chromeKiller(chromeProfileDirFor(runtimeInstance));
+        if (killed >= 1) {
+          // Give the OS a moment to release the profile-dir lock before
+          // launchManaged relaunches against the same directory.
+          await new Promise((r) => setTimeout(r, 300));
+        }
+      } catch {
+        // best effort
+      }
+    }
+  }
+};
+
+const cdpSessionProvider: BrowserSessionProvider = {
+  kind: "cdp",
+  async connect(record) {
+    const chromium = await loadChromium();
+    if (!record?.cdpUrl) {
+      throw new Error(
+        "CDP browser connection record is missing cdpUrl; reconnect via /api/browser/connect."
+      );
+    }
+    // connectOverCDP returns a Browser handle scoped to the remote
+    // process. The remote Chrome's default BrowserContext shows up
+    // under browser.contexts() — we reuse it so signed-in cookies are
+    // visible. Note: CDP attach is known-flaky under playwright-core
+    // 1.60 + Bun; we keep it for users who explicitly attach to their
+    // own Chrome but warn them in the UI.
+    let browser: Browser;
+    try {
+      browser = await chromium.connectOverCDP(record.cdpUrl, { timeout: 60_000 });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (/timeout|websocket|protocol/i.test(message)) {
+        throw new Error(
+          `Failed to attach over CDP: ${message}. ` +
+            "CDP attach can hang under the current Playwright + Bun stack. " +
+            "Prefer the managed browser launch (visible Chrome window) via " +
+            "/api/browser/connect without a cdpUrl."
+        );
+      }
+      throw error instanceof Error ? error : new Error(message);
+    }
+    const ctx = browser.contexts()[0] ?? (await browser.newContext());
+    return { kind: "cdp", browser, context: ctx };
+  },
+  async disconnect(handle) {
+    if (handle.kind !== "cdp") return;
+    const candidate = handle.browser as unknown as { disconnect?: () => Promise<void> };
+    if (typeof candidate.disconnect === "function") {
+      // Bound the disconnect like the persistent close, but NEVER kill —
+      // the remote Chrome is the user's own process.
+      await settledWithin(candidate.disconnect(), teardownCloseTimeoutMs);
+    }
+    // If disconnect() isn't available on this CDP-attached Browser, do
+    // NOT fall back to close() — close() over CDP terminates the user's
+    // Chrome. Leaking the in-process handle is strictly better than
+    // killing the user's browser; it'll be garbage-collected once
+    // nothing references it.
+  }
+};
+
+// Registry keyed by Mode. A future remote provider adds its entry here
+// (plus its Mode / modeFromRecord mapping); ensureShared and
+// teardownHandle dispatch through this table and need no changes.
+// Mutable only via __test.setSessionProviderForTest.
+const sessionProviders: Record<Mode, BrowserSessionProvider> = {
+  persistent: persistentSessionProvider,
+  cdp: cdpSessionProvider
+};
+
 // Is a shared/borrowed BrowserContext still backed by a live browser? After
 // an EXTERNAL kill (crash, or — now that the agent launches the user's
 // branded Chrome — the user quitting their everyday Chrome takes the
@@ -385,70 +543,9 @@ async function ensureShared(): Promise<SharedHandle> {
   // resulting handle is closed/disconnected so we don't leak the process.
   const launchGeneration = disconnectGeneration;
   pendingShared = (async () => {
-    const chromium = await loadChromium();
-    let built: SharedHandle;
-    if (mode === "persistent") {
-      // Persistent mode is used for BOTH the headless default and the
-      // visible "managed" connect. The profile dir is per-instance, so
-      // sign-ins stored during a headed session remain available the next
-      // time the agent relaunches headless against the same dir.
-      //
-      // Determine the data dir:
-      //   - When a managed record exists and supplies dataDir, prefer that
-      //     (covers explicit Connect flows that already materialized a
-      //     specific dir).
-      //   - Otherwise, derive from the active instance — this is the
-      //     normal path the agent takes when no Connect record exists.
-      //   - If no instance has been registered (raw test imports), refuse
-      //     to launch. Tests should install a fake handle via the __test
-      //     helpers; production callers always set the instance via
-      //     setBrowserInstance() during server boot.
-      let dataDir: string | undefined;
-      if (record?.dataDir) {
-        dataDir = record.dataDir;
-      } else if (runtimeInstance) {
-        dataDir = chromeProfileDirFor(runtimeInstance);
-      }
-      if (!dataDir) {
-        throw new Error(
-          "No instance registered for the browser session manager; call setBrowserInstance() before triggering a browser tool."
-        );
-      }
-      const { context: ctx } = await launchPersistentChrome(chromium, dataDir, {
-        headless: !headed
-      });
-      built = { kind: "persistent", context: ctx as BrowserContext, headed };
-    } else {
-      // cdp
-      if (!record?.cdpUrl) {
-        throw new Error(
-          "CDP browser connection record is missing cdpUrl; reconnect via /api/browser/connect."
-        );
-      }
-      // connectOverCDP returns a Browser handle scoped to the remote
-      // process. The remote Chrome's default BrowserContext shows up
-      // under browser.contexts() — we reuse it so signed-in cookies are
-      // visible. Note: CDP attach is known-flaky under playwright-core
-      // 1.60 + Bun; we keep it for users who explicitly attach to their
-      // own Chrome but warn them in the UI.
-      let browser: Browser;
-      try {
-        browser = await chromium.connectOverCDP(record.cdpUrl, { timeout: 60_000 });
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        if (/timeout|websocket|protocol/i.test(message)) {
-          throw new Error(
-            `Failed to attach over CDP: ${message}. ` +
-              "CDP attach can hang under the current Playwright + Bun stack. " +
-              "Prefer the managed browser launch (visible Chrome window) via " +
-              "/api/browser/connect without a cdpUrl."
-          );
-        }
-        throw error instanceof Error ? error : new Error(message);
-      }
-      const ctx = browser.contexts()[0] ?? (await browser.newContext());
-      built = { kind: "cdp", browser, context: ctx };
-    }
+    // Transport acquisition is fully delegated to the session provider —
+    // the generation choreography around it is transport-agnostic.
+    const built: SharedHandle = await sessionProviders[mode].connect(record);
     if (disconnectGeneration !== launchGeneration) {
       // Disconnect bumped the generation while we were launching. Clean
       // up the freshly-built handle and surface a clear error to the
@@ -565,53 +662,13 @@ function killChromeByProfileDir(profileDir: string): number {
   }
 }
 
-// Mode-aware teardown of a SharedHandle. Persistent: close the
-// BrowserContext, which also terminates the Chromium child Playwright
-// launched. The profile dir on disk stays put (sign-ins persist).
-// CDP: disconnect the Playwright handle without closing the remote Chrome
-// (close() over CDP would kill the user's browser; falling back to close()
-// when disconnect() is missing is the lesser of two evils only if the
-// user's process is acceptable collateral — we deliberately leak the
-// in-process handle instead).
+// Mode-aware teardown of a SharedHandle, dispatched through the session
+// provider that built it (the seam's release side). Persistent closes the
+// BrowserContext (terminating the launched Chromium child; the profile
+// dir on disk stays put so sign-ins persist); cdp disconnects the
+// Playwright handle WITHOUT closing the remote Chrome.
 async function teardownHandle(handle: SharedHandle): Promise<void> {
-  switch (handle.kind) {
-    case "persistent": {
-      // Bound the close so a wedged Chromium can't hang teardown forever.
-      // On timeout, force-kill the underlying child to release the
-      // profile-dir lock that the next launchPersistentContext needs.
-      const settled = await settledWithin(handle.context.close(), teardownCloseTimeoutMs);
-      if (!settled && runtimeInstance) {
-        // The close() wedged. Reap the Chromium child by its profile-dir
-        // pid so the lock frees for the relaunch. Best-effort — a kill
-        // failure must never throw out of teardown.
-        try {
-          const killed = chromeKiller(chromeProfileDirFor(runtimeInstance));
-          if (killed >= 1) {
-            // Give the OS a moment to release the profile-dir lock before
-            // launchManaged relaunches against the same directory.
-            await new Promise((r) => setTimeout(r, 300));
-          }
-        } catch {
-          // best effort
-        }
-      }
-      return;
-    }
-    case "cdp": {
-      const candidate = handle.browser as unknown as { disconnect?: () => Promise<void> };
-      if (typeof candidate.disconnect === "function") {
-        // Bound the disconnect like the persistent close, but NEVER kill —
-        // the remote Chrome is the user's own process.
-        await settledWithin(candidate.disconnect(), teardownCloseTimeoutMs);
-      }
-      // If disconnect() isn't available on this CDP-attached Browser, do
-      // NOT fall back to close() — close() over CDP terminates the user's
-      // Chrome. Leaking the in-process handle is strictly better than
-      // killing the user's browser; it'll be garbage-collected once
-      // nothing references it.
-      return;
-    }
-  }
+  return sessionProviders[handle.kind].disconnect(handle);
 }
 
 function registerExitHook(): void {
@@ -642,6 +699,139 @@ function startSweeper(): void {
   }, SWEEP_INTERVAL_MS);
   // Don't keep the event loop alive just for the sweeper.
   if (typeof sweepTimer.unref === "function") sweepTimer.unref();
+}
+
+// ---------------- Session trace recording (opt-in) ----------------
+//
+// When RuntimeConfig.browserRecording is true (server boot calls
+// setBrowserRecording), browser sessions record a Playwright trace for
+// debugging/audit review. Tracing (context.tracing start/stop) is used
+// instead of recordVideo because video must be configured when the
+// context is CREATED — impossible for both the persistent context
+// (launched before any task exists) and a CDP-attached user Chrome —
+// while tracing can start on an already-live context in either mode. The
+// BrowserContext is shared across tasks, so only one trace runs at a
+// time: the first session created while none is active claims it;
+// sessions starting while a trace is in flight are simply not recorded.
+//
+// Trace archives are raw Playwright captures (DOM snapshots +
+// screenshots) and do NOT pass through the secret-redaction layer — they
+// can contain anything the page displayed. They are written only to local
+// disk under <instanceRoot>/browser-traces/, never enter the model
+// context, and every save writes a browser.trace_saved audit row. That is
+// why the feature is opt-in and OFF by default.
+const TRACE_RETENTION_MAX = 10;
+let browserRecordingEnabled = false;
+// taskId of the session holding the single context-wide trace, or null.
+let activeTraceTaskId: string | null = null;
+
+// Called at server boot alongside setBrowserInstance. Safe to call
+// repeatedly; affects sessions created after the call.
+export function setBrowserRecording(enabled: boolean): void {
+  browserRecordingEnabled = enabled === true;
+}
+
+// typeof-guarded view of context.tracing so lightweight test fakes (and a
+// hypothetical context without tracing support) degrade to "no recording"
+// instead of throwing.
+interface ContextTracing {
+  start?: (options: { screenshots: boolean; snapshots: boolean }) => Promise<void>;
+  stop?: (options?: { path?: string }) => Promise<void>;
+}
+function tracingOf(context: BrowserContext): ContextTracing | undefined {
+  const tracing = (context as BrowserContext & { tracing?: ContextTracing }).tracing;
+  return tracing && typeof tracing === "object" ? tracing : undefined;
+}
+
+// Start the context-wide trace for a freshly-created session. Best-effort:
+// any failure leaves the session fully functional, just unrecorded.
+async function startSessionTrace(taskId: string, context: BrowserContext): Promise<void> {
+  if (!browserRecordingEnabled || activeTraceTaskId !== null) return;
+  const tracing = tracingOf(context);
+  if (typeof tracing?.start !== "function") return;
+  // Reserve the slot BEFORE the await so a concurrently-created second
+  // session can't start a competing trace on the same shared context.
+  activeTraceTaskId = taskId;
+  try {
+    await tracing.start({ screenshots: true, snapshots: true });
+  } catch {
+    activeTraceTaskId = null;
+  }
+}
+
+// Bounded retention: keep the newest TRACE_RETENTION_MAX archives, delete
+// the rest. Newness is mtime-based so retention survives filename-format
+// changes. Best-effort throughout.
+function pruneTraceFiles(dir: string): void {
+  let entries: Array<{ path: string; mtimeMs: number }>;
+  try {
+    entries = readdirSync(dir)
+      .filter((name) => name.endsWith(".zip"))
+      .map((name) => {
+        const path = join(dir, name);
+        return { path, mtimeMs: statSync(path).mtimeMs };
+      });
+  } catch {
+    return;
+  }
+  entries.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  for (const stale of entries.slice(TRACE_RETENTION_MAX)) {
+    try {
+      unlinkSync(stale.path);
+    } catch {
+      // best effort
+    }
+  }
+}
+
+// Stop and save the trace when the owning session closes (explicit close,
+// idle sweep, disconnect, process exit). Best-effort end to end — a
+// failed save must never block session teardown.
+async function stopSessionTrace(taskId: string, context: BrowserContext): Promise<void> {
+  if (activeTraceTaskId !== taskId) return;
+  activeTraceTaskId = null;
+  const tracing = tracingOf(context);
+  if (typeof tracing?.stop !== "function") return;
+  if (!runtimeInstance) {
+    // No instance to scope the archive under (raw test imports) — end the
+    // trace without saving so the context stops buffering.
+    await tracing.stop().catch(() => undefined);
+    return;
+  }
+  const instance = runtimeInstance;
+  try {
+    const dir = browserTracesDir(instance);
+    mkdirSync(dir, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const safeTask = taskId.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 80);
+    const path = join(dir, `trace-${stamp}-${safeTask}.zip`);
+    await tracing.stop({ path });
+    pruneTraceFiles(dir);
+    let sizeBytes: number | null = null;
+    try {
+      sizeBytes = statSync(path).size;
+    } catch {
+      // Playwright always writes the archive on stop({ path }); a missing
+      // file just means a fake/degenerate tracer — keep the audit row.
+    }
+    await mutateState(instance, (state) => {
+      addAudit(
+        state,
+        {
+          actor: "runtime",
+          action: "browser.trace_saved",
+          target: path,
+          risk: "low",
+          taskId,
+          runId: state.tasks.find((task) => task.id === taskId)?.runId,
+          evidence: { path, sizeBytes }
+        },
+        { taskId }
+      );
+    });
+  } catch {
+    // best effort — never block teardown on a failed trace save.
+  }
 }
 
 async function getOrCreate(taskId: string): Promise<Session> {
@@ -690,8 +880,16 @@ async function getOrCreate(taskId: string): Promise<Session> {
     };
     sessions.set(taskId, session);
     // Attach console capture eagerly so page.goto errors before the
-    // agent's first browser_console call are still observable.
+    // agent's first browser_console call are still observable, the
+    // dialog handler so the very first navigation's dialogs are
+    // captured instead of silently auto-dismissed by Playwright, and
+    // the network log so the first page load's requests are visible.
     attachConsole(taskId, page);
+    attachDialogHandler(taskId, page);
+    attachNetworkCapture(taskId, page);
+    // Opt-in session trace recording — no-op unless enabled at boot and
+    // no other session already holds the context-wide trace.
+    await startSessionTrace(taskId, context);
     return session;
   })().finally(() => {
     pendingSessions.delete(taskId);
@@ -742,11 +940,17 @@ async function closeSession(taskId: string): Promise<void> {
   if (!session) return;
   sessions.delete(taskId);
   consoleLogs.delete(taskId);
+  pendingDialogResponses.delete(taskId);
+  unreportedDialogs.delete(taskId);
+  networkLogs.delete(taskId);
   // Drop the per-task secret-redaction registry when the session
   // closes. The DOM is gone (the page closes below), so the
   // registry would never be consulted again for this task —
   // keeping it would just leak memory across many tasks.
   clearFilledSecrets(taskId);
+  // Stop + save the opt-in session trace while the context is still live
+  // (no-op unless this task holds the trace). Never throws.
+  await stopSessionTrace(taskId, session.context);
   try {
     // Shared context (persistent/cdp): close every page the agent opened
     // during this task. The user's window, tabs the user opened
@@ -832,6 +1036,9 @@ export async function disconnectSharedBrowser(): Promise<void> {
       // by process exit.
       clearFilledSecrets(id);
       if (!session) continue;
+      // Stop + save the opt-in session trace before the context goes away
+      // (no-op unless this task holds the trace). Never throws.
+      await stopSessionTrace(id, session.context);
       try {
         // Persistent and cdp both share a single context — close just the
         // pages we own. teardownHandle below closes the whole context for
@@ -904,6 +1111,9 @@ export async function closeAll(): Promise<void> {
     // per-task secret-redaction registry alongside the session.
     clearFilledSecrets(id);
     if (!session) continue;
+    // Stop + save the opt-in session trace before teardown (no-op unless
+    // this task holds the trace). Never throws.
+    await stopSessionTrace(id, session.context);
     try {
       // Close every agent-owned page. In CDP mode this is the only thing
       // that reaps agent-opened tabs (the user's browser stays alive).
@@ -1093,6 +1303,23 @@ export function safetyCheck(rawUrl: string, options: { allowLoopback?: boolean }
       return "Blocked: URL appears to contain an API key or token.";
     }
   }
+  // Outbound exfiltration gate: SECRET_PATTERNS above only catches
+  // pattern-shaped tokens. The values the agent typed via
+  // browser_fill_secrets are arbitrary strings, and a compromised page
+  // could steer the model into composing a navigation URL that carries
+  // one out (`https://evil.test/?q=<secret>`). Scan the raw AND
+  // percent-decoded forms against the cross-task registered-secret
+  // union. Values below the redaction floor are skipped for the same
+  // reason recordFilledSecret refuses them: a tiny value substring-
+  // matches structural URL bytes and would false-positive. The message
+  // is deliberately generic — echoing the value or naming which secret
+  // matched would leak it into the trace + audit row.
+  for (const secret of allRegisteredSecrets()) {
+    if (secret.length < FILLED_SECRET_MIN_REDACTION_LENGTH) continue;
+    if (rawUrl.includes(secret) || decoded.includes(secret)) {
+      return "Blocked: URL contains a registered secret value.";
+    }
+  }
   let parsed: URL;
   try {
     parsed = new URL(rawUrl);
@@ -1159,10 +1386,66 @@ export function safetyCheck(rawUrl: string, options: { allowLoopback?: boolean }
   return undefined;
 }
 
+// Per-agent browsing boundary on top of the SSRF gate above. Returns a
+// "Blocked:" reason when the URL's host is denied by (or, in allow-only
+// mode, absent from) the agent's BrowserDomainPolicy; undefined when no
+// policy applies or the host passes. Matching is exact host or subdomain
+// suffix (`example.com` matches `sub.example.com`), case-insensitive, no
+// wildcards. Deny is checked first so an entry on both lists stays
+// blocked. Unparseable URLs pass — safetyCheck already refuses them with
+// its own message. The reason can name the host (unlike the registered-
+// secret gate, nothing here is sensitive) so the model can route around
+// the boundary instead of retrying. See ADR browser-domain-policy.md.
+export function domainPolicyBlockReason(rawUrl: string, policy: BrowserDomainPolicy | undefined): string | undefined {
+  if (!policy) return undefined;
+  const deny = Array.isArray(policy.deny) ? policy.deny : [];
+  const allow = Array.isArray(policy.allow) ? policy.allow : [];
+  if (deny.length === 0 && allow.length === 0) return undefined;
+  let hostname: string;
+  try {
+    hostname = new URL(rawUrl).hostname;
+  } catch {
+    return undefined;
+  }
+  // Same host normalization as safetyCheck: strip IPv6 brackets and the
+  // trailing root dot, lowercase.
+  const host = hostname.replace(/^\[|\]$/g, "").replace(/\.$/, "").toLowerCase();
+  const matches = (entry: string): boolean => {
+    const domain = entry.replace(/\.$/, "").toLowerCase();
+    return domain.length > 0 && (host === domain || host.endsWith(`.${domain}`));
+  };
+  if (deny.some(matches)) {
+    return `Blocked: ${host} is denied by the agent's browser domain policy.`;
+  }
+  if (allow.length > 0 && !allow.some(matches)) {
+    return `Blocked: ${host} is not in the agent's allowed browsing domains (agent domain policy is allow-only).`;
+  }
+  return undefined;
+}
+
+// Resolve the task's owning agent's BrowserDomainPolicy through the same
+// state channel activeBrowserRecord uses. Returns undefined — no policy,
+// nothing blocked — when no runtime instance is registered (tests / direct
+// tool callers), the task has no agentId (system-driven flows), or the
+// state read fails; the always-on SSRF gate still applies in every one of
+// those cases.
+function agentDomainPolicyForTask(taskId: string | undefined): BrowserDomainPolicy | undefined {
+  if (!runtimeInstance || !taskId) return undefined;
+  try {
+    const state = readState(runtimeInstance);
+    const agentId = state.tasks.find((task) => task.id === taskId)?.agentId;
+    if (!agentId) return undefined;
+    return state.agents.find((agent) => agent.id === agentId)?.browserDomainPolicy;
+  } catch {
+    return undefined;
+  }
+}
+
 // Shared origin boundary check for any tool that reads or executes against
 // the live page. Returns the safetyCheck reason — covering EVERY origin
 // safetyCheck refuses (loopback control-plane, cloud metadata, link-local)
-// — when the page's current URL is disallowed, otherwise undefined; bounces
+// — or the agent domain-policy reason when the page's current URL is
+// disallowed, otherwise undefined; bounces
 // the page to about:blank (best-effort) on a block. browser_navigate blocks
 // these targets up front, but a page can still settle on one afterward via
 // JS navigation, meta-refresh, a link click, or a CDP-attached tab already
@@ -1173,11 +1456,11 @@ export function safetyCheck(rawUrl: string, options: { allowLoopback?: boolean }
 // Test mocks pass minimal page stubs (often only `evaluate`). Guarding
 // url()/goto() behind typeof keeps those mocks from having to grow a
 // surface just to clear this check.
-async function disallowedOriginReason(page: Page): Promise<string | undefined> {
+async function disallowedOriginReason(page: Page, taskId?: string): Promise<string | undefined> {
   if (typeof page.url !== "function") return undefined;
   const currentUrl = page.url();
   if (!currentUrl || currentUrl === "about:blank") return undefined;
-  const blocked = safetyCheck(currentUrl);
+  const blocked = safetyCheck(currentUrl) ?? domainPolicyBlockReason(currentUrl, agentDomainPolicyForTask(taskId));
   if (!blocked) return undefined;
   if (typeof page.goto === "function") {
     try {
@@ -1198,6 +1481,19 @@ interface SnapEntry {
   depth: number;
   full: boolean; // true when emitted only because we're in `full` mode
   hidden: boolean; // true when the element exists but isn't visible
+  // Stamp id (e.g. "e7") of the same-origin iframe this entry was walked
+  // from. Host-side ref resolution chains through
+  // page.frameLocator('[data-gini-ref="e7"]') for these entries since
+  // page.locator does not pierce iframes.
+  frameRef?: string;
+  // For role:"iframe" rows of walkable same-origin frames: the frame
+  // document's URL, checked host-side against safetyCheck + the agent
+  // domain policy. A blocked frame keeps its placeholder row but has
+  // its content rows stripped before the snapshot text is assembled.
+  frameUrl?: string;
+  // Rendering marker appended to placeholder rows (" [cross-origin]",
+  // " [blocked]").
+  note?: string;
 }
 
 // Cap on the number of invisible-but-locatable interactive elements we
@@ -1214,16 +1510,147 @@ const SNAPSHOT_HIDDEN_BUDGET = 50;
 // cursor-interactivity pass; see ADR browser-automation-engine.md.
 const SNAPSHOT_CLICKABLE_BUDGET = 75;
 
+// Per-row cap on prose-text emission (full-mode only). A prose container
+// (e.g. a comment body, an article paragraph block) gets ONE "text" row
+// holding its direct text content, sliced to this length so a single
+// long block can't dominate the snapshot. Many rows still ride the
+// shared SNAPSHOT_CHAR_BUDGET, so a text-heavy page truncates via the
+// existing counted markers / aux-summary remainder path.
+const SNAPSHOT_TEXT_ROW_MAX_CHARS = 400;
+
+// Bot-wall / challenge-page detection. Challenge interstitials
+// (Cloudflare "Just a moment...", CAPTCHA walls, Akamai / PerimeterX
+// blocks) render no DOM the agent can act on and never change on
+// re-snapshot, so a model that keeps re-snapshotting one burns its
+// whole context window on identical challenge trees. The heuristic is
+// deliberately structural to avoid flagging pages that merely TALK
+// about CAPTCHAs: suspect a bot wall only when the page TITLE matches
+// a known challenge title, or an IFRAME row in the snapshot text (the
+// walker emits every frame as `iframe "name|src"`) points at a known
+// challenge/captcha provider. Bare body-text mentions ("captcha",
+// "verify you are human" in a paragraph or link) never trigger on
+// their own.
+const BOT_WALL_TITLE_MARKERS = [
+  "just a moment", // Cloudflare interstitial
+  "checking your browser", // Cloudflare legacy interstitial
+  "attention required", // Cloudflare block page
+  "access denied", // Akamai / generic edge block
+  "pardon our interruption", // PerimeterX / HUMAN
+  "verify you are human",
+  "are you a robot",
+  "human verification"
+];
+const BOT_WALL_IFRAME_MARKERS = [
+  "challenges.cloudflare.com", // Turnstile / managed challenge
+  "/cdn-cgi/challenge-platform", // Cloudflare challenge assets
+  "hcaptcha.com",
+  "google.com/recaptcha",
+  "recaptcha.net",
+  "geo.captcha-delivery.com", // DataDome
+  "px-captcha", // PerimeterX
+  "arkoselabs.com" // FunCaptcha
+];
+const BOT_WALL_WARNING =
+  "This page appears to be a bot-detection challenge (CAPTCHA / interstitial). Re-snapshotting will not get past it — stop retrying and report the block to the user.";
+
+function detectBotWall(title: string, snapshotText: string): boolean {
+  const t = title.toLowerCase();
+  if (BOT_WALL_TITLE_MARKERS.some((marker) => t.includes(marker))) return true;
+  for (const line of snapshotText.split("\n")) {
+    if (!line.includes('iframe "')) continue;
+    const lowered = line.toLowerCase();
+    if (BOT_WALL_IFRAME_MARKERS.some((marker) => lowered.includes(marker))) return true;
+  }
+  return false;
+}
+
 interface SnapshotResult {
   text: string;
   refs: Map<string, RefTarget>;
+  // Ref-bearing entries rendered in `text` — what the model sees on the
+  // plain counted-truncation path.
   elementCount: number;
+  // Ref-bearing entries that fell past the char budget into the bounded
+  // remainder. Their refs ARE registered (an @eN a summary preserves stays
+  // actionable); result builders add this to elementCount only when the
+  // aux summary is actually appended.
+  remainderElementCount: number;
   truncated: boolean;
   // True when this snapshot detected a navigation (URL change since the
   // session's last snapshot, or an explicit navigate/back/tab swap that
   // dropped lastSnapshotUrl). Stamps were cleared and numbering reset;
   // callers must NOT diff this snapshot against the pre-navigation one.
   navigated: boolean;
+  // True when the page looks like a bot-detection challenge (see
+  // detectBotWall above). Result-building callers pair it with
+  // BOT_WALL_WARNING so the model stops re-snapshotting.
+  botWallSuspected: boolean;
+  // Redacted text of the entries that did not fit the char budget
+  // (bounded at SNAPSHOT_SUMMARY_INPUT_CAP). First-visit result builders
+  // (browser_navigate / browser_snapshot) summarize it via an aux model;
+  // diff-mode consumers ignore it. Absent when nothing was clipped.
+  truncatedRemainder?: string;
+}
+
+// Aux-model summarization of an over-budget first-visit snapshot. Diff
+// mode already keeps multi-step loops small; a big FIRST landing (the
+// initial navigate or an explicit browser_snapshot) used to silently
+// lose everything past SNAPSHOT_CHAR_BUDGET. Instead, the clipped
+// remainder (post-redaction) is summarized by a single bounded aux text
+// call and appended under a divider; plain counted truncation remains
+// the fallback when no runtime config reached the tool or the aux call
+// fails. Input and output are both bounded to keep the added latency
+// one small side-call on over-budget first visits only.
+const SNAPSHOT_SUMMARY_INPUT_CAP = 64_000;
+const SNAPSHOT_SUMMARY_MAX_TOKENS = 1_024;
+const SNAPSHOT_SUMMARY_DIVIDER =
+  "[--- remainder summarized by aux model; @eN refs preserved and actionable ---]";
+const SNAPSHOT_SUMMARY_SYSTEM =
+  "You summarize the overflow portion of a web-page accessibility snapshot for a browser-automation agent. "
+  + "Preserve element ref tokens like [@e12] VERBATIM next to the controls they belong to — the agent acts on those refs. "
+  + "Collapse repetitive rows (lists, cards, nav items) into one line each with representative refs. Plain text only, be concise.";
+
+// Returns the aux summary of a clipped snapshot remainder, or undefined
+// when the call fails (callers then keep the plain counted truncation).
+// `remainder` must already be redacted — snapshot() redacts it with the
+// same pass as the snapshot text itself.
+//
+// Known limitation: this routes to the GLOBAL config.provider, not a
+// per-agent provider override — tool dispatch doesn't thread the
+// resolved effective provider down to the browser tools, so the
+// (redacted) remainder of an agent's snapshot can go to the global
+// provider even when the agent's chat turns use a different one. Fixing
+// it means threading the effective provider through dispatchToolCall
+// into every snapshot-producing browser tool.
+async function summarizeSnapshotRemainder(config: RuntimeConfig, remainder: string): Promise<string | undefined> {
+  try {
+    const result = await generateAuxText(config, {
+      system: SNAPSHOT_SUMMARY_SYSTEM,
+      user: remainder.slice(0, SNAPSHOT_SUMMARY_INPUT_CAP),
+      maxTokens: SNAPSHOT_SUMMARY_MAX_TOKENS
+    });
+    const summary = result.text.trim();
+    return summary.length > 0 ? summary : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// Shared by browser_navigate / browser_snapshot: append the aux summary
+// of the clipped remainder under a divider, or return the text unchanged
+// when summarization is unavailable. The summary still rides the ok()
+// deep-redaction pass like every other string in the result. `summarized`
+// tells the caller whether the remainder's refs are reachable from this
+// result (so they belong in its elementCount) or were clipped away.
+async function withSummarizedRemainder(
+  text: string,
+  truncatedRemainder: string | undefined,
+  config: RuntimeConfig | undefined
+): Promise<{ text: string; summarized: boolean }> {
+  if (truncatedRemainder === undefined || config === undefined) return { text, summarized: false };
+  const summary = await summarizeSnapshotRemainder(config, truncatedRemainder);
+  if (summary === undefined) return { text, summarized: false };
+  return { text: `${text}\n${SNAPSHOT_SUMMARY_DIVIDER}\n${summary}`, summarized: true };
 }
 
 // Marker attribute stamped on snapshot-rendered elements so the
@@ -1253,7 +1680,7 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
   // (only evaluate is mocked, since the walker only needs DOM
   // access). Guard the url()/goto() calls behind typeof checks so
   // existing unit tests don't have to grow the mock surface.
-  const loopbackBlock = await disallowedOriginReason(page);
+  const loopbackBlock = await disallowedOriginReason(page, taskId);
   if (loopbackBlock) {
     throw new Error(`${loopbackBlock} (page settled on disallowed URL after a navigation; agent must not inspect this surface)`);
   }
@@ -1273,7 +1700,20 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
   const navigated = session !== undefined && session.lastSnapshotUrl !== currentUrl;
   if (navigated && session) {
     await page.evaluate((attr) => {
-      for (const el of document.querySelectorAll(`[${attr}]`)) el.removeAttribute(attr);
+      const clearDoc = (doc: Pick<Document, "querySelectorAll">): void => {
+        for (const el of doc.querySelectorAll(`[${attr}]`)) el.removeAttribute(attr);
+      };
+      clearDoc(document);
+      // Same-origin iframe documents carry stamps from the inline frame
+      // walk; strip those too (cross-origin access throws — skip).
+      for (const frame of Array.from(document.querySelectorAll("iframe"))) {
+        try {
+          const doc = (frame as HTMLIFrameElement).contentDocument;
+          if (doc) clearDoc(doc);
+        } catch {
+          /* cross-origin frame — nothing of ours in there */
+        }
+      }
     }, REF_ATTR).catch(() => undefined);
     session.nextRefId = 1;
     session.lastSnapshotText = undefined;
@@ -1289,10 +1729,13 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
     depth: number;
     full: boolean;
     hidden: boolean;
+    frameRef?: string;
+    frameUrl?: string;
+    note?: string;
   };
 
   const raw = await page.evaluate(
-    ({ attr, fullMode, hiddenBudget, clickableBudget, startId }: { attr: string; fullMode: boolean; hiddenBudget: number; clickableBudget: number; startId: number }) => {
+    ({ attr, fullMode, hiddenBudget, clickableBudget, textRowMaxChars, startId }: { attr: string; fullMode: boolean; hiddenBudget: number; clickableBudget: number; textRowMaxChars: number; startId: number }) => {
       const INTERACTIVE_TAGS = new Set([
         "A",
         "BUTTON",
@@ -1341,19 +1784,28 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
         return ROLE_FROM_TAG[el.tagName];
       };
 
+      // Document/window of the element itself: inline-walked same-origin
+      // iframe elements belong to the FRAME's document, so id lookups
+      // (aria-labelledby, label[for]) and computed styles must resolve
+      // against that document/view, not the main frame's. Falls back to
+      // the globals for elements without ownerDocument wiring (the unit-
+      // test fakes).
+      const docOf = (el: Element): Document => (el.ownerDocument ?? document) as Document;
+      const viewOf = (el: Element): Window => (el.ownerDocument?.defaultView ?? window) as Window;
+
       const nameOf = (el: Element): string => {
         const aria = el.getAttribute("aria-label");
         if (aria) return aria.trim();
         const labelledby = el.getAttribute("aria-labelledby");
         if (labelledby) {
-          const refs = labelledby.split(/\s+/).map((id) => document.getElementById(id)?.textContent ?? "");
+          const refs = labelledby.split(/\s+/).map((id) => docOf(el).getElementById(id)?.textContent ?? "");
           const joined = refs.join(" ").trim();
           if (joined) return joined;
         }
         if (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT") {
           const id = el.getAttribute("id");
           if (id) {
-            const lbl = document.querySelector(`label[for="${CSS.escape(id)}"]`);
+            const lbl = docOf(el).querySelector(`label[for="${CSS.escape(id)}"]`);
             const text = lbl?.textContent?.trim();
             if (text) return text;
           }
@@ -1377,8 +1829,44 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
         const rect = (el as HTMLElement).getBoundingClientRect?.();
         if (!rect) return false;
         if (rect.width === 0 && rect.height === 0) return false;
-        const style = window.getComputedStyle(el as HTMLElement);
+        const style = viewOf(el).getComputedStyle(el as HTMLElement);
         if (style.display === "none" || style.visibility === "hidden") return false;
+        return true;
+      };
+
+      // Prose-text emission (full mode only). A prose container — a div /
+      // p of comment-body or article text whose element children are only
+      // inline/text-level (e.g. <a>, <span>, <b>) — carries no interactive
+      // role, so the accessibility walk would drop its text entirely. The
+      // helpers below read the element's DIRECT text nodes only (NOT
+      // recursive textContent, which would re-emit nested controls' names
+      // that already get their own rows) and decide whether the element is
+      // a leaf prose block worth one "text" row.
+      const INLINE_TEXT_TAGS = new Set([
+        "A", "ABBR", "B", "BR", "CITE", "CODE", "EM", "I", "MARK", "P",
+        "Q", "S", "SMALL", "SPAN", "STRONG", "SUB", "SUP", "TIME", "U", "WBR"
+      ]);
+      // Direct child text nodes only — never descends into element
+      // children, so a nested emitted control's name isn't duplicated here.
+      // Test fakes without childNodes return "" (no text row), keeping
+      // existing walker tests byte-identical unless they opt in.
+      const directText = (el: Element): string => {
+        const nodes = (el as Element & { childNodes?: ArrayLike<{ nodeType: number; textContent: string | null }> }).childNodes;
+        if (!nodes) return "";
+        let acc = "";
+        for (const node of Array.from(nodes)) {
+          // Node.TEXT_NODE === 3
+          if (node.nodeType === 3) acc += `${node.textContent ?? ""} `;
+        }
+        return acc.replace(/\s+/g, " ").trim();
+      };
+      // A leaf prose block: every element child is inline/text-level (so
+      // its prose belongs to this container, not to a nested structural
+      // region that will be walked separately). Empty-children counts.
+      const isProseContainer = (el: Element): boolean => {
+        for (const child of Array.from(el.children)) {
+          if (!INLINE_TEXT_TAGS.has(child.tagName)) return false;
+        }
         return true;
       };
 
@@ -1393,9 +1881,23 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
       // Ids are bounded to 9 digits: beyond that a page-planted stamp
       // could push the counter into float-imprecision territory (2^53)
       // where ++ stops incrementing and every fresh allocation collides.
-      for (const el of Array.from(document.querySelectorAll(`[${attr}]`))) {
-        const m = /^e(\d{1,9})$/.exec(el.getAttribute(attr) ?? "");
-        if (m) nextId = Math.max(nextId, Number(m[1]) + 1);
+      // Accessible same-origin iframe documents are scanned too — the
+      // inline frame walk stamps elements in there, and missing them
+      // would let the counter collide with a frame-held stamp.
+      const stampScanDocs: Array<Pick<Document, "querySelectorAll">> = [document];
+      for (const frame of Array.from(document.querySelectorAll("iframe"))) {
+        try {
+          const doc = (frame as HTMLIFrameElement).contentDocument;
+          if (doc) stampScanDocs.push(doc);
+        } catch {
+          /* cross-origin frame — unreachable, carries no stamps of ours */
+        }
+      }
+      for (const doc of stampScanDocs) {
+        for (const el of Array.from(doc.querySelectorAll(`[${attr}]`))) {
+          const m = /^e(\d{1,9})$/.exec(el.getAttribute(attr) ?? "");
+          if (m) nextId = Math.max(nextId, Number(m[1]) + 1);
+        }
       }
       // Reuse an existing stamp (refs are stable within a page lifetime);
       // only unstamped elements get a freshly-allocated id. Two stamps are
@@ -1446,13 +1948,59 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
         }
         const id = el.getAttribute("id");
         if (id) {
-          const lbl = document.querySelector(`label[for="${CSS.escape(id)}"]`);
+          const lbl = docOf(el).querySelector(`label[for="${CSS.escape(id)}"]`);
           if (lbl && isVisible(lbl)) return true;
         }
         return false;
       };
-      const walk = (el: Element, depth: number, underCursorClickable: boolean): void => {
+      // `frameId` is the stamp id (e.g. "e7") of the same-origin iframe
+      // currently being walked inline, or undefined in the main frame.
+      // Entries emitted under a frame carry it as `frameRef` so host-side
+      // ref resolution can chain through page.frameLocator (page.locator
+      // does not pierce iframes).
+      const walk = (el: Element, depth: number, underCursorClickable: boolean, frameId?: string): void => {
         const tag = el.tagName;
+        // Iframes: every frame gets a row. Same-origin frames (reachable
+        // via contentDocument) are walked INLINE one level deep, sharing
+        // this walk's budgets and ref numbering; cross-origin frames
+        // (contentDocument throws or is null) get an opaque placeholder.
+        // Frames nested inside an already-inlined frame are placeholder-
+        // only — host-side ref resolution chains exactly one frameLocator
+        // hop. Whether a same-origin frame's CONTENT may be included is
+        // decided host-side (safetyCheck + domain policy on frameUrl);
+        // blocked frames keep the placeholder and lose their content rows.
+        if (tag === "IFRAME") {
+          const src = el.getAttribute("src") ?? "";
+          const frameName = el.getAttribute("name") ?? el.getAttribute("title") ?? "";
+          const label = [frameName, src].filter(Boolean).join("|") || "(no src)";
+          const visible = isVisible(el);
+          let frameDoc: Document | null = null;
+          try {
+            frameDoc = (el as HTMLIFrameElement).contentDocument;
+          } catch {
+            frameDoc = null;
+          }
+          if (!frameDoc || !frameDoc.body) {
+            out.push({ ref: "", role: "iframe", name: label, value: "", url: "", depth, full: false, hidden: !visible, note: " [cross-origin]", frameRef: frameId });
+            return;
+          }
+          if (!visible || frameId !== undefined) {
+            // Hidden frames and frames nested inside an inlined frame:
+            // placeholder only, no inline content.
+            out.push({ ref: "", role: "iframe", name: label, value: "", url: "", depth, full: false, hidden: !visible, frameRef: frameId });
+            return;
+          }
+          let frameUrl = src;
+          try {
+            frameUrl = frameDoc.location?.href || src;
+          } catch {
+            /* keep the src attribute as the best-effort URL */
+          }
+          const ref = refFor(el);
+          out.push({ ref, role: "iframe", name: label, value: "", url: "", depth, full: false, hidden: false, frameUrl });
+          walk(frameDoc.body, depth + 1, false, ref.slice(1));
+          return;
+        }
         const role = roleOf(el);
         const interactive = role !== undefined && (INTERACTIVE_TAGS.has(tag) || el.getAttribute("role"));
         const visible = isVisible(el);
@@ -1514,7 +2062,8 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
             url,
             depth,
             full: false,
-            hidden: !visible
+            hidden: !visible,
+            frameRef: frameId
           });
           // For <select>, surface its <option> children as sibling rows at
           // depth+1 so the agent can address each option by its own @eN
@@ -1538,7 +2087,8 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
                 url: "",
                 depth: depth + 1,
                 full: false,
-                hidden: false
+                hidden: false,
+                frameRef: frameId
               });
             }
           }
@@ -1559,7 +2109,8 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
               url: "",
               depth,
               full: false,
-              hidden: true
+              hidden: true,
+              frameRef: frameId
             });
             hiddenEmitted++;
           }
@@ -1575,7 +2126,7 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
           // BODY is excluded: a page styling `body { cursor: pointer }`
           // would otherwise emit the entire page text as one name AND
           // dedupe-suppress every real clickable underneath it.
-          const cursorPointer = tag !== "BODY" && window.getComputedStyle(el as HTMLElement).cursor === "pointer";
+          const cursorPointer = tag !== "BODY" && viewOf(el).getComputedStyle(el as HTMLElement).cursor === "pointer";
           const tabindexAttr = el.getAttribute("tabindex");
           const selfQualified = el.getAttribute("onclick") !== null
             || (tabindexAttr !== null && Number.parseInt(tabindexAttr, 10) >= 0);
@@ -1594,7 +2145,7 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
             clickableTotal++;
             if (clickableEmitted < clickableBudget) {
               const ref = refFor(el);
-              out.push({ ref, role: "clickable", name, value: "", url: "", depth, full: false, hidden: false });
+              out.push({ ref, role: "clickable", name, value: "", url: "", depth, full: false, hidden: false, frameRef: frameId });
               clickableEmitted++;
             }
             if (cursorPointer) childUnderCursorClickable = true;
@@ -1615,20 +2166,41 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
               SECTION: "region"
             };
             const fallbackRole = role ?? tagToRole[tag];
+            let emittedLandmark = false;
             if (fallbackRole && landmarkRoles.includes(fallbackRole)) {
               const text = (el.textContent ?? "").replace(/\s+/g, " ").trim().slice(0, 200);
               if (text) {
-                out.push({ ref: "", role: fallbackRole, name: text, value: "", url: "", depth, full: true, hidden: false });
+                out.push({ ref: "", role: fallbackRole, name: text, value: "", url: "", depth, full: true, hidden: false, frameRef: frameId });
+                emittedLandmark = true;
+              }
+            }
+            // Prose-text fallback: a visible, non-interactive, non-clickable
+            // leaf prose container (its element children are only
+            // inline/text-level) gets ONE low-priority "text" row holding
+            // its DIRECT text content. This captures comment bodies /
+            // article paragraphs the accessibility walk would otherwise
+            // drop. Skipped when a landmark row already covered this element
+            // (no double-emit) and for data-gini-secret-stamped elements
+            // (their text is the typed value — never emit raw). Inline child
+            // links/spans still emit their own rows via the recursion below;
+            // reading direct text nodes only means their names aren't
+            // duplicated in this row. Sliced to bound a single block; the
+            // post-pass redaction + SNAPSHOT_CHAR_BUDGET apply to it like
+            // every other row.
+            if (!emittedLandmark && el.getAttribute("data-gini-secret") === null && isProseContainer(el)) {
+              const prose = directText(el).slice(0, textRowMaxChars);
+              if (prose.length > 1) {
+                out.push({ ref: "", role: "text", name: prose, value: "", url: "", depth, full: true, hidden: false, frameRef: frameId });
               }
             }
           }
         }
-        for (const child of Array.from(el.children)) walk(child, depth + 1, childUnderCursorClickable);
+        for (const child of Array.from(el.children)) walk(child, depth + 1, childUnderCursorClickable, frameId);
       };
       walk(document.body, 0, false);
       return { entries: out, hiddenEmitted, hiddenTotal, hiddenBudget, clickableEmitted, clickableTotal, nextId };
     },
-    { attr: REF_ATTR, fullMode: full, hiddenBudget: SNAPSHOT_HIDDEN_BUDGET, clickableBudget: SNAPSHOT_CLICKABLE_BUDGET, startId }
+    { attr: REF_ATTR, fullMode: full, hiddenBudget: SNAPSHOT_HIDDEN_BUDGET, clickableBudget: SNAPSHOT_CLICKABLE_BUDGET, textRowMaxChars: SNAPSHOT_TEXT_ROW_MAX_CHARS, startId }
   );
 
   const refs = new Map<string, RefTarget>();
@@ -1639,7 +2211,32 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
   let charCount = 0;
   let truncated = false;
   let elementCount = 0;
-  const entries = (raw as { entries: SnapEntry[] }).entries;
+  let remainderElementCount = 0;
+  const allEntries = (raw as { entries: SnapEntry[] }).entries;
+  // Frame gating: the walker inlines same-origin iframe content, but
+  // whether that content may REACH the model is decided here, where the
+  // SSRF gate and the agent domain policy live. A frame whose document
+  // URL fails either check keeps its placeholder row (marked
+  // " [blocked]", ref dropped) and loses every content row walked from
+  // it. about:blank / about:srcdoc frames have no remote origin and are
+  // allowed — mirrors the snapshot boundary's about:blank special case.
+  const domainPolicy = agentDomainPolicyForTask(taskId);
+  const blockedFrameIds = new Set<string>();
+  for (const entry of allEntries) {
+    if (entry.role === "iframe" && entry.ref && entry.frameUrl !== undefined) {
+      const frameUrl = entry.frameUrl;
+      const localDoc = frameUrl === "" || frameUrl === "about:blank" || frameUrl === "about:srcdoc";
+      const blocked = localDoc ? undefined : safetyCheck(frameUrl) ?? domainPolicyBlockReason(frameUrl, domainPolicy);
+      if (blocked) {
+        blockedFrameIds.add(entry.ref.slice(1));
+        entry.ref = "";
+        entry.note = " [blocked]";
+      }
+    }
+  }
+  const entries = blockedFrameIds.size > 0
+    ? allEntries.filter((e) => !e.frameRef || !blockedFrameIds.has(e.frameRef))
+    : allEntries;
   const hiddenEmitted = (raw as { hiddenEmitted: number }).hiddenEmitted;
   const hiddenTotal = (raw as { hiddenTotal: number }).hiddenTotal;
   const clickableEmitted = (raw as { clickableEmitted: number }).clickableEmitted;
@@ -1651,6 +2248,13 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
     const advanced = (raw as { nextId?: number }).nextId;
     session.nextRefId = typeof advanced === "number" ? advanced : startId;
   }
+  // Lines past the char budget are collected (bounded) instead of being
+  // dropped on the floor: first-visit result builders can hand them to an
+  // aux model for summarization (see SNAPSHOT_SUMMARY_INPUT_CAP below).
+  // Their refs are registered too, so an @eN the summary preserves stays
+  // actionable — the stamps exist on the page either way.
+  const remainderLines: string[] = [];
+  let remainderChars = 0;
   for (const entry of entries) {
     const indent = "  ".repeat(entry.depth);
     let line: string;
@@ -1668,36 +2272,74 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
       }
     } else {
       line = `${indent}${entry.role} "${entry.name}"`;
+      // Placeholder iframe rows annotate why their content is absent:
+      // [hidden] (frame not visible), [cross-origin] (contentDocument
+      // unreachable), or [blocked] (frame URL failed the SSRF gate /
+      // domain policy above).
+      if (entry.hidden) line += " [hidden]";
+      if (entry.note) line += entry.note;
     }
-    if (charCount + line.length + 1 > SNAPSHOT_CHAR_BUDGET) {
+    const clipped = truncated || charCount + line.length + 1 > SNAPSHOT_CHAR_BUDGET;
+    if (clipped) {
       truncated = true;
-      break;
+      // Stop all work (rendering AND ref registration) once the
+      // summarization input cap is full — the counted marker below only
+      // needs entries.length, and refs for rows no summary will ever
+      // mention are dead weight.
+      if (remainderChars > SNAPSHOT_SUMMARY_INPUT_CAP) break;
+      remainderLines.push(line);
+      remainderChars += line.length + 1;
+    } else {
+      lines.push(line);
+      charCount += line.length + 1;
     }
-    lines.push(line);
-    charCount += line.length + 1;
     if (entry.ref) {
-      const nthKey = `${entry.role}\u0000${entry.name}`;
+      // nth is FRAME-LOCAL: healing re-queries page.getByRole / getByText,
+      // which search the main frame only, so framed entries sharing a
+      // role+name with main-frame ones must not inflate the main-frame
+      // ordinals (framed refs never heal — see resolveRefForAction — so
+      // their own nth is never queried).
+      const nthKey = `${entry.frameRef ?? ""}\u0000${entry.role}\u0000${entry.name}`;
       const nth = nthByRoleName.get(nthKey) ?? 0;
       nthByRoleName.set(nthKey, nth + 1);
+      // page.locator does not pierce iframes: entries walked from a
+      // same-origin frame resolve through page.frameLocator on the
+      // OWNING iframe's stamp, then the element's stamp inside it.
+      // Fake test pages may not implement frameLocator — fall back to
+      // the flat locator there (their refs are usually planted directly).
+      const ownSelector = `[${REF_ATTR}="${entry.ref.slice(1)}"]`;
+      const locator = entry.frameRef && typeof page.frameLocator === "function"
+        ? page.frameLocator(`[${REF_ATTR}="${entry.frameRef}"]`).locator(ownSelector)
+        : page.locator(ownSelector);
       refs.set(entry.ref, {
-        locator: page.locator(`[${REF_ATTR}="${entry.ref.slice(1)}"]`),
+        locator,
         role: entry.role,
         name: entry.name,
-        nth
+        nth,
+        ...(entry.frameRef ? { framed: true } : {})
       });
-      elementCount++;
+      // Count rendered and remainder refs separately so result builders
+      // can report exactly what the model sees: rendered rows only on the
+      // plain counted-truncation path, plus the remainder's refs when the
+      // aux summary (which preserves them) is actually appended.
+      if (clipped) remainderElementCount++;
+      else elementCount++;
     }
   }
   let text = lines.join("\n");
-  if (truncated) text += "\n[...truncated]";
+  // Each truncation marker carries the omitted count so the model gets a
+  // scroll-vs-stop signal (how much more is out there) instead of a bare
+  // "there was more". Every entry renders exactly one line, so the
+  // char-budget count is entries-not-emitted.
+  if (truncated) text += `\n[...truncated +${entries.length - lines.length} more entries]`;
   // Separate marker for hidden-budget truncation so the model can tell
   // "more interactive elements exist on the page, just hidden" apart
   // from "snapshot text was clipped at the char budget".
-  if (hiddenTotal > hiddenEmitted) text += "\n[...hidden truncated]";
+  if (hiddenTotal > hiddenEmitted) text += `\n[...hidden truncated +${hiddenTotal - hiddenEmitted} more hidden]`;
   // Same idea for the clickable cap: tells the model more cursor-detected
   // clickables exist beyond SNAPSHOT_CLICKABLE_BUDGET, distinct from
   // char-budget clipping.
-  if (clickableTotal > clickableEmitted) text += "\n[...clickable truncated]";
+  if (clickableTotal > clickableEmitted) text += `\n[...clickable truncated +${clickableTotal - clickableEmitted} more clickables]`;
   // Defense in depth: redact any literal occurrence of a known
   // data-gini-secret value from the assembled snapshot text. The
   // walker's element-local redaction only catches the stamped
@@ -1709,8 +2351,13 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
   // snapshot text against the live secret list closes this gap
   // with the same primitive browserConsole and browserVision use.
   const secretValues = await collectSecretValuesFromPageWithSession(page, taskId);
+  let remainderText = remainderLines.join("\n");
   if (secretValues.length > 0) {
     text = redactSecretValuesFromString(text, secretValues);
+    // The remainder can be forwarded to an aux summarization model —
+    // redact it with the exact same pass BEFORE it leaves this function,
+    // so the aux provider never sees a secret the agent loop wouldn't.
+    if (remainderText.length > 0) remainderText = redactSecretValuesFromString(remainderText, secretValues);
   }
   // Store the REDACTED text as the diff base for the next post-action
   // snapshot — diffing always compares redacted text against redacted
@@ -1725,7 +2372,21 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
     if (!full) session.lastSnapshotText = text;
     session.lastSnapshotUrl = currentUrl;
   }
-  return { text, refs, elementCount, truncated, navigated };
+  // Bot-wall sniff on the assembled (already-redacted) snapshot text plus
+  // the page title. Fake test pages often mock only evaluate — guard the
+  // title call like the url()/goto() guards above.
+  const pageTitle = typeof page.title === "function" ? await page.title().catch(() => "") : "";
+  const botWallSuspected = detectBotWall(pageTitle, text);
+  return {
+    text,
+    refs,
+    elementCount,
+    remainderElementCount,
+    truncated,
+    navigated,
+    botWallSuspected,
+    ...(remainderText.length > 0 ? { truncatedRemainder: remainderText } : {})
+  };
 }
 
 // Post-action snapshots return a line diff instead of the full tree when
@@ -1837,17 +2498,22 @@ function renderSnapshotDiff(prevText: string, currText: string): string | undefi
 async function snapshotAfterAction(
   session: Session,
   taskId: string
-): Promise<{ snapshot: string; snapshotMode: "full" | "diff"; elementCount: number; truncated: boolean }> {
+): Promise<{ snapshot: string; snapshotMode: "full" | "diff"; elementCount: number; truncated: boolean; botWallSuspected?: true; warning?: string }> {
   const prev = session.lastSnapshotText;
   const snap = await snapshot(session.page, false, taskId);
   session.refs = snap.refs;
+  // An action can land the page on a challenge wall (e.g. a click that
+  // navigated into a Cloudflare interstitial) — surface the same
+  // botWallSuspected flag the navigate/snapshot results carry, so every
+  // action tool inherits it via its spread of these fields.
+  const botWall = snap.botWallSuspected ? { botWallSuspected: true as const, warning: BOT_WALL_WARNING } : {};
   if (!snap.navigated && prev !== undefined) {
     const diff = renderSnapshotDiff(prev, snap.text);
     if (diff !== undefined && diff.length < snap.text.length * SNAPSHOT_DIFF_MAX_RATIO) {
-      return { snapshot: diff, snapshotMode: "diff", elementCount: snap.elementCount, truncated: snap.truncated };
+      return { snapshot: diff, snapshotMode: "diff", elementCount: snap.elementCount, truncated: snap.truncated, ...botWall };
     }
   }
-  return { snapshot: snap.text, snapshotMode: "full", elementCount: snap.elementCount, truncated: snap.truncated };
+  return { snapshot: snap.text, snapshotMode: "full", elementCount: snap.elementCount, truncated: snap.truncated, ...botWall };
 }
 
 // Resolve a ref for an action tool (click / type / hover / drag /
@@ -1886,6 +2552,11 @@ async function resolveRefForAction(
     // element or the action fails with the standard message.
   }
   if (stampedCount > 0) return { locator: target.locator, healed: false };
+  // In-frame refs fail loudly on stamp loss instead of healing: the
+  // healing queries below search the MAIN frame only, so they could find
+  // a same-role/name bystander outside the iframe and restamp it with
+  // this ref's id — the action would land in the wrong document.
+  if (target.framed) return undefined;
   const healed = await healLostRef(session, target, ref);
   return healed ? { locator: healed, healed: true } : undefined;
 }
@@ -1997,7 +2668,14 @@ async function healLostRef(session: Session, target: RefTarget, ref: string): Pr
 // string leaf — url, title, tab.url, tab.title, plus anything
 // future tool responses surface.
 //
-// taskId is accepted for API symmetry but the redaction consults
+// taskId selects the per-task unreported-dialog buffer (see
+// attachDialogHandler): any JS dialogs that fired since the task's
+// last reported tool result are merged in as a `dialogs` field and
+// the buffer cleared, so each dialog is surfaced to the model
+// exactly once — and the dialog message text rides the same
+// redaction pass as every other string leaf.
+//
+// For redaction, taskId is advisory: the pass consults
 // allRegisteredSecrets() across every active task's registry, not
 // just this task's. The shared BrowserContext (CDP / persistent
 // profile) bleeds DOM state across tasks — Task A's page can copy
@@ -2008,13 +2686,17 @@ async function healLostRef(session: Session, target: RefTarget, ref: string): Pr
 // over-redacting in edge cases where two tasks coincidentally
 // typed the same long string (vanishingly unlikely given the
 // 4-char minimum).
-function ok(payload: Record<string, unknown>, _taskId?: string): string {
-  void _taskId;
+function ok(payload: Record<string, unknown>, taskId?: string): string {
+  const body: Record<string, unknown> = { success: true, ...payload };
+  if (taskId !== undefined) {
+    const dialogs = takeUnreportedDialogs(taskId);
+    if (dialogs.length > 0) body.dialogs = dialogs;
+  }
   const secrets = allRegisteredSecrets();
   if (secrets.length === 0) {
-    return JSON.stringify({ success: true, ...payload });
+    return JSON.stringify(body);
   }
-  const redacted = redactSecretValuesDeep({ success: true, ...payload }, secrets);
+  const redacted = redactSecretValuesDeep(body, secrets);
   return JSON.stringify(redacted);
 }
 
@@ -2044,10 +2726,247 @@ function str(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
-export async function browserNavigate(taskId: string, args: Record<string, unknown>): Promise<string> {
+// ---------------- PDF navigation handling ----------------
+//
+// A URL that renders as a PDF gives Chrome's PDF-viewer DOM to the
+// snapshot walker — a useless, near-empty tree. Detect the PDF at the
+// navigation boundary via the response content-type and return extracted
+// text (bounded to the snapshot char budget) instead of a DOM snapshot.
+// The bytes come from the navigation response when it can be buffered,
+// falling back to a native-fetch re-fetch of the same gated URL (the
+// URL has already passed the SSRF gate + domain policy + post-redirect
+// re-checks; the re-fetch re-runs those gates on every redirect hop).
+// Extraction reuses the shared attachment extractor (lazy pdfjs-dist);
+// when bytes or extraction are unavailable the result still flags
+// `pdf: true` with an honest note so the model stops re-snapshotting.
+
+// Cap on PDF bytes handed to the extractor. Injectable for tests.
+const PDF_EXTRACT_MAX_BYTES_DEFAULT = 20 * 1024 * 1024;
+let pdfExtractMaxBytes = PDF_EXTRACT_MAX_BYTES_DEFAULT;
+
+// Extractor seam: production lazily imports the shared attachment
+// extractor; tests stub it so the suite never loads pdfjs-dist.
+type PdfTextExtractor = (bytes: Uint8Array) => Promise<{ text: string } | null>;
+const defaultPdfTextExtractor: PdfTextExtractor = async (bytes) => {
+  const { extractText } = await import("../capabilities/attachment-extract");
+  return extractText(bytes, "application/pdf", "document.pdf");
+};
+let pdfTextExtractor: PdfTextExtractor = defaultPdfTextExtractor;
+
+// Content-type of a navigation response, lowercased ("" when the response
+// or its headers aren't available — fake test pages, aborted loads).
+function navigationContentType(response: unknown): string {
+  const headersFn = (response as { headers?: () => Record<string, string> } | null | undefined)?.headers;
+  if (typeof headersFn !== "function") return "";
+  try {
+    const headers = headersFn.call(response);
+    return (headers["content-type"] ?? "").toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+// PDFs must start with the "%PDF-" magic. Acquired navigation bytes are
+// validated against it before extraction because a successful body read is
+// NOT proof of PDF bytes: when Chrome's PDF viewer intercepts a main-frame
+// PDF navigation, response.body() resolves successfully with the viewer's
+// HTML wrapper bytes — without this check that HTML would reach pdfjs and
+// fail with "Invalid PDF structure".
+const PDF_MAGIC = new TextEncoder().encode("%PDF-");
+function isPdfBytes(bytes: Uint8Array): boolean {
+  if (bytes.byteLength < PDF_MAGIC.byteLength) return false;
+  return PDF_MAGIC.every((b, i) => bytes[i] === b);
+}
+
+// Timeout for each native re-fetch request so a hung server can't stall
+// the turn; redirect hops each get their own budget.
+const PDF_REFETCH_TIMEOUT_MS = 15_000;
+// Bound on manual redirect hops the re-fetch will follow.
+const PDF_REFETCH_MAX_REDIRECTS = 5;
+// Injectable fetch seam so the re-fetch path can be exercised without
+// touching the network. Mirrors the pdfTextExtractor seam above.
+type PdfRefetchFetch = (url: string, init: RequestInit) => Promise<Response>;
+const defaultPdfRefetchFetch: PdfRefetchFetch = (url, init) => fetch(url, init);
+let pdfRefetchFetch: PdfRefetchFetch = defaultPdfRefetchFetch;
+
+// Cookie header for the URL from the browser context, so the native
+// re-fetch carries the same auth the page navigation had (auth-gated
+// PDFs still extract). typeof-guarded so lightweight test fakes without
+// a cookies() implementation degrade to "no cookies".
+async function contextCookieHeader(context: BrowserContext, url: string): Promise<string | undefined> {
+  const cookiesFn = (context as BrowserContext & {
+    cookies?: (urls?: string | string[]) => Promise<Array<{ name: string; value: string }>>;
+  }).cookies;
+  if (typeof cookiesFn !== "function") return undefined;
+  try {
+    const cookies = await cookiesFn.call(context, url);
+    if (!Array.isArray(cookies) || cookies.length === 0) return undefined;
+    return cookies.map((c) => `${c.name}=${c.value}`).join("; ");
+  } catch {
+    return undefined;
+  }
+}
+
+// Native re-fetch of the PDF bytes. Playwright's APIRequestContext
+// (page.request.get) is unusable under Bun: its node:_http_client shim
+// hands a path-only string to new URL() inside _parseSetCookieHeader,
+// and the resulting unhandled rejection escapes the promise chain and
+// kills the whole process. Bun's own fetch is used instead, preserving
+// the trust boundary the context request rode for free: the browser
+// context's cookies for each hop's URL are sent as a Cookie header, and
+// redirects are followed manually with the SSRF gate + domain policy
+// re-run on every hop — the initial URL already passed the
+// post-redirect navigation gates, and per-hop checks keep that
+// invariant for the re-fetch (a redirect must never reach a blocked
+// host). Any failure degrades to { bytes: null } so the caller emits
+// the honest could-not-retrieve note.
+async function refetchPdfBytes(
+  context: BrowserContext,
+  startUrl: string,
+  taskId: string
+): Promise<{ bytes: Uint8Array | null; oversize: boolean }> {
+  let url = startUrl;
+  for (let hop = 0; hop <= PDF_REFETCH_MAX_REDIRECTS; hop++) {
+    const cookie = await contextCookieHeader(context, url);
+    let res: Response;
+    try {
+      res = await pdfRefetchFetch(url, {
+        redirect: "manual",
+        signal: AbortSignal.timeout(PDF_REFETCH_TIMEOUT_MS),
+        ...(cookie ? { headers: { cookie } } : {})
+      });
+    } catch {
+      return { bytes: null, oversize: false };
+    }
+    if (res.status >= 300 && res.status < 400) {
+      const location = res.headers.get("location");
+      if (!location) return { bytes: null, oversize: false };
+      let next: string;
+      try {
+        next = new URL(location, url).toString();
+      } catch {
+        return { bytes: null, oversize: false };
+      }
+      const blocked = safetyCheck(next) ?? domainPolicyBlockReason(next, agentDomainPolicyForTask(taskId));
+      if (blocked) return { bytes: null, oversize: false };
+      url = next;
+      continue;
+    }
+    // Honor the byte cap before buffering when the server declares a
+    // content-length; the caller's shared byteLength check covers
+    // undeclared bodies.
+    const declared = Number(res.headers.get("content-length"));
+    if (Number.isFinite(declared) && declared > pdfExtractMaxBytes) {
+      return { bytes: null, oversize: true };
+    }
+    let body: Uint8Array;
+    try {
+      body = new Uint8Array(await res.arrayBuffer());
+    } catch {
+      return { bytes: null, oversize: false };
+    }
+    // The same magic validation applies to re-fetched bytes (an error
+    // page or HTML redirect target is not a PDF either).
+    return { bytes: isPdfBytes(body) ? body : null, oversize: false };
+  }
+  // Redirect chain exceeded the hop bound.
+  return { bytes: null, oversize: false };
+}
+
+// Build the navigate result for a PDF response. Extracted text rides the
+// standard ok() redaction pass; failures degrade to a structured hint
+// (`pdf: true` + note) rather than an empty snapshot.
+async function pdfNavigateResult(
+  session: Session,
+  response: unknown,
+  finalUrl: string,
+  taskId: string
+): Promise<string> {
+  // A PDF page has no DOM the agent can act on — drop any refs from the
+  // previous page so a stale click can't fire against the viewer.
+  session.refs = new Map();
+  session.lastSnapshotText = undefined;
+  const status = (response as { status?: () => number } | null | undefined)?.status?.() ?? null;
+  let bytes: Uint8Array | null = null;
+  try {
+    const bodyFn = (response as { body?: () => Promise<Uint8Array> } | null | undefined)?.body;
+    if (typeof bodyFn === "function") bytes = await bodyFn.call(response);
+  } catch {
+    bytes = null;
+  }
+  // Empty or non-PDF bytes count as a failed read: when Chrome's PDF viewer
+  // intercepts a main-frame PDF navigation, response.body() either throws OR
+  // resolves successfully with the viewer's HTML wrapper bytes, so the magic
+  // check is what routes real navigations to the re-fetch below.
+  if (bytes && !isPdfBytes(bytes)) bytes = null;
+  // Re-fetch the bytes with a Bun-native fetch (see refetchPdfBytes):
+  // finalUrl is the SAME post-redirect URL that already passed
+  // safetyCheck + domain policy above, the context's cookies ride along
+  // as a Cookie header, and any further redirects are re-gated per hop.
+  let fetchOversize = false;
+  if (!bytes) {
+    const refetched = await refetchPdfBytes(session.context, finalUrl, taskId);
+    bytes = refetched.bytes;
+    fetchOversize = refetched.oversize;
+  }
+  if (fetchOversize || (bytes && bytes.byteLength > pdfExtractMaxBytes)) {
+    return ok({
+      url: finalUrl,
+      status,
+      pdf: true,
+      note: `This URL is a PDF document larger than the ${Math.floor(pdfExtractMaxBytes / (1024 * 1024))}MB extraction cap; no text was extracted. There is no DOM to snapshot — do not re-snapshot this page.`
+    }, taskId);
+  }
+  // Both retrieval attempts failed — degrade honestly, naming the cause
+  // so the model doesn't blame the extractor.
+  if (!bytes) {
+    return ok({
+      url: finalUrl,
+      status,
+      pdf: true,
+      note: "This URL is a PDF document; text extraction was not possible (could not retrieve PDF bytes). There is no DOM to snapshot — do not re-snapshot this page. If the user needs its contents, report that the PDF could not be read."
+    }, taskId);
+  }
+  let text: string | null = null;
+  try {
+    text = (await pdfTextExtractor(bytes))?.text ?? null;
+  } catch {
+    text = null;
+  }
+  if (text === null) {
+    return ok({
+      url: finalUrl,
+      status,
+      pdf: true,
+      note: "This URL is a PDF document; text extraction was not possible. There is no DOM to snapshot — do not re-snapshot this page. If the user needs its contents, report that the PDF could not be read."
+    }, taskId);
+  }
+  let truncated = false;
+  if (text.length > SNAPSHOT_CHAR_BUDGET) {
+    const omitted = text.length - SNAPSHOT_CHAR_BUDGET;
+    text = `${text.slice(0, SNAPSHOT_CHAR_BUDGET)}\n[...PDF text truncated +${omitted} more chars]`;
+    truncated = true;
+  }
+  return ok({
+    url: finalUrl,
+    status,
+    pdf: true,
+    pdfText: text,
+    truncated,
+    note: "This URL rendered as a PDF document; extracted text is shown instead of a DOM snapshot."
+  }, taskId);
+}
+
+export async function browserNavigate(
+  taskId: string,
+  args: Record<string, unknown>,
+  // Runtime config enables the over-budget aux summarization fallback;
+  // direct callers / tests may omit it and get plain counted truncation.
+  config?: RuntimeConfig
+): Promise<string> {
   const url = str(args.url);
   if (!url) return fail("Missing required string argument: url");
-  const blocked = safetyCheck(url);
+  const blocked = safetyCheck(url) ?? domainPolicyBlockReason(url, agentDomainPolicyForTask(taskId));
   if (blocked) return fail(blocked);
   try {
     return await withSession(taskId, async (session) => {
@@ -2104,7 +3023,9 @@ export async function browserNavigate(taskId: string, args: Record<string, unkno
       // a prior cleanup landed us there. Skip the post-nav block
       // for it; the snapshot() boundary check already special-
       // cases it the same way.
-      const postBlock = finalUrl === "about:blank" ? undefined : safetyCheck(finalUrl);
+      const postBlock = finalUrl === "about:blank"
+        ? undefined
+        : safetyCheck(finalUrl) ?? domainPolicyBlockReason(finalUrl, agentDomainPolicyForTask(taskId));
       if (postBlock) {
         try {
           await session.page.goto("about:blank", { waitUntil: "domcontentloaded" });
@@ -2119,15 +3040,25 @@ export async function browserNavigate(taskId: string, args: Record<string, unkno
       // any stale stamps, restarts ref numbering at @e1, and returns the
       // full tree (never a diff).
       session.lastSnapshotUrl = undefined;
+      // PDF responses have no DOM worth walking — return extracted text
+      // (or an honest hint) instead of a useless viewer snapshot.
+      if (navigationContentType(response).includes("application/pdf")) {
+        return await pdfNavigateResult(session, response, finalUrl, taskId);
+      }
       const snap = await snapshot(session.page, false, taskId);
       session.refs = snap.refs;
+      const rendered = await withSummarizedRemainder(snap.text, snap.truncatedRemainder, config);
       return ok({
         url: finalUrl,
         status: response?.status() ?? null,
         title: await session.page.title(),
-        snapshot: snap.text,
-        elementCount: snap.elementCount,
-        truncated: snap.truncated
+        snapshot: rendered.text,
+        // Count what THIS result lets the model act on: the rendered rows,
+        // plus the remainder's refs only when the appended summary actually
+        // carries them.
+        elementCount: snap.elementCount + (rendered.summarized ? snap.remainderElementCount : 0),
+        truncated: snap.truncated,
+        ...(snap.botWallSuspected ? { botWallSuspected: true, warning: BOT_WALL_WARNING } : {})
       }, taskId);
     });
   } catch (error) {
@@ -2135,18 +3066,28 @@ export async function browserNavigate(taskId: string, args: Record<string, unkno
   }
 }
 
-export async function browserSnapshot(taskId: string, args: Record<string, unknown>): Promise<string> {
+export async function browserSnapshot(
+  taskId: string,
+  args: Record<string, unknown>,
+  // Runtime config enables the over-budget aux summarization fallback;
+  // direct callers / tests may omit it and get plain counted truncation.
+  config?: RuntimeConfig
+): Promise<string> {
   const full = bool(args.full, false);
   try {
     return await withSession(taskId, async (session) => {
       const snap = await snapshot(session.page, full, taskId);
       session.refs = snap.refs;
+      const rendered = await withSummarizedRemainder(snap.text, snap.truncatedRemainder, config);
       return ok({
         url: session.page.url(),
         title: await session.page.title(),
-        snapshot: snap.text,
-        elementCount: snap.elementCount,
-        truncated: snap.truncated
+        snapshot: rendered.text,
+        // Same accounting as browser_navigate: remainder refs count only
+        // when the appended summary carries them.
+        elementCount: snap.elementCount + (rendered.summarized ? snap.remainderElementCount : 0),
+        truncated: snap.truncated,
+        ...(snap.botWallSuspected ? { botWallSuspected: true, warning: BOT_WALL_WARNING } : {})
       }, taskId);
     });
   } catch (error) {
@@ -2191,6 +3132,75 @@ export async function browserType(taskId: string, args: Record<string, unknown>)
         url: session.page.url(),
         ...snapFields,
         ...(resolved.healed ? { healedRef: true } : {})
+      }, taskId);
+    });
+  } catch (error) {
+    return fail(error instanceof Error ? error.message : String(error));
+  }
+}
+
+// Batch form fill for labeled NON-secret fields: each {ref, text} entry
+// is filled with the same semantics as browser_type (clear-then-fill via
+// the self-healing ref resolution), but the page is snapshotted ONCE
+// after all fills instead of once per field. Stops at the first failing
+// field and reports which fields were filled and which were not
+// attempted, so the model can re-snapshot and retry the remainder.
+//
+// Secrets stay exclusively in browser_fill_secrets: as a defensive
+// mirror of the outbound-URL gate in safetyCheck, any field text
+// containing a registered secret value fails closed with a generic
+// message that never echoes the value.
+export async function browserFillForm(taskId: string, args: Record<string, unknown>): Promise<string> {
+  const rawFields = args.fields;
+  if (!Array.isArray(rawFields) || rawFields.length === 0) {
+    return fail("Missing required argument: fields (non-empty array of {ref, text}).");
+  }
+  const fields: Array<{ ref: string; text: string }> = [];
+  for (const entry of rawFields) {
+    const ref = entry !== null && typeof entry === "object" ? str((entry as Record<string, unknown>).ref) : undefined;
+    const text = entry !== null && typeof entry === "object" ? (entry as Record<string, unknown>).text : undefined;
+    if (!ref || typeof text !== "string") {
+      return fail("Each fields entry must be an object with string 'ref' and string 'text'.");
+    }
+    fields.push({ ref, text });
+  }
+  // Values below the redaction floor are skipped for the same reason
+  // recordFilledSecret refuses them: a tiny value substring-matches
+  // ordinary text and would false-positive.
+  for (const secret of allRegisteredSecrets()) {
+    if (secret.length < FILLED_SECRET_MIN_REDACTION_LENGTH) continue;
+    if (fields.some((f) => f.text.includes(secret))) {
+      return fail("Blocked: a field value contains a registered secret. Use browser_fill_secrets for credentials/secrets.");
+    }
+  }
+  try {
+    return await withSession(taskId, async (session) => {
+      const filled: string[] = [];
+      let healedAny = false;
+      const report = (failedRef: string): string => {
+        const notAttempted = fields.slice(filled.length + 1).map((f) => f.ref);
+        return `Filled before failure: ${filled.join(", ") || "none"}. Not attempted: ${notAttempted.join(", ") || "none"}. Take a fresh snapshot and retry the remaining fields starting at ${failedRef}.`;
+      };
+      for (const field of fields) {
+        const resolved = await resolveRefForAction(session, field.ref);
+        if (!resolved) {
+          return fail(`Unknown ref ${field.ref}. ${report(field.ref)}`);
+        }
+        try {
+          await resolved.locator.fill(field.text, { timeout: 10_000 });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          return fail(`Fill failed at ${field.ref}: ${message}. ${report(field.ref)}`);
+        }
+        if (resolved.healed) healedAny = true;
+        filled.push(field.ref);
+      }
+      const snapFields = await snapshotAfterAction(session, taskId);
+      return ok({
+        url: session.page.url(),
+        filled,
+        ...snapFields,
+        ...(healedAny ? { healedRef: true } : {})
       }, taskId);
     });
   } catch (error) {
@@ -2545,14 +3555,163 @@ export async function browserBack(taskId: string, _args: Record<string, unknown>
 const consoleLogs = new Map<string, Array<{ type: string; text: string }>>();
 const consoleHooked = new WeakSet<Page>();
 
+// Pages outlive tasks: an adopted user tab survives closeSession and is
+// re-instrumented by a LATER task, but the console/dialog/network
+// listeners install once per page (re-listening would duplicate records).
+// Handlers therefore resolve the OWNING task at EVENT time through this
+// map — refreshed by every attach call — instead of closing over the
+// taskId that happened to do the hooking, which would route a later
+// task's records (and ignore its browser_dialog arming) into a dead
+// task's buffers.
+const pageTaskOwner = new WeakMap<Page, string>();
+
 function attachConsole(taskId: string, page: Page): void {
+  pageTaskOwner.set(page, taskId);
   if (consoleHooked.has(page)) return;
   consoleHooked.add(page);
   page.on("console", (msg) => {
-    const buf = consoleLogs.get(taskId) ?? [];
+    const owner = pageTaskOwner.get(page) ?? taskId;
+    const buf = consoleLogs.get(owner) ?? [];
     buf.push({ type: msg.type(), text: msg.text() });
     if (buf.length > 200) buf.splice(0, buf.length - 200);
-    consoleLogs.set(taskId, buf);
+    consoleLogs.set(owner, buf);
+  });
+}
+
+// JS dialog (alert / confirm / prompt / beforeunload) capture. With no
+// "dialog" listener installed, Playwright auto-dismisses every dialog
+// silently — the model never learns a confirm() fired, so an "Are you
+// sure?" flow always takes the cancel path without anyone knowing. The
+// handler below keeps the auto-respond behavior (responding immediately
+// means page JS never blocks on an open dialog, which would freeze every
+// in-flight action) but makes it observable and steerable:
+//   - default response is dismiss, matching Playwright's no-handler
+//     behavior;
+//   - browser_dialog arms a ONE-SHOT response (accept / dismiss /
+//     promptText) consumed by the next dialog that fires for the task;
+//   - every dialog is recorded and surfaced once in a `dialogs` field of
+//     the task's next ok() tool result, riding the standard
+//     secret-redaction pass there.
+interface DialogRecord {
+  type: string;
+  message: string;
+  defaultValue?: string;
+  url: string;
+  at: string;
+  response: "accepted" | "dismissed";
+  promptText?: string;
+}
+// Cap on unreported dialog records held per task. A page firing dialogs
+// in a loop between tool calls would otherwise grow the buffer without
+// bound; the model only needs the most recent few to understand what
+// happened.
+const DIALOG_BUFFER_CAP = 5;
+const dialogHooked = new WeakSet<Page>();
+const pendingDialogResponses = new Map<string, { accept: boolean; promptText?: string }>();
+const unreportedDialogs = new Map<string, DialogRecord[]>();
+
+// Drain the task's unreported dialog records. Called by ok() so each
+// record is surfaced exactly once, in the next successful tool result.
+function takeUnreportedDialogs(taskId: string): DialogRecord[] {
+  const buf = unreportedDialogs.get(taskId);
+  if (!buf || buf.length === 0) return [];
+  unreportedDialogs.delete(taskId);
+  return buf;
+}
+
+// Read-only network request visibility. Per-task ring buffer of the most
+// recent completed (and failed) requests on agent-owned pages — method,
+// URL, status, resourceType, optional failure text. No bodies, no
+// headers, no interception/mocking: this is observability only, read by
+// browser_requests. Plain strings keep the buffer cheap; the cap bounds
+// memory on chatty pages (analytics beacons, polling).
+interface NetworkLogEntry {
+  method: string;
+  url: string;
+  status: number | null;
+  resourceType: string;
+  failure?: string;
+}
+const NETWORK_LOG_CAP = 100;
+const networkLogs = new Map<string, NetworkLogEntry[]>();
+const networkHooked = new WeakSet<Page>();
+
+function attachNetworkCapture(taskId: string, page: Page): void {
+  // Fake test pages may not expose .on — same typeof-guard pattern
+  // snapshot() uses for page.url.
+  if (typeof page.on !== "function") return;
+  pageTaskOwner.set(page, taskId);
+  if (networkHooked.has(page)) return;
+  networkHooked.add(page);
+  const push = (entry: NetworkLogEntry): void => {
+    // Resolve the owner at event time — see pageTaskOwner.
+    const owner = pageTaskOwner.get(page) ?? taskId;
+    const buf = networkLogs.get(owner) ?? [];
+    buf.push(entry);
+    if (buf.length > NETWORK_LOG_CAP) buf.splice(0, buf.length - NETWORK_LOG_CAP);
+    networkLogs.set(owner, buf);
+  };
+  page.on("response", (response) => {
+    try {
+      const request = response.request();
+      push({
+        method: request.method(),
+        url: response.url(),
+        status: response.status(),
+        resourceType: request.resourceType()
+      });
+    } catch {
+      // A response whose request handle is already gone (page teardown
+      // race) just doesn't get logged.
+    }
+  });
+  page.on("requestfailed", (request) => {
+    try {
+      push({
+        method: request.method(),
+        url: request.url(),
+        status: null,
+        resourceType: request.resourceType(),
+        failure: request.failure()?.errorText ?? "failed"
+      });
+    } catch {
+      // ignore — same teardown race as above
+    }
+  });
+}
+
+function attachDialogHandler(taskId: string, page: Page): void {
+  // Fake test pages may not expose .on — same typeof-guard pattern
+  // snapshot() uses for page.url.
+  if (typeof page.on !== "function") return;
+  pageTaskOwner.set(page, taskId);
+  if (dialogHooked.has(page)) return;
+  dialogHooked.add(page);
+  page.on("dialog", (dialog) => {
+    // Resolve the owner at event time — see pageTaskOwner. A page adopted
+    // by a later task consumes THAT task's armed response and records into
+    // its buffer, not the buffer of whichever task installed the listener.
+    const owner = pageTaskOwner.get(page) ?? taskId;
+    const armed = pendingDialogResponses.get(owner);
+    pendingDialogResponses.delete(owner);
+    const accept = armed?.accept ?? false;
+    const record: DialogRecord = {
+      type: dialog.type(),
+      message: dialog.message(),
+      ...(dialog.type() === "prompt" ? { defaultValue: dialog.defaultValue() } : {}),
+      url: typeof page.url === "function" ? page.url() : "",
+      at: new Date().toISOString(),
+      response: accept ? "accepted" : "dismissed",
+      ...(accept && armed?.promptText !== undefined ? { promptText: armed.promptText } : {})
+    };
+    const buf = unreportedDialogs.get(owner) ?? [];
+    buf.push(record);
+    if (buf.length > DIALOG_BUFFER_CAP) buf.splice(0, buf.length - DIALOG_BUFFER_CAP);
+    unreportedDialogs.set(owner, buf);
+    // Respond immediately so page JS unblocks. Errors (dialog already
+    // handled, page closed mid-response) are swallowed — the record
+    // above already captured what fired.
+    void (accept ? dialog.accept(armed?.promptText) : dialog.dismiss()).catch(() => undefined);
   });
 }
 
@@ -2571,7 +3730,7 @@ export async function browserConsole(taskId: string, args: Record<string, unknow
       // on a now-refused page so it can't surface on a later call.
       const preUrl = typeof session.page.url === "function" ? session.page.url() : "";
       if (preUrl && preUrl !== "about:blank") {
-        const preBlock = safetyCheck(preUrl);
+        const preBlock = safetyCheck(preUrl) ?? domainPolicyBlockReason(preUrl, agentDomainPolicyForTask(taskId));
         if (preBlock) {
           if (typeof session.page.goto === "function") {
             try {
@@ -2643,7 +3802,7 @@ export async function browserConsole(taskId: string, args: Record<string, unknow
       // messages (console output the page emitted): the write is already
       // blocked, but returning — or later resurfacing — that state would still
       // leak it, so drop the captured logs too.
-      const postEvalBlock = await disallowedOriginReason(session.page);
+      const postEvalBlock = await disallowedOriginReason(session.page, taskId);
       if (postEvalBlock) {
         consoleLogs.delete(taskId);
         return fail(`${postEvalBlock} (refusing to return console state from a disallowed origin)`);
@@ -2669,6 +3828,155 @@ export async function browserConsole(taskId: string, args: Record<string, unknow
         messages: redactedMessages,
         evalResult: redactedEvalResult,
         evalError: evalError ? redactSecretValuesFromString(evalError, secretValues) : null
+      }, taskId);
+    });
+  } catch (error) {
+    return fail(error instanceof Error ? error.message : String(error));
+  }
+}
+
+// Arm a one-shot response for the NEXT JavaScript dialog that fires for
+// this task. Dialogs are auto-dismissed (and recorded) the moment they
+// fire — see attachDialogHandler — so this tool cannot answer a dialog
+// retroactively; it pre-registers the answer for the next one, letting
+// the model deliberately complete a confirm()/prompt() flow by arming
+// accept and then re-triggering the action.
+export async function browserDialog(taskId: string, args: Record<string, unknown>): Promise<string> {
+  const action = str(args.action);
+  if (action !== "accept" && action !== "dismiss") {
+    return fail("Argument 'action' must be one of: accept, dismiss.");
+  }
+  if (args.promptText !== undefined && typeof args.promptText !== "string") {
+    return fail("Argument 'promptText' must be a string.");
+  }
+  const promptText = typeof args.promptText === "string" ? args.promptText : undefined;
+  // promptText is typed into page JS when the dialog fires — an outbound
+  // channel into the page. Defensive mirror of the browser_fill_form gate:
+  // a registered secret fails closed with a generic message that never
+  // echoes the value (values under the redaction floor are skipped for the
+  // same false-positive reason recordFilledSecret refuses them).
+  if (promptText !== undefined) {
+    for (const secret of allRegisteredSecrets()) {
+      if (secret.length < FILLED_SECRET_MIN_REDACTION_LENGTH) continue;
+      if (promptText.includes(secret)) {
+        return fail("Blocked: promptText contains a registered secret. Use browser_fill_secrets for credentials/secrets.");
+      }
+    }
+  }
+  try {
+    return await withSession(taskId, async (session) => {
+      pendingDialogResponses.set(taskId, {
+        accept: action === "accept",
+        ...(promptText !== undefined ? { promptText } : {})
+      });
+      return ok({
+        url: typeof session.page.url === "function" ? session.page.url() : "",
+        armed: action,
+        ...(promptText !== undefined ? { promptText } : {})
+      }, taskId);
+    });
+  } catch (error) {
+    return fail(error instanceof Error ? error.message : String(error));
+  }
+}
+
+// Read-only list of the task's recent network requests (see
+// attachNetworkCapture). URLs ride the standard ok() redaction pass, so
+// a registered secret appearing in a recorded URL never reaches the
+// model verbatim.
+export async function browserRequests(taskId: string, args: Record<string, unknown>): Promise<string> {
+  if (args.filter !== undefined && typeof args.filter !== "string") {
+    return fail("Argument 'filter' must be a string.");
+  }
+  const filter = str(args.filter);
+  try {
+    return await withSession(taskId, async (session) => {
+      const all = networkLogs.get(taskId) ?? [];
+      const requests = filter ? all.filter((r) => r.url.includes(filter)) : all;
+      return ok({
+        url: typeof session.page.url === "function" ? session.page.url() : "",
+        requests
+      }, taskId);
+    });
+  } catch (error) {
+    return fail(error instanceof Error ? error.message : String(error));
+  }
+}
+
+// Curated viewport-resize utility (no raw CDP passthrough). Dimensions
+// are clamped to a sane range so the agent can't set a degenerate or
+// absurd viewport.
+const RESIZE_MIN_WIDTH = 320;
+const RESIZE_MAX_WIDTH = 3840;
+const RESIZE_MIN_HEIGHT = 240;
+const RESIZE_MAX_HEIGHT = 2160;
+
+export async function browserResize(taskId: string, args: Record<string, unknown>): Promise<string> {
+  const width = typeof args.width === "number" && Number.isFinite(args.width) ? Math.round(args.width) : undefined;
+  const height = typeof args.height === "number" && Number.isFinite(args.height) ? Math.round(args.height) : undefined;
+  if (width === undefined) return fail("Missing required number argument: width");
+  if (height === undefined) return fail("Missing required number argument: height");
+  const clampedWidth = Math.min(Math.max(width, RESIZE_MIN_WIDTH), RESIZE_MAX_WIDTH);
+  const clampedHeight = Math.min(Math.max(height, RESIZE_MIN_HEIGHT), RESIZE_MAX_HEIGHT);
+  try {
+    return await withSession(taskId, async (session) => {
+      if (typeof session.page.setViewportSize !== "function") {
+        return fail("Viewport resize is not supported by this browser session.");
+      }
+      await session.page.setViewportSize({ width: clampedWidth, height: clampedHeight });
+      return ok({
+        url: typeof session.page.url === "function" ? session.page.url() : "",
+        width: clampedWidth,
+        height: clampedHeight,
+        ...(clampedWidth !== width || clampedHeight !== height ? { clamped: true } : {})
+      }, taskId);
+    });
+  } catch (error) {
+    return fail(error instanceof Error ? error.message : String(error));
+  }
+}
+
+// Curated cookie READ (no writes, no raw CDP passthrough). Values are
+// ALWAYS replaced with "[redacted]" — the metadata (name, domain, path,
+// expiry, flags) is what the agent needs to reason about auth state;
+// the value itself is a credential and never reaches the model.
+export async function browserCookies(taskId: string, args: Record<string, unknown>): Promise<string> {
+  void args;
+  try {
+    return await withSession(taskId, async (session) => {
+      const context = session.context;
+      if (!context || typeof context.cookies !== "function") {
+        return fail("Cookie read is not supported by this browser session.");
+      }
+      // Cookies are live page/origin state. Like every other live-page
+      // reader (console, vision, the snapshot boundary), refuse to read
+      // them while the page sits on a disallowed origin — otherwise a
+      // redirect onto a blocked host would let its cookie metadata reach
+      // the model.
+      const originBlock = await disallowedOriginReason(session.page, taskId);
+      if (originBlock) {
+        return fail(`${originBlock} (refusing to read cookies from a disallowed origin)`);
+      }
+      const pageUrl = typeof session.page.url === "function" ? session.page.url() : "";
+      // Scope to the current page when it has a real http(s) URL so the
+      // agent sees the cookies that apply to where it is; fall back to
+      // the whole shared context otherwise.
+      const scopedToPage = /^https?:/i.test(pageUrl);
+      const cookies = await (scopedToPage ? context.cookies(pageUrl) : context.cookies());
+      const redacted = cookies.map((cookie) => ({
+        name: cookie.name,
+        value: "[redacted]",
+        domain: cookie.domain,
+        path: cookie.path,
+        expires: cookie.expires,
+        httpOnly: cookie.httpOnly,
+        secure: cookie.secure,
+        sameSite: cookie.sameSite
+      }));
+      return ok({
+        url: pageUrl,
+        scope: scopedToPage ? "page" : "context",
+        cookies: redacted
       }, taskId);
     });
   } catch (error) {
@@ -2969,7 +4277,7 @@ export async function browserTabs(taskId: string, args: Record<string, unknown>)
         }
         const url = str(args.url);
         if (url) {
-          const blocked = safetyCheck(url);
+          const blocked = safetyCheck(url) ?? domainPolicyBlockReason(url, agentDomainPolicyForTask(taskId));
           if (blocked) return fail(blocked);
         }
         const page = await session.context.newPage();
@@ -2983,6 +4291,8 @@ export async function browserTabs(taskId: string, args: Record<string, unknown>)
         // model how to address the tab it just opened without re-listing.
         const id = tabHandleFor(session, page);
         attachConsole(taskId, page);
+        attachDialogHandler(taskId, page);
+        attachNetworkCapture(taskId, page);
         if (url) {
           await page.goto(url, { waitUntil: "domcontentloaded" });
         }
@@ -3017,6 +4327,12 @@ export async function browserTabs(taskId: string, args: Record<string, unknown>)
         session.refs = new Map();
         session.lastSnapshotUrl = undefined;
         session.page = target;
+        // The target may be a user-opened tab or window.open popup that
+        // never went through getOrCreate / tabs:new — hook its dialogs
+        // and network log now that the agent is acting on it
+        // (idempotent via WeakSet).
+        attachDialogHandler(taskId, target);
+        attachNetworkCapture(taskId, target);
         await target.bringToFront().catch(() => undefined);
         const snap = await snapshot(session.page, false, taskId);
         session.refs = snap.refs;
@@ -3059,6 +4375,11 @@ export async function browserTabs(taskId: string, args: Record<string, unknown>)
           session.ownedPageIds.add(fallback);
           session.page = fallback;
         }
+        // Whichever page became active — an adopted survivor or the
+        // fresh fallback — gets the dialog and network hooks
+        // (idempotent via WeakSet).
+        attachDialogHandler(taskId, session.page);
+        attachNetworkCapture(taskId, session.page);
       } else {
         // Active page didn't change, but refs map points at the old
         // snapshot we're about to refresh — drop it now for consistency
@@ -3104,6 +4425,22 @@ const MAX_SCREENSHOT_BYTES = 5 * 1024 * 1024;
 // the very content the screenshot is meant to show.
 const VISION_ANNOTATE_BADGE_CAP = 50;
 
+// Native-vision fast-path gate. When the active model accepts image
+// input, attaching the screenshot directly to the conversation would
+// save the aux round trip and the OCR fidelity loss of describing
+// pixels in text — but a raw image cannot be post-OCR-redacted, so the
+// native route is allowed ONLY when no secrets are registered for ANY
+// active task (allRegisteredSecrets() is the cross-task union; one
+// task's typed credential can be visible on another task's page via
+// the shared BrowserContext). With any secret registered, the aux
+// side-call with pre-blur + post-OCR redaction stays mandatory.
+type VisionRoute = "native-image" | "aux-side-call";
+
+function resolveVisionRoute(config: RuntimeConfig): VisionRoute {
+  if (allRegisteredSecrets().length > 0) return "aux-side-call";
+  return resolveProviderModality(config.provider).vision ? "native-image" : "aux-side-call";
+}
+
 // Screenshot the current page and ask the configured vision model a question
 // about it. Returns the model's text answer. The agent never sees the
 // screenshot bytes — vision is a side call mediated by the provider layer so
@@ -3128,7 +4465,7 @@ export async function browserVision(
       // rendered pixels to the vision provider, so an unguarded screenshot of
       // a loopback page would exfiltrate control-plane state as an image —
       // the same surface browser_console and snapshot() already gate.
-      const visionBlock = await disallowedOriginReason(session.page);
+      const visionBlock = await disallowedOriginReason(session.page, taskId);
       if (visionBlock) {
         return fail(`${visionBlock} (refusing to screenshot a disallowed origin)`);
       }
@@ -3261,7 +4598,7 @@ export async function browserVision(
       // Re-check after the capture: if the page navigated to a refused origin
       // while the screenshot was in flight, discard the buffer rather than
       // sending its pixels to the vision provider.
-      const postShotBlock = await disallowedOriginReason(session.page);
+      const postShotBlock = await disallowedOriginReason(session.page, taskId);
       if (postShotBlock) {
         return fail(`${postShotBlock} (page navigated to a disallowed origin during capture; discarding screenshot)`);
       }
@@ -3271,6 +4608,18 @@ export async function browserVision(
       const prompt = annotate
         ? `${question}\n\nThe numbered badges overlaid on the screenshot are element refs (badge "e12" = @e12 in the page snapshot); cite them when referring to specific elements.`
         : question;
+      // Route selection (see resolveVisionRoute). "native-image" means
+      // the screenshot is ALLOWED to enter the conversation directly —
+      // but every provider tool-result serializer is string-only today
+      // (translateMessagesToAnthropic JSON-stringifies tool_result
+      // parts; the chat-completions `tool` role and codex
+      // function_call_output accept no image parts), so there is no
+      // transport for an image tool result yet. Until that plumbing
+      // exists the native route degrades to the same aux side-call;
+      // the gate is evaluated and pinned by tests HERE so the
+      // transport swap is local to this branch when it lands.
+      const route = resolveVisionRoute(config);
+      void route;
       const result = await generateVisionAnalysis(config, {
         prompt,
         imageBase64,
@@ -3463,6 +4812,148 @@ export async function browserUploadFileApproved(
   }
 }
 
+// ---------------- Downloads (approval-gated) ----------------
+
+// Size cap for browser_download saves. Checked AFTER the save — Playwright
+// streams the download to disk and the byte count isn't known up front —
+// so an over-cap file is deleted and the tool fails. Injectable for tests
+// via __test.setDownloadMaxBytesForTest.
+const DOWNLOAD_MAX_BYTES_DEFAULT = 50 * 1024 * 1024;
+let downloadMaxBytes = DOWNLOAD_MAX_BYTES_DEFAULT;
+
+// How long to wait for the page to actually start a download after the
+// approved click. Generous because the server decides when the
+// Content-Disposition response begins. Injectable for tests via
+// __test.setDownloadEventTimeoutForTest.
+const DOWNLOAD_EVENT_TIMEOUT_MS_DEFAULT = 30_000;
+let downloadEventTimeoutMs = DOWNLOAD_EVENT_TIMEOUT_MS_DEFAULT;
+
+// Reduce a server-suggested filename to a safe basename. The suggested
+// name is attacker-controlled (the remote server picks it), so path
+// separators and traversal segments are stripped down to the final path
+// component, control chars removed, and empty/dot-only results replaced
+// with a generic name. Exported for direct unit testing.
+export function sanitizeDownloadFilename(name: string): string {
+  const base = name.replace(/\\/g, "/").split("/").pop() ?? "";
+  // eslint-disable-next-line no-control-regex
+  const cleaned = base.replace(/[\x00-\x1f\x7f]/g, "").trim();
+  if (cleaned === "" || cleaned === "." || cleaned === "..") return "download";
+  return cleaned.slice(0, 255);
+}
+
+// Unique-ify a save path on collision: invoice.pdf → invoice-1.pdf,
+// invoice-2.pdf, … so repeated downloads never overwrite earlier ones.
+function uniqueDownloadPath(dir: string, filename: string): string {
+  let candidate = join(dir, filename);
+  if (!existsSync(candidate)) return candidate;
+  const dot = filename.lastIndexOf(".");
+  const stem = dot > 0 ? filename.slice(0, dot) : filename;
+  const ext = dot > 0 ? filename.slice(dot) : "";
+  for (let i = 1; ; i++) {
+    candidate = join(dir, `${stem}-${i}${ext}`);
+    if (!existsSync(candidate)) return candidate;
+  }
+}
+
+// Approved-download executor. Called by agent.executeApprovedAction after
+// the user explicitly authorizes a browser.download approval (mirrors
+// browserUploadFileApproved). Clicks the approved element, captures the
+// resulting download via Playwright's download event, and saves it under
+// the instance-scoped downloads dir with a sanitized, collision-safe
+// filename. The saved file is size-capped post-save (over-cap files are
+// deleted). Returns the standard redacted envelope reporting the saved
+// path, size, and the server's suggested filename.
+export async function browserDownloadApproved(
+  taskId: string,
+  ref: string,
+  instance: Instance
+): Promise<string> {
+  try {
+    return await withSession(taskId, async (session) => {
+      // Trust boundary: the approval was granted for the exact stamped
+      // element — no resolveRefForAction self-healing here; a lost stamp
+      // fails loudly (same stance as browser_upload_file; see ADR
+      // browser-fill-secret.md).
+      const target = session.refs.get(ref);
+      if (!target) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
+      if (typeof session.page.waitForEvent !== "function") {
+        return fail("Download capture is not supported by this browser session.");
+      }
+      const downloadPromise = session.page.waitForEvent("download", { timeout: downloadEventTimeoutMs });
+      // Pre-attach a no-op catch: if the click below throws (and we
+      // return its failure), the still-pending wait eventually times out
+      // and must not surface as an unhandled rejection.
+      downloadPromise.catch(() => undefined);
+      await target.locator.click({ timeout: 10_000 });
+      let download: Awaited<typeof downloadPromise>;
+      try {
+        download = await downloadPromise;
+      } catch {
+        // The wait expired (or the page went away) with no download
+        // event. The common cause: the link points at content the
+        // browser renders inline (Chrome opens PDFs in its viewer
+        // instead of downloading), so no download ever fires. Steer the
+        // model to the path that works for inline content.
+        return fail(
+          "The click did not trigger a file download. Content the browser renders inline (like PDFs) never fires a download — use browser_navigate to open the URL instead; PDF text is extracted on navigation."
+        );
+      }
+      // Trust boundary: the approval named the PAGE the click happens on,
+      // but the browser fetches the download from wherever the element
+      // points (redirect targets, signed CDN URLs, attacker-controlled
+      // hrefs) — so the actual download SOURCE must pass the same SSRF
+      // gate + agent domain policy as navigation before any bytes are
+      // saved. On a block the transfer is cancelled and nothing is kept.
+      // blob:/data: sources skip the gate: those are client-generated
+      // downloads (the common "export CSV" anchor pattern) whose bytes
+      // come from the already-gated page with no network fetch, so SSRF
+      // and domain policy don't apply — the size cap, filename
+      // sanitization, and audit below still do.
+      // An empty URL skips the gate too: real Playwright Download.url()
+      // always returns the source URL; only test fakes lack it.
+      const downloadUrl = typeof download.url === "function" ? download.url() : "";
+      const clientGenerated = downloadUrl.startsWith("blob:") || downloadUrl.startsWith("data:");
+      const sourceBlock = downloadUrl && !clientGenerated
+        ? safetyCheck(downloadUrl) ?? domainPolicyBlockReason(downloadUrl, agentDomainPolicyForTask(taskId))
+        : undefined;
+      if (sourceBlock) {
+        if (typeof download.cancel === "function") {
+          await download.cancel().catch(() => undefined);
+        }
+        return fail(`${sourceBlock} (download source URL)`);
+      }
+      const suggested = typeof download.suggestedFilename === "function" ? download.suggestedFilename() : "";
+      const filename = sanitizeDownloadFilename(suggested || "download");
+      const dir = downloadsDir(instance);
+      mkdirSync(dir, { recursive: true });
+      const savedPath = uniqueDownloadPath(dir, filename);
+      await download.saveAs(savedPath);
+      const size = statSync(savedPath).size;
+      if (size > downloadMaxBytes) {
+        try {
+          unlinkSync(savedPath);
+        } catch {
+          // Best-effort cleanup; the failure message below still tells
+          // the model (and the audit trail) the cap fired.
+        }
+        return fail(`Download exceeds the ${Math.floor(downloadMaxBytes / (1024 * 1024))}MB size cap (${size} bytes); the file was deleted.`);
+      }
+      return ok({
+        url: session.page.url(),
+        // The real source the bytes came from (gated above) — surfaced so
+        // the audit row records where the download actually originated,
+        // not just the page it was triggered from.
+        downloadUrl: downloadUrl || null,
+        path: savedPath,
+        suggestedFilename: suggested || null,
+        size
+      }, taskId);
+    });
+  } catch (error) {
+    return fail(error instanceof Error ? error.message : String(error));
+  }
+}
+
 // Internal hooks exported for unit tests. The session manager keeps its
 // state module-local so production callers don't accidentally poke at the
 // shared browser; tests need controlled access to verify the
@@ -3515,6 +5006,27 @@ export const __test = {
   // setBrowserInstance() doesn't leak it into sibling tests.
   resetBrowserInstanceForTest(): void {
     runtimeInstance = undefined;
+  },
+  // Swap a session provider so the seam-dispatch test can verify
+  // ensureShared / teardownHandle route through the registry without
+  // touching playwright-core. Pass null to restore the built-in provider.
+  setSessionProviderForTest(kind: Mode, provider: BrowserSessionProvider | null): void {
+    sessionProviders[kind] =
+      provider ?? (kind === "persistent" ? persistentSessionProvider : cdpSessionProvider);
+  },
+  // Reset the opt-in recording flag and any active trace claim so
+  // recording tests don't leak state into siblings.
+  resetSessionTraceForTest(): void {
+    browserRecordingEnabled = false;
+    activeTraceTaskId = null;
+  },
+  activeTraceTaskIdForTest(): string | null {
+    return activeTraceTaskId;
+  },
+  // Direct access to the bounded-retention pruner so the keep-newest-N
+  // behavior can be pinned without driving a whole session lifecycle.
+  pruneTraceFilesForTest(dir: string): void {
+    pruneTraceFiles(dir);
   },
   // Install a fake shared handle so the close-path tests can assert
   // teardown behavior without launching Chromium. The `headed` flag
@@ -3642,13 +5154,14 @@ export const __test = {
     if (!session) return;
     const normalized = new Map<string, RefTarget>();
     for (const [key, value] of refs) {
-      const maybe = value as { locator?: unknown; role?: unknown; name?: unknown; nth?: unknown };
+      const maybe = value as { locator?: unknown; role?: unknown; name?: unknown; nth?: unknown; framed?: unknown };
       if (maybe !== null && typeof maybe === "object" && typeof maybe.locator === "object" && maybe.locator !== null) {
         normalized.set(key, {
           locator: maybe.locator as Locator,
           role: typeof maybe.role === "string" ? maybe.role : "",
           name: typeof maybe.name === "string" ? maybe.name : "",
-          nth: typeof maybe.nth === "number" ? maybe.nth : 0
+          nth: typeof maybe.nth === "number" ? maybe.nth : 0,
+          ...(maybe.framed === true ? { framed: true } : {})
         });
       } else {
         normalized.set(key, { locator: value as Locator, role: "", name: "", nth: 0 });
@@ -3660,18 +5173,73 @@ export const __test = {
     const session = sessions.get(taskId);
     if (session) session.inFlight = inFlight;
   },
+  // Override the browser_download size cap so cap-rejection tests don't
+  // need to materialize a 50MB file. Pass null to restore the default.
+  setDownloadMaxBytesForTest(value: number | null): void {
+    downloadMaxBytes = value ?? DOWNLOAD_MAX_BYTES_DEFAULT;
+  },
+  // Shrink the download-event wait so the no-download failure path can be
+  // exercised without the 30s production timeout. Pass null to restore.
+  setDownloadEventTimeoutForTest(value: number | null): void {
+    downloadEventTimeoutMs = value ?? DOWNLOAD_EVENT_TIMEOUT_MS_DEFAULT;
+  },
+  // Stub the PDF text extractor so navigation tests never load
+  // pdfjs-dist. Pass null to restore the lazy attachment-extract path.
+  setPdfTextExtractorForTest(extractor: ((bytes: Uint8Array) => Promise<{ text: string } | null>) | null): void {
+    pdfTextExtractor = extractor ?? defaultPdfTextExtractor;
+  },
+  // Override the PDF extraction byte cap so over-cap tests don't need a
+  // 20MB buffer. Pass null to restore the default.
+  setPdfExtractMaxBytesForTest(value: number | null): void {
+    pdfExtractMaxBytes = value ?? PDF_EXTRACT_MAX_BYTES_DEFAULT;
+  },
+  // Stub the native PDF re-fetch so its cookie/redirect/cap logic can be
+  // exercised without touching the network. Pass null to restore.
+  setPdfRefetchFetchForTest(impl: ((url: string, init: RequestInit) => Promise<Response>) | null): void {
+    pdfRefetchFetch = impl ?? defaultPdfRefetchFetch;
+  },
+  // Register a secret value for a task exactly as browserFillByLocator
+  // would, so the safetyCheck registered-secret URL gate can be
+  // exercised without driving a real fill.
+  recordFilledSecretForTest(taskId: string, value: string): void {
+    recordFilledSecret(taskId, value);
+  },
+  // Drop every per-task secret registry so registered-secret tests
+  // don't leak redaction targets into sibling tests.
+  resetFilledSecretsForTest(): void {
+    filledSecretValues.clear();
+  },
   clearFakeSessionsForTest(): void {
     sessions.clear();
     // Match the real session-teardown contract: also drop the
-    // per-task secret-redaction registry so tests that install
-    // fake sessions then call this helper don't leak state into
-    // subsequent tests.
+    // per-task secret-redaction registry and dialog state so tests
+    // that install fake sessions then call this helper don't leak
+    // state into subsequent tests.
     filledSecretValues.clear();
+    pendingDialogResponses.clear();
+    unreportedDialogs.clear();
+    networkLogs.clear();
+  },
+  // Hook a fake page's response/requestfailed events for a task exactly
+  // as getOrCreate / browser_tabs would, so network capture can be
+  // exercised by invoking the registered handlers — no Chromium.
+  attachNetworkCaptureForTest(taskId: string, page: Page): void {
+    attachNetworkCapture(taskId, page);
+  },
+  // Hook a fake page's dialog events for a task exactly as getOrCreate /
+  // browser_tabs would, so dialog capture can be exercised by invoking
+  // the registered handler with a fake Dialog — no Chromium.
+  attachDialogHandlerForTest(taskId: string, page: Page): void {
+    attachDialogHandler(taskId, page);
+  },
+  // Read (without draining) the task's unreported dialog buffer.
+  peekUnreportedDialogsForTest(taskId: string): DialogRecord[] {
+    return unreportedDialogs.get(taskId) ?? [];
   },
   // Expose the server-side loopback boundary check for direct unit
   // testing — snapshot() and browser_console both gate on it.
-  disallowedOriginReasonForTest(page: Page): Promise<string | undefined> {
-    return disallowedOriginReason(page);
+  disallowedOriginReasonForTest(page: Page, taskId?: string): Promise<string | undefined> {
+    return disallowedOriginReason(page, taskId);
   },
   // Seed / read the per-task console-log buffer so tests can assert that a
   // blocked browser_console call drops captured control-plane output.
@@ -3695,5 +5263,11 @@ export const __test = {
   // asserted without driving a full page walk.
   renderSnapshotDiffForTest(prevText: string, currText: string): string | undefined {
     return renderSnapshotDiff(prevText, currText);
+  },
+  // Expose the browser_vision route gate (native-image vs aux side-call)
+  // so its secret-registry × model-capability matrix can be pinned
+  // without a provider call.
+  resolveVisionRouteForTest(config: RuntimeConfig): VisionRoute {
+    return resolveVisionRoute(config);
   }
 };

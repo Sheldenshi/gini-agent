@@ -29,17 +29,22 @@ import {
 import { defaultToolsets } from "../state/defaults";
 import type { RuntimeState, ToolsetRecord } from "../types";
 
-// The 15 browser tools that are deferred (the cluster minus the always-on
+// The 21 browser tools that are deferred (the cluster minus the always-on
 // browser_navigate plus the escalation/onboarding meta-tools
 // browser_fill_secrets and browser_connect).
 const DEFERRED_BROWSER = [
   "browser_snapshot",
   "browser_click",
   "browser_type",
+  "browser_fill_form",
   "browser_press",
   "browser_scroll",
   "browser_back",
   "browser_console",
+  "browser_dialog",
+  "browser_requests",
+  "browser_resize",
+  "browser_cookies",
   "browser_close",
   "browser_hover",
   "browser_drag",
@@ -47,6 +52,7 @@ const DEFERRED_BROWSER = [
   "browser_wait_for",
   "browser_tabs",
   "browser_upload_file",
+  "browser_download",
   "browser_vision"
 ];
 
@@ -396,6 +402,60 @@ describe("buildToolCatalog", () => {
       expect(desc).toContain("You are");
     });
   });
+
+  describe("cross-toolset routing hints", () => {
+    // browser_navigate's description steers content discovery to
+    // web_search, and the search/fetch descriptions steer page
+    // interaction to the browser tools. Each hint joins the description
+    // only when its referenced toolset is reachable in the assembled
+    // catalog, so the model is never pointed at tools it doesn't have.
+    // The web_fetch steer is part of browser_navigate's BASE description —
+    // web_fetch is always-on, so no toolset gate may drop it.
+    const SEARCH_HINT = "prefer web_search over guessing URLs";
+    const FETCH_STEER = "for plain content retrieval from a known URL prefer web_fetch";
+    const WEB_HINT = "use the browser tools (browser_navigate) instead";
+    const descOf = (catalog: ReturnType<typeof buildToolCatalog>, name: string): string =>
+      catalog.find((t) => t.function.name === name)?.function.description ?? "";
+
+    test("both toolsets enabled: hints join both sides' descriptions", () => {
+      const state = stateWithToolsets([ts("browser"), ts("web_search")]);
+      const catalog = buildToolCatalog(state);
+      expect(descOf(catalog, "browser_navigate")).toContain(SEARCH_HINT);
+      expect(descOf(catalog, "browser_navigate")).toContain(FETCH_STEER);
+      expect(descOf(catalog, "web_search")).toContain(WEB_HINT);
+      expect(descOf(catalog, "web_fetch")).toContain(WEB_HINT);
+      // The annotation never survives catalog assembly — the provider
+      // payload must carry only the (possibly extended) description.
+      for (const tool of catalog) {
+        expect(tool.crossToolsetHint).toBeUndefined();
+      }
+    });
+
+    test("web_search toolset disabled: browser_navigate drops the search hint but keeps the web_fetch steer", () => {
+      const state = stateWithToolsets([ts("browser")]);
+      const catalog = buildToolCatalog(state);
+      expect(descOf(catalog, "browser_navigate")).not.toContain("web_search");
+      // web_fetch is always-on, so the steer toward it survives the gate.
+      expect(descOf(catalog, "browser_navigate")).toContain(FETCH_STEER);
+      // The browser toolset is on, so the always-on web_fetch still points
+      // page-interaction work at it.
+      expect(descOf(catalog, "web_fetch")).toContain(WEB_HINT);
+    });
+
+    test("browser toolset disabled: web_search and web_fetch drop the hint", () => {
+      const state = stateWithToolsets([ts("web_search")]);
+      const catalog = buildToolCatalog(state);
+      expect(descOf(catalog, "web_search")).not.toContain(WEB_HINT);
+      expect(descOf(catalog, "web_fetch")).not.toContain(WEB_HINT);
+    });
+
+    test("agent whitelist excluding browser strips the hint even when globally enabled", () => {
+      const state = stateWithToolsets([ts("browser"), ts("web_search")]);
+      const catalog = buildToolCatalog(state, new Set(["web_search"]));
+      expect(descOf(catalog, "web_search")).not.toContain(WEB_HINT);
+      expect(descOf(catalog, "web_fetch")).not.toContain(WEB_HINT);
+    });
+  });
 });
 
 describe("deferred tools", () => {
@@ -404,7 +464,7 @@ describe("deferred tools", () => {
   // kill switch).
   const fullState = stateWithToolsets(defaultToolsets("test", "2026-01-01T00:00:00.000Z"));
 
-  test("the 15 browser tools are deferred; load_tools, browser_navigate, browser_connect, browser_fill_secrets are core", () => {
+  test("the 21 browser tools are deferred; load_tools, browser_navigate, browser_connect, browser_fill_secrets are core", () => {
     const catalog = buildToolCatalog(fullState);
     for (const name of DEFERRED_BROWSER) {
       const tool = catalog.find((t) => t.function.name === name);

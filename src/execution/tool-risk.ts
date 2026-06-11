@@ -9,8 +9,12 @@ export type RiskLevel = "low" | "medium" | "high";
 export const ACTION_RISK: ReadonlyMap<string, RiskLevel> = new Map<string, RiskLevel>([
   ["browser.click", "medium"],
   ["browser.type", "medium"],
+  ["browser.fill_form", "medium"],
   ["browser.drag", "medium"],
   ["browser.select_option", "medium"],
+  // Arming an accept for the next confirm()/beforeunload commits a page
+  // side effect when it fires — same bucket as the click that triggers it.
+  ["browser.dialog", "medium"],
   ["browser.tabs.new", "medium"],
   ["browser.tabs.switch", "medium"],
   ["browser.tabs.close", "medium"],
@@ -21,6 +25,9 @@ export const ACTION_RISK: ReadonlyMap<string, RiskLevel> = new Map<string, RiskL
   // the action that establishes that window.
   ["browser.connect", "medium"],
   ["browser.upload_file", "high"],
+  // Saves remote bytes onto the local disk (instance-scoped downloads
+  // dir). Approval-gated like upload; same risk bucket.
+  ["browser.download", "high"],
   // Routes user-typed secrets directly into a DOM field on the
   // agent's page. High risk because the approval card is the user's
   // last chance to refuse before a credential leaves their keyboard.

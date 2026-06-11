@@ -11,8 +11,13 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  clearEchoAuxTextResponses,
   clearEchoToolCallingResponses,
+  getEchoAuxTextRequests,
   getEchoToolCallingCalls,
+  setEchoAuxTextFailure,
+  setEchoAuxTextResponse,
+  setEchoToolCallingFailure,
   setEchoToolCallingResponse,
   normalizeProvider,
   type ToolCallingMessage
@@ -45,8 +50,13 @@ import {
   buildInactiveSkillsBlock,
   buildMcpServersBlock,
   buildSkillScriptsBlock,
+  compactionMiddleSpan,
   elideOldToolResultsToBudget,
-  nextNavWithoutAction
+  IN_TURN_COMPACTION_NOTE_PREFIX,
+  initialNavStallState,
+  nextNavStallState,
+  promptTokensFromUsage,
+  renderMessagesForCompaction
 } from "./chat-task";
 import type { EffectiveContext } from "./effective-context";
 
@@ -66,6 +76,18 @@ function buildConfig(workspaceRoot: string, instance: string, opts: Partial<Runt
     approvalMode: "strict",
     ...opts
   };
+}
+
+// Seed an enabled skill with an arbitrary (large) body. read_skill returns
+// the body verbatim, which makes it the simplest way to drive big tool
+// results through the loop without touching the filesystem caps.
+async function seedBulkSkill(config: RuntimeConfig, name: string, body: string): Promise<void> {
+  const skill = await createSkillFromInput(config, { name, description: `Bulk ${name}` });
+  await mutateState(config.instance, (state) => {
+    const item = state.skills.find((s) => s.id === skill.id)!;
+    item.body = body;
+  });
+  await setSkillStatus(config, skill.id, "enabled");
 }
 
 async function waitForTerminal(config: RuntimeConfig, taskId: string, timeoutMs = 5000): Promise<Task> {
@@ -93,6 +115,7 @@ describe("chat-task loop", () => {
     process.env.GINI_STATE_ROOT = root;
     process.env.GINI_LOG_ROOT = `${root}-logs`;
     clearEchoToolCallingResponses();
+    clearEchoAuxTextResponses();
   });
 
   afterEach(() => {
@@ -102,6 +125,7 @@ describe("chat-task loop", () => {
     else process.env.GINI_LOG_ROOT = prevLog;
     rmSync(root, { recursive: true, force: true });
     clearEchoToolCallingResponses();
+    clearEchoAuxTextResponses();
   });
 
   test("dispatches a low-risk tool call then completes with a final answer", async () => {
@@ -951,6 +975,123 @@ describe("chat-task loop", () => {
         /repeating the same tool call\(s\) with identical arguments \(loop-breaker\)/.test(t.message)
     );
     expect(breaker).toBeDefined();
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // Navigation loop-breaker MUST NOT false-positive on legitimate sequential
+  // research. A model that navigates across many DISTINCT URLs (each blocked
+  // here by the loopback SSRF gate, so no Chromium launches) is making progress,
+  // not looping — the per-URL recent-window guard must let it run to the
+  // iteration cap rather than tripping the navigation loop-breaker. (Loopback
+  // URLs all yield the same generic block message, so distinct ports differ
+  // only in arguments — exactly the trace signature the false-positive showed:
+  // climbing nav count with identicalRunLength 1.)
+  test("does NOT trip the navigation loop-breaker on distinct-URL research", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-nav-distinct");
+    config.agent = { maxIterations: 9 };
+    const provider = normalizeProvider(config.provider);
+
+    // Nine navigations to nine DISTINCT loopback URLs. Each is SSRF-blocked
+    // pre-flight (deterministic, no browser), but the nav guard counts the
+    // call regardless of result — and since every URL is new, the count never
+    // climbs. The loop exhausts the iteration cap instead.
+    for (let i = 1; i <= 9; i++) {
+      setEchoToolCallingResponse({
+        provider,
+        text: "",
+        toolCalls: [
+          {
+            id: `call_nav_${i}`,
+            type: "function",
+            function: { name: "browser_navigate", arguments: JSON.stringify({ url: `http://127.0.0.1:${i}/` }) }
+          }
+        ],
+        finishReason: "tool_calls"
+      });
+    }
+    // Tool-less summary turn the cap-exhaustion exit consumes.
+    setEchoToolCallingResponse({
+      provider,
+      text: "I checked nine different pages but ran out of steps before finishing.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "research across pages", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id, 10000);
+
+    expect(finished.status).toBe("completed");
+    // Reached the iteration cap — NOT the loop-breaker.
+    expect(finished.currentStep).toBe("Completed (iteration cap reached: 9)");
+
+    const { readTrace } = await import("../state");
+    const traces = readTrace(config.instance, task.id);
+    // No navigation loop-breaker warning fired.
+    const navBreaker = traces.find(
+      (t) => t.type === "warning" && /navigations to recently-visited URLs.*loop-breaker/.test(t.message)
+    );
+    expect(navBreaker).toBeUndefined();
+    // The cap warning is what stopped us.
+    const capWarning = traces.find((t) => t.type === "warning" && /Iteration cap \(9\)/.test(t.message));
+    expect(capWarning).toBeDefined();
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // The navigation loop-breaker's protection MUST NOT regress: a model that
+  // oscillates between a small set of URLs (the degenerate reload/ping-pong
+  // pattern behind the original context-overflow incident) still trips it at
+  // the existing threshold. Oscillating between TWO URLs keeps the exact-match
+  // and action-only guards from firing (arguments alternate every turn), so
+  // only the navigation guard can catch it — isolating the guard under test.
+  test("STILL trips the navigation loop-breaker on oscillating-URL reload loops", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-nav-oscillate");
+    const provider = normalizeProvider(config.provider);
+
+    // Two distinct first-visits seed the recent-URL window (count stays 0),
+    // then alternating between them is a repeat every turn so the count climbs
+    // to MAX_NAVIGATION_WITHOUT_ACTION (8): 2 seed + 8 repeats = 10 navigations.
+    const urls = ["http://127.0.0.1:1/", "http://127.0.0.1:2/"];
+    for (let i = 0; i < 10; i++) {
+      setEchoToolCallingResponse({
+        provider,
+        text: "",
+        toolCalls: [
+          {
+            id: `call_osc_${i}`,
+            type: "function",
+            function: { name: "browser_navigate", arguments: JSON.stringify({ url: urls[i % 2] }) }
+          }
+        ],
+        finishReason: "tool_calls"
+      });
+    }
+    // Tool-less summary turn the loop-breaker exit consumes.
+    setEchoToolCallingResponse({
+      provider,
+      text: "I kept bouncing between the same two pages without getting anywhere.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "open these pages", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id, 10000);
+
+    expect(finished.status).toBe("completed");
+    expect(finished.currentStep).toBe("Completed (stopped: tool loop made no progress)");
+
+    const { readTrace } = await import("../state");
+    const traces = readTrace(config.instance, task.id);
+    const navBreaker = traces.find(
+      (t) => t.type === "warning" && /navigations to recently-visited URLs.*loop-breaker/.test(t.message)
+    );
+    expect(navBreaker).toBeDefined();
+    // Stopped well before the 90-cap: 10 navigation turns + 1 summary turn.
+    const calls = getEchoToolCallingCalls();
+    expect(calls.length).toBe(11);
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
@@ -3166,45 +3307,1003 @@ describe("chat-task loop", () => {
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
+
+  // Provider-reported prompt tokens drive the in-turn trim trigger. The
+  // chars/4 estimate here stays under every threshold, so without
+  // calibration no elision would ever fire. A stubbed call reporting a real
+  // prompt size near the window (29.6k of the echo provider's 32k) must
+  // tighten the NEXT iteration's budgets so the oldest unprotected tool
+  // results shrink before the following call — via pruning alone, with no
+  // summarization (aux) involvement. Toolsets are disabled to pin the tool
+  // schemas to the always-on floor (file_read still dispatches; the catalog
+  // only shapes what the provider sees).
+  test("inflated provider-reported prompt tokens engage the trim path on the next iteration", async () => {
+    const ELISION_MARKER =
+      "[Earlier tool result elided to fit the context window. Re-run the tool if you still need its output.]";
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-usage-trim");
+    const provider = normalizeProvider(config.provider);
+    await mutateState(config.instance, (state) => {
+      for (const toolset of state.toolsets) toolset.status = "disabled";
+    });
+
+    // Twelve tool-call turns reading DISTINCT files (so no loop-breaker
+    // trips), each result ~3.6k chars — elidable (>200 chars) but the total
+    // stays under every estimate-driven threshold. Only the LAST response
+    // reports usage; the resulting calibration gap forces the pre-call trim
+    // ahead of the 13th call.
+    for (let i = 0; i < 12; i++) {
+      writeFileSync(join(workspaceRoot, `chunk${i}.md`), `chunk-${i} `.repeat(450));
+      setEchoToolCallingResponse({
+        provider,
+        text: "",
+        toolCalls: [
+          { id: `call_u${i}`, type: "function", function: { name: "file_read", arguments: JSON.stringify({ path: `chunk${i}.md` }) } }
+        ],
+        finishReason: "tool_calls",
+        ...(i === 11 ? { usage: { prompt_tokens: 29_600 } } : {})
+      });
+    }
+    setEchoToolCallingResponse({
+      provider,
+      text: "Done reading.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "read all the chunks", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id, 10000);
+    expect(finished.status).toBe("completed");
+    expect(finished.summary).toBe("Done reading.");
+
+    // The 13th provider call (after the usage report) must see the oldest
+    // tool results elided — oldest-first, with the recent tail untouched —
+    // and the trim must be pure pruning (no aux summarization).
+    const calls = getEchoToolCallingCalls();
+    expect(calls.length).toBe(13);
+    const finalToolMessages = calls[12]!.filter((m) => m.role === "tool");
+    expect(finalToolMessages.length).toBe(12);
+    const markerCount = finalToolMessages.filter((m) => m.content === ELISION_MARKER).length;
+    expect(markerCount).toBeGreaterThanOrEqual(2);
+    for (let i = 0; i < finalToolMessages.length; i++) {
+      if (i < markerCount) expect(finalToolMessages[i]!.content).toBe(ELISION_MARKER);
+      else expect(finalToolMessages[i]!.content).toContain(`chunk-${i}`);
+    }
+    expect(getEchoAuxTextRequests().length).toBe(0);
+    // No call BEFORE the usage report saw any elision.
+    for (let c = 0; c < 12; c++) {
+      expect(calls[c]!.some((m) => m.content === ELISION_MARKER)).toBe(false);
+    }
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // Reactive overflow recovery: a provider that rejects the prompt as too
+  // long gets a compacted transcript on retry (bounded attempts). Two
+  // overflow failures followed by a success must complete the task with the
+  // retried call's answer — and the retried call must carry elided results.
+  test("compacts and retries when the provider reports a context overflow, then completes", async () => {
+    const ELISION_MARKER =
+      "[Earlier tool result elided to fit the context window. Re-run the tool if you still need its output.]";
+    const OVERFLOW_MESSAGE =
+      "This model's maximum context length is 32000 tokens. However, your messages resulted in 99999 tokens.";
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-overflow-retry");
+    const provider = normalizeProvider(config.provider);
+
+    // Seven mid-size tool results (distinct files so no loop-breaker trips)
+    // give the overflow compaction passes something to shrink, while the
+    // estimated total stays under every proactive threshold — the overflow
+    // is driven purely by the stubbed provider failures.
+    for (let i = 0; i < 7; i++) {
+      writeFileSync(join(workspaceRoot, `bulk${i}.md`), `bulk-${i} ${"x".repeat(4_800)}`);
+      setEchoToolCallingResponse({
+        provider,
+        text: "",
+        toolCalls: [
+          { id: `call_o${i}`, type: "function", function: { name: "file_read", arguments: JSON.stringify({ path: `bulk${i}.md` }) } }
+        ],
+        finishReason: "tool_calls"
+      });
+    }
+    // Iteration 8's model call: two overflow rejections, then success.
+    setEchoToolCallingFailure(OVERFLOW_MESSAGE);
+    setEchoToolCallingFailure(OVERFLOW_MESSAGE);
+    setEchoToolCallingResponse({
+      provider,
+      text: "Recovered after compaction.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "read all the bulk files", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id, 10000);
+    expect(finished.status).toBe("completed");
+    expect(finished.summary).toBe("Recovered after compaction.");
+    expect(finished.error).toBeUndefined();
+
+    // 7 tool turns + 2 failed attempts + 1 successful retry = 10 calls.
+    const calls = getEchoToolCallingCalls();
+    expect(calls.length).toBe(10);
+    // The successful retry saw a harder-compacted transcript than the first
+    // failed attempt (the proactive pre-call elision may already have shrunk
+    // the oldest results; the overflow passes must shrink strictly more,
+    // including into the protected-recent window on the final retry).
+    const elidedInFirstAttempt = calls[7]!.filter((m) => m.content === ELISION_MARKER).length;
+    const elidedInRetry = calls[9]!.filter((m) => m.content === ELISION_MARKER).length;
+    expect(elidedInRetry).toBeGreaterThan(elidedInFirstAttempt);
+    expect(elidedInRetry).toBeGreaterThanOrEqual(2);
+
+    // The compact-and-retry warnings landed in the trace.
+    const { readTrace } = await import("../state");
+    const traces = readTrace(config.instance, task.id);
+    const retries = traces.filter(
+      (t) => t.type === "warning" && /rejected the prompt as too long/.test(t.message)
+    );
+    expect(retries.length).toBe(2);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // The calibration gap after an overflow retry must compare the retry's
+  // reported usage against the COMPACTED payload it actually sent. Against
+  // the stale pre-elision estimate the gap would clamp toward 0 and the
+  // next iteration's budget would loosen right back into the overflow.
+  // Geometry: ten ~1.2k-token reads, then a retry whose reported usage sits
+  // between the stale and recomputed estimates — only the recomputed base
+  // yields a gap big enough to force elision before the final call.
+  test("overflow retry recalibrates the token estimate to the compacted payload", async () => {
+    const ELISION_MARKER =
+      "[Earlier tool result elided to fit the context window. Re-run the tool if you still need its output.]";
+    const OVERFLOW_MESSAGE = "prompt is too long: 33000 tokens > 32000 maximum";
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-overflow-recalibrate");
+    const provider = normalizeProvider(config.provider);
+    await mutateState(config.instance, (state) => {
+      for (const toolset of state.toolsets) toolset.status = "disabled";
+    });
+
+    for (let i = 0; i < 11; i++) {
+      await seedBulkSkill(config, `bulk-skill-${i}`, `BODY-${i} ${"x".repeat(4_800)}`);
+    }
+    for (let i = 0; i < 10; i++) {
+      setEchoToolCallingResponse({
+        provider,
+        text: "",
+        toolCalls: [
+          { id: `call_g${i}`, type: "function", function: { name: "read_skill", arguments: JSON.stringify({ name: `bulk-skill-${i}` }) } }
+        ],
+        finishReason: "tool_calls"
+      });
+    }
+    // Iteration 11: one overflow rejection, then a successful retry that
+    // reports usage and keeps working (one more read).
+    setEchoToolCallingFailure(OVERFLOW_MESSAGE);
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_g10", type: "function", function: { name: "read_skill", arguments: JSON.stringify({ name: "bulk-skill-10" }) } }
+      ],
+      finishReason: "tool_calls",
+      usage: { prompt_tokens: 26_000 }
+    });
+    setEchoToolCallingResponse({
+      provider,
+      text: "Recalibrated.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "read all the bulk skills", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id, 10000);
+    expect(finished.status).toBe("completed");
+    expect(finished.summary).toBe("Recalibrated.");
+
+    // The final call must see MORE elision than the retry left behind —
+    // driven purely by the recalibrated gap (no overflow fired after the
+    // retry).
+    const calls = getEchoToolCallingCalls();
+    expect(calls.length).toBe(13);
+    const markersInRetry = calls[11]!.filter((m) => m.content === ELISION_MARKER).length;
+    const markersInFinal = calls[12]!.filter((m) => m.content === ELISION_MARKER).length;
+    expect(markersInFinal).toBeGreaterThan(markersInRetry);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // Overflow that persists through every retry must exit gracefully with a
+  // partial result — completed, not failed — without making the tool-less
+  // summary call (which would itself overflow).
+  test("persistent context overflow exits gracefully with a partial result", async () => {
+    const OVERFLOW_MESSAGE = "prompt is too long: 250000 tokens > 200000 maximum";
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-overflow-exhaust");
+    const provider = normalizeProvider(config.provider);
+
+    // Two small tool turns first so the partial exit has prior work behind it.
+    for (let i = 0; i < 2; i++) {
+      writeFileSync(join(workspaceRoot, `note${i}.md`), `note-${i} content`);
+      setEchoToolCallingResponse({
+        provider,
+        text: "",
+        toolCalls: [
+          { id: `call_x${i}`, type: "function", function: { name: "file_read", arguments: JSON.stringify({ path: `note${i}.md` }) } }
+        ],
+        finishReason: "tool_calls"
+      });
+    }
+    // Every attempt of iteration 3's model call overflows (3 total attempts).
+    setEchoToolCallingFailure(OVERFLOW_MESSAGE);
+    setEchoToolCallingFailure(OVERFLOW_MESSAGE);
+    setEchoToolCallingFailure(OVERFLOW_MESSAGE);
+
+    const task = await submitTask(config, "read the notes", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id, 10000);
+
+    expect(finished.status).toBe("completed");
+    expect(finished.currentStep).toBe("Completed (stopped: context window exhausted)");
+    expect(finished.summary).toContain("This is a partial result.");
+    expect(finished.error).toBeUndefined();
+
+    // 2 tool turns + 3 failed attempts, and no summary call after exhaustion.
+    expect(getEchoToolCallingCalls().length).toBe(5);
+
+    const { readTrace } = await import("../state");
+    const traces = readTrace(config.instance, task.id);
+    expect(
+      traces.some((t) => t.type === "warning" && /overflow persisted after 3 attempts/.test(t.message))
+    ).toBe(true);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // A provider can stream text before EVERY overflow failure. When the
+  // attempts exhaust, the exit must settle the failed attempt's in-flight
+  // assistant block (streaming:false) and drain queued flushes so the
+  // discarded partial text can't land on the completed task.
+  test("overflow exhaustion settles the failed attempt's stream", async () => {
+    const OVERFLOW_MESSAGE = "prompt is too long: 250000 tokens > 200000 maximum";
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-overflow-stream-exhaust");
+    const session = await mutateState(config.instance, (state) =>
+      createChatSession(state, "stream-exhaust")
+    );
+    const { submitChatMessage } = await import("./chat");
+
+    // Every attempt streams partial text before throwing the overflow.
+    setEchoToolCallingFailure(OVERFLOW_MESSAGE, { streamTextBeforeFailure: "DISCARDED-PARTIAL " });
+    setEchoToolCallingFailure(OVERFLOW_MESSAGE, { streamTextBeforeFailure: "DISCARDED-PARTIAL " });
+    setEchoToolCallingFailure(OVERFLOW_MESSAGE, { streamTextBeforeFailure: "DISCARDED-PARTIAL " });
+
+    const submitted = await submitChatMessage(config, session.id, { content: "go" });
+    const finished = await waitForTerminal(config, submitted.taskId, 10000);
+
+    expect(finished.status).toBe("completed");
+    expect(finished.summary).toContain("This is a partial result.");
+    // The discarded stream never resurrects into the partial summary.
+    expect(finished.partialSummary ?? "").toBe("");
+
+    // No block on the completed task is left streaming.
+    const { listChatBlocks } = await import("../state");
+    const blocks = listChatBlocks(config.instance, session.id);
+    const streamingBlocks = blocks.filter((b) => b.kind === "assistant_text" && b.streaming);
+    expect(streamingBlocks.length).toBe(0);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // The partial-result exit surfaces only THIS turn's narration. The packed
+  // prior context inside workingMessages carries earlier turns' assistant
+  // answers, so a transcript re-scan would resurrect one of those as this
+  // turn's partial result; and the explanatory note must reach the chat
+  // exactly once (as a system note), never duplicated into an
+  // assistant_text block.
+  test("partial exit never resurrects a prior turn's answer and emits the note once", async () => {
+    const OVERFLOW_MESSAGE = "prompt is too long: 250000 tokens > 200000 maximum";
+    const PARTIAL_NOTE =
+      "Stopped early: the conversation no longer fits the model's context window even after compaction. This is a partial result.";
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-partial-prior-turn");
+    const provider = normalizeProvider(config.provider);
+    const session = await mutateState(config.instance, (state) =>
+      createChatSession(state, "partial-exit")
+    );
+    const { submitChatMessage } = await import("./chat");
+
+    // Turn 1 completes normally with a distinctive answer.
+    setEchoToolCallingResponse({ provider, text: "PRIOR-TURN-ANSWER", toolCalls: [], finishReason: "stop" });
+    const first = await submitChatMessage(config, session.id, { content: "first question" });
+    const firstDone = await waitForTerminal(config, first.taskId, 10000);
+    expect(firstDone.summary).toBe("PRIOR-TURN-ANSWER");
+
+    // Turn 2: a narration-less tool turn, then persistent overflow.
+    writeFileSync(join(workspaceRoot, "note.md"), "note content");
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_p1", type: "function", function: { name: "file_read", arguments: JSON.stringify({ path: "note.md" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    setEchoToolCallingFailure(OVERFLOW_MESSAGE);
+    setEchoToolCallingFailure(OVERFLOW_MESSAGE);
+    setEchoToolCallingFailure(OVERFLOW_MESSAGE);
+    const second = await submitChatMessage(config, session.id, { content: "second question" });
+    const finished = await waitForTerminal(config, second.taskId, 10000);
+
+    expect(finished.status).toBe("completed");
+    // Note-only: no narration happened this turn — the prior turn's answer
+    // must not be presented as this turn's partial result.
+    expect(finished.summary).toBe(PARTIAL_NOTE);
+
+    // The note reaches the chat exactly once, as a system note.
+    const { listChatBlocks } = await import("../state");
+    const blocks = listChatBlocks(config.instance, session.id);
+    const noteBlocks = blocks.filter((b) => JSON.stringify(b).includes("Stopped early"));
+    expect(noteBlocks.length).toBe(1);
+    expect(noteBlocks[0]!.kind).toBe("system_note");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // When the turn DID narrate before exhausting the window, the partial
+  // exit surfaces that narration (cleaned) with the note appended.
+  test("partial exit surfaces the current turn's narration with the note appended", async () => {
+    const OVERFLOW_MESSAGE = "prompt is too long: 250000 tokens > 200000 maximum";
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-partial-narration");
+    const provider = normalizeProvider(config.provider);
+
+    writeFileSync(join(workspaceRoot, "note.md"), "note content");
+    setEchoToolCallingResponse({
+      provider,
+      text: "STEP-NARRATION before reading.",
+      toolCalls: [
+        { id: "call_n1", type: "function", function: { name: "file_read", arguments: JSON.stringify({ path: "note.md" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    setEchoToolCallingFailure(OVERFLOW_MESSAGE);
+    setEchoToolCallingFailure(OVERFLOW_MESSAGE);
+    setEchoToolCallingFailure(OVERFLOW_MESSAGE);
+
+    const task = await submitTask(config, "read the note", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id, 10000);
+
+    expect(finished.status).toBe("completed");
+    expect(finished.summary).toBe(
+      "STEP-NARRATION before reading.\n\n" +
+      "Stopped early: the conversation no longer fits the model's context window even after compaction. This is a partial result."
+    );
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // Narration from a NON-streaming provider never opens an assistant_text
+  // block (the tool-call path only finalizes a streamed one), so the partial
+  // exit must emit it one-shot — otherwise task.summary carries narration
+  // the chat timeline never shows.
+  test("partial exit emits non-streaming narration as a block alongside the note", async () => {
+    const OVERFLOW_MESSAGE = "prompt is too long: 250000 tokens > 200000 maximum";
+    const PARTIAL_NOTE =
+      "Stopped early: the conversation no longer fits the model's context window even after compaction. This is a partial result.";
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-partial-nonstream");
+    const provider = normalizeProvider(config.provider);
+    const session = await mutateState(config.instance, (state) =>
+      createChatSession(state, "partial-nonstream")
+    );
+    const { submitChatMessage } = await import("./chat");
+
+    writeFileSync(join(workspaceRoot, "note.md"), "note content");
+    // Whole-string response (no deltas) narrating before a tool call, then
+    // persistent overflow.
+    setEchoToolCallingResponse(
+      {
+        provider,
+        text: "ONE-SHOT NARRATION before reading.",
+        toolCalls: [
+          { id: "call_ns1", type: "function", function: { name: "file_read", arguments: JSON.stringify({ path: "note.md" }) } }
+        ],
+        finishReason: "tool_calls"
+      },
+      undefined,
+      { nonStreaming: true }
+    );
+    setEchoToolCallingFailure(OVERFLOW_MESSAGE);
+    setEchoToolCallingFailure(OVERFLOW_MESSAGE);
+    setEchoToolCallingFailure(OVERFLOW_MESSAGE);
+
+    const submitted = await submitChatMessage(config, session.id, { content: "read the note" });
+    const finished = await waitForTerminal(config, submitted.taskId, 10000);
+
+    expect(finished.status).toBe("completed");
+    expect(finished.summary).toBe(`ONE-SHOT NARRATION before reading.\n\n${PARTIAL_NOTE}`);
+
+    // The narration reaches the timeline as a settled block; the note stays
+    // a system note (never folded into the block).
+    const { listChatBlocks } = await import("../state");
+    const blocks = listChatBlocks(config.instance, session.id);
+    const narrationBlocks = blocks.filter(
+      (b) => b.kind === "assistant_text" && b.text === "ONE-SHOT NARRATION before reading."
+    );
+    expect(narrationBlocks.length).toBe(1);
+    expect(narrationBlocks[0]!.kind === "assistant_text" && narrationBlocks[0]!.streaming).toBe(false);
+    const noteBlocks = blocks.filter((b) => JSON.stringify(b).includes("Stopped early"));
+    expect(noteBlocks.length).toBe(1);
+    expect(noteBlocks[0]!.kind).toBe("system_note");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // A provider can stream part of a response BEFORE throwing the overflow.
+  // The retry must start from a clean stream: without a per-attempt reset
+  // the failed attempt's text accretes onto the retry's in the route buffer
+  // and the in-flight assistant block.
+  test("a stream that fails with overflow does not leak its partial text into the retry", async () => {
+    const OVERFLOW_MESSAGE = "Error code 400: context_length_exceeded";
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-overflow-stream-reset");
+    const provider = normalizeProvider(config.provider);
+    const session = await mutateState(config.instance, (state) =>
+      createChatSession(state, "stream-reset")
+    );
+    const { submitChatMessage } = await import("./chat");
+
+    writeFileSync(join(workspaceRoot, "note.md"), "note content");
+    // Attempt 1 streams partial text, then fails with overflow. The retry
+    // narrates cleanly and calls a tool (so its narration settles as a
+    // block); the final iteration completes the task.
+    setEchoToolCallingFailure(OVERFLOW_MESSAGE, { streamTextBeforeFailure: "LEAKED-PARTIAL " });
+    setEchoToolCallingResponse({
+      provider,
+      text: "Clean narration.",
+      toolCalls: [
+        { id: "call_s1", type: "function", function: { name: "file_read", arguments: JSON.stringify({ path: "note.md" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    setEchoToolCallingResponse({ provider, text: "Done.", toolCalls: [], finishReason: "stop" });
+
+    const submitted = await submitChatMessage(config, session.id, { content: "read the note" });
+    const finished = await waitForTerminal(config, submitted.taskId, 10000);
+
+    expect(finished.status).toBe("completed");
+    expect(finished.summary).toBe("Done.");
+
+    // No settled block carries the failed attempt's partial stream.
+    const { listChatBlocks } = await import("../state");
+    const blocks = listChatBlocks(config.instance, session.id);
+    const assistantTexts = blocks.filter((b): b is typeof blocks[0] & { kind: "assistant_text" } =>
+      b.kind === "assistant_text"
+    );
+    expect(assistantTexts.length).toBeGreaterThan(0);
+    for (const block of assistantTexts) {
+      expect(block.text).not.toContain("LEAKED-PARTIAL");
+    }
+    expect(assistantTexts.some((b) => b.text === "Clean narration.")).toBe(true);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // In-turn compaction happy path. Token geometry under the echo provider
+  // (32k window, high-water 27,200): the always-on tool schemas + system
+  // prompt occupy ~13.8k tokens, so six ~2.4k-token read_skill results cross
+  // the high-water mark before the 7th call — and pruning can't help (all
+  // six results sit inside the elision layer's protected-recent window). The
+  // loop must summarize the middle exchanges via ONE aux call, splice in the
+  // marked summary message, protect the head and the recent tail, and keep
+  // going to completion. Toolsets are disabled to pin the schema to the
+  // always-on floor — read_skill is always-on, so the calls still dispatch.
+  test("in-turn compaction summarizes the middle, protects head and tail, and continues", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-compaction");
+    const provider = normalizeProvider(config.provider);
+    await mutateState(config.instance, (state) => {
+      for (const toolset of state.toolsets) toolset.status = "disabled";
+    });
+
+    for (let i = 0; i < 7; i++) {
+      await seedBulkSkill(config, `bulk-skill-${i}`, `BODY-${i} ${"x".repeat(9_600)}`);
+      setEchoToolCallingResponse({
+        provider,
+        text: "",
+        toolCalls: [
+          { id: `call_s${i}`, type: "function", function: { name: "read_skill", arguments: JSON.stringify({ name: `bulk-skill-${i}` }) } }
+        ],
+        finishReason: "tool_calls"
+      });
+    }
+    setEchoAuxTextResponse({ text: "SUMMARY-OF-MIDDLE" });
+    setEchoToolCallingResponse({
+      provider,
+      text: "All skills reviewed.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "review every bulk skill", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id, 10000);
+    expect(finished.status).toBe("completed");
+    expect(finished.summary).toBe("All skills reviewed.");
+
+    // Exactly one aux summarization call, fed ONLY the middle exchanges —
+    // at compaction time (before the 7th call) six exchanges exist: BODY-0
+    // is the protected head exchange, BODY-4/BODY-5 the protected tail, so
+    // the middle is BODY-1..BODY-3. BODY-6 is read after the compaction.
+    const auxRequests = getEchoAuxTextRequests();
+    expect(auxRequests.length).toBe(1);
+    for (const middle of ["BODY-1", "BODY-2", "BODY-3"]) {
+      expect(auxRequests[0]!.user).toContain(middle);
+    }
+    for (const protectedBody of ["BODY-0", "BODY-4", "BODY-5", "BODY-6"]) {
+      expect(auxRequests[0]!.user).not.toContain(protectedBody);
+    }
+
+    // The final call carries the marked synthetic summary…
+    const calls = getEchoToolCallingCalls();
+    expect(calls.length).toBe(8);
+    const finalCall = calls[7]!;
+    const summaryMessage = finalCall.find(
+      (m) =>
+        m.role === "user" &&
+        typeof m.content === "string" &&
+        m.content.startsWith(IN_TURN_COMPACTION_NOTE_PREFIX)
+    );
+    expect(summaryMessage).toBeDefined();
+    expect(String(summaryMessage!.content)).toContain("SUMMARY-OF-MIDDLE");
+    // …the middle tool results are gone…
+    const toolContents = finalCall.filter((m) => m.role === "tool").map((m) => String(m.content));
+    for (const middle of ["BODY-1", "BODY-2", "BODY-3"]) {
+      expect(toolContents.some((c) => c.includes(middle))).toBe(false);
+    }
+    // …the recent tail (and the post-compaction read) stay verbatim…
+    expect(toolContents.some((c) => c.includes("BODY-4"))).toBe(true);
+    expect(toolContents.some((c) => c.includes("BODY-5"))).toBe(true);
+    expect(toolContents.some((c) => c.includes("BODY-6"))).toBe(true);
+    // …and the head is intact: system prompt, the original ask, and the
+    // first in-turn exchange.
+    expect(finalCall[0]!.role).toBe("system");
+    expect(
+      finalCall.some((m) => m.role === "user" && String(m.content).includes("review every bulk skill"))
+    ).toBe(true);
+    expect(
+      finalCall.some((m) => m.role === "assistant" && (m.tool_calls ?? []).some((c) => c.id === "call_s0"))
+    ).toBe(true);
+    expect(toolContents.some((c) => c.includes("BODY-0"))).toBe(true);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // Anti-thrash: when the only summarizable middle is tiny while the
+  // protected head/tail carries the bulk, compaction reclaims almost
+  // nothing — the loop must bail to the graceful partial exit instead of
+  // grinding through pointless aux calls.
+  test("in-turn compaction bails gracefully when the savings are too small", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-compaction-savings");
+    const provider = normalizeProvider(config.provider);
+    await mutateState(config.instance, (state) => {
+      for (const toolset of state.toolsets) toolset.status = "disabled";
+    });
+
+    // Exchange sizes: big, tiny, big, big. The middle span (everything
+    // between the protected first exchange and the protected last two) is
+    // ONLY the tiny exchange, so the summary cannot reclaim anything.
+    const bodies = [`BODY-0 ${"x".repeat(19_000)}`, "tiny note", `BODY-2 ${"x".repeat(19_000)}`, `BODY-3 ${"x".repeat(19_000)}`];
+    for (let i = 0; i < bodies.length; i++) {
+      await seedBulkSkill(config, `bulk-skill-${i}`, bodies[i]!);
+      setEchoToolCallingResponse({
+        provider,
+        text: "",
+        toolCalls: [
+          { id: `call_v${i}`, type: "function", function: { name: "read_skill", arguments: JSON.stringify({ name: `bulk-skill-${i}` }) } }
+        ],
+        finishReason: "tool_calls"
+      });
+    }
+    setEchoAuxTextResponse({ text: "TINY-SUMMARY" });
+
+    const task = await submitTask(config, "review the bulk skills", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id, 10000);
+
+    expect(finished.status).toBe("completed");
+    expect(finished.currentStep).toBe("Completed (stopped: context window exhausted)");
+    expect(finished.summary).toContain("could not reclaim enough");
+    // One compaction was attempted (the tiny middle), then the bail fired —
+    // no further model calls.
+    expect(getEchoAuxTextRequests().length).toBe(1);
+    expect(getEchoToolCallingCalls().length).toBe(4);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // The savings bail only applies while the projection is still ABOVE the
+  // high-water mark. A compaction that reclaims little in absolute terms
+  // but gets the next call back under the mark is a success — the turn
+  // must proceed, not exit one call short of finishing.
+  test("in-turn compaction proceeds when small savings still get under the high-water mark", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-compaction-small-win");
+    const provider = normalizeProvider(config.provider);
+    await mutateState(config.instance, (state) => {
+      for (const toolset of state.toolsets) toolset.status = "disabled";
+    });
+
+    // Geometry: the projection crosses the high-water mark (27,200 tokens
+    // under the echo provider's 32k window) by a hair, with a small middle
+    // span — so the compaction reclaims under 10% of the projection (the
+    // savings-bail threshold) but enough to dip back under the mark.
+    // Exchange 0 is the protected head, exchanges 1–2 the summarizable
+    // middle, exchanges 3–4 the protected tail.
+    const bodies = [
+      `BODY-0 ${"x".repeat(9_600)}`,
+      `BODY-1 ${"x".repeat(4_000)}`,
+      `BODY-2 ${"x".repeat(4_000)}`,
+      `BODY-3 ${"x".repeat(19_000)}`,
+      `BODY-4 ${"x".repeat(19_000)}`
+    ];
+    for (let i = 0; i < bodies.length; i++) {
+      await seedBulkSkill(config, `bulk-skill-${i}`, bodies[i]!);
+      setEchoToolCallingResponse({
+        provider,
+        text: "",
+        toolCalls: [
+          { id: `call_w${i}`, type: "function", function: { name: "read_skill", arguments: JSON.stringify({ name: `bulk-skill-${i}` }) } }
+        ],
+        finishReason: "tool_calls"
+      });
+    }
+    setEchoAuxTextResponse({ text: "MIDDLE-SUMMARY" });
+    setEchoToolCallingResponse({
+      provider,
+      text: "Finished within budget.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "review the bulk skills", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id, 10000);
+
+    expect(finished.status).toBe("completed");
+    expect(finished.summary).toBe("Finished within budget.");
+    // One compaction, then the loop proceeded to the final call.
+    expect(getEchoAuxTextRequests().length).toBe(1);
+    expect(getEchoToolCallingCalls().length).toBe(6);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // Anti-thrash: a compaction whose reclaimed space refills within two
+  // iterations (the model keeps pulling huge results) must stop and exit
+  // with a partial result rather than compact again.
+  test("in-turn compaction bails gracefully when the window refills immediately", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-compaction-refill");
+    const provider = normalizeProvider(config.provider);
+    await mutateState(config.instance, (state) => {
+      for (const toolset of state.toolsets) toolset.status = "disabled";
+    });
+
+    // Same geometry as the happy path (compaction fires before call 7) plus
+    // a 7th huge read that immediately refills the reclaimed space.
+    for (let i = 0; i < 7; i++) {
+      const chars = i === 6 ? 36_000 : 9_600;
+      await seedBulkSkill(config, `bulk-skill-${i}`, `BODY-${i} ${"x".repeat(chars)}`);
+      setEchoToolCallingResponse({
+        provider,
+        text: "",
+        toolCalls: [
+          { id: `call_r${i}`, type: "function", function: { name: "read_skill", arguments: JSON.stringify({ name: `bulk-skill-${i}` }) } }
+        ],
+        finishReason: "tool_calls"
+      });
+    }
+    setEchoAuxTextResponse({ text: "REFILL-SUMMARY" });
+
+    const task = await submitTask(config, "review every bulk skill", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id, 10000);
+
+    expect(finished.status).toBe("completed");
+    expect(finished.currentStep).toBe("Completed (stopped: context window exhausted)");
+    expect(finished.summary).toContain("refilled immediately");
+    // Exactly one compaction, then the refill bail before an 8th call.
+    expect(getEchoAuxTextRequests().length).toBe(1);
+    expect(getEchoToolCallingCalls().length).toBe(7);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // The per-turn compaction cap: after two compactions (spaced widely enough
+  // that the refill guard stays quiet), a third trigger must NOT summarize
+  // again — the loop proceeds (the reactive overflow retry is the backstop)
+  // and completes normally.
+  test("in-turn compaction respects the per-turn cap and proceeds without a third summary", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-compaction-cap");
+    const provider = normalizeProvider(config.provider);
+    await mutateState(config.instance, (state) => {
+      for (const toolset of state.toolsets) toolset.status = "disabled";
+    });
+
+    const queueRead = (i: number): void => {
+      setEchoToolCallingResponse({
+        provider,
+        text: "",
+        toolCalls: [
+          { id: `call_c${i}`, type: "function", function: { name: "read_skill", arguments: JSON.stringify({ name: `bulk-skill-${i}` }) } }
+        ],
+        finishReason: "tool_calls"
+      });
+    };
+    // Twelve ~2.4k-token reads. The high-water mark trips after every sixth
+    // accumulated full result, so compactions land at iterations 7 and 10 —
+    // three iterations apart, wide enough that the refill guard stays quiet
+    // — and the third trigger at iteration 13 hits the cap.
+    for (let i = 0; i < 12; i++) {
+      await seedBulkSkill(config, `bulk-skill-${i}`, `BODY-${i} ${"x".repeat(9_600)}`);
+      queueRead(i);
+    }
+    setEchoAuxTextResponse({ text: "SUMMARY-ONE" });
+    setEchoAuxTextResponse({ text: "SUMMARY-TWO" });
+    setEchoToolCallingResponse({
+      provider,
+      text: "Finished after two compactions.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "review every bulk skill", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id, 10000);
+
+    expect(finished.status).toBe("completed");
+    expect(finished.summary).toBe("Finished after two compactions.");
+    // Exactly two aux summaries — the third trigger hit the cap and the
+    // loop proceeded to the final call instead of summarizing again.
+    expect(getEchoAuxTextRequests().length).toBe(2);
+    expect(getEchoToolCallingCalls().length).toBe(13);
+
+    const { readTrace } = await import("../state");
+    const traces = readTrace(config.instance, task.id);
+    const compactions = traces.filter(
+      (t) => t.type === "warning" && /In-turn compaction replaced/.test(t.message)
+    );
+    expect(compactions.length).toBe(2);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // No aux model → compaction is impossible. Cheap pruning already failed
+  // to bring the projection under the mark, so the loop must exit
+  // gracefully with a partial result instead of failing the task.
+  test("in-turn compaction falls back to a graceful partial exit when the aux model is unavailable", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-compaction-aux-fail");
+    const provider = normalizeProvider(config.provider);
+    await mutateState(config.instance, (state) => {
+      for (const toolset of state.toolsets) toolset.status = "disabled";
+    });
+
+    for (let i = 0; i < 7; i++) {
+      await seedBulkSkill(config, `bulk-skill-${i}`, `BODY-${i} ${"x".repeat(9_600)}`);
+      setEchoToolCallingResponse({
+        provider,
+        text: "",
+        toolCalls: [
+          { id: `call_f${i}`, type: "function", function: { name: "read_skill", arguments: JSON.stringify({ name: `bulk-skill-${i}` }) } }
+        ],
+        finishReason: "tool_calls"
+      });
+    }
+    setEchoAuxTextFailure("aux model unavailable");
+
+    const task = await submitTask(config, "review every bulk skill", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id, 10000);
+
+    expect(finished.status).toBe("completed");
+    expect(finished.currentStep).toBe("Completed (stopped: context window exhausted)");
+    expect(finished.summary).toContain("no summarization model was available");
+    expect(finished.error).toBeUndefined();
+    // The trigger fired before the 7th call, the aux call failed, and no
+    // further model call ran.
+    expect(getEchoToolCallingCalls().length).toBe(6);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // Non-overflow provider errors keep their existing contract: the task
+  // fails with the raw error, no compact-and-retry.
+  test("non-overflow provider errors still fail the task without retrying", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-provider-error");
+
+    setEchoToolCallingFailure("upstream exploded (500)");
+
+    const task = await submitTask(config, "say hi", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id, 10000);
+
+    expect(finished.status).toBe("failed");
+    expect(finished.error).toContain("upstream exploded");
+    // Exactly one provider call — no retry on a non-overflow failure.
+    expect(getEchoToolCallingCalls().length).toBe(1);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // Fallback: a provider that reports no usage (the echo default) keeps the
+  // plain chars/4 behavior — the identical transcript never trims.
+  test("without provider usage the trim path stays on the chars/4 estimate and never engages", async () => {
+    const ELISION_MARKER =
+      "[Earlier tool result elided to fit the context window. Re-run the tool if you still need its output.]";
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-no-usage-trim");
+    const provider = normalizeProvider(config.provider);
+    await mutateState(config.instance, (state) => {
+      for (const toolset of state.toolsets) toolset.status = "disabled";
+    });
+
+    for (let i = 0; i < 12; i++) {
+      writeFileSync(join(workspaceRoot, `chunk${i}.md`), `chunk-${i} `.repeat(450));
+      setEchoToolCallingResponse({
+        provider,
+        text: "",
+        toolCalls: [
+          { id: `call_n${i}`, type: "function", function: { name: "file_read", arguments: JSON.stringify({ path: `chunk${i}.md` }) } }
+        ],
+        finishReason: "tool_calls"
+      });
+    }
+    setEchoToolCallingResponse({
+      provider,
+      text: "Done reading.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "read all the chunks", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id, 10000);
+    expect(finished.status).toBe("completed");
+
+    const calls = getEchoToolCallingCalls();
+    expect(calls.length).toBe(13);
+    for (const call of calls) {
+      expect(call.some((m) => m.content === ELISION_MARKER)).toBe(false);
+    }
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
 });
 
-// Navigation-without-action counter (loop-breaker guard 3). Driving the real
+// Navigation-without-progress counter (loop-breaker guard 3). Driving the real
 // browser tool through the loop would launch Chromium — heavy and flaky in a
 // unit test — so the counter step is a pure helper tested directly. The model's
-// emitted tool names per iteration are all the input it needs.
-describe("nextNavWithoutAction", () => {
-  test("navigation tools increment, page-actions reset, neutral tools are unchanged", () => {
-    // A run of navigations climbs.
-    expect(nextNavWithoutAction(0, ["browser_navigate"])).toBe(1);
-    expect(nextNavWithoutAction(1, ["browser_navigate"])).toBe(2);
-    expect(nextNavWithoutAction(2, ["browser_back"])).toBe(3);
-    // A page-action resets to zero.
-    expect(nextNavWithoutAction(7, ["browser_click"])).toBe(0);
-    expect(nextNavWithoutAction(3, ["browser_type"])).toBe(0);
-    // Neutral tools (snapshot, scroll, time, etc.) leave the count alone.
-    expect(nextNavWithoutAction(4, ["browser_snapshot"])).toBe(4);
-    expect(nextNavWithoutAction(4, ["get_current_time"])).toBe(4);
-    expect(nextNavWithoutAction(0, [])).toBe(0);
+// emitted (tool name, navigation URL) pairs per iteration are all it needs.
+describe("nextNavStallState", () => {
+  // Convenience: thread a sequence of single-call iterations through the state
+  // and return the running count after each one.
+  function counts(steps: { name: string; url?: string }[]): number[] {
+    let state = initialNavStallState();
+    const out: number[] = [];
+    for (const s of steps) {
+      state = nextNavStallState(state, [s]);
+      out.push(state.count);
+    }
+    return out;
+  }
+
+  test("repeated navigation to the SAME url climbs; page-actions reset", () => {
+    expect(
+      counts([
+        { name: "browser_navigate", url: "https://a.com" }, // 0: first visit is progress
+        { name: "browser_navigate", url: "https://a.com" }, // 1: repeat
+        { name: "browser_navigate", url: "https://a.com" }, // 2: repeat
+        { name: "browser_click" }, // 0: page-action resets
+        { name: "browser_navigate", url: "https://a.com" } // 0: still in window but reset wins on the click line; new line is a repeat
+      ])
+    ).toEqual([0, 1, 2, 0, 1]);
+  });
+
+  test("navigating to a NEW url is progress and resets the count", () => {
+    // Reload the same page twice (climb), then move to a fresh URL (reset).
+    expect(
+      counts([
+        { name: "browser_navigate", url: "https://a.com" }, // 0
+        { name: "browser_navigate", url: "https://a.com" }, // 1
+        { name: "browser_navigate", url: "https://b.com" }, // 0: new URL
+        { name: "browser_navigate", url: "https://c.com" } // 0: new URL
+      ])
+    ).toEqual([0, 1, 0, 0]);
+  });
+
+  test("a browser_console data extraction resets the count (the research pattern)", () => {
+    // navigate -> console-extract -> navigate across DISTINCT pages never climbs:
+    // a fresh URL is already progress, and the console reset reinforces it.
+    expect(
+      counts([
+        { name: "browser_navigate", url: "https://a.com" }, // 0
+        { name: "browser_console" }, // 0: progress
+        { name: "browser_navigate", url: "https://b.com" }, // 0: new URL
+        { name: "browser_console" }, // 0
+        { name: "browser_navigate", url: "https://c.com" } // 0: new URL
+      ])
+    ).toEqual([0, 0, 0, 0, 0]);
+    // A console extraction resets even a climbing reload count (the model pulled
+    // data off the page — genuine progress), though the URL stays in the window.
+    expect(
+      counts([
+        { name: "browser_navigate", url: "https://a.com" }, // 0
+        { name: "browser_navigate", url: "https://a.com" }, // 1: repeat
+        { name: "browser_navigate", url: "https://a.com" }, // 2: repeat
+        { name: "browser_console" }, // 0: progress resets
+        { name: "browser_navigate", url: "https://a.com" } // 1: still in window, repeat again
+      ])
+    ).toEqual([0, 1, 2, 0, 1]);
+  });
+
+  test("browser_snapshot is NEUTRAL — re-snapshotting the same page does NOT reset", () => {
+    // The degenerate overflow incident: navigate then re-snapshot the same URL
+    // repeatedly. Snapshot must not reset the stall, so the reload count climbs.
+    expect(
+      counts([
+        { name: "browser_navigate", url: "https://a.com" }, // 0
+        { name: "browser_snapshot" }, // 0 (neutral, count unchanged)
+        { name: "browser_navigate", url: "https://a.com" }, // 1: repeat URL
+        { name: "browser_snapshot" }, // 1 (neutral)
+        { name: "browser_navigate", url: "https://a.com" } // 2: repeat URL
+      ])
+    ).toEqual([0, 0, 1, 1, 2]);
   });
 
   test("multiple tools in one iteration apply in order (last write wins on reset)", () => {
-    // navigate then click in the same turn nets a reset.
-    expect(nextNavWithoutAction(5, ["browser_navigate", "browser_click"])).toBe(0);
-    // click then navigate ends incremented from zero.
-    expect(nextNavWithoutAction(5, ["browser_click", "browser_navigate"])).toBe(1);
-    // two navigations in one turn climb by two.
-    expect(nextNavWithoutAction(2, ["browser_navigate", "browser_navigate"])).toBe(4);
+    // navigate (repeat) then click in the same turn nets a reset.
+    let s = nextNavStallState({ count: 4, recentUrls: ["https://a.com"] }, [
+      { name: "browser_navigate", url: "https://a.com" },
+      { name: "browser_click" }
+    ]);
+    expect(s.count).toBe(0);
+    // click then navigate-to-known ends at 1 (reset, then a repeat).
+    s = nextNavStallState({ count: 4, recentUrls: ["https://a.com"] }, [
+      { name: "browser_click" },
+      { name: "browser_navigate", url: "https://a.com" }
+    ]);
+    expect(s.count).toBe(1);
   });
 
   test("oscillation between two URLs climbs to the threshold (the case guard 2 misses)", () => {
-    // Alternating navigate targets keep the ACTION signature flipping, so the
-    // action-only guard resets every turn — but the navigation counter climbs
-    // monotonically because no page-action ever intervenes.
-    let count = 0;
+    // Alternating navigate targets keep the ACTION signature flipping so the
+    // action-only guard resets every turn — but both URLs stay in the recent
+    // window, so each navigation is a repeat and the stall climbs monotonically.
+    let state = initialNavStallState();
+    // Seed both URLs into the window first (two distinct first-visits).
+    state = nextNavStallState(state, [{ name: "browser_navigate", url: "https://a.com" }]);
+    state = nextNavStallState(state, [{ name: "browser_navigate", url: "https://b.com" }]);
     for (let i = 0; i < 8; i++) {
-      count = nextNavWithoutAction(count, ["browser_navigate"]);
+      const url = i % 2 === 0 ? "https://a.com" : "https://b.com";
+      state = nextNavStallState(state, [{ name: "browser_navigate", url }]);
     }
-    expect(count).toBe(8);
+    expect(state.count).toBeGreaterThanOrEqual(8);
+  });
+
+  test("a long run of DISTINCT urls never trips (the legitimate-research case)", () => {
+    let state = initialNavStallState();
+    for (let i = 0; i < 12; i++) {
+      state = nextNavStallState(state, [{ name: "browser_navigate", url: `https://site.com/page-${i}` }]);
+    }
+    expect(state.count).toBe(0);
+  });
+
+  test("repeated browser_back oscillation climbs (back has no url of its own)", () => {
+    let state = initialNavStallState();
+    const out: number[] = [];
+    for (let i = 0; i < 10; i++) {
+      state = nextNavStallState(state, [{ name: "browser_back" }]);
+      out.push(state.count);
+    }
+    // First back is the first visit of the back-sentinel (0), then it repeats.
+    expect(out[0]).toBe(0);
+    expect(out[8]).toBeGreaterThanOrEqual(8);
   });
 });
 
@@ -3276,6 +4375,110 @@ describe("elideOldToolResultsToBudget", () => {
     elideOldToolResultsToBudget(messages, 10);
     expect(messages[0]!.content).not.toBe(ELISION_MARKER);
     expect(messages[1]!.content).toBe("tiny");
+  });
+});
+
+// Group-aligned middle-span selection for in-turn compaction. Pure over a
+// messages array, so the pairing/protection rules are pinned directly.
+describe("compactionMiddleSpan", () => {
+  const asst = (id: string, calls = 1): ToolCallingMessage => ({
+    role: "assistant",
+    content: null,
+    tool_calls: Array.from({ length: calls }, (_, i) => ({
+      id: `${id}_${i}`,
+      type: "function" as const,
+      function: { name: "t", arguments: "{}" }
+    }))
+  });
+  const tool = (id: string): ToolCallingMessage => ({ role: "tool", tool_call_id: id, content: "r" });
+
+  test("protects the head (initial messages + first exchange) and the recent-tail exchanges", () => {
+    const messages: ToolCallingMessage[] = [
+      { role: "system", content: "s" },
+      { role: "user", content: "u" },
+      asst("a"), tool("a_0"),
+      asst("b"), tool("b_0"),
+      asst("c"), tool("c_0"),
+      asst("d"), tool("d_0"),
+      asst("e"), tool("e_0")
+    ];
+    // initialCount=2 (system+user). Head also covers exchange a; tail keeps
+    // exchanges d and e; middle = exchanges b and c (indices 4..8).
+    expect(compactionMiddleSpan(messages, 2, 2)).toEqual({ start: 4, end: 8 });
+  });
+
+  test("keeps multi-result exchanges whole (group-aligned boundaries)", () => {
+    const messages: ToolCallingMessage[] = [
+      { role: "user", content: "u" },
+      asst("a", 2), tool("a_0"), tool("a_1"),
+      asst("b", 2), tool("b_0"), tool("b_1"),
+      asst("c"), tool("c_0"),
+      asst("d"), tool("d_0")
+    ];
+    // Middle = exchange b only (indices 4..7) — both of its tool results
+    // travel with their assistant row.
+    expect(compactionMiddleSpan(messages, 1, 2)).toEqual({ start: 4, end: 7 });
+  });
+
+  test("returns undefined when everything is protected", () => {
+    const messages: ToolCallingMessage[] = [
+      { role: "user", content: "u" },
+      asst("a"), tool("a_0"),
+      asst("b"), tool("b_0"),
+      asst("c"), tool("c_0")
+    ];
+    expect(compactionMiddleSpan(messages, 1, 2)).toBeUndefined();
+    expect(compactionMiddleSpan([], 0, 2)).toBeUndefined();
+  });
+});
+
+describe("renderMessagesForCompaction", () => {
+  test("renders roles, tool-call signatures, and content", () => {
+    const rendered = renderMessagesForCompaction([
+      {
+        role: "assistant",
+        content: "checking",
+        tool_calls: [{ id: "x", type: "function", function: { name: "file_read", arguments: '{"path":"a.md"}' } }]
+      },
+      { role: "tool", tool_call_id: "x", content: "file body" }
+    ]);
+    expect(rendered).toContain('assistant -> file_read({"path":"a.md"}): checking');
+    expect(rendered).toContain("tool: file body");
+  });
+
+  test("caps oversized messages and the total input", () => {
+    const big = "z".repeat(10_000);
+    const rendered = renderMessagesForCompaction([{ role: "tool", tool_call_id: "x", content: big }]);
+    expect(rendered.length).toBeLessThan(5_000);
+    expect(rendered).toContain("[truncated]");
+
+    const many = Array.from({ length: 30 }, (_, i): ToolCallingMessage => ({
+      role: "tool",
+      tool_call_id: `t${i}`,
+      content: "y".repeat(9_000)
+    }));
+    const total = renderMessagesForCompaction(many);
+    expect(total.length).toBeLessThan(70_000);
+    expect(total).toContain("[remaining messages omitted from summary input]");
+  });
+});
+
+// Provider usage records carry the real prompt size under different keys per
+// provider family; the extractor must accept both and reject junk.
+describe("promptTokensFromUsage", () => {
+  test("reads input_tokens (anthropic/bedrock) and prompt_tokens (openai-compatible)", () => {
+    expect(promptTokensFromUsage({ input_tokens: 1234 })).toBe(1234);
+    expect(promptTokensFromUsage({ prompt_tokens: 567 })).toBe(567);
+    // input_tokens wins when both are present (normalized Converse usage).
+    expect(promptTokensFromUsage({ input_tokens: 10, prompt_tokens: 20 })).toBe(10);
+  });
+
+  test("rejects missing, non-numeric, and negative counts", () => {
+    expect(promptTokensFromUsage(undefined)).toBeUndefined();
+    expect(promptTokensFromUsage({})).toBeUndefined();
+    expect(promptTokensFromUsage({ prompt_tokens: "9" })).toBeUndefined();
+    expect(promptTokensFromUsage({ input_tokens: Number.NaN })).toBeUndefined();
+    expect(promptTokensFromUsage({ input_tokens: -5 })).toBeUndefined();
   });
 });
 

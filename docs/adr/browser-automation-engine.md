@@ -37,6 +37,33 @@ Verified in agent-browser's source; each stood alone as an improvement to `src/t
 4. **Annotated screenshots sharing the ref namespace**: numbered badges on the `browser_vision` screenshot keyed to the same `@eN` refs, so vision answers can point at elements the model can act on. Badges carry only ref ids, cover only refs the session holds, and skip secret-stamped elements.
 5. **Stable, never-reused tab handles** (`t1`, `t2`, …) instead of positional indices in `browser_tabs`.
 
+## Iframes in snapshots
+
+The snapshot walker emits a row for every iframe and inlines same-origin frame content one level deep, inside the SAME budgets (char / hidden / clickable) and the same redaction pass as main-frame content:
+
+- **Same-origin frames** (reachable via `contentDocument` from the in-page walk) contribute normal `@eN` rows nested under their `iframe "name|src"` row. Refs are stamped with the same `data-gini-ref` scheme; host-side resolution chains `page.frameLocator('[data-gini-ref="<frame stamp>"]')` → element stamp, because `page.locator` does not pierce frame boundaries. Framed refs **never self-heal** — healing re-queries the main frame's tree and could restamp a same-name bystander outside the targeted frame, so a lost in-frame stamp fails loudly.
+- **Cross-origin frames** (contentDocument throws / null) get an opaque `iframe "name|src" [cross-origin]` placeholder.
+- **Gated frames**: whether a same-origin frame's content may reach the model is decided host-side — the frame document's URL runs through the same `safetyCheck` SSRF gate and agent domain policy as navigations. A blocked frame keeps a `[blocked]` placeholder and has its content rows stripped before the snapshot text is assembled. `about:blank`/`about:srcdoc` frames have no remote origin and are allowed.
+- Hidden frames and frames nested inside an already-inlined frame are placeholder-only (one `frameLocator` hop maximum).
+
+## Downloads
+
+`browser_download` captures a page-initiated file download (Playwright's `download` event around a click on an approved `@eN` ref) and saves it under the instance-scoped downloads directory (`paths.downloadsDir` → `~/.gini/instances/<inst>/downloads/`), so downloaded artifacts live and die with the instance like uploads do. Trust contract:
+
+- **Approval-gated like `browser_upload_file`.** The dispatch routes through `resolveApprovalPolicy` as `browser.download` (gated under `strict`, auto-approved under `auto`/`yolo` per [approvalMode](approval-mode.md)), and the approved click runs in `agent.executeApprovedAction` with the same abort contract as upload: a `browser.download` / `browser.download_aborted` audit row at decision time, plus a `browser.download_late_completion` follow-up row if a detached download settles after a cancel.
+- **No ref self-healing.** The approval names the exact stamped element; a lost stamp fails loudly instead of re-resolving (same stance as upload and `browser_fill_secrets`).
+- **Size cap.** Saves above 50 MB (constant, test-injectable) are deleted and the call fails — the cap is enforced post-save because Playwright streams the download and the byte count isn't known up front.
+- **Filename safety.** The server-suggested filename is attacker-controlled: it is reduced to a safe basename (separators/traversal stripped, control chars removed) and unique-ified on collision so downloads never overwrite each other.
+- The result envelope (saved path, size, suggested filename) rides the standard `ok()`/`fail()` secret-redaction pass like every other browser tool result.
+
+## Remote session provider seam
+
+The one capability the in-process local engine cannot fake is IP reputation: datacenter-IP blocks and geo walls discriminate on where the browser's traffic originates, not on how it is driven. `src/tools/browser.ts` therefore defines a `BrowserSessionProvider` seam — each provider owns exactly one transport concern (`connect()` returns a live `SharedHandle`, `disconnect()` releases it), and the two modes that always existed (persistent local launch, CDP attach to an external Chrome) are the two registered providers.
+
+- **Integration of an actual remote/cloud provider is deferred.** No provider is shipped; the seam is the deliverable. A future remote provider registers as a third entry that provisions its cloud session, attaches over CDP/WebSocket, and returns a cdp-shaped handle (or its own `SharedHandle` variant when teardown needs extra release work, e.g. an API call ending the cloud session).
+- **The in-process trust machinery is preserved by construction.** Snapshot walking, secret redaction, SSRF/domain-policy gating, approvals, and audit all run in-process against the Playwright client *above* this seam; a provider only changes where the transport endpoint points. This is the same property that ruled out subprocess engines (the Rationale above), restated as a structural requirement on any future provider.
+- One caveat carries over to remote browsers: the SSRF gate's private-IP/loopback checks evaluate addresses from the *runtime's* perspective. A remote provider's browser has its own network locality, so the gate's threat model (protecting the host the runtime runs on) must be revisited as part of any provider integration — another reason integration is deferred rather than stubbed.
+
 ## Revisit triggers
 
 - agent-browser ships a supported programmatic SDK (library entry point with hooks for output filtering and navigation policy).
