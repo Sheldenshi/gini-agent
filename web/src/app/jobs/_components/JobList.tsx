@@ -1,5 +1,6 @@
 "use client";
 
+import { Trash2 } from "lucide-react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/PageHeader";
@@ -12,13 +13,15 @@ export function JobList({
   selected,
   actionPending,
   onSelect,
-  onAction
+  onAction,
+  onRequestDelete
 }: {
   jobs: JobRecord[];
   selected: string | null;
   actionPending: boolean;
   onSelect: (id: string) => void;
   onAction: (id: string, op: "run" | "pause" | "resume") => void;
+  onRequestDelete: (id: string) => void;
 }) {
   if (jobs.length === 0) {
     return <EmptyState title="No jobs" description="Add via `gini job add` for now." />;
@@ -63,6 +66,16 @@ export function JobList({
               ) : (
                 <Button size="sm" variant="outline" disabled={actionPending} onClick={(event) => { event.stopPropagation(); onAction(job.id, "resume"); }}>Resume</Button>
               )}
+              <Button
+                size="icon"
+                variant="ghost"
+                aria-label={`Delete ${job.name}`}
+                title="Delete job"
+                className="ml-auto size-8 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+                onClick={(event) => { event.stopPropagation(); onRequestDelete(job.id); }}
+              >
+                <Trash2 className="size-4" />
+              </Button>
             </div>
           </CardContent>
         </Card>
