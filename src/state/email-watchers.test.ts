@@ -750,6 +750,24 @@ describe("per-concern channels + fan-out routes", () => {
     expect(channel?.kind).toBe("channel");
   });
 
+  test("a targeted concern's channel is titled distinctly, and the title survives a backfill", async () => {
+    const config = buildConfig("ew-concern-title");
+    const sender = await addEmailWatcher(config, { sender: "nadia@x.com" });
+    const thread = await addEmailWatcher(config, { threadId: "thread-abc123" });
+    const senderChannel = () =>
+      readState(config.instance).chatSessions.find((s) => s.id === sender.channelId);
+    const threadChannel = () =>
+      readState(config.instance).chatSessions.find((s) => s.id === thread.channelId);
+    expect(senderChannel()?.title).toBe("Email: nadia@x.com");
+    expect(threadChannel()?.title).toBe("Email thread: thread-abc123");
+
+    // The legacy rename-heal runs in backfill and renames the SHARED session to
+    // "Email watch"; it must never clobber a per-concern channel's distinct title.
+    await backfillEmailWatcherJobs(config);
+    expect(senderChannel()?.title).toBe("Email: nadia@x.com");
+    expect(threadChannel()?.title).toBe("Email thread: thread-abc123");
+  });
+
   test("a persona watcher routes with a layered systemPrompt; toolsets pass through", async () => {
     const config = buildConfig("ew-concern-persona");
     const watcher = await addEmailWatcher(config, { sender: "quinn@x.com" });

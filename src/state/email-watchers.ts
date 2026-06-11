@@ -64,6 +64,19 @@ const EMAIL_WATCH_TITLE = "Email watch";
 // never confused with the shared/legacy session.
 const EMAIL_WATCH_TRIAGE_TITLE = "Inbox triage";
 
+// Distinct, navigable title for a targeted concern's own channel, derived
+// deterministically from the watcher identity (no network fetch): a sender watch
+// reads "Email: <sender>", a thread watch reads "Email thread: <threadId>", and a
+// raw-query watch with neither falls back to the generic EMAIL_WATCH_TITLE.
+// Identity-based orphan cleanup keys on the feature marker, not the title, so a
+// distinct per-concern title is safe; the legacy rename-heal only touches the
+// SHARED session, never a per-concern channel.
+function concernChannelTitle(opts: { sender?: string; threadId?: string }): string {
+  if (opts.sender) return `Email: ${opts.sender}`;
+  if (opts.threadId) return `Email thread: ${opts.threadId}`;
+  return EMAIL_WATCH_TITLE;
+}
+
 // The constant routeKey of the triage concern — the broad `in:inbox` watch that
 // catches mail no targeted watcher claimed. Matches the routeKey detect emits for
 // the triage watch and the JobRoute key the triage worker dispatches from.
@@ -386,7 +399,7 @@ export async function addEmailWatcher(
   // Provision this concern's OWN channel before the rebuild, so the route built
   // for it targets the dedicated channel (not the shared session). The shared
   // session stays the fallback for legacy/unmigrated watchers.
-  const channel = await createConcernChannel(config, owningAgentId);
+  const channel = await createConcernChannel(config, owningAgentId, concernChannelTitle({ sender, threadId }));
 
   const watcher = await mutateState(config.instance, (state) =>
     createEmailWatcher(state, {
@@ -418,13 +431,16 @@ export async function addEmailWatcher(
 // Create a per-concern email-watch channel for one agent: a `channel`-kind chat
 // session stamped with the email-watch feature marker so identity-based orphan
 // cleanup can sweep it once its watcher is removed. The fan-out scheduler
-// dispatches this concern's drafting worker into it.
+// dispatches this concern's drafting worker into it. The title is the navigable
+// per-concern label (see concernChannelTitle); cleanup keys on the marker, not the
+// title, so a distinct title doesn't affect the sweep.
 async function createConcernChannel(
   config: RuntimeConfig,
-  agentId: string | undefined
+  agentId: string | undefined,
+  title: string
 ): Promise<{ id: string }> {
   return mutateState(config.instance, (state) => {
-    const created = createChatSession(state, EMAIL_WATCH_TITLE, undefined, agentId, "job", "channel");
+    const created = createChatSession(state, title, undefined, agentId, "job", "channel");
     created.feature = "email-watch";
     return { id: created.id };
   });
@@ -844,7 +860,14 @@ async function migrateWatchersToPerConcernChannels(config: RuntimeConfig): Promi
     if (state.emailWatcherChannelsMigratedAt) return;
     for (const w of state.emailWatchers) {
       if (!w.enabled || w.channelId) continue;
-      const channel = createChatSession(state, EMAIL_WATCH_TITLE, undefined, w.agentId, "job", "channel");
+      const channel = createChatSession(
+        state,
+        concernChannelTitle({ sender: w.sender, threadId: w.threadId }),
+        undefined,
+        w.agentId,
+        "job",
+        "channel"
+      );
       channel.feature = "email-watch";
       w.channelId = channel.id;
       w.updatedAt = now();
