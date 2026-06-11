@@ -43,11 +43,13 @@ export async function setDefaultModel(
     ? { providerName: config.provider.name, model: config.provider.model }
     : undefined;
   // Forward only the selection pair. This endpoint is selection-only;
-  // credential/transport writes stay on POST /api/setup/provider.
+  // credential/transport writes stay on POST /api/setup/provider — so it
+  // must not act as a needs-reauth clear seam either: a model pick proves
+  // nothing about the credential.
   const result = await setSetupProvider(config, {
     provider: payload.provider,
     model: payload.model
-  });
+  }, { clearAuthFailureOnSuccess: false });
   if (!result.ok) return result;
   const agents = readState(config.instance).agents;
   const defaultAgent = DEFAULT_AGENT_IDS

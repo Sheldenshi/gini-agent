@@ -25,7 +25,9 @@ const ACTION_TO_KEYS: Record<string, string[]> = {
   job: ["jobs", "jobRuns", "improvements"],
   subagent: ["subagents"],
   chat: ["chat"],
-  provider: ["status"],
+  // `provider.auth.needs_reauth` / `provider.auth.cleared` (issue #233) must
+  // refresh the Settings catalog query, not just the status card.
+  provider: ["status", "providers"],
   mcp: [],
   messaging: ["chat"],
   notification: [],
@@ -43,7 +45,7 @@ const KIND_TO_KEYS: Record<string, string[]> = {
   connector: ["connectors"],
   mcp: [],
   messaging: ["chat"],
-  provider: ["status"],
+  provider: ["status", "providers"],
   runtime: ["status"],
   // Every pairing mutator (request/approve/reject/claim/cancel) emits a
   // content-free kind:"pairing" tick; refresh the operator's pending-requests

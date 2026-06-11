@@ -48,10 +48,12 @@
 // child's responsibility.
 
 import { writeRuntimeConfig } from "../paths";
-import { anthropicNeedsHttps, azureNeedsBaseUrl, azureNeedsHttps, hasUsableAwsCredentials, hasUsableCodexCredentials, isValidAwsRegion, normalizeProvider, providerCatalog, providerHealth } from "../provider";
+import { anthropicNeedsHttps, azureNeedsBaseUrl, azureNeedsHttps, CODEX_RETRY_REWRITE_DELAY_MS, hasUsableAwsCredentials, hasUsableCodexCredentials, isValidAwsRegion, normalizeProvider, probeCodexCredentials, providerCatalog, providerHealth } from "../provider";
+import { codexAccessTokenExpiredAt } from "../integrations/connectors/codex";
+import { clearProviderAuthFailureIfPresent } from "../state";
 import { isValidEnvVarName, removeKeyFromSecretsEnv, writeKeyToSecretsEnv } from "../state/secrets-env";
 import { requestAutostartRefresh } from "./autostart-refresh";
-import type { ProviderConfig, RuntimeConfig } from "../types";
+import type { ProviderConfig, ProviderName, RuntimeConfig } from "../types";
 
 const SUPPORTED_PROVIDERS = ["openai", "codex", "openrouter", "deepseek", "local", "anthropic", "bedrock", "azure"] as const;
 type SupportedProvider = (typeof SUPPORTED_PROVIDERS)[number];
@@ -118,7 +120,12 @@ export interface SetSetupProviderResult {
 
 export async function setSetupProvider(
   config: RuntimeConfig,
-  payload: Record<string, unknown>
+  payload: Record<string, unknown>,
+  // clearAuthFailureOnSuccess (default true): a successful write normally
+  // drops the provider's needs-reauth record (issue #233). Selection-only
+  // callers (setDefaultModel) opt out — a model pick proves nothing about
+  // the credential.
+  options?: { clearAuthFailureOnSuccess?: boolean }
 ): Promise<SetSetupProviderResult> {
   // Field name is `provider` to match the CLI (`gini provider set ...`).
   const providerName = typeof payload.provider === "string" ? payload.provider : "";
@@ -251,6 +258,21 @@ export async function setSetupProvider(
     });
     writeRuntimeConfig(config);
 
+    // A key-carrying write supersedes any persistent needs-reauth record —
+    // a rotated key is the user re-establishing the credential (issue #233).
+    // A keyless edit (the dialog leaves the key field blank to keep the saved
+    // key, so a model/baseUrl-only save reaches here) proves nothing about
+    // the credential and must NOT clear, or the amber row flips back to a
+    // stale "Connected" on the same dead key — mirrors the set_provider
+    // self-tool gate. The next provider call re-records if it still fails.
+    // Cleared BEFORE the plist-refresh SIGTERM below so the write can't be
+    // lost to the restart.
+    if (options?.clearAuthFailureOnSuccess !== false && apiKey) {
+      await clearProviderAuthFailureIfPresent(config.instance, providerName as ProviderName, {
+        reason: "provider configuration updated"
+      });
+    }
+
     // Request plist refresh via a marker file + SIGTERM. A simpler
     // approach (setImmediate → setTimeout(200ms) → detached spawn)
     // would be a heuristic — a slow client could still be mid-read
@@ -316,10 +338,32 @@ export async function setSetupProvider(
       ...(existing?.extraBody ? { extraBody: existing.extraBody } : {})
     });
     writeRuntimeConfig(config);
+    // Config write supersedes the needs-reauth record (see the env-keyed
+    // branch above for the rationale).
+    if (options?.clearAuthFailureOnSuccess !== false) {
+      await clearProviderAuthFailureIfPresent(config.instance, "bedrock", {
+        reason: "provider configuration updated"
+      });
+    }
     return { ok: true, provider: providerHealth(config), plistRefreshNeeded: false };
   }
   // providerName === "codex"
-  if (!hasUsableCodexCredentials(config.provider)) {
+  // Pin the provider across the retry: the 50ms wait is a real macrotask, so
+  // a concurrent provider switch could otherwise make the retry resolve a
+  // different auth file (apiKeyEnv) than the first attempt — the same
+  // resolved-at-entry pinning the connector probe and call attribution use.
+  const verifyProvider = config.provider;
+  let codexProbe = probeCodexCredentials(verifyProvider);
+  if (!codexProbe.ok && codexProbe.transient) {
+    // Mid-rewrite torn read of auth.json — same single-retry contract as the
+    // connector probe (readCredentialProbe) and the chat path's
+    // withCodexSessionRetry, so Verify can't falsely report "not found" to a
+    // fully-authenticated user (or an unattended set_provider flow) that
+    // raced the codex CLI's non-atomic rewrite.
+    await new Promise<void>((resolve) => setTimeout(resolve, CODEX_RETRY_REWRITE_DELAY_MS));
+    codexProbe = probeCodexCredentials(verifyProvider);
+  }
+  if (!codexProbe.ok) {
     return {
       ok: false,
       provider: providerHealth(config),
@@ -327,12 +371,48 @@ export async function setSetupProvider(
       error: "Codex credentials not found. Run `codex login` in your terminal, then retry."
     };
   }
+  // Presence is not enough to Verify: the runtime can decode the OAuth JWT's
+  // exp locally (zero network), and the connector probe already reports an
+  // expired token as unhealthy — a button named "Verify" must not bless the
+  // very credential the probe calls dead, or the amber row flips back to a
+  // stale "Connected" until the next failed turn. api_key-shaped and
+  // exp-unknown credentials stay presence-only (no exp to consult).
+  const codexExpiredAt = codexAccessTokenExpiredAt(codexProbe, Date.now());
+  if (codexExpiredAt) {
+    return {
+      ok: false,
+      provider: providerHealth(config),
+      plistRefreshNeeded: false,
+      error: `Codex access token expired at ${codexExpiredAt}. Run \`codex login\` to re-authenticate, then retry.`
+    };
+  }
   const codexCatalog = providerCatalog().find((p) => p.id === "codex");
+  const existingCodex = config.provider?.name === "codex" ? config.provider : undefined;
   const model = typeof payload.model === "string" && payload.model.length > 0
     ? payload.model
-    : (config.provider?.name === "codex" && config.provider.model ? config.provider.model : codexCatalog?.models[0] ?? "gpt-5.5");
-  config.provider = normalizeProvider({ name: "codex", model } as ProviderConfig);
+    : (existingCodex?.model ? existingCodex.model : codexCatalog?.models[0] ?? "gpt-5.5");
+  // Preserve a same-provider apiKeyEnv (a CODEX_AUTH_JSON-style path env) and
+  // baseUrl across the write: the Verify gate above probed THROUGH that
+  // resolution, so dropping it would sever the very credential source just
+  // validated — and then clear the amber record on the strength of a config
+  // that now points somewhere unprobed. Mirrors the env-keyed and bedrock
+  // branches' preservation of CLI-set fields a web save never carries.
+  config.provider = normalizeProvider({
+    name: "codex",
+    model,
+    ...(existingCodex?.apiKeyEnv ? { apiKeyEnv: existingCodex.apiKeyEnv } : {}),
+    ...(existingCodex?.baseUrl ? { baseUrl: existingCodex.baseUrl } : {})
+  } as ProviderConfig);
   writeRuntimeConfig(config);
+  // The gate above passed — credentials are present AND not provably expired
+  // (locally-decoded JWT exp) — so the user has (re-)established codex
+  // credentials; this is the setup Verify seam. Clear the needs-reauth
+  // record; the next codex call re-records if the token is still dead.
+  if (options?.clearAuthFailureOnSuccess !== false) {
+    await clearProviderAuthFailureIfPresent(config.instance, "codex", {
+      reason: "provider configuration updated"
+    });
+  }
   // Codex switching DOES require a plist refresh: the gateway's config.json
   // is the source of truth for which provider it boots with, and that's
   // already updated. But the plist still has GINI_INSTANCE etc — no env
@@ -362,10 +442,10 @@ export interface RemoveSetupProviderResult {
 // Codex itself isn't removable through the UI because ~/.codex/auth.json
 // is owned by the `codex` CLI — the user manages it via codex logout.
 // Local has no key to remove; the gate below mirrors that.
-export function removeSetupProvider(
+export async function removeSetupProvider(
   config: RuntimeConfig,
   providerName: string
-): RemoveSetupProviderResult {
+): Promise<RemoveSetupProviderResult> {
   if (providerName === "codex") {
     return {
       ok: false,
@@ -398,6 +478,12 @@ export function removeSetupProvider(
     removeKeyFromSecretsEnv(envVar);
     delete process.env[envVar];
   }
+
+  // The credential is gone — a stale needs-reauth record would otherwise
+  // survive the disconnect and resurface as soon as the provider is re-added.
+  await clearProviderAuthFailureIfPresent(config.instance, providerName as ProviderName, {
+    reason: "provider removed"
+  });
 
   let switched = false;
   if (config.provider?.name === providerName) {

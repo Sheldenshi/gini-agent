@@ -5,7 +5,7 @@ import { createHandler } from "./http";
 import { logDir, webPortPath } from "./paths";
 import { clearWebTargetCache } from "./web-target";
 import { dirname, join } from "node:path";
-import { addAudit, appendEvent, approvePairingRequest, claimPairingRequest, createPairingRequest, insertChatBlock, isPlausibleMime, mutateState, readState, readTrace, revokeDevice, sanitizeFilename, storeUpload, uploadStat } from "./state";
+import { addAudit, appendEvent, approvePairingRequest, claimPairingRequest, createPairingRequest, insertChatBlock, isPlausibleMime, mutateState, readState, readTrace, recordProviderAuthFailure, revokeDevice, sanitizeFilename, storeUpload, uploadStat } from "./state";
 import { getOrCreateAgentChat } from "./execution/chat";
 import { listAllDevices } from "./state/devices";
 import { removeMemoryDb } from "./state/memory-db";
@@ -1203,6 +1203,38 @@ describe("runtime api", () => {
     expect(chat.runIds).toContain(submitted.runId);
     expect(chat.messages.some((message: { role: string; runId?: string }) => message.role === "assistant" && message.runId === submitted.runId)).toBe(true);
     expect(runs.some((item: { id: string }) => item.id === submitted.runId)).toBe(true);
+  });
+
+  test("GET /api/providers/catalog carries the persistent per-provider auth status", async () => {
+    const config = testConfig("providers-catalog-auth");
+    const handler = createHandler(config);
+
+    // No failure records: every row reads ok with no reauth payload.
+    const clean = await call(handler, config, "/api/providers/catalog");
+    expect(clean.every((row: { authStatus?: string; reauth?: unknown }) => row.authStatus === "ok" && row.reauth === undefined)).toBe(true);
+
+    // Record a codex auth failure (what failTask persists on a
+    // ProviderAuthError, issue #233) and re-read the catalog.
+    await mutateState(config.instance, (state) => {
+      recordProviderAuthFailure(state, {
+        provider: "codex",
+        detail: "Provided authentication token is expired.",
+        taskId: "task_catalog"
+      });
+    });
+    const flagged = await call(handler, config, "/api/providers/catalog");
+    const codex = flagged.find((row: { name: string }) => row.name === "codex");
+    expect(codex.authStatus).toBe("needs_reauth");
+    expect(codex.reauth).toMatchObject({
+      detail: "Provided authentication token is expired.",
+      reauthKind: "docs",
+      reauthUrl: "https://gini.lilaclabs.ai/docs/providers/codex#re-authentication"
+    });
+    expect(typeof codex.reauth.at).toBe("string");
+    // Unaffected rows stay ok.
+    const openai = flagged.find((row: { name: string }) => row.name === "openai");
+    expect(openai.authStatus).toBe("ok");
+    expect(openai.reauth).toBeUndefined();
   });
 
   test("connector CRUD round-trips through /api/connectors without persisting plaintext secrets", async () => {

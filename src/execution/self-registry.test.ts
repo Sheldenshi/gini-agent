@@ -11,10 +11,10 @@
 // {name, args} envelope) — that is the contract this file pins.
 
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createChatSession, createTask, mutateState, readState, upsertTask } from "../state";
+import { createChatSession, createTask, mutateState, readState, recordProviderAuthFailure, upsertTask } from "../state";
 import type { RuntimeConfig } from "../types";
 import { dispatchToolCall } from "./tool-dispatch";
 import { findSelfOperation, SELF_OPERATIONS } from "./self-registry";
@@ -255,6 +255,39 @@ describe("direct self tools — query", () => {
       else process.env.ANTHROPIC_API_KEY = prevCanonical;
     }
   });
+
+  test("list_providers carries authStatus and reauth so the agent sees needs-reauth state", async () => {
+    // The agent participates in the needs-reauth clear lifecycle via
+    // set_provider, so list_providers must expose the same authStatus/reauth
+    // enrichment the HTTP catalog carries — `configured: true` alone is the
+    // misleading presence-only signal issue #233 eliminates.
+    const instance = `self-providers-reauth-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    await mutateState(config.instance, (state) => {
+      recordProviderAuthFailure(state, { provider: "openai", detail: "token expired", taskId: "task_seed" });
+    });
+    const taskId = await newTask(config);
+    const result = await dispatchToolCall(config, taskId, "list_providers", "call_1", "{}");
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      const parsed = JSON.parse(result.result) as {
+        ok: boolean;
+        providers: Array<{
+          name: string;
+          authStatus?: string;
+          reauth?: { detail: string; reauthKind: string; reauthUrl: string };
+        }>;
+      };
+      expect(parsed.ok).toBe(true);
+      const openai = parsed.providers.find((p) => p.name === "openai");
+      expect(openai?.authStatus).toBe("needs_reauth");
+      expect(openai?.reauth?.detail).toBe("token expired");
+      expect(openai?.reauth?.reauthKind).toBe("settings");
+      const echo = parsed.providers.find((p) => p.name === "echo");
+      expect(echo?.authStatus).toBe("ok");
+      expect(echo?.reauth).toBeUndefined();
+    }
+  });
 });
 
 describe("direct self tools — mutate", () => {
@@ -446,6 +479,82 @@ describe("direct self tools — mutate", () => {
     } finally {
       if (prevKey === undefined) delete process.env.AZURE_OPENAI_API_KEY;
       else process.env.AZURE_OPENAI_API_KEY = prevKey;
+    }
+  });
+
+  test("a model-only set_provider patch does not clear the provider's needs-reauth record", async () => {
+    const instance = `self-setprov-keyless-keep-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance, "auto");
+    const taskId = await newTask(config);
+    const prevKey = process.env.OPENAI_API_KEY;
+    // The dead key sits in process.env, so the keyless patch passes
+    // setSetupProvider's env-already-set gate without touching the credential.
+    process.env.OPENAI_API_KEY = "sk-dead";
+    try {
+      await mutateState(config.instance, (state) => {
+        recordProviderAuthFailure(state, { provider: "openai", detail: "token expired", taskId: "task_seed" });
+      });
+      const result = await dispatchToolCall(
+        config,
+        taskId,
+        "set_provider",
+        "call_1",
+        JSON.stringify({ provider: "openai", model: "gpt-5.4-mini" })
+      );
+      expect(result.kind).toBe("sync");
+      // "Switch to <model>" proves nothing about the credential: the record
+      // (and the amber Settings row it drives) must survive, and no clear may
+      // be audited — otherwise the row flips back to a stale "Connected".
+      const state = readState(config.instance);
+      expect(state.providerAuthFailures?.openai).toBeDefined();
+      expect(state.audit.some((a) => a.action === "provider.auth.cleared" && a.target === "openai")).toBe(false);
+    } finally {
+      if (prevKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = prevKey;
+    }
+  });
+
+  test("a set_provider write carrying an apiKey clears the provider's needs-reauth record", async () => {
+    const instance = `self-setprov-key-clears-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance, "auto");
+    const taskId = await newTask(config);
+    const prevKey = process.env.OPENAI_API_KEY;
+    const prevHome = process.env.HOME;
+    const prevSkipRefresh = process.env.GINI_SKIP_PLIST_REFRESH;
+    // The supplied apiKey routes through writeKeyToSecretsEnv, which resolves
+    // ~/.gini/secrets.env via process.env.HOME — point HOME at a scratch dir
+    // so the write never touches the real file, and skip the plist refresh so
+    // the key-carrying path can't signal the developer's running gateway.
+    const home = join(ROOT, `home-${instance}`);
+    mkdirSync(home, { recursive: true });
+    process.env.HOME = home;
+    process.env.GINI_SKIP_PLIST_REFRESH = "1";
+    try {
+      await mutateState(config.instance, (state) => {
+        recordProviderAuthFailure(state, { provider: "openai", detail: "token expired", taskId: "task_seed" });
+      });
+      const result = await dispatchToolCall(
+        config,
+        taskId,
+        "set_provider",
+        "call_1",
+        JSON.stringify({ provider: "openai", model: "gpt-5.4-mini", apiKey: "sk-rotated" })
+      );
+      expect(result.kind).toBe("sync");
+      // The env-keyed write landed in the sandboxed home, not the real one.
+      expect(readFileSync(join(home, ".gini", "secrets.env"), "utf8")).toContain("sk-rotated");
+      // A supplied key is a credential re-establishment — the documented
+      // clear seam — so the record drops and the clear is audited.
+      const state = readState(config.instance);
+      expect(state.providerAuthFailures?.openai).toBeUndefined();
+      expect(state.audit.some((a) => a.action === "provider.auth.cleared" && a.target === "openai")).toBe(true);
+    } finally {
+      if (prevKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = prevKey;
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+      if (prevSkipRefresh === undefined) delete process.env.GINI_SKIP_PLIST_REFRESH;
+      else process.env.GINI_SKIP_PLIST_REFRESH = prevSkipRefresh;
     }
   });
 

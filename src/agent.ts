@@ -34,6 +34,7 @@ import {
   mutateState,
   now,
   readState,
+  recordProviderAuthFailure,
   upsertTask
 } from "./state";
 import type { AgentContext } from "./state/audit";
@@ -811,6 +812,17 @@ export async function failTask(config: RuntimeConfig, taskId: string, error: unk
   // providers echo a partial key in the error text.
   const message = authProvider ? redactSecrets(rawMessage) : rawMessage;
   const task = await mutateState(config.instance, (state) => {
+    // Persist the needs-reauth record BEFORE the task lookup and terminal
+    // guard below: credential state is independent of task lifecycle, and a
+    // concurrent cancel (user Stop racing a just-rejected 401) or sibling
+    // approval denial that flipped the task terminal first must not drop the
+    // record — Settings would keep saying "Connected" against a dead
+    // credential (issue #233). recordProviderAuthFailure carries its own
+    // ok→needs_reauth transition dedup, so this cannot double-audit.
+    // `message` is already redacted above.
+    if (authProvider) {
+      recordProviderAuthFailure(state, { provider: authProvider, detail: message, taskId });
+    }
     // The two `runTask(...).catch(failTask(...))` fire-and-forget call
     // sites in createTask/retryTask can race with test cleanup or a
     // parent-task cancelation that removes the task row before this
@@ -832,7 +844,9 @@ export async function failTask(config: RuntimeConfig, taskId: string, error: unk
     // Record the failed provider so syncChatTaskResult can render the same
     // actionable, provider-named message for legacy/text-only clients that the
     // chat system note shows the web (issue #205).
-    if (authProvider) task.authErrorProvider = authProvider;
+    if (authProvider) {
+      task.authErrorProvider = authProvider;
+    }
     task.currentStep = "Failed";
     task.updatedAt = now();
     addAudit(

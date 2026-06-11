@@ -647,6 +647,20 @@ describe("chat session waiting-approval placeholder", () => {
     // for codex, the docs link inline since there's no CTA button.
     const failedTask = readState(config.instance).tasks.find((t) => t.id === taskId);
     expect(failedTask?.authErrorProvider).toBe("codex");
+
+    // The failure also lands the persistent per-provider record (issue #233)
+    // so Settings/connector surfaces stop claiming "Connected", plus the
+    // transition audit row.
+    const stateAfterFail = readState(config.instance);
+    expect(stateAfterFail.providerAuthFailures?.codex).toMatchObject({
+      provider: "codex",
+      detail: "Provided authentication token is expired. Please try signing in again.",
+      taskId
+    });
+    expect(typeof stateAfterFail.providerAuthFailures?.codex?.at).toBe("string");
+    expect(
+      stateAfterFail.audit.find((a) => a.action === "provider.auth.needs_reauth" && a.target === "codex")
+    ).toBeDefined();
     const synced = await syncChatTaskResult(config, session.id, taskId);
     expect(synced?.content).toBe(
       "Codex authentication failed. Re-authenticate Codex to continue: https://gini.lilaclabs.ai/docs/providers/codex#re-authentication"
@@ -685,6 +699,63 @@ describe("chat session waiting-approval placeholder", () => {
     if (plainNote?.kind !== "system_note") throw new Error("expected a system_note block");
     expect(plainNote.authError).toBeUndefined();
     expect(plainNote.text).toBe("Tool failed: HTTP 401 Unauthorized from example.com");
+    // A plain Error must not write a persistent needs-reauth record either —
+    // the only key still present is the codex one from the typed failure above.
+    expect(Object.keys(readState(config.instance).providerAuthFailures ?? {})).toEqual(["codex"]);
+  });
+
+  test("failTask records the needs-reauth state even when the task already went terminal", async () => {
+    // A concurrent cancel (user Stop racing a just-rejected 401) or a sibling
+    // approval denial can flip the task terminal before failTask's mutation
+    // runs. The task-lifecycle idempotency guard must still skip the status
+    // flip and the task.failed audit — but the credential record is
+    // independent of task lifecycle and must land regardless, or Settings
+    // keeps claiming "Connected" against a dead credential (issue #233).
+    const config = {
+      ...buildConfig(workspaceRoot, "chat-fail-auth-terminal"),
+      provider: { name: "openai" as const, model: "gpt-5.4-mini" }
+    };
+    const session = await createChat(config, { title: "auth-fail-terminal" });
+    const taskId = "task_authfail_terminal";
+    await mutateState(config.instance, (state) => {
+      const task: Task = {
+        id: taskId,
+        title: "chat turn",
+        input: "do it",
+        status: "cancelled",
+        instance: state.instance,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        tracePath: "",
+        auditIds: [],
+        approvalIds: [],
+        skillIds: [],
+        chatSessionId: session.id,
+        currentStep: "Cancelled"
+      };
+      state.tasks.push(task);
+      const record = state.chatSessions.find((s) => s.id === session.id);
+      if (record) record.taskIds.push(task.id);
+    });
+
+    await failTask(config, taskId, new ProviderAuthError("openai", "Incorrect API key provided"));
+
+    const state = readState(config.instance);
+    // The credential record landed despite the terminal short-circuit.
+    expect(state.providerAuthFailures?.openai).toMatchObject({
+      provider: "openai",
+      detail: "Incorrect API key provided",
+      taskId
+    });
+    expect(
+      state.audit.find((a) => a.action === "provider.auth.needs_reauth" && a.target === "openai")
+    ).toBeDefined();
+    // The task-lifecycle guard still holds: status untouched, no failure
+    // bookkeeping on the already-terminal task.
+    const task = state.tasks.find((t) => t.id === taskId);
+    expect(task?.status).toBe("cancelled");
+    expect(task?.authErrorProvider).toBeUndefined();
+    expect(state.audit.find((a) => a.action === "task.failed" && a.target === taskId)).toBeUndefined();
   });
 
   test("ProviderAuthError names the provider that served the turn, not the active one", async () => {
@@ -737,6 +808,11 @@ describe("chat session waiting-approval placeholder", () => {
     expect(readState(config.instance).tasks.find((t) => t.id === taskId)?.error).toBe(
       "Incorrect API key provided: sk-***"
     );
+    // The persistent record stores the SAME redacted detail (issue #233) —
+    // the raw key fragment never lands in state.json.
+    const persisted = readState(config.instance).providerAuthFailures?.openai;
+    expect(persisted?.detail).toBe("Incorrect API key provided: sk-***");
+    expect(JSON.stringify(persisted)).not.toContain("ABC123def456ghi");
     expect(note.text).toBe("OpenAI authentication failed. Re-authenticate OpenAI to continue.");
 
     // Text-only clients get the Settings-form line for an API-key provider.

@@ -3557,6 +3557,78 @@ describe("auth-error classification", () => {
     }
   });
 
+  test("auth failures are attributed to the provider resolved at call entry, not the post-switch one", async () => {
+    // A Settings POST or the agent's own set_provider can swap
+    // config.provider while a call is in flight. The 401 belongs to the
+    // provider that SERVED the call — the needs-reauth record keys off this
+    // name, so a stale attribution would flag the wrong provider (issue #233).
+    const restoreEnv = setEnv("OPENAI_API_KEY", "sk-dead");
+    const cfg = config(normalizeProvider({ name: "openai", model: "gpt-test" }));
+    const fetchStub = installFetch(() => {
+      // The switch lands mid-call, before the 401 resolves.
+      cfg.provider = normalizeProvider({ name: "openrouter", model: "or-test" });
+      return new Response(
+        JSON.stringify({ error: { message: "Incorrect API key provided" } }),
+        { status: 401, headers: { "content-type": "application/json" } }
+      );
+    });
+    try {
+      const err = await generateToolCallingResponse(cfg, [{ role: "user", content: "hi" }], []).catch((e) => e);
+      expect(err).toBeInstanceOf(ProviderAuthError);
+      expect((err as ProviderAuthError).provider).toBe("openai");
+      expect((err as Error).message).toContain("Incorrect API key provided");
+    } finally {
+      fetchStub.restore();
+      restoreEnv();
+    }
+  });
+
+  test("generateTaskSummary surfaces a backend 401 as a typed ProviderAuthError", async () => {
+    // The imperative path's model call: failTask records the needs-reauth
+    // state only for typed errors, so an untyped 401 here would leave
+    // sessionless tasks invisible to the amber Settings row.
+    const restoreEnv = setEnv("OPENROUTER_API_KEY", "sk-or-dead");
+    const fetchStub = installFetch(() =>
+      new Response(
+        JSON.stringify({ error: { message: "invalid api key" } }),
+        { status: 401, headers: { "content-type": "application/json" } }
+      )
+    );
+    try {
+      const err = await generateTaskSummary(
+        config(normalizeProvider({ name: "openrouter", model: "or-test" })),
+        "summarize this"
+      ).catch((e) => e);
+      expect(err).toBeInstanceOf(ProviderAuthError);
+      expect((err as ProviderAuthError).provider).toBe("openrouter");
+    } finally {
+      fetchStub.restore();
+      restoreEnv();
+    }
+  });
+
+  test("openai: a missing API key env var surfaces as a typed ProviderAuthError, not a generic failure", async () => {
+    // Mirrors the anthropic/bedrock pins: the missing-env message never
+    // matches isAuthExpiredError, so only a typed throw reaches the
+    // needs-reauth record and the amber Settings row.
+    const restoreEnv = setEnv("OPENAI_API_KEY", undefined);
+    const fetchStub = installFetch(() => anthropicJson({}));
+    try {
+      const err = await generateToolCallingResponse(
+        config(normalizeProvider({ name: "openai", model: "gpt-test" })),
+        [{ role: "user", content: "hi" }],
+        []
+      ).catch((e) => e);
+      expect(err).toBeInstanceOf(ProviderAuthError);
+      expect((err as ProviderAuthError).provider).toBe("openai");
+      expect((err as Error).message).toContain("OPENAI_API_KEY is not set");
+      expect(fetchStub.calls.length).toBe(0);
+    } finally {
+      fetchStub.restore();
+      restoreEnv();
+    }
+  });
+
   test("providerDisplayLabel returns clean brand labels", () => {
     expect(providerDisplayLabel("codex")).toBe("Codex");
     expect(providerDisplayLabel("openai")).toBe("OpenAI");
