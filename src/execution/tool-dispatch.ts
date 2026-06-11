@@ -26,7 +26,7 @@ import {
   now,
   readState
 } from "../state";
-import { addEmailWatcher, clearEmailWatcherObjective, listEmailWatchers, removeEmailWatcher, setEmailTriageEnabled, setEmailWatcherEnabled, setEmailWatcherObjective } from "../state/email-watchers";
+import { accountSelectionNeeded, addEmailWatcher, clearEmailWatcherObjective, listEmailWatchers, removeEmailWatcher, setEmailTriageEnabled, setEmailWatcherEnabled, setEmailWatcherObjective } from "../state/email-watchers";
 import { ApprovalRaceLostError, ApprovedActionFailedError, TaskAlreadyTerminalError, cancelTask, findTask, resolveAuthorization, runTerminalCommand } from "../agent";
 import { walkFiles, simpleDiff } from "../tools/file";
 import { codeExecutionCommand } from "../tools/code";
@@ -2098,6 +2098,21 @@ async function emailWatchTool(
         ? "Whole-inbox triage enabled: newly-arrived mail no specific watch claims gets a proposed reply or a flag in the Inbox triage channel. Never sends without your approval."
         : "Whole-inbox triage disabled. Targeted sender/thread watches are unaffected.";
     }
+  }
+
+  // Belt-and-suspenders for multi-account selection: when no `account` was given
+  // and 2+ Google accounts are signed in, do NOT default arbitrarily — return a
+  // hint that lists the accounts and tells the model to ask the user (ask_user),
+  // then re-add with the chosen `account`. One signed-in account auto-defaults
+  // (Phase A); an explicit `account` resolves; so this fires only on a genuinely
+  // ambiguous add. No watcher is created.
+  const selectionHint = await accountSelectionNeeded(account);
+  if (selectionHint) {
+    appendTrace(config.instance, taskId, {
+      type: "tool",
+      message: "Email watch needs account selection"
+    });
+    return selectionHint;
   }
 
   const watcher = await addEmailWatcher(config, { sender, query: rawQuery, account, objective, threadId, followUpAfterHours, agentId: owningAgentId });

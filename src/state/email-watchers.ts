@@ -168,6 +168,32 @@ export function resolveWatchAccount(
   };
 }
 
+// Decide whether `email_watch action:add` must ask the user which Google account
+// to watch, against the registered accounts. The belt-and-suspenders that keeps a
+// multi-account install from silently defaulting: when the caller passed NO
+// `accountEmail` AND 2+ accounts are signed in, return a hint string (listing the
+// signed-in account emails) instructing the model to ask the user via ask_user and
+// re-add with the chosen `account`; otherwise return undefined (proceed — one
+// signed-in account auto-defaults, an explicit account resolves, zero/one keep the
+// Phase A behavior). Pure over (accountEmail, accounts) so it's unit-testable; the
+// add path calls accountSelectionNeeded() to read the live registry.
+export function accountSelectionHint(
+  accountEmail: string | undefined,
+  accounts: { email: string; configDir: string; signedIn: boolean }[]
+): string | undefined {
+  if (accountEmail) return undefined;
+  const signedIn = accounts.filter((a) => a.signedIn);
+  if (signedIn.length < 2) return undefined;
+  const list = signedIn.map((a) => a.email).join(", ");
+  return `Multiple Google accounts are connected (${list}). Ask the user which account this watch should use (call ask_user with these as the options), then add the watch with that account.`;
+}
+
+// Read the live registry and decide whether the add must ask the user which
+// account (see accountSelectionHint). Returns the hint string or undefined.
+export async function accountSelectionNeeded(accountEmail: string | undefined): Promise<string | undefined> {
+  return accountSelectionHint(accountEmail, await readRegisteredAccounts());
+}
+
 // The declarative watch entry for one enabled watcher inside the shared job's
 // hook config: a stable watcher id (so the detection script keys per-watch state
 // by it) + the Gmail query, the resolved account + its gws configDir (so
@@ -344,8 +370,9 @@ export interface AddEmailWatcherInput {
   sender?: string;
   // Raw Gmail search query; wins over `sender` when both are given.
   query?: string;
-  // The account to watch. v1 watches the single signed-in gws identity;
-  // recorded for the multi-account future.
+  // The connected Google account to watch (authoritative — detection targets it).
+  // Resolved against the registry case-insensitively; unset defaults to the single
+  // signed-in account. The tool/dispatch asks the user when multiple are connected.
   account?: string;
   // The user's standing goal for this watch (validated: trimmed, capped).
   objective?: string;
