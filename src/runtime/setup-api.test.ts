@@ -816,6 +816,35 @@ describe("setup-api", () => {
     expect(readState(config.instance).providerAuthFailures?.codex).toBeUndefined();
   });
 
+  test("codex Verify preserves a same-provider apiKeyEnv and baseUrl across the write", async () => {
+    // Verify probes THROUGH the custom apiKeyEnv resolution; the persisted
+    // config must keep pointing at the credential source it just validated.
+    await seedAuthFailure("codex");
+    const authPath = join(s.stateRoot, "codex-auth-custom.json");
+    mkdirSync(s.stateRoot, { recursive: true });
+    writeFileSync(authPath, JSON.stringify({ auth_mode: "chatgpt", tokens: { access_token: "fresh", refresh_token: "r" } }));
+    const prevCustom = process.env.MY_CODEX_AUTH_SETUP;
+    process.env.MY_CODEX_AUTH_SETUP = authPath;
+    // No CODEX_AUTH_JSON fallback: the custom env is the only working source.
+    delete process.env.CODEX_AUTH_JSON;
+    config.provider = {
+      name: "codex",
+      model: "gpt-5.5",
+      baseUrl: "http://127.0.0.1:9999/custom",
+      apiKeyEnv: "MY_CODEX_AUTH_SETUP"
+    };
+    try {
+      const result = await setSetupProvider(config, { provider: "codex" });
+      expect(result.ok).toBe(true);
+      expect(config.provider.apiKeyEnv).toBe("MY_CODEX_AUTH_SETUP");
+      expect(config.provider.baseUrl).toBe("http://127.0.0.1:9999/custom");
+      expect(readState(config.instance).providerAuthFailures?.codex).toBeUndefined();
+    } finally {
+      if (prevCustom === undefined) delete process.env.MY_CODEX_AUTH_SETUP;
+      else process.env.MY_CODEX_AUTH_SETUP = prevCustom;
+    }
+  });
+
   test("codex Verify recovers from a torn auth.json read via the single retry", async () => {
     // A read landing inside the codex CLI's non-atomic rewrite produces a
     // transient parse failure; Verify retries once after the rewrite-settle

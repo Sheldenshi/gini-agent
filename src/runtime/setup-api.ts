@@ -387,10 +387,22 @@ export async function setSetupProvider(
     };
   }
   const codexCatalog = providerCatalog().find((p) => p.id === "codex");
+  const existingCodex = config.provider?.name === "codex" ? config.provider : undefined;
   const model = typeof payload.model === "string" && payload.model.length > 0
     ? payload.model
-    : (config.provider?.name === "codex" && config.provider.model ? config.provider.model : codexCatalog?.models[0] ?? "gpt-5.5");
-  config.provider = normalizeProvider({ name: "codex", model } as ProviderConfig);
+    : (existingCodex?.model ? existingCodex.model : codexCatalog?.models[0] ?? "gpt-5.5");
+  // Preserve a same-provider apiKeyEnv (a CODEX_AUTH_JSON-style path env) and
+  // baseUrl across the write: the Verify gate above probed THROUGH that
+  // resolution, so dropping it would sever the very credential source just
+  // validated — and then clear the amber record on the strength of a config
+  // that now points somewhere unprobed. Mirrors the env-keyed and bedrock
+  // branches' preservation of CLI-set fields a web save never carries.
+  config.provider = normalizeProvider({
+    name: "codex",
+    model,
+    ...(existingCodex?.apiKeyEnv ? { apiKeyEnv: existingCodex.apiKeyEnv } : {}),
+    ...(existingCodex?.baseUrl ? { baseUrl: existingCodex.baseUrl } : {})
+  } as ProviderConfig);
   writeRuntimeConfig(config);
   // The gate above passed — credentials are present AND not provably expired
   // (locally-decoded JWT exp) — so the user has (re-)established codex
