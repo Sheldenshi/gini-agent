@@ -1248,6 +1248,115 @@ describe("chat-task loop", () => {
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
 
+  // [SILENT] sentinel suppression at the chat-block layer. A scheduled
+  // job (or fan-out subagent worker) that has nothing to report responds
+  // with exactly "[SILENT]". The legacy message layer drops the
+  // ChatMessageRecord, but the UI renders chat blocks — so a completed
+  // turn whose final text is exactly "[SILENT]" must NOT leave a visible
+  // assistant_text block behind.
+  test("suppresses the assistant_text block when the final turn text is exactly [SILENT]", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-silent-suppress");
+    const provider = normalizeProvider(config.provider);
+
+    const sessionId = await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "Inbox triage");
+      const run = createRun(state, {
+        kind: "conversation_turn",
+        title: "Watcher turn",
+        input: "kick off",
+        conversationId: session.id
+      });
+      return { runId: run.id, sessionId: session.id };
+    });
+
+    setEchoToolCallingResponse({
+      provider,
+      text: "[SILENT]",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "anything new?", { mode: "chat", runId: sessionId.runId, chatSessionId: sessionId.sessionId });
+    const finished = await waitForTerminal(config, task.id);
+    expect(finished.status).toBe("completed");
+
+    const blocks = listChatBlocks(config.instance, sessionId.sessionId);
+    expect(blocks.some((b) => b.kind === "assistant_text")).toBe(false);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("does NOT suppress when the final text merely contains [SILENT]", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-silent-contains");
+    const provider = normalizeProvider(config.provider);
+
+    const sessionId = await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "Inbox triage");
+      const run = createRun(state, {
+        kind: "conversation_turn",
+        title: "Watcher turn",
+        input: "kick off",
+        conversationId: session.id
+      });
+      return { runId: run.id, sessionId: session.id };
+    });
+
+    setEchoToolCallingResponse({
+      provider,
+      text: "[SILENT] but here's an update",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "anything new?", { mode: "chat", runId: sessionId.runId, chatSessionId: sessionId.sessionId });
+    const finished = await waitForTerminal(config, task.id);
+    expect(finished.status).toBe("completed");
+
+    const blocks = listChatBlocks(config.instance, sessionId.sessionId);
+    const assistantText = blocks.filter((b) => b.kind === "assistant_text");
+    expect(assistantText).toHaveLength(1);
+    expect(assistantText[0]).toMatchObject({ text: "[SILENT] but here's an update" });
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("writes a normal assistant_text block when the final text is real content", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-silent-normal");
+    const provider = normalizeProvider(config.provider);
+
+    const sessionId = await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "Inbox triage");
+      const run = createRun(state, {
+        kind: "conversation_turn",
+        title: "Watcher turn",
+        input: "kick off",
+        conversationId: session.id
+      });
+      return { runId: run.id, sessionId: session.id };
+    });
+
+    setEchoToolCallingResponse({
+      provider,
+      text: "You have one new invoice from Acme.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "anything new?", { mode: "chat", runId: sessionId.runId, chatSessionId: sessionId.sessionId });
+    const finished = await waitForTerminal(config, task.id);
+    expect(finished.status).toBe("completed");
+
+    const blocks = listChatBlocks(config.instance, sessionId.sessionId);
+    const assistantText = blocks.filter((b) => b.kind === "assistant_text");
+    expect(assistantText).toHaveLength(1);
+    expect(assistantText[0]).toMatchObject({ text: "You have one new invoice from Acme." });
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
   test("emits the full runtime identity block on the first turn of a chat session", async () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
     const config = buildConfig(workspaceRoot, "chat-task-identity-first");
