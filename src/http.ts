@@ -46,7 +46,7 @@ import { getGoogleAccount, googleAccountsRoot } from "./state/google-accounts";
 import { listProviders } from "./integrations/connectors/registry";
 import { runConnectorDetection } from "./jobs/connector-detection";
 import { createScheduledJob, listJobRuns, removeJob, replayJobRun, runJobNow, updateJob, updateJobStatus } from "./jobs";
-import { addEmailWatcher, clearEmailWatcherObjective, getEmailWatcher, listEmailWatchers, removeEmailWatcher, setEmailWatcherEnabled, setEmailWatcherObjective } from "./state/email-watchers";
+import { addEmailWatcher, clearEmailWatcherObjective, getEmailWatcher, listEmailWatchers, removeEmailWatcher, setEmailTriageEnabled, setEmailWatcherEnabled, setEmailWatcherObjective } from "./state/email-watchers";
 import { migrateLegacyMemories, recall, reflect, retain } from "./memory";
 import { embeddingStatus, reembedAllBanks, reembedBank } from "./memory/embedding";
 import { rerankerStatus } from "./memory/reranker";
@@ -1360,6 +1360,19 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["GET", /^\/api\/email\/watchers$/, () => json(listEmailWatchers(config))],
     ["POST", /^\/api\/email\/watchers$/, async (request) => {
       const payload = await body(request);
+      // Whole-inbox triage opt-in (ADR email-watch.md): `triage: true` provisions
+      // the broad respond-or-flag concern for the active agent, `false` tears it
+      // down. Triage is OPT-IN and independent of targeted watches; when triage is
+      // the only field, toggle it without creating a normal watcher.
+      if (payload.triage !== undefined && payload.triage !== null) {
+        if (typeof payload.triage !== "boolean") {
+          return json({ error: "Invalid input: triage must be a boolean" }, 400);
+        }
+        const enabled = await setEmailTriageEnabled(config, readState(config.instance).activeAgentId, payload.triage);
+        if (payload.sender === undefined && payload.query === undefined && payload.threadId === undefined) {
+          return json({ triage: enabled }, 201);
+        }
+      }
       return json(await addEmailWatcher(config, {
         sender: typeof payload.sender === "string" ? payload.sender : undefined,
         query: typeof payload.query === "string" ? payload.query : undefined,

@@ -19,6 +19,7 @@ import {
   readState,
   removeEmailWatcher,
   renameChatSession,
+  setEmailTriageEnabled,
   setEmailWatcherEnabled,
   setEmailWatcherObjective,
   clearEmailWatcherObjective,
@@ -354,16 +355,16 @@ describe("shared backing job lifecycle", () => {
     const state = readState(config.instance);
     // Exactly two distinct watchers (one sender, one thread) — no duplicates.
     expect(state.emailWatchers).toHaveLength(2);
-    // One channel per distinct concern (plus the shared session + the triage
-    // channel); the duplicate adds minted no extra channels or routes.
+    // One channel per distinct concern (plus the shared session); triage is opt-in,
+    // so no triage channel exists here. The duplicate adds minted no extra channels.
     const channels = state.chatSessions.filter((s) => s.feature === "email-watch" && s.kind === "channel");
-    const concernChannels = channels.filter((s) => s.title !== "Inbox triage");
+    expect(channels.some((s) => s.title === "Inbox triage")).toBe(false);
     // shared session + 2 concern channels = 3.
-    expect(concernChannels).toHaveLength(3);
+    expect(channels).toHaveLength(3);
     const jobs = state.jobs.filter((j) => (j.preRunHook?.config as { skill?: string })?.skill === "gmail-watch");
     const routes = jobs[0]!.routes ?? {};
-    // Routes for exactly the two watchers + triage (no dup route keys).
-    expect(Object.keys(routes).sort()).toEqual([s1.id, t1.id, "triage"].sort());
+    // Routes for exactly the two watchers — no triage route (opt-in), no dup keys.
+    expect(Object.keys(routes).sort()).toEqual([s1.id, t1.id].sort());
   });
 
   test("removing one of several rebuilds watches but keeps the shared job + session", async () => {
@@ -578,6 +579,9 @@ describe("shared backing job lifecycle", () => {
     const sharedJobId = w1.jobId!;
     const sharedSessionId = w1.chatSessionId!;
     expect(w2.jobId).toBe(sharedJobId);
+    // Opt this agent into whole-inbox triage so the heal must keep the live
+    // triage channel (triage is opt-in; a plain sender watch provisions none).
+    await setEmailTriageEnabled(config, readState(config.instance).activeAgentId, true);
 
     // An ORPHAN duplicate gmail-watch job (watches:[]) with its own session — the
     // residue of a pre-atomicity-fix race. The session carries the email-watch
@@ -885,10 +889,28 @@ describe("triage concern + intelligent router", () => {
   function allWatches(config: ReturnType<typeof buildConfig>) {
     return (sharedJob(config)?.preRunHook?.config as { watches?: { watcherId: string; routeKey?: string; query: string }[] }).watches ?? [];
   }
+  // Opt the ACTIVE agent (the one addEmailWatcher stamps onto its watchers) in or
+  // out of whole-inbox triage — mirrors how the tool/API resolve the agent.
+  function enableTriage(config: ReturnType<typeof buildConfig>, enabled: boolean) {
+    return setEmailTriageEnabled(config, readState(config.instance).activeAgentId, enabled);
+  }
 
-  test("the first watcher provisions a SINGLE triage channel + a broad in:inbox triage watch", async () => {
+  test("a sender/thread watch alone provisions NO triage (triage is opt-in)", async () => {
+    const config = buildConfig("ew-triage-optin-default-off");
+    await addEmailWatcher(config, { sender: "alice@x.com" });
+    await addEmailWatcher(config, { threadId: "t-no-triage" });
+    // No triage channel, no triage watch, no triage route — only the targeted watches.
+    expect(triageChannels(config)).toHaveLength(0);
+    expect(allWatches(config).some((w) => w.watcherId === "triage")).toBe(false);
+    expect(sharedJob(config)?.routes?.triage).toBeUndefined();
+  });
+
+  test("opting in (triage:true) provisions a SINGLE triage channel + a broad in:inbox triage watch + route", async () => {
     const config = buildConfig("ew-triage-provision");
     await addEmailWatcher(config, { sender: "alice@x.com" });
+    // Before opt-in there is no triage.
+    expect(triageChannels(config)).toHaveLength(0);
+    await enableTriage(config, true);
     // Exactly one triage channel for the agent.
     expect(triageChannels(config)).toHaveLength(1);
     const triageId = triageChannels(config)[0]!.id;
@@ -903,10 +925,27 @@ describe("triage concern + intelligent router", () => {
     expect(sharedJob(config)?.routes?.triage?.chatSessionId).toBe(triageId);
   });
 
-  test("the triage concern is provisioned ONCE — adding more watchers never duplicates it", async () => {
+  test("opting out (triage:false) removes the triage channel + watch + route", async () => {
+    const config = buildConfig("ew-triage-optout");
+    const watcher = await addEmailWatcher(config, { sender: "bob@x.com" });
+    await enableTriage(config, true);
+    const triageId = triageChannels(config)[0]!.id;
+    expect(triageId).toBeString();
+    await enableTriage(config, false);
+    // Triage gone; the targeted watcher and its route survive untouched.
+    expect(triageChannels(config)).toHaveLength(0);
+    expect(readState(config.instance).chatSessions.some((s) => s.id === triageId)).toBe(false);
+    expect(allWatches(config).some((w) => w.watcherId === "triage")).toBe(false);
+    expect(sharedJob(config)?.routes?.triage).toBeUndefined();
+    expect(sharedJob(config)?.routes?.[watcher.id]?.chatSessionId).toBe(watcher.channelId);
+  });
+
+  test("opting in is idempotent — it never duplicates the triage concern", async () => {
     const config = buildConfig("ew-triage-idempotent");
     await addEmailWatcher(config, { sender: "bob@x.com" });
+    await enableTriage(config, true);
     const triageId = triageChannels(config)[0]!.id;
+    await enableTriage(config, true);
     await addEmailWatcher(config, { sender: "carol@x.com" });
     await addEmailWatcher(config, { query: "subject:invoice" });
     // Still exactly one triage channel (same id), one triage watch, one triage route.
@@ -919,6 +958,7 @@ describe("triage concern + intelligent router", () => {
   test("the triage route is a CONSTRAINED subagent: respond-or-flag systemPrompt + minimal toolset whitelist", async () => {
     const config = buildConfig("ew-triage-route");
     await addEmailWatcher(config, { sender: "dave@x.com" });
+    await enableTriage(config, true);
     const route = sharedJob(config)?.routes?.triage;
     expect(route).toBeDefined();
     // The respond-or-flag playbook, with the untrusted-fence rule preserved.
@@ -944,6 +984,7 @@ describe("triage concern + intelligent router", () => {
   test("the triage channel is torn down with the LAST watcher", async () => {
     const config = buildConfig("ew-triage-teardown");
     const watcher = await addEmailWatcher(config, { sender: "erin@x.com" });
+    await enableTriage(config, true);
     const triageId = triageChannels(config)[0]!.id;
     expect(triageId).toBeString();
     await removeEmailWatcher(config, watcher.id);
@@ -956,6 +997,7 @@ describe("triage concern + intelligent router", () => {
     const config = buildConfig("ew-triage-survives");
     const keep = await addEmailWatcher(config, { sender: "frank@x.com" });
     const drop = await addEmailWatcher(config, { sender: "grace@x.com" });
+    await enableTriage(config, true);
     const triageId = triageChannels(config)[0]!.id;
     await removeEmailWatcher(config, drop.id);
     // The remove rebuild + orphan sweep ran; the triage channel must NOT be swept.
@@ -966,8 +1008,9 @@ describe("triage concern + intelligent router", () => {
 
   test("escalation: an email_watch add from a triage context mints a concern + its own route", async () => {
     const config = buildConfig("ew-triage-escalate");
-    // A live install with triage running over one watcher.
+    // A live install with triage opted in, running over one watcher.
     const existing = await addEmailWatcher(config, { sender: "heidi@x.com" });
+    await enableTriage(config, true);
     const job = sharedJob(config)!;
     expect(job.routes?.triage).toBeDefined();
     // The triage worker, having recognized an ongoing thread, calls email_watch —
@@ -988,5 +1031,28 @@ describe("triage concern + intelligent router", () => {
     expect(ids.has(escalated.id)).toBe(true);
     expect(ids.has("triage")).toBe(true);
     expect(allWatches(config).find((w) => w.watcherId === escalated.id)).toMatchObject({ query: "thread:t-escalated" });
+  });
+
+  test("backfill never force-deletes an existing opted-in triage concern", async () => {
+    const config = buildConfig("ew-triage-backfill-preserve");
+    await addEmailWatcher(config, { sender: "ivan@x.com" });
+    await enableTriage(config, true);
+    const triageId = triageChannels(config)[0]!.id;
+    expect(triageId).toBeString();
+    // The startup self-heal must not strip a triage concern the agent opted into.
+    await backfillEmailWatcherJobs(config);
+    expect(readState(config.instance).chatSessions.some((s) => s.id === triageId)).toBe(true);
+    expect(allWatches(config).some((w) => w.watcherId === "triage")).toBe(true);
+    expect(sharedJob(config)?.routes?.triage?.chatSessionId).toBe(triageId);
+  });
+
+  test("backfill does NOT auto-create triage for an install that never opted in", async () => {
+    const config = buildConfig("ew-triage-backfill-no-optin");
+    await addEmailWatcher(config, { sender: "judy@x.com" });
+    await backfillEmailWatcherJobs(config);
+    // No opt-in => no triage, even after the self-heal pass.
+    expect(triageChannels(config)).toHaveLength(0);
+    expect(allWatches(config).some((w) => w.watcherId === "triage")).toBe(false);
+    expect(sharedJob(config)?.routes?.triage).toBeUndefined();
   });
 });

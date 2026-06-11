@@ -26,7 +26,7 @@ import {
   now,
   readState
 } from "../state";
-import { addEmailWatcher, clearEmailWatcherObjective, listEmailWatchers, removeEmailWatcher, setEmailWatcherEnabled, setEmailWatcherObjective } from "../state/email-watchers";
+import { addEmailWatcher, clearEmailWatcherObjective, listEmailWatchers, removeEmailWatcher, setEmailTriageEnabled, setEmailWatcherEnabled, setEmailWatcherObjective } from "../state/email-watchers";
 import { ApprovalRaceLostError, ApprovedActionFailedError, TaskAlreadyTerminalError, cancelTask, findTask, resolveAuthorization, runTerminalCommand } from "../agent";
 import { walkFiles, simpleDiff } from "../tools/file";
 import { codeExecutionCommand } from "../tools/code";
@@ -2054,6 +2054,28 @@ async function emailWatchTool(
   // Inherit the originating task's agent so the watcher + its dedicated chat
   // session (and the future woken turns) attribute to the right agent.
   const owningAgentId = readState(config.instance).tasks.find((t) => t.id === taskId)?.agentId;
+
+  // Whole-inbox triage opt-in: `triage: true` provisions the broad respond-or-flag
+  // concern over the ENTIRE inbox; `triage: false` tears it down. Triage is OPT-IN
+  // — only set it when the user explicitly asked to triage all their new mail, never
+  // when they name a specific sender/thread. When triage is the ONLY thing requested
+  // (no sender/query/threadId), opt in/out without creating a normal watcher.
+  if (args.triage !== undefined && args.triage !== null) {
+    if (typeof args.triage !== "boolean") {
+      throw new Error("Invalid input: triage must be a boolean.");
+    }
+    await setEmailTriageEnabled(config, owningAgentId, args.triage);
+    appendTrace(config.instance, taskId, {
+      type: "tool",
+      message: args.triage ? "Enabled inbox triage" : "Disabled inbox triage"
+    });
+    if (sender === undefined && rawQuery === undefined && threadId === undefined) {
+      return args.triage
+        ? "Whole-inbox triage enabled: newly-arrived mail no specific watch claims gets a proposed reply or a flag in the Inbox triage channel. Never sends without your approval."
+        : "Whole-inbox triage disabled. Targeted sender/thread watches are unaffected.";
+    }
+  }
+
   const watcher = await addEmailWatcher(config, { sender, query: rawQuery, account, objective, threadId, followUpAfterHours, agentId: owningAgentId });
 
   appendTrace(config.instance, taskId, {
