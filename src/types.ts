@@ -1569,6 +1569,25 @@ export interface SkillVersion {
   requiredPermissions: string[];
 }
 
+// A fan-out destination for one routed hook bucket (see ADR job-pre-run-hooks.md
+// and the concern fan-out design). When a pre-run hook returns ROUTED buckets
+// (keyed by an opaque routeKey), the scheduler dispatches ONE worker turn per
+// non-empty bucket into the route resolved from `JobRecord.routes[routeKey]`.
+// Domain-agnostic: the routeKey -> destination mapping is trusted, typed config
+// here, never derived from the (untrusted) handler output. All fields except
+// `chatSessionId` are optional and constrain the spawned worker:
+//   - `systemPrompt`/`toolsets`/`skills` constrain the per-route subagent worker
+//     (objective + playbook + whitelist), exactly like a spawn_subagent call.
+//   - `prompt`, when set, replaces `job.prompt` for this route's worker.
+// Absent `routes` on a job ⇒ today's single-turn behavior.
+export interface JobRoute {
+  chatSessionId: string;
+  systemPrompt?: string;
+  toolsets?: string[];
+  skills?: string[];
+  prompt?: string;
+}
+
 export interface JobRecord {
   id: string;
   instance: Instance;
@@ -1594,6 +1613,13 @@ export interface JobRecord {
   // handler/script (e.g. the gmail-watch cursor + a small boundary dedup set).
   // See ADR job-pre-run-hooks.md.
   hookState?: Record<string, unknown>;
+  // Fan-out routing table for a routed pre-run hook. Maps each hook routeKey to a
+  // JobRoute (where/how to dispatch that bucket's worker). When a pre-run hook
+  // returns ROUTED buckets, the scheduler spawns one worker per non-empty bucket
+  // into `routes[routeKey]`. Absent ⇒ today's single-turn behavior (one turn into
+  // `chatSessionId`). Domain-agnostic; the email layer populates this from its
+  // per-concern channels. See ADR job-pre-run-hooks.md.
+  routes?: Record<string, JobRoute>;
   // Interval-driven schedule. Optional — cron-driven jobs (cronExpression
   // set) carry no intervalSeconds at all. Exactly one of (intervalSeconds,
   // cronExpression) is the active driver per job. The pair is validated
