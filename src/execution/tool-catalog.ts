@@ -693,11 +693,11 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     // persisted, never enter the LLM context, never reach the
     // transcript or audit payload — see ADR browser-fill-secret.md.
     toolset: "browser",
-    displayLabel: "Ask user for browser input",
+    displayLabel: "Ask user for credentials",
     type: "function",
     function: {
       name: "browser_fill_secrets",
-      description: "Ask the user to fill one or more input fields on the active browser page. Use this for credentials, OTPs, account ids, or any value the user must type — NEVER attempt to fill these fields yourself with browser_type. The user sees a single card in chat with one input per slot; once they submit, the gateway fills each locator on the page with the user's value via playwright. Requires an active browser session — call browser_navigate first if needed. Your tool result is a plain-text summary naming which slots filled (by slot.name, never values), which errored, and any abort condition (cancel, origin drift); you never see the values themselves. Re-snapshot the page after this returns to see the post-fill state. If more fields need filling (e.g. an MFA code on the next page), call this tool again.",
+      description: "Ask the user to fill one or more input fields on the active browser page. ONLY for credentials and other secret values the user must supply (passwords, OTPs, account ids, MFA codes) — NEVER for ordinary text like search queries or form content you already know; type that yourself with browser_type. Every call here interrupts the user with an approval card, and conversely NEVER attempt to fill credential fields yourself with browser_type. The user sees a single card in chat with one input per slot; once they submit, the gateway fills each locator on the page with the user's value via playwright. Requires an active browser session — call browser_navigate first if needed. Your tool result is a plain-text summary naming which slots filled (by slot.name, never values), which errored, and any abort condition (cancel, origin drift); you never see the values themselves. Re-snapshot the page after this returns to see the post-fill state. If more fields need filling (e.g. an MFA code on the next page), call this tool again.",
       parameters: {
         type: "object",
         properties: {
