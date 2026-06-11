@@ -13,7 +13,7 @@ This is the long-form version of the short list in the [README](README.md#roadma
 - ✅ **Approval-gated tools.** File, terminal, and code tools always raise high-risk approvals before side-effecting; trace and audit handoff is preserved.
 - ✅ **Four-network memory.** Retain, recall, embeddings, and reranking ship locally by default; Transformers.js model cache is shared across instances.
 - ✅ **Trace-backed improvement proposals.** Memory, skill, and job changes are proposed from traces rather than written blindly.
-- ✅ **Provider support.** Codex OAuth (existing `codex --login`), OpenAI API key, and OpenRouter-compatible records. Provider tokens are never written to Gini config.
+- ✅ **Provider support.** Codex OAuth (existing `codex login`), OpenAI API key, and OpenRouter-compatible records. Provider tokens are never written to Gini config.
 - ✅ **Paired-device auth.** Mobile bootstrap contract and device records are in place so a future mobile client can pair once and hold its own token.
 - ✅ **Instance-local snapshots.** Snapshots and promotion proposal records preserve the "before trying a candidate" state.
 - ✅ **Hermes / OpenClaw parity primitives.** Memory, skills, jobs, search, providers, toolsets, subagents, MCP records, messaging records, and import inspection.
@@ -39,7 +39,7 @@ The current flow makes the user type `gini start` after install. The target expe
 
 The CLI install runs to completion, the runtime + webapp start, and the user's browser is opened to a first-run `/setup` route on the webapp. Provider picker happens in the UI instead of the terminal. The terminal `gini setup` flow remains for headless installs and power users.
 
-- ✅ **`/setup` route in the webapp.** Detects first-run state via `/api/setup/status`, renders a two-tab form (OpenAI API key, Codex `--login` instructions + Refresh), redirects to `/` on success.
+- ✅ **`/setup` route in the webapp.** Detects first-run state via `/api/setup/status`, renders a two-tab form (OpenAI API key, Codex `login` instructions + Refresh), redirects to `/` on success.
 - ✅ **Auto-open the browser.** The installer waits for the webapp's healthz on the port read from `~/.gini/instances/<inst>/web.port` (hash-derived per instance, written by the autostart web shim at boot), then calls `open` on the resulting `/setup` URL. Works in both interactive and piped-curl runs on macOS.
 - ✅ **Proxy guard.** Next.js proxy.ts redirects unconfigured users to `/setup` from any other route. Configured users pass through.
 - ⚪ **First-task suggestion.** After provider setup, the onboarding ends with a "try this" example (e.g., "ask Gini to read its own architecture") so the user lands on a useful first interaction, not a blank chat.

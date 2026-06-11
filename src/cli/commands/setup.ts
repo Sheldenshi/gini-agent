@@ -111,7 +111,7 @@ export interface ProviderModule {
 // for display purposes by checking whether CODEX_AUTH_JSON drove the lookup.
 function checkCodexCredentialsStatus(): CredentialStatus {
   if (!hasUsableCodexCredentials({ name: "codex", model: "gpt-5.5" })) {
-    return { available: false, source: "missing", display: "✗ missing — run codex --login" };
+    return { available: false, source: "missing", display: "✗ missing — run codex login" };
   }
   const envPath = process.env.CODEX_AUTH_JSON;
   if (envPath && envPath.length > 0) {
@@ -150,7 +150,7 @@ const openaiProvider: ProviderModule = {
 const codexProvider: ProviderModule = {
   id: "codex",
   label: "OpenAI Codex",
-  description: "Use existing codex --login auth (~/.codex/auth.json)",
+  description: "Use existing codex login auth (~/.codex/auth.json)",
   defaultModel: "gpt-5.5",
   suggestedModels: ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.2"],
   checkCredentials(): CredentialStatus {
@@ -165,7 +165,7 @@ const codexProvider: ProviderModule = {
           "What would you like to do?",
           [
             { label: "Use existing credentials", value: "use" as const },
-            { label: "Reauthenticate (run codex --login)", value: "reauth" as const },
+            { label: "Reauthenticate (run codex login)", value: "reauth" as const },
             { label: "Cancel", value: "cancel" as const }
           ],
           0
@@ -184,7 +184,7 @@ const codexProvider: ProviderModule = {
       const action = await io.select(
         "What would you like to do?",
         [
-          { label: "Run codex --login now", value: "login" as const },
+          { label: "Run codex login now", value: "login" as const },
           { label: "I've already logged in elsewhere — re-check", value: "recheck" as const },
           { label: "Cancel", value: "cancel" as const }
         ],
@@ -204,19 +204,23 @@ const codexProvider: ProviderModule = {
   }
 };
 
-function runCodexLogin(io: SetupIO): boolean {
-  const result = spawnSync("codex", ["--login"], { stdio: "inherit" });
+// `spawn` is injectable so tests can pin the exact argv without launching
+// the real codex CLI (which would start an interactive OAuth flow).
+function runCodexLogin(io: SetupIO, spawn: typeof spawnSync = spawnSync): boolean {
+  // `login` is a codex CLI subcommand, not a flag — `codex --login` is
+  // rejected by the CLI, so the argv must be the bare subcommand.
+  const result = spawn("codex", ["login"], { stdio: "inherit" });
   if (result.error) {
     const err = result.error as NodeJS.ErrnoException;
     if (err.code === "ENOENT") {
-      io.error("codex CLI not found — install it from https://github.com/openai/codex then run codex --login");
+      io.error("codex CLI not found — install it from https://github.com/openai/codex then run codex login");
     } else {
-      io.error(`Failed to run codex --login: ${err.message}`);
+      io.error(`Failed to run codex login: ${err.message}`);
     }
     return false;
   }
   if (typeof result.status === "number" && result.status !== 0) {
-    io.error(`codex --login exited with status ${result.status}.`);
+    io.error(`codex login exited with status ${result.status}.`);
     return false;
   }
   return true;
@@ -308,7 +312,7 @@ async function runNonInteractive(config: RuntimeConfig, io: SetupIO): Promise<vo
   }
 
   throw new Error(
-    "No provider credentials found. Set OPENAI_API_KEY in your environment, write it to ~/.gini/secrets.env, set CODEX_AUTH_JSON, or run codex --login (~/.codex/auth.json), then re-run `gini setup --yes`."
+    "No provider credentials found. Set OPENAI_API_KEY in your environment, write it to ~/.gini/secrets.env, set CODEX_AUTH_JSON, or run codex login (~/.codex/auth.json), then re-run `gini setup --yes`."
   );
 }
 
@@ -438,7 +442,7 @@ async function selectModelForProvider(
 }
 
 // Exported for tests.
-export const __testing = { openaiProvider, codexProvider, PROVIDERS };
+export const __testing = { openaiProvider, codexProvider, PROVIDERS, runCodexLogin };
 
 const STEPS: SetupStep[] = [providerStep];
 

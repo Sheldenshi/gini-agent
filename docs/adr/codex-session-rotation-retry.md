@@ -6,7 +6,7 @@ Gini speaks to the Codex `/responses` backend by:
 
 1. **Mirroring the upstream Codex CLI's request shape exactly.** The `User-Agent` and `originator` headers are byte-for-byte the same as the codex CLI's own emission — no daemon-identifying suffix. Drop fingerprintable identifiers; do not append `(Gini Agent)` or similar tags.
 2. **Re-reading `~/.codex/auth.json` on every request.** `readCodexBearer` opens the file each call so a token rotation written by the codex CLI's refresh path is picked up automatically by the next attempt, with no in-process cache to invalidate.
-3. **Retrying once on session-shaped failures.** `withCodexSessionRetry` wraps every Codex request path. On `CodexSessionExpiredError` (backend 401 or SSE `error` / `response.failed` matching the session-expired classifier) or `CodexAuthRaceError` (local `readCodexBearer` observed a mid-rewrite `auth.json`), the helper sleeps `CODEX_RETRY_REWRITE_DELAY_MS` (50 ms) and reruns the request once. A second consecutive failure surfaces.
+3. **Retrying once on session-shaped failures.** `withCodexSessionRetry` wraps every Codex request path. On `CodexSessionExpiredError` (backend 401 or SSE `error` / `response.failed` matching the session-expired classifier) or `CodexAuthRaceError` (local `readCodexBearer` observed a mid-rewrite `auth.json`), the helper sleeps `CODEX_RETRY_REWRITE_DELAY_MS` (50 ms) and reruns the request once. On a second consecutive failure, a `CodexAuthRaceError` is converted to `ProviderAuthError("codex")` — a persistently unreadable or corrupt `auth.json` is a credential problem, not a mid-write race — while a second `CodexSessionExpiredError` surfaces unchanged (its backend message already matches `isAuthExpiredError` downstream); see ADR provider-reauth-guidance.md.
 4. **Gating retry on caller visibility.** The two SSE readers track an `emittedToCaller` boolean flipped only when `onDelta` actually fires. Internal buffers (text accumulation, tool-call argument deltas, `response.completed` backstop) do NOT count — a session expired before any bytes reach the caller is safely retryable; once `onDelta` fires, the retry path falls through to the generic error so we don't double-deliver.
 5. **Canceling the reader on every exit.** Both SSE consumption loops wrap in `try { … } finally { reader.cancel().catch(() => {}) }` so a throw from mid-stream classification cannot leave attempt 1's reader locked while withCodexSessionRetry starts attempt 2.
 
@@ -20,7 +20,7 @@ Codex `/responses` is gated on a ChatGPT account session token written to `~/.co
 - **Stale-token initial 401**: Gini read `auth.json` before the CLI's refresh landed, so attempt 1 sends an already-rotated token and gets `401 Unauthorized: access token expired` before the stream even opens.
 - **Auth.json read race**: the codex CLI writes `auth.json` non-atomically (truncate + write + flush, no temp-file + rename — see `codex-rs/login/src/auth/storage.rs` `FileAuthStorage::save`). A reader observing the file between the truncate and the flush sees an empty or partial JSON document and `JSON.parse` throws.
 
-The retry helper unifies recovery for all three: re-read `auth.json` after a small wait, then retry exactly once. The wait kills the rewrite race window; the re-read catches both backend-driven and local rotations; the cap-at-one prevents a hot loop when the CLI is offline or the user is logged out.
+The retry helper unifies recovery for all three: re-read `auth.json` after a small wait, then retry exactly once. The wait kills the rewrite race window; the re-read catches both backend-driven and local rotations; the cap-at-one prevents a hot loop when the CLI is offline or the backend keeps rejecting the token. Steady-state credential absence never enters the retry at all: `auth.json` missing (the post-`codex logout` state) or present without `OPENAI_API_KEY` / `tokens.access_token` makes `readCodexBearer` throw `ProviderAuthError("codex")` before any request is made.
 
 The retry's correctness depends on two invariants:
 
@@ -48,7 +48,7 @@ Both classes funnel into the same retry path, but they describe different failur
 - `CodexSessionExpiredError` — the backend rejected the token. The token Gini holds is real but invalidated upstream.
 - `CodexAuthRaceError` — Gini couldn't read the token. The local file is mid-rewrite and `JSON.parse` failed.
 
-Conflating them under one class would force readers to inspect the message to know what actually happened; keeping them distinct lets future code (logging, metrics, alternative recovery paths) treat them separately without re-parsing. The retry helper catches both with one `instanceof` check apiece — same behavior, separate semantics.
+Conflating them under one class would force readers to inspect the message to know what actually happened; keeping them distinct lets future code (logging, metrics, alternative recovery paths) treat them separately without re-parsing. The retry helper catches both with one `instanceof` check apiece — the retry trigger is shared, but the second-failure handling diverges by class (the race error converts to a typed credential failure, the expired error surfaces unchanged; see item 3 of the Decision).
 
 ## Session-Expired Classifier
 
@@ -66,6 +66,7 @@ Retry behavior is pinned in `src/provider.test.ts`:
 
 - Tool-calling path: SSE error event, post-`onDelta` no-retry, buffered text without `onDelta` (retries), buffered tool-call args (retries), initial 401, no-retry on generic 500, `response.failed` event, snake_case `incomplete_details.reason`, retry cap, 50 ms wait, reader cancellation, bearer rotation across attempts, auth.json mid-rewrite race.
 - Per-path coverage: `generateTaskSummary`, `generateStructured`, and `generateVisionAnalysis` each have their own retry test exercising the `callOpenAIResponses` codex branch, `callStructuredCodex`, and `callVisionCodex` respectively.
+- Local credential failures (typed, no retry entry): missing `auth.json` surfaces as `ProviderAuthError` with zero network calls; wrong-shape `auth.json` (no `OPENAI_API_KEY` / `tokens.access_token`) surfaces as `ProviderAuthError` with zero network calls; persistently corrupt `auth.json` fails typed as `ProviderAuthError` after exactly one 50 ms retry.
 - Header pinning: `codex_cli_rs/0.0.0` User-Agent and `codex_cli_rs` originator are asserted with a regression guard that fails if a Gini-identifying suffix re-appears.
 
 ## Out Of Scope

@@ -497,6 +497,12 @@ export interface AuthorizationRequestedBlock extends ChatBlockBase {
 //   - `messaging.remove_bridge` → destructive confirmation card showing
 //     bridge name + irreversibility warning. Submit POSTs `{}` to /complete
 //     → server calls removeMessagingBridge.
+//   - `chat.choice` → single-select question card (ask_user tool). Options
+//     live in the SetupRequest payload; the card always adds its own
+//     "Other (type your answer)" freeform input and a Skip affordance.
+//     Submit POSTs `{ choice: { label } }` or `{ choice: { other } }` to
+//     /complete; Skip POSTs to /cancel, which resumes the loop with a skip
+//     fallback instead of failing the task.
 // Cancel always POSTs to /api/setup-requests/<id>/cancel.
 export interface SetupRequestedBlock extends ChatBlockBase {
   kind: "setup_requested";
@@ -1436,7 +1442,14 @@ export type SetupRequestAction =
   | "skill.grant_connector"
   | "messaging.add_bridge"
   | "messaging.approve_pairing"
-  | "messaging.remove_bridge";
+  | "messaging.remove_bridge"
+  // chat.choice — the ask_user tool's single-select question card. The
+  // payload carries { question, options: [{label, description?}], toolCallId };
+  // /complete resolves with the user's pick ({choice:{label}} for a listed
+  // option, {choice:{other}} for the freeform answer) and /cancel is the Skip
+  // affordance, which resumes the loop with a skip fallback rather than
+  // failing the task. See docs/adr/user-choice-prompt.md.
+  | "chat.choice";
 
 export interface SetupRequest {
   id: string;

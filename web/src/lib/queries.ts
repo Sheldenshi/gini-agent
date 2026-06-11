@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient, type UseQueryOptions } from "@tanstack/react-query";
 import { api } from "@/lib/api";
+import { openResilientEventSource } from "@/lib/resilient-event-source";
 import type {
   Authorization,
   BrowserConnectionRecord,
@@ -491,24 +492,28 @@ export function useChatBlocks(sessionId: string | null) {
         setIsLoading(false);
       });
 
-    const source = new EventSource(`/api/runtime/chat/${sessionId}/stream`);
-    source.addEventListener("chat_block", (event) => {
-      const messageEvent = event as MessageEvent;
-      try {
-        const block = JSON.parse(messageEvent.data) as ChatBlock;
-        merge(block);
-      } catch {
-        // A malformed frame shouldn't kill the stream — ignore and
-        // wait for the next one. The SSE browser implementation
-        // handles reconnect with Last-Event-ID on transport errors.
+    // Resilient transport: a bare EventSource is permanently CLOSED when a
+    // reconnect attempt hits the BFF's gateway-down 503; the
+    // wrapper reopens with backoff. A reopen replays the session's block log
+    // (no Last-Event-ID on a fresh source) and merge() upserts by id, so
+    // blocks missed during a gateway restart backfill on their own.
+    const stream = openResilientEventSource(`/api/runtime/chat/${sessionId}/stream`, {
+      attach: (source) => {
+        source.addEventListener("chat_block", (event) => {
+          const messageEvent = event as MessageEvent;
+          try {
+            const block = JSON.parse(messageEvent.data) as ChatBlock;
+            merge(block);
+          } catch {
+            // A malformed frame shouldn't kill the stream — ignore and
+            // wait for the next one.
+          }
+        });
       }
     });
-    // EventSource has built-in reconnect with backoff; don't close on
-    // error or transient hiccups turn into permanent disconnects.
-    source.onerror = () => {};
     return () => {
       cancelled = true;
-      source.close();
+      stream.close();
     };
   }, [sessionId]);
 
@@ -665,19 +670,23 @@ export function useThread(sessionId: string | null, threadId: string | null) {
         setIsLoading(false);
       });
 
-    const source = new EventSource(`/api/runtime/chat/${sessionId}/stream`);
-    source.addEventListener("chat_block", (event) => {
-      const messageEvent = event as MessageEvent;
-      try {
-        merge(JSON.parse(messageEvent.data) as ChatBlock);
-      } catch {
-        // Ignore a malformed frame; the next one will land.
+    // Same resilient transport as useChatBlocks — survives the gateway-down
+    // 503 that permanently closes a bare EventSource.
+    const stream = openResilientEventSource(`/api/runtime/chat/${sessionId}/stream`, {
+      attach: (source) => {
+        source.addEventListener("chat_block", (event) => {
+          const messageEvent = event as MessageEvent;
+          try {
+            merge(JSON.parse(messageEvent.data) as ChatBlock);
+          } catch {
+            // Ignore a malformed frame; the next one will land.
+          }
+        });
       }
     });
-    source.onerror = () => {};
     return () => {
       cancelled = true;
-      source.close();
+      stream.close();
     };
   }, [sessionId, threadId, key]);
 

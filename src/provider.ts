@@ -3476,7 +3476,12 @@ function readCodexBearer(provider: ProviderConfig): string {
     if (credentials.transient) {
       throw new CodexAuthRaceError(credentials.message);
     }
-    throw new Error(credentials.message);
+    // Steady-state credential absence (file missing — the post-`codex logout`
+    // state — or a file without OPENAI_API_KEY / tokens.access_token) is
+    // typed so failTask names the codex credential and emits the re-auth CTA
+    // note directly — typed errors bypass the chat-task message classifier
+    // (mirrors anthropic/bedrock; issue #233).
+    throw new ProviderAuthError("codex", credentials.message);
   }
   return credentials.bearer;
 }
@@ -3588,7 +3593,21 @@ async function withCodexSessionRetry<T>(make: () => Promise<T>): Promise<T> {
       throw err;
     }
     await new Promise<void>((resolve) => setTimeout(resolve, CODEX_RETRY_REWRITE_DELAY_MS));
-    return await make();
+    try {
+      return await make();
+    } catch (retryErr) {
+      // A second consecutive auth.json read failure is no longer a mid-write
+      // race — the file is persistently unreadable or corrupt, which is a
+      // credential problem the user must fix. Surface it typed so failTask
+      // renders the codex re-auth CTA directly (issue #233); typed errors
+      // bypass the chat-task message classifier. A second
+      // CodexSessionExpiredError stays untouched: its backend message
+      // already matches isAuthExpiredError downstream.
+      if (retryErr instanceof CodexAuthRaceError) {
+        throw new ProviderAuthError("codex", retryErr.message);
+      }
+      throw retryErr;
+    }
   }
 }
 
@@ -3609,7 +3628,7 @@ function readCodexCredentials(provider: ProviderConfig): {
     return {
       ok: false,
       authPath,
-      message: `No Codex credentials found at ${authPath}. Run codex --login or set CODEX_AUTH_JSON.`
+      message: `No Codex credentials found at ${authPath}. Run codex login or set CODEX_AUTH_JSON.`
     };
   }
 

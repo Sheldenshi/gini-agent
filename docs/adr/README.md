@@ -47,6 +47,7 @@ Each file in this directory captures one architecture decision: the context, the
 - [Mobile Push Notifications (APNs + NSE + Inline Actions)](mobile-push-notifications.md)
 - [Codex Session-Rotation Retry, UA Mirroring, And auth.json Race Handling](codex-session-rotation-retry.md)
 - [Authorization vs SetupRequest](authorization-vs-setup-request.md)
+- [User Choice Prompt (ask_user / chat.choice)](user-choice-prompt.md)
 - [Skill Env Containment For terminal_exec And skill_run](skill-env-containment.md)
 - [Per-Skill Connector Consent Grant](skill-connector-consent.md)
 - [Multiple Tagged Google Accounts For The Workspace Skills](google-multi-account.md)

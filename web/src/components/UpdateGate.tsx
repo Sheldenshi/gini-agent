@@ -13,7 +13,7 @@ import {
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { CheckCircle2, Loader2 } from "lucide-react";
 import { toast } from "sonner";
-import { api } from "@/lib/api";
+import { api, type ApiError } from "@/lib/api";
 import { useStatus } from "@/lib/queries";
 import type { GiniUpdateResult, GiniVersionInfo } from "@runtime/types";
 
@@ -220,15 +220,18 @@ export function UpdateGateProvider({
       });
     },
     onError: (error: Error) => {
-      // Release the blur only on a structured gateway error — one that carries
-      // an HTTP status, meaning the gateway responded non-2xx (a genuine
-      // pre-flight failure). Any other rejection (fetch failing, or the body
-      // parse throwing on a truncated response) means the gateway most likely
-      // applied the update and restarted before the response flushed: keep the
-      // blur and let the new-revision detector / stall timer resolve it rather
-      // than handing the app back mid-update.
-      const status = (error as Error & { status?: number }).status;
-      if (typeof status === "number") {
+      // Release the blur only on a structured gateway error — the gateway
+      // itself responded non-2xx (a genuine pre-flight failure). Everything
+      // else means the gateway most likely applied the update and restarted
+      // before the response flushed: keep the blur and let the new-revision
+      // detector / stall timer resolve it rather than handing the app back
+      // mid-update. That includes BOTH unreachable shapes api() can throw —
+      // the BFF's gateway_unreachable 503 (the gateway died mid-POST and the
+      // BFF answered for it) and a tagged transport/parse failure. Checking
+      // `status` alone would mistake the BFF's 503 for a gateway response
+      // and release the gate in exactly the window it exists to cover.
+      const { status, unreachable } = error as ApiError;
+      if (typeof status === "number" && !unreachable) {
         reset();
         toast.error(error.message);
       }

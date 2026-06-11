@@ -5,6 +5,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useState, type ReactNode } from "react";
 import { usePathname } from "next/navigation";
 import { Toaster } from "sonner";
+import { ConnectionBanner } from "./ConnectionBanner";
 import { RuntimeStreamBridge } from "./RuntimeStreamBridge";
 import { UpdateGateProvider } from "./UpdateGate";
 
@@ -60,6 +61,10 @@ export function Providers({ children }: { children: ReactNode }) {
     <ThemeProvider attribute="class" defaultTheme="light" enableSystem={false} disableTransitionOnChange>
       <QueryClientProvider client={client}>
         {!onPairPage && <RuntimeStreamBridge />}
+        {/* Reconnecting pill rides the same shared stream the bridge opens; it
+            is a passive observer, so /pair (which mounts neither) stays
+            silent. */}
+        {!onPairPage && <ConnectionBanner />}
         {/* The update gate blurs the app while a self-update applies. It needs
             /status, so skip it on the pre-auth /pair screen (same as the
             stream bridge); Toaster stays outside it so error toasts render

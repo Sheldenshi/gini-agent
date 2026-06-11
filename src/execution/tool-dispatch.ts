@@ -260,6 +260,8 @@ async function dispatchToolCallInner(
       return { kind: "sync", result: await visionQueryTool(config, taskId, args) };
     case "request_connector":
       return await requestConnectorTool(config, taskId, toolCallId, args, messageHistory);
+    case "ask_user":
+      return await askUserTool(config, taskId, toolCallId, args);
     case "browser_fill_secrets":
       return await browserFillSecretsTool(config, taskId, toolCallId, args);
     case "request_messaging_bridge":
@@ -3546,6 +3548,110 @@ async function requestConnectorTool(
       type: "approval",
       message: "Approval requested for connector connect (chat-task)",
       data: { approvalId: approval.id, provider: target, toolCallId }
+    });
+    return approval.id;
+  });
+  return { kind: "pending", approvalId };
+}
+
+// ask_user tool. Mints a chat.choice SetupRequest whose payload carries the
+// question + options; the chat-task loop's pending handler emits a
+// setup_requested block and the web chat renders the single-select choice
+// card (which adds its own "Other" freeform input and Skip affordance — they
+// are not tool params). POST /api/setup-requests/<id>/complete resumes the
+// loop with the user's pick; /cancel (Skip) resumes with a skip fallback
+// instead of failing the task. Unlike connector.request, no approval_reason
+// assistant bubble is persisted — the question lives in the card itself.
+// See docs/adr/user-choice-prompt.md.
+async function askUserTool(
+  config: RuntimeConfig,
+  taskId: string,
+  toolCallId: string,
+  args: Record<string, unknown>
+): Promise<DispatchResult> {
+  const question = typeof args.question === "string" ? args.question.trim() : "";
+  if (!question) {
+    return {
+      kind: "sync",
+      result: JSON.stringify({ ok: false, error: "ask_user needs a non-empty `question` string." })
+    };
+  }
+  const rawOptions = args.options;
+  if (!Array.isArray(rawOptions) || rawOptions.length < 2 || rawOptions.length > 6) {
+    return {
+      kind: "sync",
+      result: JSON.stringify({ ok: false, error: "ask_user needs `options`: an array of 2-6 entries, each { label, description? }." })
+    };
+  }
+  const options: Array<{ label: string; description?: string }> = [];
+  for (const entry of rawOptions) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      return {
+        kind: "sync",
+        result: JSON.stringify({ ok: false, error: "Each ask_user option must be an object: { label: string, description?: string }." })
+      };
+    }
+    const candidate = entry as { label?: unknown; description?: unknown };
+    const label = typeof candidate.label === "string" ? candidate.label.trim() : "";
+    if (!label) {
+      return {
+        kind: "sync",
+        result: JSON.stringify({ ok: false, error: "Each ask_user option needs a non-empty `label` string." })
+      };
+    }
+    if (options.some((o) => o.label === label)) {
+      return {
+        kind: "sync",
+        result: JSON.stringify({ ok: false, error: `Duplicate ask_user option label: "${label}". Labels must be distinct.` })
+      };
+    }
+    const description = typeof candidate.description === "string" && candidate.description.trim().length > 0
+      ? candidate.description.trim()
+      : undefined;
+    options.push({ label, ...(description ? { description } : {}) });
+  }
+
+  // Surface guard — same rationale as requestConnectorTool. The choice card
+  // is React UI rendered only in the web chat; a task running over a
+  // messaging bridge or in a headless job session would park in
+  // waiting_approval with no way to answer. Fail synchronously so the agent
+  // asks the question as a regular message instead.
+  const surfaceState = readState(config.instance);
+  const surfaceTask = findTask(surfaceState, taskId);
+  const surfaceSession = surfaceTask.chatSessionId
+    ? surfaceState.chatSessions.find((s) => s.id === surfaceTask.chatSessionId)
+    : undefined;
+  const surfaceKind = surfaceSession?.source?.kind ?? surfaceSession?.outboundMirror?.kind;
+  if (!surfaceSession || surfaceSession.origin === "job" || surfaceKind === "telegram" || surfaceKind === "discord") {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: "The choice card only renders in a web chat session — this task isn't attached to one. Ask the question as a regular message listing the options and continue from the user's reply."
+      })
+    };
+  }
+
+  const approvalId = await mutateState(config.instance, (mutable: RuntimeState) => {
+    const item = findTask(mutable, taskId);
+    if (isTerminalTaskStatus(item.status)) {
+      throw new TaskAlreadyTerminalError(taskId, item.status);
+    }
+    const approval = createSetupRequest(mutable, {
+      taskId: item.id,
+      action: "chat.choice",
+      target: question,
+      // `reason` is the question so the setup_requested block summary (and
+      // transcripts) read as the question itself.
+      reason: question,
+      payload: { question, options, toolCallId }
+    });
+    item.approvalIds.push(approval.id);
+    item.updatedAt = now();
+    appendTrace(config.instance, item.id, {
+      type: "approval",
+      message: "User choice requested (chat-task)",
+      data: { approvalId: approval.id, question, toolCallId }
     });
     return approval.id;
   });

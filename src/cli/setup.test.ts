@@ -11,7 +11,8 @@ import {
   checkOpenAIKeyStatus,
   hasKeyInSecretsFile,
   readKeyFromSecretsFile,
-  writeKeyToSecretsFile
+  writeKeyToSecretsFile,
+  type SetupIO
 } from "./commands/setup";
 
 const PROJECT_ROOT = resolve(import.meta.dir, "..", "..");
@@ -415,6 +416,71 @@ describe("codexProvider.checkCredentials (direct)", () => {
       expect(status.available).toBe(false);
       expect(status.source).toBe("missing");
     });
+  });
+});
+
+describe("runCodexLogin (direct)", () => {
+  // The spawn is injected so no real codex CLI ever launches (the real one
+  // would start an interactive OAuth flow and hang the suite). Only the
+  // fields runCodexLogin reads are modeled.
+  type SpawnSyncResult = { error?: NodeJS.ErrnoException; status?: number | null };
+
+  function fakeSpawn(result: SpawnSyncResult): {
+    calls: Array<{ cmd: string; args: readonly string[] }>;
+    spawn: Parameters<typeof __testing.runCodexLogin>[1];
+  } {
+    const calls: Array<{ cmd: string; args: readonly string[] }> = [];
+    const spawn = ((cmd: string, args: readonly string[]) => {
+      calls.push({ cmd, args });
+      return result;
+    }) as unknown as Parameters<typeof __testing.runCodexLogin>[1];
+    return { calls, spawn };
+  }
+
+  function stubIo(errors: string[]): SetupIO {
+    return {
+      select: async <T,>(_prompt: string, choices: { label: string; value: T }[]) => choices[0]!.value,
+      prompt: async () => "",
+      secret: async () => "",
+      info: () => {},
+      success: () => {},
+      error: (msg: string) => { errors.push(msg); },
+      isNonInteractive: false
+    };
+  }
+
+  test("spawns the `codex login` subcommand, not a --login flag", () => {
+    // The codex CLI has no `--login` flag — login is a subcommand, so the
+    // spawned argv must be exactly ["login"] or the setup option is broken.
+    const errors: string[] = [];
+    const { calls, spawn } = fakeSpawn({ status: 0 });
+    expect(__testing.runCodexLogin(stubIo(errors), spawn)).toBe(true);
+    expect(calls).toEqual([{ cmd: "codex", args: ["login"] }]);
+    expect(errors).toEqual([]);
+  });
+
+  test("missing codex binary (ENOENT) → install hint citing codex login", () => {
+    const errors: string[] = [];
+    const enoent = Object.assign(new Error("spawnSync codex ENOENT"), { code: "ENOENT" });
+    const { spawn } = fakeSpawn({ error: enoent });
+    expect(__testing.runCodexLogin(stubIo(errors), spawn)).toBe(false);
+    expect(errors.join("\n")).toContain("codex CLI not found");
+    expect(errors.join("\n")).toContain("codex login");
+    expect(errors.join("\n")).not.toContain("--login");
+  });
+
+  test("other spawn error → failure message naming codex login", () => {
+    const errors: string[] = [];
+    const { spawn } = fakeSpawn({ error: Object.assign(new Error("EACCES boom"), { code: "EACCES" }) });
+    expect(__testing.runCodexLogin(stubIo(errors), spawn)).toBe(false);
+    expect(errors.join("\n")).toContain("Failed to run codex login");
+  });
+
+  test("non-zero exit status → failure message with the status", () => {
+    const errors: string[] = [];
+    const { spawn } = fakeSpawn({ status: 3 });
+    expect(__testing.runCodexLogin(stubIo(errors), spawn)).toBe(false);
+    expect(errors.join("\n")).toContain("codex login exited with status 3");
   });
 });
 

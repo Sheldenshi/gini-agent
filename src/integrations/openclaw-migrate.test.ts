@@ -1985,7 +1985,7 @@ describe("planMigration", () => {
     expect(ref?.detail).not.toContain("CorpName-Vault");
   });
 
-  test("skips codex secret writes and points the operator at codex --login", () => {
+  test("skips codex secret writes and points the operator at codex login", () => {
     // Gini's codex provider reads OAuth from ~/.codex/auth.json, the
     // same file openclaw uses. There's no bearer env to migrate, so
     // writing a CODEX_API_KEY would be unread by the runtime and would
@@ -2013,7 +2013,7 @@ describe("planMigration", () => {
     expect(plan.steps.some((step) => step.kind === "secret")).toBe(false);
     expect(
       plan.unsupported.some(
-        (entry) => entry.kind === "provider:codex" && entry.detail.includes("codex --login")
+        (entry) => entry.kind === "provider:codex" && entry.detail.includes("codex login")
       )
     ).toBe(true);
   });

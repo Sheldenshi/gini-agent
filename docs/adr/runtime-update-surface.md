@@ -73,17 +73,24 @@ installer-origin guardrails rather than adding a browser-only shortcut.
   notice instead of trapping the user. Because the restart only fires
   after the response flushes (above), a dropped `POST /api/update`
   connection is read as "restarting, not failed" — the blur is held and
-  released only on a structured (HTTP-status-bearing) gateway error. The
+  released only on a structured error the gateway itself produced. An HTTP
+  status alone is not sufficient: the BFF answers for an unreachable
+  gateway with its own status-bearing `gateway_unreachable` 503 envelope,
+  which arrives exactly in the restart window, so the client treats that
+  tagged shape like a transport failure and holds the blur. The
   in-flight state is persisted to `sessionStorage` so the restart-triggered
   reload resumes the blur instead of briefly exposing a half-updated app.
 - The scheduled restart is supervisor-aware. On a launchd-supervised
   instance the runtime self-SIGTERMs (drains, exits 0) and `KeepAlive`
   respawns it with the freshly checked-out code — no detached stop+start
   helper that would reparent and orphan the respawn outside supervision —
-  plus a detached `gini autostart kick --kind web` re-execs the web service
-  for any new `web/` dependencies. Foreground / `gini run` instances keep
-  the detached stop+start helper because there is no KeepAlive to respawn
-  them. The always-respawn KeepAlive model, the watchdog, and the
+  plus detached `gini autostart kick` children re-exec the web service (for
+  any new `web/` dependencies) and the watchdog — the watchdog is a
+  long-lived probe loop, so neither KeepAlive (it never exits) nor the
+  plist-stamp reconcile (the template is unchanged by a code-only update)
+  would otherwise replace its process with the new code. Foreground /
+  `gini run` instances keep the detached stop+start helper because there
+  is no KeepAlive to respawn them. The always-respawn KeepAlive model, the watchdog, and the
   bootout-as-stop contract live in
   [Always-Up Supervision](always-up-supervision.md); this ADR cross-links
   rather than duplicating them.

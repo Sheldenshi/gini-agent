@@ -35,6 +35,7 @@ The split makes the line structural: the type discriminates how a row is created
 - `browser.connect` — user opens a managed browser to sign in. Has a navigate-first precondition: the dispatcher refuses a cold call (no page open) with a "call `browser_navigate` first" nudge instead of minting an approval, so an ordinary browse-the-web request never pops a Connect card. The escalation is reserved for a navigation that genuinely lands on a sign-in / auth wall. Connect cards are also capped per wall (a first prompt plus one retry): once two Connect cards exist for the same host in the task, a further call returns a "you're blocked on signing in" nudge instead of minting another card — without this, an agent that can't get past a persisting sign-in wall re-issues `browser_connect` every iteration and spams the user with identical cards. The headless reconnect (the setup skill re-opening invisibly after `browser_close`) is exempt because it has no live session by design.
 - `connector.request` — user enters provider credentials via the connect dialog.
 - `browser.fill_secret` — user types a credential into a form field. Even though the underlying action is high-risk credential routing, the user is the actor (they type), the trust anchor is a non-spoofable page URL, and `/approve` always rejected this action because the credential value must arrive in a request body. Structurally identical to `connector.request`. Shares the same navigate-first precondition as `browser.connect`.
+- `chat.choice` — user answers a single-select question minted by the `ask_user` tool (the card always adds an "Other" freeform input and a Skip affordance). User-actor, no risk pill; `/complete` carries the pick, `/cancel` is Skip and resumes the loop with a skip fallback instead of failing the task. See ADR [user-choice-prompt.md](user-choice-prompt.md).
 
 A new tool author chooses by asking: when this row resolves, who pushed the button — the agent (after user consent) or the user (after performing the step)?
 
@@ -69,7 +70,7 @@ No `/api/approvals*` alias is exposed; the legacy endpoint family is removed and
 
 `resolveSetupRequest` flips status and owns the action-specific continuation policy. Per-action side effects (visible Chrome launch, connector creation, credential routing) run inside the `/complete` handler. The `browser.connect` flow uses `completeBrowserConnectSetup` in `src/capabilities/browser-connect.ts` so the HTTP path and the test path share one implementation.
 
-`connector.request` cancellation resumes the paused chat loop with a negative tool result so the agent can continue without that connector or explain what input is still required. Setup actions without an explicit continuation contract may mark the task failed on cancel rather than inventing a generic fallback.
+`connector.request` and `chat.choice` cancellations resume the paused chat loop with a negative tool result (continue without the connector / continue past the skipped question) so the agent can keep going or explain what input is still required. Setup actions without an explicit continuation contract may mark the task failed on cancel rather than inventing a generic fallback.
 
 ## Consequences
 

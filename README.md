@@ -54,7 +54,7 @@ See the [Whitepaper](docs/whitepaper.md) and [Architecture Overview](docs/archit
 curl -fsSL https://raw.githubusercontent.com/Lilac-Labs/gini-agent/main/scripts/install.sh | bash
 ```
 
-On macOS the installer enables autostart (per-user LaunchAgents for the runtime and webapp), waits for the webapp to come up, and opens the `/setup` page in your browser. Pick a provider in the browser form (OpenAI API key or existing `codex --login` auth) and you land on the running app. The runtime stays alive across reboots and crashes until you explicitly run `gini stop` or `gini autostart disable`.
+On macOS the installer enables autostart (per-user LaunchAgents for the runtime and webapp), waits for the webapp to come up, and opens the `/setup` page in your browser. Pick a provider in the browser form (OpenAI API key or existing `codex login` auth) and you land on the running app. The runtime stays alive across reboots and crashes until you explicitly run `gini stop` or `gini autostart disable`.
 
 If the browser doesn't open automatically (or you want to navigate manually), run `gini status` to print the actual web URL. The installed `default` instance always lives at `:7777`; other instances get hash-derived ports, so check `gini status` rather than guessing. The installer also prints the URL right before opening the browser.
 

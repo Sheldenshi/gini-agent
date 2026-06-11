@@ -296,7 +296,7 @@ export async function setSetupProvider(
     // request with the caller's AWS credentials (AWS_* env or the
     // ~/.aws/credentials profile). "Configured" therefore means those
     // credentials resolve — reject up front with a clear hint when they don't,
-    // mirroring codex's "run codex --login" gate. Only model + region are
+    // mirroring codex's "run codex login" gate. Only model + region are
     // persisted (never secret values).
     const existing = config.provider?.name === "bedrock" ? config.provider : undefined;
     if (!hasUsableAwsCredentials()) {
@@ -368,7 +368,7 @@ export async function setSetupProvider(
       ok: false,
       provider: providerHealth(config),
       plistRefreshNeeded: false,
-      error: "Codex credentials not found. Run `codex --login` in your terminal, then retry."
+      error: "Codex credentials not found. Run `codex login` in your terminal, then retry."
     };
   }
   // Presence is not enough to Verify: the runtime can decode the OAuth JWT's
@@ -440,7 +440,7 @@ export interface RemoveSetupProviderResult {
 // secrets.env, and, when removing the currently-active provider, fall
 // back to codex if codex auth is available so the gateway stays usable.
 // Codex itself isn't removable through the UI because ~/.codex/auth.json
-// is owned by the `codex` CLI — the user manages it via codex --logout.
+// is owned by the `codex` CLI — the user manages it via codex logout.
 // Local has no key to remove; the gate below mirrors that.
 export async function removeSetupProvider(
   config: RuntimeConfig,
@@ -451,7 +451,7 @@ export async function removeSetupProvider(
       ok: false,
       provider: providerHealth(config),
       switched: false,
-      error: "Codex is managed by the codex CLI. Run `codex --logout` to sign out."
+      error: "Codex is managed by the codex CLI. Run `codex logout` to sign out."
     };
   }
   const envKeySpec = ENV_KEY_PROVIDERS[providerName];

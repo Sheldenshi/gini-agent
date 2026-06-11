@@ -1395,7 +1395,9 @@ export async function resolveSetupRequest(
     );
     // On connector.request cancel, feed a negative tool result back into the
     // chat loop so the agent can either find another path or explain that it
-    // needs the connector. Other setup cancellations still fail the owning
+    // needs the connector. chat.choice cancel (the card's Skip affordance)
+    // resumes the same way with a skip fallback — skipping a question must
+    // never kill the turn. Other setup cancellations still fail the owning
     // task: those flows are user-supplied secret/login actions where there is
     // no safe generic continuation contract yet.
     let taskRow: Task | undefined;
@@ -1403,7 +1405,7 @@ export async function resolveSetupRequest(
     if (decision === "cancel" && item.taskId) {
       const toolCallId = approvalToolCallId(item.payload);
       const task = state.tasks.find((t) => t.id === item.taskId);
-      if (item.action === "connector.request" && toolCallId && task && !isTerminalTaskStatus(task.status)) {
+      if ((item.action === "connector.request" || item.action === "chat.choice") && toolCallId && task && !isTerminalTaskStatus(task.status)) {
         task.updatedAt = item.updatedAt;
         resumeCancelledConnector = true;
         return { item, task: taskRow, resumeCancelledConnector };
@@ -1442,9 +1444,10 @@ export async function resolveSetupRequest(
   if (decision === "cancel" && result.resumeCancelledConnector && result.item.taskId) {
     const toolCallId = approvalToolCallId(result.item.payload);
     if (resume && toolCallId) {
-      const toolResult =
-        `User canceled connector setup for ${result.item.target}. ` +
-        `Continue without that connector if possible. If the original request requires it, tell the user what input or connector is needed.`;
+      const toolResult = result.item.action === "chat.choice"
+        ? "User skipped the question. Continue with your best judgment, or explain what you need if you cannot proceed without an answer."
+        : `User canceled connector setup for ${result.item.target}. ` +
+          `Continue without that connector if possible. If the original request requires it, tell the user what input or connector is needed.`;
       if (opts.awaitResume === false) {
         void resumeChatTask(config, result.item.taskId, toolCallId, toolResult).catch((error) =>
           failTask(config, result.item.taskId!, error)

@@ -8,7 +8,7 @@ clean exits, and self-restarts. Three per-instance LaunchAgents under
 
 - `ai.lilaclabs.gini.<instance>.gateway` — the Bun runtime (`src/server.ts`).
 - `ai.lilaclabs.gini.<instance>.web` — the Next.js dev server (the BFF).
-- `ai.lilaclabs.gini.<instance>.watchdog` — a periodic health probe.
+- `ai.lilaclabs.gini.<instance>.watchdog` — a long-lived health-probe loop.
 
 The model rests on four pieces:
 
@@ -37,10 +37,19 @@ The model rests on four pieces:
   foreground without the foreground path ever triggering launchd-only
   behavior.
 
-- **A dedicated watchdog service.** The third LaunchAgent is a periodic
-  one-shot — `StartInterval` (~30s) + `RunAtLoad`, and *no* `KeepAlive`
-  (it is a short-lived probe that always exits 0, so KeepAlive would
-  respawn it in a tight loop). Each tick (`gini watchdog`) health-checks
+- **A dedicated watchdog service.** The third LaunchAgent is a *long-lived
+  probe loop* — `KeepAlive` + `ThrottleInterval` like the gateway/web, with
+  the probe cadence (`WATCHDOG_TICK_INTERVAL_MS`, 10s) driven by an
+  in-process timer in `gini watchdog` rather than by launchd respawns
+  (`gini watchdog --once` runs a single tick for manual use). It was
+  previously a `StartInterval` (30s) one-shot, but that made the safety net
+  subject to the exact failure it guards: launchd's spawn deferral on
+  macOS 26 defers `StartInterval` spawns just as it defers KeepAlive
+  respawns, so during a gateway respawn-deferral window the watchdog's own
+  ticks gapped (50-99s observed against the 30s interval) and a
+  dead gateway stayed down for the same stretch. A long-lived loop asks
+  launchd for one spawn at login; the steady-state cadence is immune to
+  spawn deferral. Each tick health-checks
   the gateway (`/api/status`, where any HTTP response — including a 401 —
   proves the process is answering) and the web child
   (`/api/runtime/__healthz`, verified to be *our* `gini-web` on the
@@ -168,10 +177,12 @@ launchd instances so foreground/conductor/tmux runs are unaffected.
 - The runtime stays under launchd supervision across an auto-update: the
   gateway is never reparented to PID 1, so a crash after an update is still
   respawned.
-- The watchdog adds one more launchd job per instance and a localhost
-  health probe every ~30s. The probe is read-only and idempotent — a
-  `kickstart -k` against an already-running healthy job is a no-op, so the
-  watchdog overlapping with KeepAlive's own respawn is benign.
+- The watchdog adds one more launchd job per instance — a single resident
+  process probing localhost every 10s. The probe is read-only and
+  idempotent — a `kickstart -k` against an already-running healthy job is a
+  no-op, so the watchdog overlapping with KeepAlive's own respawn is benign.
+  A dead gateway is revived within one tick plus the 2s probe timeout, even
+  while launchd is deferring its own respawns.
 - Foreground / `gini run` / conductor / tmux instances keep their existing
   behavior end to end: no KeepAlive, PID-kill stop, and the detached
   stop+start update helper. The `GINI_SUPERVISOR` marker is the single
@@ -184,9 +195,11 @@ launchd instances so foreground/conductor/tmux runs are unaffected.
 
 ## Acceptance Checks
 
-- The generated gateway/web plist contains `KeepAlive` as `<true/>` plus a
-  `ThrottleInterval`; the watchdog plist contains `StartInterval` +
-  `RunAtLoad` and *no* `KeepAlive`.
+- All three generated plists (gateway, web, watchdog) contain `KeepAlive` as
+  `<true/>` plus a `ThrottleInterval` and *no* `StartInterval`; the watchdog's
+  probe cadence lives in its own loop, and the stamp-driven startup reconcile
+  migrates an installed `StartInterval`-shaped watchdog plist to the
+  long-lived shape on the next gateway boot.
 - Both the gateway and web plist `EnvironmentVariables` carry
   `GINI_SUPERVISOR=launchd`; foreground / `gini run` env never sets it, and
   `supervisor()` returns `null` there.
@@ -195,13 +208,18 @@ launchd instances so foreground/conductor/tmux runs are unaffected.
   stop); on a foreground instance it SIGTERMs the PID and does not call
   bootout.
 - An auto-update on a launchd instance self-SIGTERMs and is respawned by
-  KeepAlive with the new code, and dispatches a detached
-  `gini autostart kick --kind web`; on a foreground instance it uses the
-  detached stop+start helper.
+  KeepAlive with the new code, and dispatches detached
+  `gini autostart kick` children for web AND the watchdog — the long-lived
+  watchdog loop never exits on its own and a code-only update leaves its
+  plist stamp unchanged, so the explicit kick is the only thing that
+  replaces its process with the new code. On a foreground instance the
+  update uses the detached stop+start helper.
 - A `gini watchdog` tick against a healthy instance takes no action; with
   the gateway down it `kickstart -k`s the gateway; with web down it
   `kickstart -k`s web (and queues a web crash report for consent-gated
-  filing — see the crash ADR).
+  filing — see the crash ADR). The loop paces itself at
+  `WATCHDOG_TICK_INTERVAL_MS` between ticks and never exits on its own;
+  `gini watchdog --once` runs exactly one tick.
 - Every generated plist's `EnvironmentVariables` carries a `GINI_PLIST_STAMP`.
   The stamp is identical for two plists that differ only in PATH, a secret
   value, `HOME`, `SHELL`, the state/log roots, or the stdout/err paths, and it

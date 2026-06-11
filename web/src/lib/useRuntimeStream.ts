@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useLayoutEffect, useRef } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { openResilientEventSource, type ResilientEventSourceHandle } from "./resilient-event-source";
 
 // Runtime-side event kinds. Source of truth: src/types.ts RuntimeEventKind.
 // The server emits each event as `event: <kind>` (named SSE events), so the
@@ -25,32 +26,44 @@ const EVENT_KINDS = [
 export type RuntimeStreamEvent = { kind: string; data: string };
 type Listener = (event: RuntimeStreamEvent) => void;
 
-// Module-level singletons — one EventSource per browser tab, shared by every
+// Module-level singletons — one SSE transport per browser tab, shared by every
 // `useRuntimeStream` caller and the global `RuntimeStreamBridge`. Subscribing
-// from N places does not open N connections.
-let source: EventSource | null = null;
+// from N places does not open N connections. The transport is the resilient
+// wrapper, not a bare EventSource: a gateway restart turns the BFF's stream
+// route into a 503, which permanently CLOSES a bare EventSource —
+// the wrapper reopens it with backoff so live updates resume on their own.
+let handle: ResilientEventSourceHandle | null = null;
 const listeners = new Set<Listener>();
 
+// Tab-wide connection state for the "reconnecting" UI. Starts true so the
+// banner never flashes during initial page load before the first stream
+// opens; the wrapper reports the first real transition either way.
+let connected = true;
+const connectionListeners = new Set<(connected: boolean) => void>();
+
+function notifyConnection(next: boolean): void {
+  connected = next;
+  for (const listener of connectionListeners) listener(next);
+}
+
 function openSseTransport(): void {
-  const next = new EventSource("/api/runtime/events/stream");
-  const fanOut = (kind: string) => (event: MessageEvent) => {
-    for (const listener of listeners) listener({ kind, data: event.data });
-  };
-  for (const kind of EVENT_KINDS) next.addEventListener(kind, fanOut(kind));
-  // Default `message` listener kept as a fallback for servers that emit
-  // unnamed events; the local runtime does not, but this avoids breakage if
-  // the upstream surface changes.
-  next.addEventListener("message", fanOut("message"));
-  // Intentionally NOT closing on error — EventSource has built-in reconnect
-  // with backoff, and closing turns transient hiccups into permanent
-  // disconnects. Some browsers fire onerror on every reconnect attempt during
-  // a brief outage, so we stay quiet.
-  next.onerror = () => {};
-  source = next;
+  handle = openResilientEventSource("/api/runtime/events/stream", {
+    attach: (source) => {
+      const fanOut = (kind: string) => (event: MessageEvent) => {
+        for (const listener of listeners) listener({ kind, data: event.data });
+      };
+      for (const kind of EVENT_KINDS) source.addEventListener(kind, fanOut(kind));
+      // Default `message` listener kept as a fallback for servers that emit
+      // unnamed events; the local runtime does not, but this avoids breakage if
+      // the upstream surface changes.
+      source.addEventListener("message", fanOut("message"));
+    },
+    onStateChange: notifyConnection
+  });
 }
 
 function ensureConnection(): void {
-  if (source) return;
+  if (handle) return;
   openSseTransport();
 }
 
@@ -58,11 +71,11 @@ function closeConnection(): void {
   // Defense in depth: callers gate this on `listeners.size === 0`, but a
   // resubscribe that races the unsubscribe could leave the listener set
   // non-empty when we arrive here. Closing in that case would strand those
-  // subscribers — bail out and let the existing source keep serving them.
+  // subscribers — bail out and let the existing transport keep serving them.
   if (listeners.size > 0) return;
-  if (source) {
-    source.close();
-    source = null;
+  if (handle) {
+    handle.close();
+    handle = null;
   }
 }
 
@@ -79,7 +92,7 @@ function subscribe(listener: Listener): () => void {
 
 /**
  * Subscribes to /api/runtime/events/stream (SSE). Multiple callers share a
- * single underlying EventSource (module-level singleton), so mounting many
+ * single underlying transport (module-level singleton), so mounting many
  * subscribers across the app does not open many connections.
  *
  * Stability:
@@ -101,20 +114,51 @@ export function useRuntimeStream(onEvent: Listener): void {
   }, []);
 }
 
+/**
+ * Tab-wide gateway-stream connection state. Passive observer: it never opens
+ * the transport itself (RuntimeStreamBridge does), it only mirrors the shared
+ * state — so the ConnectionBanner can render "reconnecting" without owning a
+ * stream subscription.
+ */
+export function useRuntimeStreamConnected(): boolean {
+  const [state, setState] = useState(connected);
+  useEffect(() => {
+    // Re-sync after mount: the state can have transitioned between the
+    // initial useState snapshot and the effect running.
+    setState(connected);
+    const listener = (next: boolean) => setState(next);
+    connectionListeners.add(listener);
+    return () => {
+      connectionListeners.delete(listener);
+    };
+  }, []);
+  return state;
+}
+
 /** Test-only hooks for the SSE singleton. */
 export const __streamTestHooks = {
   subscribe,
   getSource(): EventSource | null {
-    return source;
+    return handle?.current() ?? null;
   },
   listenerCount(): number {
     return listeners.size;
   },
+  isConnected(): boolean {
+    return connected;
+  },
+  // Drive the shared connection state directly — lets component tests cover
+  // the reconnecting UI without standing up a fake SSE transport.
+  setConnectedForTest(next: boolean): void {
+    notifyConnection(next);
+  },
   reset(): void {
-    if (source) {
-      source.close();
-      source = null;
+    if (handle) {
+      handle.close();
+      handle = null;
     }
     listeners.clear();
+    connectionListeners.clear();
+    connected = true;
   }
 };

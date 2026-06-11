@@ -2306,6 +2306,9 @@ async function runLoop(
               // above the card. Without this the reason would be invisible in
               // the block UI (the legacy ChatMessageRecord persisted in
               // tool-dispatch only feeds the deprecated getChatSession path).
+              // chat.choice deliberately gets NO reason bubble — the question
+              // IS the card content (the block summary carries it), so a
+              // bubble would duplicate it above the choice card.
               if (setupRow.action === "connector.request" && setupRow.reason) {
                 const reasonBlock = emitAssistantTextStart(emitCtx, setupRow.reason);
                 if (reasonBlock?.id) finalizeAssistantText(emitCtx, reasonBlock.id, setupRow.reason);

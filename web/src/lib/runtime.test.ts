@@ -3,7 +3,21 @@
 // the browser-facing BFF and the bearer-gated gateway.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { guardCsrf, pickForwardHeaders, proxyRequest } from "./runtime";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { GATEWAY_UNREACHABLE_CODE } from "./gateway-codes";
+import {
+  __fileCacheTestHooks,
+  __unreachableLogTestHooks,
+  canonicalizeSegments,
+  guardCsrf,
+  pickForwardHeaders,
+  proxyRequest,
+  runtimeInstance,
+  runtimeToken,
+  runtimeUrl
+} from "./runtime";
 
 const originalTrusted = process.env.GINI_TRUSTED_ORIGINS;
 
@@ -116,6 +130,15 @@ describe("guardCsrf — loopback short-circuit (gateway is the single front)", (
 
   test("loopback Host + malformed Origin → 403", () => {
     const res = guardCsrf(makeReq({ method: "POST", host: "127.0.0.1:7777", origin: "not a url" }), []);
+    expect(res).not.toBeNull();
+    expect(res!.status).toBe(403);
+  });
+
+  test("non-loopback Host + malformed Origin → 403", () => {
+    const res = guardCsrf(
+      makeReq({ method: "POST", host: "evil.example", origin: "not a url", url: "https://evil.example/api/runtime/chat" }),
+      []
+    );
     expect(res).not.toBeNull();
     expect(res!.status).toBe(403);
   });
@@ -285,6 +308,263 @@ describe("proxyRequest — upload size cap", () => {
       expect(forwarded).toBe(false);
     } finally {
       delete process.env.GINI_MAX_UPLOAD_BYTES;
+    }
+  });
+});
+
+describe("proxyRequest — gateway unreachable", () => {
+  test("a rejecting upstream fetch returns a retryable 503 JSON envelope, not a bare 500", async () => {
+    const fetcher = (async () => {
+      throw new Error("connect ECONNREFUSED 127.0.0.1:7778");
+    }) as unknown as typeof fetch;
+    const req = new Request("http://127.0.0.1:7777/api/runtime/status", {
+      method: "GET",
+      headers: { host: "127.0.0.1:7777" }
+    });
+    const res = await proxyRequest(req, ["status"], {
+      runtimeUrl: "http://127.0.0.1:9999",
+      token: "t",
+      fetcher
+    });
+    expect(res.status).toBe(503);
+    expect(res.headers.get("retry-after")).toBe("2");
+    expect(res.headers.get("content-type")).toContain("application/json");
+    const body = (await res.json()) as { error: string; code: string };
+    expect(body.code).toBe(GATEWAY_UNREACHABLE_CODE);
+    expect(body.error.length).toBeGreaterThan(0);
+  });
+
+  test("the unreachable path logs target + cause once, deduplicating repeats inside the window", async () => {
+    __unreachableLogTestHooks.reset();
+    const logged: string[] = [];
+    const realConsoleError = console.error;
+    console.error = ((...args: unknown[]) => {
+      logged.push(String(args[0]));
+    }) as typeof console.error;
+    try {
+      const refusedFetcher = (async () => {
+        throw new Error("fetch failed", { cause: new Error("connect ECONNREFUSED 127.0.0.1:9999") });
+      }) as unknown as typeof fetch;
+      const send = () =>
+        proxyRequest(
+          new Request("http://127.0.0.1:7777/api/runtime/status", { method: "GET", headers: { host: "127.0.0.1:7777" } }),
+          ["status"],
+          { runtimeUrl: "http://127.0.0.1:9999", token: "t", fetcher: refusedFetcher }
+        );
+      // A restart window's polling burst: same target, same cause — one line.
+      await send();
+      await send();
+      await send();
+      expect(logged.length).toBe(1);
+      // The single line carries the load-bearing data: dialed target + errno.
+      expect(logged[0]).toContain("http://127.0.0.1:9999/api/status");
+      expect(logged[0]).toContain("ECONNREFUSED");
+
+      // A DIFFERENT failure (new cause) logs immediately despite the window.
+      const timeoutFetcher = (async () => {
+        throw new Error("fetch failed", { cause: new Error("connect ETIMEDOUT 127.0.0.1:9999") });
+      }) as unknown as typeof fetch;
+      await proxyRequest(
+        new Request("http://127.0.0.1:7777/api/runtime/status", { method: "GET", headers: { host: "127.0.0.1:7777" } }),
+        ["status"],
+        { runtimeUrl: "http://127.0.0.1:9999", token: "t", fetcher: timeoutFetcher }
+      );
+      expect(logged.length).toBe(2);
+      expect(logged[1]).toContain("ETIMEDOUT");
+    } finally {
+      console.error = realConsoleError;
+      __unreachableLogTestHooks.reset();
+    }
+  });
+
+  test("a client-aborted request rethrows instead of fabricating a 503 for nobody", async () => {
+    const fetcher = (async () => {
+      throw new Error("aborted");
+    }) as unknown as typeof fetch;
+    const controller = new AbortController();
+    controller.abort();
+    const req = new Request("http://127.0.0.1:7777/api/runtime/status", {
+      method: "GET",
+      headers: { host: "127.0.0.1:7777" }
+    });
+    await expect(
+      proxyRequest(req, ["status"], {
+        runtimeUrl: "http://127.0.0.1:9999",
+        token: "t",
+        fetcher,
+        signal: controller.signal
+      })
+    ).rejects.toThrow("aborted");
+  });
+});
+
+describe("proxyRequest — SSE passthrough", () => {
+  test("a text/event-stream upstream streams through with SSE headers", async () => {
+    const fetcher = (async () =>
+      new Response("data: hi\n\n", {
+        status: 200,
+        headers: { "content-type": "text/event-stream; charset=utf-8" }
+      })) as unknown as typeof fetch;
+    const req = new Request("http://127.0.0.1:7777/api/runtime/events/stream", {
+      method: "GET",
+      headers: { host: "127.0.0.1:7777" }
+    });
+    const res = await proxyRequest(req, ["events", "stream"], {
+      runtimeUrl: "http://127.0.0.1:9999",
+      token: "t",
+      fetcher
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/event-stream");
+    expect(res.headers.get("cache-control")).toBe("no-cache, no-transform");
+    expect(res.headers.get("x-accel-buffering")).toBe("no");
+    expect(await res.text()).toBe("data: hi\n\n");
+  });
+});
+
+describe("canonicalizeSegments", () => {
+  test("decodes nested encodings until stable", () => {
+    // %2561 → %61 → a (two decode passes).
+    expect(canonicalizeSegments(["%2561", "chat"])).toEqual(["a", "chat"]);
+  });
+
+  test("rejects traversal, separators, empties, control bytes, and undecodable segments", () => {
+    expect(canonicalizeSegments(["%2e%2e"])).toBeNull();
+    expect(canonicalizeSegments(["a%2fb"])).toBeNull();
+    expect(canonicalizeSegments([""])).toBeNull();
+    expect(canonicalizeSegments(["a%00b"])).toBeNull();
+    // A lone % cannot decode — refuse rather than guess.
+    expect(canonicalizeSegments(["%zz"])).toBeNull();
+  });
+
+  test("rejects a segment still decoding at the depth cap", () => {
+    // Five nested encodings of "." — still unstable after MAX_DECODE_DEPTH.
+    let segment = ".";
+    for (let i = 0; i < 6; i += 1) segment = encodeURIComponent(segment).replace(/\./g, "%2e");
+    expect(canonicalizeSegments([segment])).toBeNull();
+  });
+});
+
+describe("runtimeUrl / runtimeToken / runtimeInstance (state-root resolution)", () => {
+  let stateRoot: string;
+  const savedEnv: Record<string, string | undefined> = {};
+  const ENV_KEYS = ["GINI_RUNTIME_URL", "GINI_TOKEN", "GINI_STATE_ROOT", "GINI_INSTANCE"] as const;
+
+  beforeEach(() => {
+    stateRoot = mkdtempSync(join(tmpdir(), "gini-runtime-test-"));
+    for (const key of ENV_KEYS) {
+      savedEnv[key] = process.env[key];
+      delete process.env[key];
+    }
+    process.env.GINI_STATE_ROOT = stateRoot;
+    process.env.GINI_INSTANCE = "bff-test";
+    __fileCacheTestHooks.clear();
+  });
+
+  afterEach(() => {
+    for (const key of ENV_KEYS) {
+      if (savedEnv[key] === undefined) delete process.env[key];
+      else process.env[key] = savedEnv[key];
+    }
+    rmSync(stateRoot, { recursive: true, force: true });
+    __fileCacheTestHooks.clear();
+  });
+
+  function instanceDir(): string {
+    const dir = join(stateRoot, "instances", "bff-test");
+    mkdirSync(dir, { recursive: true });
+    return dir;
+  }
+
+  test("runtimeInstance: env override wins, default otherwise", () => {
+    expect(runtimeInstance()).toBe("bff-test");
+    delete process.env.GINI_INSTANCE;
+    expect(runtimeInstance()).toBe("default");
+  });
+
+  test("runtimeUrl: GINI_RUNTIME_URL override wins outright", () => {
+    process.env.GINI_RUNTIME_URL = "http://127.0.0.1:4242";
+    expect(runtimeUrl()).toBe("http://127.0.0.1:4242");
+  });
+
+  test("runtimeUrl: reads the recorded port file, falls back to 7778 when absent", () => {
+    expect(runtimeUrl()).toBe("http://127.0.0.1:7778");
+    writeFileSync(join(instanceDir(), "runtime.port"), "7413\n");
+    // The miss above negative-cached the port file; expire it like the TTL would.
+    __fileCacheTestHooks.entry(join(instanceDir(), "runtime.port"))!.readAt = 0;
+    expect(runtimeUrl()).toBe("http://127.0.0.1:7413");
+  });
+
+  test("runtimeUrl: within the cache TTL the port file is not re-read", () => {
+    const portPath = join(instanceDir(), "runtime.port");
+    writeFileSync(portPath, "7413\n");
+    expect(runtimeUrl()).toBe("http://127.0.0.1:7413");
+    // A rewrite inside the TTL window is intentionally not observed yet.
+    writeFileSync(portPath, "7500\n");
+    expect(runtimeUrl()).toBe("http://127.0.0.1:7413");
+  });
+
+  test("runtimeUrl: an expired entry with an UNCHANGED mtime refreshes without re-reading", () => {
+    const portPath = join(instanceDir(), "runtime.port");
+    writeFileSync(portPath, "7413\n");
+    expect(runtimeUrl()).toBe("http://127.0.0.1:7413");
+    const entry = __fileCacheTestHooks.entry(portPath)!;
+    entry.readAt = 0;
+    expect(runtimeUrl()).toBe("http://127.0.0.1:7413");
+    // The readAt was refreshed in place (cache hit, not a fresh stat+read).
+    expect(__fileCacheTestHooks.entry(portPath)!.readAt).toBeGreaterThan(0);
+  });
+
+  test("runtimeUrl: an expired entry with a CHANGED mtime re-reads (gateway respawned on a new port)", () => {
+    const portPath = join(instanceDir(), "runtime.port");
+    writeFileSync(portPath, "7413\n");
+    expect(runtimeUrl()).toBe("http://127.0.0.1:7413");
+    writeFileSync(portPath, "7500\n");
+    const entry = __fileCacheTestHooks.entry(portPath)!;
+    entry.readAt = 0;
+    entry.mtime = -1;
+    expect(runtimeUrl()).toBe("http://127.0.0.1:7500");
+  });
+
+  test("runtimeUrl: a whitespace-only port file is treated as absent", () => {
+    writeFileSync(join(instanceDir(), "runtime.port"), "   \n");
+    expect(runtimeUrl()).toBe("http://127.0.0.1:7778");
+  });
+
+  test("runtimeUrl: an unreadable path (directory) is treated as absent", () => {
+    mkdirSync(join(instanceDir(), "runtime.port"), { recursive: true });
+    expect(runtimeUrl()).toBe("http://127.0.0.1:7778");
+  });
+
+  test("runtimeToken: GINI_TOKEN override wins; config token read otherwise", () => {
+    process.env.GINI_TOKEN = "env-token";
+    expect(runtimeToken()).toBe("env-token");
+    delete process.env.GINI_TOKEN;
+    writeFileSync(join(instanceDir(), "config.json"), JSON.stringify({ token: "disk-token" }));
+    expect(runtimeToken()).toBe("disk-token");
+  });
+
+  test("runtimeToken: missing config, non-string token, and invalid JSON all yield empty string", () => {
+    expect(runtimeToken()).toBe("");
+    writeFileSync(join(instanceDir(), "config.json"), JSON.stringify({ token: 42 }));
+    __fileCacheTestHooks.entry(join(instanceDir(), "config.json"))!.readAt = 0;
+    expect(runtimeToken()).toBe("");
+    writeFileSync(join(instanceDir(), "config.json"), "{not json");
+    __fileCacheTestHooks.entry(join(instanceDir(), "config.json"))!.readAt = 0;
+    __fileCacheTestHooks.entry(join(instanceDir(), "config.json"))!.mtime = -1;
+    expect(runtimeToken()).toBe("");
+  });
+
+  test("state root falls back to $HOME/.gini when GINI_STATE_ROOT is unset", () => {
+    delete process.env.GINI_STATE_ROOT;
+    const savedHome = process.env.HOME;
+    process.env.HOME = stateRoot;
+    try {
+      mkdirSync(join(stateRoot, ".gini", "instances", "bff-test"), { recursive: true });
+      writeFileSync(join(stateRoot, ".gini", "instances", "bff-test", "runtime.port"), "7901\n");
+      expect(runtimeUrl()).toBe("http://127.0.0.1:7901");
+    } finally {
+      process.env.HOME = savedHome;
     }
   });
 });

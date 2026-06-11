@@ -2126,6 +2126,131 @@ describe("chat-task loop", () => {
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
 
+  test("ask_user pauses the turn with a chat.choice setup card and no reason bubble", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-blocks-choice");
+    const provider = normalizeProvider(config.provider);
+
+    const session = await mutateState(config.instance, (state) =>
+      createChatSession(state, "block-choice", undefined, "agent_q")
+    );
+
+    const question = "How should I search the web?";
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        {
+          id: "call_q",
+          type: "function",
+          function: {
+            name: "ask_user",
+            arguments: JSON.stringify({
+              question,
+              options: [
+                { label: "Set up Brave only" },
+                { label: "Neither — use web_fetch", description: "No setup needed" }
+              ]
+            })
+          }
+        }
+      ],
+      finishReason: "tool_calls"
+    });
+
+    const { submitChatMessage } = await import("./chat");
+    const submitted = await submitChatMessage(config, session.id, { content: "find the best cafe" });
+    const paused = await waitForTerminal(config, submitted.taskId);
+    expect(paused.status).toBe("waiting_approval");
+
+    const setup = readState(config.instance).setupRequests.find((s) => s.taskId === submitted.taskId);
+    expect(setup?.action).toBe("chat.choice");
+    expect(setup?.payload.question).toBe(question);
+
+    const { listChatBlocks } = await import("../state");
+    const blocks = listChatBlocks(config.instance, session.id);
+    const setupBlock = blocks.find((b) => b.kind === "setup_requested");
+    if (setupBlock?.kind === "setup_requested") {
+      expect(setupBlock.action).toBe("chat.choice");
+      // The summary IS the question — that's what transcripts/sessions show.
+      expect(setupBlock.summary).toBe(question);
+    } else {
+      throw new Error("missing setup_requested block");
+    }
+    // Unlike connector.request, no assistant bubble accompanies the card —
+    // the question lives in the card itself.
+    expect(blocks.some((b) => b.kind === "assistant_text")).toBe(false);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("chat.choice cancel (Skip) resumes the chat loop with the skip fallback", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-blocks-choice-cancel");
+    const provider = normalizeProvider(config.provider);
+
+    const session = await mutateState(config.instance, (state) =>
+      createChatSession(state, "block-choice-cancel", undefined, "agent_q")
+    );
+
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        {
+          id: "call_q",
+          type: "function",
+          function: {
+            name: "ask_user",
+            arguments: JSON.stringify({
+              question: "Which format do you want?",
+              options: [{ label: "Markdown" }, { label: "Plain text" }]
+            })
+          }
+        }
+      ],
+      finishReason: "tool_calls"
+    });
+    setEchoToolCallingResponse({
+      provider,
+      text: "I'll go with Markdown since it reads best in chat.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const { submitChatMessage } = await import("./chat");
+    const submitted = await submitChatMessage(config, session.id, { content: "export my notes" });
+    const paused = await waitForTerminal(config, submitted.taskId);
+    expect(paused.status).toBe("waiting_approval");
+
+    const setup = readState(config.instance).setupRequests.find((s) => s.taskId === submitted.taskId);
+    expect(setup?.action).toBe("chat.choice");
+
+    await resolveSetupRequest(config, setup!.id, "cancel", { actor: "user" });
+
+    let finished = readState(config.instance).tasks.find((t) => t.id === submitted.taskId);
+    const deadline = Date.now() + 5000;
+    while (finished?.status !== "completed" && Date.now() < deadline) {
+      await Bun.sleep(20);
+      finished = readState(config.instance).tasks.find((t) => t.id === submitted.taskId);
+    }
+    // Skip must resume the loop, NOT fail the task.
+    expect(finished?.status).toBe("completed");
+    expect(finished?.summary).toBe("I'll go with Markdown since it reads best in chat.");
+
+    const { listChatBlocks } = await import("../state");
+    const blocks = listChatBlocks(config.instance, session.id);
+    const askUserCall = blocks.find((b) => b.kind === "tool_call" && b.toolName === "ask_user");
+    expect(askUserCall?.kind).toBe("tool_call");
+    if (askUserCall?.kind === "tool_call") {
+      expect(askUserCall.status).toBe("ok");
+    }
+    expect(blocks.some((b) => b.kind === "tool_result" && b.preview.includes("User skipped the question"))).toBe(true);
+    expect(readState(config.instance).setupRequests.find((s) => s.id === setup!.id)?.status).toBe("cancelled");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
   test("emits parallel tool_calls with distinct callIds and ordinals", async () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
     writeFileSync(join(workspaceRoot, "a.md"), "alpha");
