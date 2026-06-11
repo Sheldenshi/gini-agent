@@ -613,6 +613,11 @@ export interface RuntimeState {
   // a user's raw query that happens to match a retired auto-built shape on a
   // later boot. Legacy states omit it (treated as "not yet healed").
   emailWatcherQueryHealedAt?: string;
+  // Run-once marker for the per-concern channel migration (ISO timestamp of the
+  // first pass). Once set, the migration returns early so a watcher provisioned
+  // its own channel exactly once; later boots leave an already-migrated install
+  // alone. Legacy states omit it (treated as "not yet migrated").
+  emailWatcherChannelsMigratedAt?: string;
   events: RuntimeEvent[];
   jobRuns: JobRunRecord[];
   chatSessions: ChatSessionRecord[];
@@ -1334,7 +1339,21 @@ export interface EmailWatcherRecord {
   // Optional Gmail label ids to scope the query. Unused in v1.
   labelIds?: string[];
   // Dedicated chat session the woken turn posts its proposed reply into.
+  // Shared across an agent's watchers in the legacy single-channel model; kept
+  // for back-compat (a watcher with no `channelId` falls back to this).
   chatSessionId?: string;
+  // This concern's OWN channel — where the fan-out scheduler dispatches THIS
+  // watcher's drafting turn (one routed worker per non-empty detection bucket).
+  // Provisioned on add (and backfilled once by the channel migration); a watcher
+  // without it routes to the shared `chatSessionId`. See ADR email-watch.md.
+  channelId?: string;
+  // Optional system-prompt persona for this concern's drafting worker, layered
+  // over the shared playbook (e.g. a tone/role for one watch). Drives the routed
+  // worker's systemPrompt; unset => the shared playbook only.
+  persona?: string;
+  // Optional toolset whitelist for this concern's drafting worker (constrains
+  // the routed subagent). Unset => the worker's default toolset.
+  toolsets?: string[];
   // Backing scheduled job that drives this watcher (interval-driven cron job
   // with a `skill-script` preRunHook bound to `chatSessionId`). The job is the
   // scheduler; the watcher is the durable detection identity. Optional only for
