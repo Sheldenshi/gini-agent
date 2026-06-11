@@ -4694,8 +4694,16 @@ export async function browserDownloadApproved(
       // hrefs) — so the actual download SOURCE must pass the same SSRF
       // gate + agent domain policy as navigation before any bytes are
       // saved. On a block the transfer is cancelled and nothing is kept.
+      // blob:/data: sources skip the gate: those are client-generated
+      // downloads (the common "export CSV" anchor pattern) whose bytes
+      // come from the already-gated page with no network fetch, so SSRF
+      // and domain policy don't apply — the size cap, filename
+      // sanitization, and audit below still do.
+      // An empty URL skips the gate too: real Playwright Download.url()
+      // always returns the source URL; only test fakes lack it.
       const downloadUrl = typeof download.url === "function" ? download.url() : "";
-      const sourceBlock = downloadUrl
+      const clientGenerated = downloadUrl.startsWith("blob:") || downloadUrl.startsWith("data:");
+      const sourceBlock = downloadUrl && !clientGenerated
         ? safetyCheck(downloadUrl) ?? domainPolicyBlockReason(downloadUrl, agentDomainPolicyForTask(taskId))
         : undefined;
       if (sourceBlock) {

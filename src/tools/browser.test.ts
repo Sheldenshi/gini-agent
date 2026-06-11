@@ -5182,6 +5182,30 @@ describe("browserDownloadApproved", () => {
     expect(existsSync(downloadsDirFor("dl-ssrf-inst"))).toBe(false);
   });
 
+  test("saves a client-generated blob: download without gating its source", async () => {
+    // A blob: URL is the page exporting bytes it already holds (the
+    // common "export CSV" anchor) — no network fetch happens, so the
+    // SSRF/domain gate must not cancel it.
+    let cancelled = 0;
+    const download = {
+      url: () => "blob:https://portal.example.com/3f0a8a44-1c2e-4f0b-9d52-aaaa00001111",
+      suggestedFilename: () => "export.csv",
+      saveAs: async (p: string) => writeFileSync(p, "a,b\n1,2"),
+      cancel: async () => {
+        cancelled++;
+      }
+    };
+    installDownloadSession("dl-blob", download);
+
+    const raw = await browserDownloadApproved("dl-blob", "@e2", "dl-blob-inst");
+    const parsed = JSON.parse(raw) as { success: boolean; path?: string; downloadUrl?: string };
+    expect(parsed.success).toBe(true);
+    expect(cancelled).toBe(0);
+    expect(parsed.path).toBe(join(downloadsDirFor("dl-blob-inst"), "export.csv"));
+    expect(parsed.downloadUrl).toBe("blob:https://portal.example.com/3f0a8a44-1c2e-4f0b-9d52-aaaa00001111");
+    expect(existsSync(parsed.path!)).toBe(true);
+  });
+
   test("sanitizes a traversal-laden suggested filename down to its basename", async () => {
     const download = {
       suggestedFilename: () => "../../../etc/evil.sh",
