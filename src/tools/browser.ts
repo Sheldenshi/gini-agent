@@ -2701,6 +2701,18 @@ function navigationContentType(response: unknown): string {
   }
 }
 
+// PDFs must start with the "%PDF-" magic. Acquired navigation bytes are
+// validated against it before extraction because a successful body read is
+// NOT proof of PDF bytes: when Chrome's PDF viewer intercepts a main-frame
+// PDF navigation, response.body() resolves successfully with the viewer's
+// HTML wrapper bytes — without this check that HTML would reach pdfjs and
+// fail with "Invalid PDF structure".
+const PDF_MAGIC = new TextEncoder().encode("%PDF-");
+function isPdfBytes(bytes: Uint8Array): boolean {
+  if (bytes.byteLength < PDF_MAGIC.byteLength) return false;
+  return PDF_MAGIC.every((b, i) => bytes[i] === b);
+}
+
 // Build the navigate result for a PDF response. Extracted text rides the
 // standard ok() redaction pass; failures degrade to a structured hint
 // (`pdf: true` + note) rather than an empty snapshot.
@@ -2722,13 +2734,15 @@ async function pdfNavigateResult(
   } catch {
     bytes = null;
   }
-  if (bytes && bytes.byteLength === 0) bytes = null;
-  // Chrome's PDF viewer intercepts main-frame PDF responses, so
-  // response.body() throws on real PDF navigations (it only works for
-  // sub-resource responses and test fakes). Re-fetch the bytes through
-  // the context's own request API: finalUrl is the SAME post-redirect URL
-  // that already passed safetyCheck + domain policy above, so the gating
-  // is preserved, and page.request rides the context's cookies/auth.
+  // Empty or non-PDF bytes count as a failed read: when Chrome's PDF viewer
+  // intercepts a main-frame PDF navigation, response.body() either throws OR
+  // resolves successfully with the viewer's HTML wrapper bytes, so the magic
+  // check is what routes real navigations to the re-fetch below.
+  if (bytes && !isPdfBytes(bytes)) bytes = null;
+  // Re-fetch the bytes through the context's own request API: finalUrl is
+  // the SAME post-redirect URL that already passed safetyCheck + domain
+  // policy above, so the gating is preserved, and page.request rides the
+  // context's cookies/auth.
   let fetchOversize = false;
   if (!bytes) {
     const requestApi = (session.page as unknown as {
@@ -2749,8 +2763,10 @@ async function pdfNavigateResult(
         if (Number.isFinite(declared) && declared > pdfExtractMaxBytes) {
           fetchOversize = true;
         } else {
+          // The same magic validation applies to re-fetched bytes (an error
+          // page or HTML redirect target is not a PDF either).
           const body = await fetched.body();
-          bytes = body.byteLength > 0 ? body : null;
+          bytes = isPdfBytes(body) ? body : null;
         }
       } catch {
         bytes = null;
