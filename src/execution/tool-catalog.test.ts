@@ -404,12 +404,15 @@ describe("buildToolCatalog", () => {
   });
 
   describe("cross-toolset routing hints", () => {
-    // browser_navigate's description steers plain content retrieval to
-    // web_search / web_fetch, and the search/fetch descriptions steer page
+    // browser_navigate's description steers content discovery to
+    // web_search, and the search/fetch descriptions steer page
     // interaction to the browser tools. Each hint joins the description
     // only when its referenced toolset is reachable in the assembled
     // catalog, so the model is never pointed at tools it doesn't have.
-    const BROWSER_HINT = "for plain content retrieval prefer web_search / web_fetch";
+    // The web_fetch steer is part of browser_navigate's BASE description —
+    // web_fetch is always-on, so no toolset gate may drop it.
+    const SEARCH_HINT = "prefer web_search over guessing URLs";
+    const FETCH_STEER = "for plain content retrieval from a known URL prefer web_fetch";
     const WEB_HINT = "use the browser tools (browser_navigate) instead";
     const descOf = (catalog: ReturnType<typeof buildToolCatalog>, name: string): string =>
       catalog.find((t) => t.function.name === name)?.function.description ?? "";
@@ -417,7 +420,8 @@ describe("buildToolCatalog", () => {
     test("both toolsets enabled: hints join both sides' descriptions", () => {
       const state = stateWithToolsets([ts("browser"), ts("web_search")]);
       const catalog = buildToolCatalog(state);
-      expect(descOf(catalog, "browser_navigate")).toContain(BROWSER_HINT);
+      expect(descOf(catalog, "browser_navigate")).toContain(SEARCH_HINT);
+      expect(descOf(catalog, "browser_navigate")).toContain(FETCH_STEER);
       expect(descOf(catalog, "web_search")).toContain(WEB_HINT);
       expect(descOf(catalog, "web_fetch")).toContain(WEB_HINT);
       // The annotation never survives catalog assembly — the provider
@@ -427,10 +431,12 @@ describe("buildToolCatalog", () => {
       }
     });
 
-    test("web_search toolset disabled: browser_navigate drops the hint", () => {
+    test("web_search toolset disabled: browser_navigate drops the search hint but keeps the web_fetch steer", () => {
       const state = stateWithToolsets([ts("browser")]);
       const catalog = buildToolCatalog(state);
       expect(descOf(catalog, "browser_navigate")).not.toContain("web_search");
+      // web_fetch is always-on, so the steer toward it survives the gate.
+      expect(descOf(catalog, "browser_navigate")).toContain(FETCH_STEER);
       // The browser toolset is on, so the always-on web_fetch still points
       // page-interaction work at it.
       expect(descOf(catalog, "web_fetch")).toContain(WEB_HINT);

@@ -37,7 +37,10 @@ import type { RuntimeState } from "../types";
 // retrieval). buildToolCatalog appends it to the description only when the
 // referenced toolset is reachable in the assembled catalog — same gate the
 // referenced tools themselves pass — so the model is never steered toward
-// tools it doesn't have.
+// tools it doesn't have. The hint text must name only tools that toolset
+// actually guarantees; steers toward ALWAYS-ON tools (web_fetch bypasses
+// toolset gating entirely) belong in the base description instead, where
+// no gate can drop them while the tool exists.
 const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: string; deferred?: boolean; indexSummary?: string; crossToolsetHint?: { toolset: string; text: string } }> = [
   {
     toolset: "file",
@@ -326,14 +329,17 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   {
     toolset: "browser",
     displayLabel: "Open page",
+    // The web_fetch steer lives in the base description because web_fetch is
+    // always-on (it bypasses toolset gating in toolsForState), so it is
+    // unconditionally reachable; only the web_search half needs the gate.
     crossToolsetHint: {
       toolset: "web_search",
-      text: "The browser is for interacting with pages (clicking, typing, authenticated sessions); for plain content retrieval prefer web_search / web_fetch."
+      text: "To discover pages or fresh information, prefer web_search over guessing URLs."
     },
     type: "function",
     function: {
       name: "browser_navigate",
-      description: "Open a URL in a headless browser session and return a compact accessibility snapshot with @eN refs the agent can click or type into. URLs that serve a PDF return the document's extracted text (`pdfText`) instead of a snapshot — there is no DOM to act on.",
+      description: "Open a URL in a headless browser session and return a compact accessibility snapshot with @eN refs the agent can click or type into. URLs that serve a PDF return the document's extracted text (`pdfText`) instead of a snapshot — there is no DOM to act on. The browser is for interacting with pages (clicking, typing, authenticated sessions); for plain content retrieval from a known URL prefer web_fetch.",
       parameters: {
         type: "object",
         properties: {
