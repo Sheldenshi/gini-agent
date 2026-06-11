@@ -3282,6 +3282,78 @@ export async function browserRequests(taskId: string, args: Record<string, unkno
   }
 }
 
+// Curated viewport-resize utility (no raw CDP passthrough). Dimensions
+// are clamped to a sane range so the agent can't set a degenerate or
+// absurd viewport.
+const RESIZE_MIN_WIDTH = 320;
+const RESIZE_MAX_WIDTH = 3840;
+const RESIZE_MIN_HEIGHT = 240;
+const RESIZE_MAX_HEIGHT = 2160;
+
+export async function browserResize(taskId: string, args: Record<string, unknown>): Promise<string> {
+  const width = typeof args.width === "number" && Number.isFinite(args.width) ? Math.round(args.width) : undefined;
+  const height = typeof args.height === "number" && Number.isFinite(args.height) ? Math.round(args.height) : undefined;
+  if (width === undefined) return fail("Missing required number argument: width");
+  if (height === undefined) return fail("Missing required number argument: height");
+  const clampedWidth = Math.min(Math.max(width, RESIZE_MIN_WIDTH), RESIZE_MAX_WIDTH);
+  const clampedHeight = Math.min(Math.max(height, RESIZE_MIN_HEIGHT), RESIZE_MAX_HEIGHT);
+  try {
+    return await withSession(taskId, async (session) => {
+      if (typeof session.page.setViewportSize !== "function") {
+        return fail("Viewport resize is not supported by this browser session.");
+      }
+      await session.page.setViewportSize({ width: clampedWidth, height: clampedHeight });
+      return ok({
+        url: typeof session.page.url === "function" ? session.page.url() : "",
+        width: clampedWidth,
+        height: clampedHeight,
+        ...(clampedWidth !== width || clampedHeight !== height ? { clamped: true } : {})
+      }, taskId);
+    });
+  } catch (error) {
+    return fail(error instanceof Error ? error.message : String(error));
+  }
+}
+
+// Curated cookie READ (no writes, no raw CDP passthrough). Values are
+// ALWAYS replaced with "[redacted]" — the metadata (name, domain, path,
+// expiry, flags) is what the agent needs to reason about auth state;
+// the value itself is a credential and never reaches the model.
+export async function browserCookies(taskId: string, args: Record<string, unknown>): Promise<string> {
+  void args;
+  try {
+    return await withSession(taskId, async (session) => {
+      const context = session.context;
+      if (!context || typeof context.cookies !== "function") {
+        return fail("Cookie read is not supported by this browser session.");
+      }
+      const pageUrl = typeof session.page.url === "function" ? session.page.url() : "";
+      // Scope to the current page when it has a real http(s) URL so the
+      // agent sees the cookies that apply to where it is; fall back to
+      // the whole shared context otherwise.
+      const scopedToPage = /^https?:/i.test(pageUrl);
+      const cookies = await (scopedToPage ? context.cookies(pageUrl) : context.cookies());
+      const redacted = cookies.map((cookie) => ({
+        name: cookie.name,
+        value: "[redacted]",
+        domain: cookie.domain,
+        path: cookie.path,
+        expires: cookie.expires,
+        httpOnly: cookie.httpOnly,
+        secure: cookie.secure,
+        sameSite: cookie.sameSite
+      }));
+      return ok({
+        url: pageUrl,
+        scope: scopedToPage ? "page" : "context",
+        cookies: redacted
+      }, taskId);
+    });
+  } catch (error) {
+    return fail(error instanceof Error ? error.message : String(error));
+  }
+}
+
 // Hover over an element identified by its @eN ref from the last snapshot.
 // Hovering can reveal tooltips or trigger CSS :hover-only menus the agent
 // needs to interact with next; we re-snapshot afterwards so any newly

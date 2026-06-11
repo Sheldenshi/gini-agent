@@ -530,6 +530,37 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   },
   {
     toolset: "browser",
+    displayLabel: "Resize viewport",
+    deferred: true,
+    indexSummary: "Resize the browser viewport (clamped to 320–3840 × 240–2160).",
+    type: "function",
+    function: {
+      name: "browser_resize",
+      description: "Resize the browser viewport. Width is clamped to 320–3840 and height to 240–2160. Useful for exercising responsive layouts or revealing elements hidden at the default size. Returns the applied (possibly clamped) dimensions.",
+      parameters: {
+        type: "object",
+        properties: {
+          width: { type: "number", description: "Viewport width in CSS pixels (clamped to 320–3840)." },
+          height: { type: "number", description: "Viewport height in CSS pixels (clamped to 240–2160)." }
+        },
+        required: ["width", "height"]
+      }
+    }
+  },
+  {
+    toolset: "browser",
+    displayLabel: "List cookies",
+    deferred: true,
+    indexSummary: "List cookies for the current page (values always redacted; read-only).",
+    type: "function",
+    function: {
+      name: "browser_cookies",
+      description: "List cookies that apply to the current page (or the whole browser context when no page is open). READ-ONLY, and cookie VALUES are always redacted — only name, domain, path, expiry, and the httpOnly/secure/sameSite flags are returned. Useful for checking whether a session/auth cookie exists without exposing it.",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+  {
+    toolset: "browser",
     displayLabel: "Close browser",
     deferred: true,
     indexSummary: "Close the browser session for the current task.",
@@ -2469,6 +2500,8 @@ export function chatBlockArgsPreviewFor(
       return truncatePreview(previewValue(safe.ref));
     case "browser_press":
       return truncatePreview(previewValue(safe.key));
+    case "browser_resize":
+      return truncatePreview(`${previewValue(safe.width)}x${previewValue(safe.height)}`);
     case "browser_scroll":
       return truncatePreview(previewValue(safe.direction));
     case "browser_wait_for":

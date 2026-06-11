@@ -73,6 +73,7 @@ import {
   browserClick,
   browserClose,
   browserConsole,
+  browserCookies,
   browserDialog,
   browserDrag,
   browserFillForm,
@@ -80,6 +81,7 @@ import {
   browserNavigate,
   browserPress,
   browserRequests,
+  browserResize,
   browserScroll,
   browserSelectOption,
   browserSnapshot,
@@ -301,6 +303,10 @@ async function dispatchToolCallInner(
       return { kind: "sync", result: await browserDispatch(config, taskId, "browser.dialog", () => browserDialog(taskId, args), args) };
     case "browser_requests":
       return { kind: "sync", result: await browserDispatch(config, taskId, "browser.requests", () => browserRequests(taskId, args), args) };
+    case "browser_resize":
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.resize", () => browserResize(taskId, args), args) };
+    case "browser_cookies":
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.cookies", () => browserCookies(taskId, args), args) };
     case "browser_close":
       return { kind: "sync", result: await browserDispatch(config, taskId, "browser.close", () => browserClose(taskId, args), args) };
     case "browser_hover":
@@ -585,7 +591,7 @@ async function fileSearch(config: RuntimeConfig, taskId: string, args: Record<st
 // the dispatch and pass it through. Audit risk is derived from the single
 // source of truth in src/execution/tool-risk.ts:
 //   - read-only paths (navigate/snapshot/hover/scroll/back/press/console/
-//     requests/close/wait_for/tabs.list/vision) are "low"
+//     requests/resize/cookies/close/wait_for/tabs.list/vision) are "low"
 //   - side-effecting calls (click/type/fill_form/drag/select_option/
 //     dialog/tabs.{new,switch,close}) are "medium"
 // browser.upload_file is classified "high" in the registry but never

@@ -5,6 +5,7 @@ import {
   __test as browserTest,
   browserClick,
   browserConsole,
+  browserCookies,
   browserDialog,
   browserDownloadApproved,
   browserDrag,
@@ -13,6 +14,7 @@ import {
   browserHover,
   browserNavigate,
   browserRequests,
+  browserResize,
   browserSelectOption,
   browserSnapshot,
   browserTabs,
@@ -3447,6 +3449,139 @@ describe("browser network capture and browser_requests", () => {
     expect(raw).not.toContain("hunter2secret");
     const parsed = JSON.parse(raw) as { requests?: Array<{ url: string }> };
     expect(parsed.requests![0]!.url).toBe("https://evil.example.com/?q=[redacted]");
+  });
+});
+
+// Curated viewport-resize utility: dimensions clamp to 320–3840 × 240–2160
+// and the applied size is reported back (with a `clamped` flag when the
+// request was adjusted).
+describe("browserResize", () => {
+  afterEach(() => {
+    browserTest.clearFakeSessionsForTest();
+    browserTest.setInFlightDisconnectsForTest(0);
+  });
+
+  function installResizePage(taskId: string): { sizes: Array<{ width: number; height: number }> } {
+    const sizes: Array<{ width: number; height: number }> = [];
+    const page = {
+      url: () => "https://example.com/",
+      setViewportSize: async (size: { width: number; height: number }) => {
+        sizes.push(size);
+      }
+    } as unknown as Partial<import("playwright-core").Page>;
+    browserTest.installFakeSessionWithPageForTest(taskId, page);
+    return { sizes };
+  }
+
+  test("applies an in-range size as-is", async () => {
+    const { sizes } = installResizePage("resize-ok");
+    const raw = await browserResize("resize-ok", { width: 1280, height: 800 });
+    const parsed = JSON.parse(raw) as { success: boolean; width?: number; height?: number; clamped?: boolean };
+    expect(parsed.success).toBe(true);
+    expect(parsed.width).toBe(1280);
+    expect(parsed.height).toBe(800);
+    expect(parsed.clamped).toBeUndefined();
+    expect(sizes).toEqual([{ width: 1280, height: 800 }]);
+  });
+
+  test("clamps out-of-range dimensions and flags the adjustment", async () => {
+    const { sizes } = installResizePage("resize-clamp");
+    const raw = await browserResize("resize-clamp", { width: 10_000, height: 10 });
+    const parsed = JSON.parse(raw) as { success: boolean; width?: number; height?: number; clamped?: boolean };
+    expect(parsed.success).toBe(true);
+    expect(parsed.width).toBe(3840);
+    expect(parsed.height).toBe(240);
+    expect(parsed.clamped).toBe(true);
+    expect(sizes).toEqual([{ width: 3840, height: 240 }]);
+
+    const low = await browserResize("resize-clamp", { width: 1, height: 9999 });
+    const lowParsed = JSON.parse(low) as { width?: number; height?: number };
+    expect(lowParsed.width).toBe(320);
+    expect(lowParsed.height).toBe(2160);
+  });
+
+  test("rejects missing or non-numeric dimensions", async () => {
+    installResizePage("resize-bad");
+    expect(JSON.parse(await browserResize("resize-bad", { height: 800 })).error).toMatch(/width/);
+    expect(JSON.parse(await browserResize("resize-bad", { width: 800 })).error).toMatch(/height/);
+    expect(JSON.parse(await browserResize("resize-bad", { width: "wide", height: 800 })).error).toMatch(/width/);
+  });
+});
+
+// Curated cookie READ: values are ALWAYS replaced with "[redacted]" —
+// only name/domain/path/expiry/flags reach the model. No write surface.
+describe("browserCookies", () => {
+  afterEach(() => {
+    browserTest.clearFakeSessionsForTest();
+    browserTest.setInFlightDisconnectsForTest(0);
+  });
+
+  const sessionCookie = {
+    name: "session_id",
+    value: "supersecretsessiontoken",
+    domain: ".example.com",
+    path: "/",
+    expires: 1893456000,
+    httpOnly: true,
+    secure: true,
+    sameSite: "Lax" as const
+  };
+
+  test("returns cookie metadata with values redacted, scoped to the current page URL", async () => {
+    const cookieCalls: Array<string | undefined> = [];
+    const page = { url: () => "https://example.com/account" } as unknown as Partial<import("playwright-core").Page>;
+    const context = {
+      cookies: async (url?: string) => {
+        cookieCalls.push(url);
+        return [sessionCookie];
+      }
+    } as unknown as Partial<import("playwright-core").BrowserContext>;
+    browserTest.installFakeSessionWithPageAndContextForTest("cookies-page", page, context);
+
+    const raw = await browserCookies("cookies-page", {});
+    expect(raw).not.toContain("supersecretsessiontoken");
+    const parsed = JSON.parse(raw) as {
+      success: boolean;
+      scope?: string;
+      cookies?: Array<{ name: string; value: string; domain: string; httpOnly: boolean; secure: boolean; sameSite: string }>;
+    };
+    expect(parsed.success).toBe(true);
+    expect(parsed.scope).toBe("page");
+    expect(cookieCalls).toEqual(["https://example.com/account"]);
+    expect(parsed.cookies).toHaveLength(1);
+    expect(parsed.cookies![0]!.value).toBe("[redacted]");
+    expect(parsed.cookies![0]!.name).toBe("session_id");
+    expect(parsed.cookies![0]!.domain).toBe(".example.com");
+    expect(parsed.cookies![0]!.httpOnly).toBe(true);
+    expect(parsed.cookies![0]!.secure).toBe(true);
+    expect(parsed.cookies![0]!.sameSite).toBe("Lax");
+  });
+
+  test("falls back to whole-context cookies when no http(s) page is open", async () => {
+    const cookieCalls: Array<string | undefined> = [];
+    const page = { url: () => "about:blank" } as unknown as Partial<import("playwright-core").Page>;
+    const context = {
+      cookies: async (url?: string) => {
+        cookieCalls.push(url);
+        return [sessionCookie];
+      }
+    } as unknown as Partial<import("playwright-core").BrowserContext>;
+    browserTest.installFakeSessionWithPageAndContextForTest("cookies-blank", page, context);
+
+    const raw = await browserCookies("cookies-blank", {});
+    const parsed = JSON.parse(raw) as { success: boolean; scope?: string };
+    expect(parsed.success).toBe(true);
+    expect(parsed.scope).toBe("context");
+    expect(cookieCalls).toEqual([undefined]);
+    expect(raw).not.toContain("supersecretsessiontoken");
+  });
+
+  test("fails cleanly when the session context has no cookie surface", async () => {
+    const page = { url: () => "https://example.com/" } as unknown as Partial<import("playwright-core").Page>;
+    browserTest.installFakeSessionWithPageForTest("cookies-none", page);
+    const parsed = JSON.parse(await browserCookies("cookies-none", {})) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toMatch(/not supported/);
   });
 });
 
