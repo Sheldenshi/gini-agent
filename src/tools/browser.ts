@@ -1599,6 +1599,14 @@ const SNAPSHOT_SUMMARY_SYSTEM =
 // when the call fails (callers then keep the plain counted truncation).
 // `remainder` must already be redacted — snapshot() redacts it with the
 // same pass as the snapshot text itself.
+//
+// Known limitation: this routes to the GLOBAL config.provider, not a
+// per-agent provider override — tool dispatch doesn't thread the
+// resolved effective provider down to the browser tools, so the
+// (redacted) remainder of an agent's snapshot can go to the global
+// provider even when the agent's chat turns use a different one. Fixing
+// it means threading the effective provider through dispatchToolCall
+// into every snapshot-producing browser tool.
 async function summarizeSnapshotRemainder(config: RuntimeConfig, remainder: string): Promise<string | undefined> {
   try {
     const result = await generateAuxText(config, {

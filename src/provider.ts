@@ -420,12 +420,14 @@ export function isAuthExpiredError(message: string | undefined): boolean {
 //   - "prompt is too long"                    Anthropic: "prompt is too long: X tokens > Y maximum"
 //   - "exceed context limit"                  Anthropic: "input length and max_tokens exceed context limit"
 //   - "input is too long for requested model" Bedrock ValidationException
+//   - "exceeds the available context size"    llama.cpp server: "the request exceeds the available context size"
 const CONTEXT_OVERFLOW_MARKERS = [
   "context_length_exceeded",
   "maximum context length",
   "prompt is too long",
   "exceed context limit",
-  "input is too long for requested model"
+  "input is too long for requested model",
+  "exceeds the available context size"
 ];
 
 export function isContextOverflowError(message: string | undefined): boolean {
@@ -627,7 +629,7 @@ export interface ToolCallingResult {
 // loop calls the provider multiple times. A stub with `error` set makes
 // the echo call throw instead, exercising callers' provider-failure paths
 // (context-overflow retries, auth tagging, task failure).
-const echoToolCallingStubs: Array<{ tag?: string; result?: ToolCallingResult; error?: string }> = [];
+const echoToolCallingStubs: Array<{ tag?: string; result?: ToolCallingResult; error?: string; streamTextBeforeFailure?: string }> = [];
 // Capture the messages each echo call was invoked with. Tests inspect this
 // to assert that the chat-task loop built the expected system prompt /
 // conversation transcript. The buffer is cleared by
@@ -641,9 +643,13 @@ export function setEchoToolCallingResponse(result: ToolCallingResult, tag?: stri
 // Queue an echo tool-calling FAILURE: the next echo-backed
 // generateToolCallingResponse call throws `new Error(message)` instead of
 // returning a result. The call is still recorded in echoToolCallingCalls so
-// tests can assert what payload the failed attempt carried.
-export function setEchoToolCallingFailure(message: string): void {
-  echoToolCallingStubs.push({ error: message });
+// tests can assert what payload the failed attempt carried. When
+// `streamTextBeforeFailure` is set, the failing call first delivers that
+// text through `onDelta` — mirroring a real provider that streams part of
+// a response before erroring — so callers' stream-reset paths can be
+// exercised.
+export function setEchoToolCallingFailure(message: string, opts?: { streamTextBeforeFailure?: string }): void {
+  echoToolCallingStubs.push({ error: message, streamTextBeforeFailure: opts?.streamTextBeforeFailure });
 }
 
 export function clearEchoToolCallingResponses(): void {
@@ -658,9 +664,22 @@ export function getEchoToolCallingCalls(): ToolCallingMessage[][] {
   return echoToolCallingCalls.map((messages) => messages.slice());
 }
 
-function nextEchoToolCallingResult(provider: ProviderConfig, lastUserText: string): ToolCallingResult {
+function nextEchoToolCallingResult(
+  provider: ProviderConfig,
+  lastUserText: string,
+  onDelta?: (text: string) => void
+): ToolCallingResult {
   const stub = echoToolCallingStubs.shift();
-  if (stub?.error !== undefined) throw new Error(stub.error);
+  if (stub?.error !== undefined) {
+    if (stub.streamTextBeforeFailure && onDelta) {
+      try {
+        onDelta(stub.streamTextBeforeFailure);
+      } catch {
+        // never let onDelta crash the test path.
+      }
+    }
+    throw new Error(stub.error);
+  }
   if (stub?.result) return stub.result;
   // Default: behave like generateTaskSummary's echo branch — finish with a
   // canned text response so callers that don't pre-register stubs still see
@@ -700,7 +719,7 @@ export async function generateToolCallingResponse(
 
   if (provider.name === "echo") {
     echoToolCallingCalls.push(messages.map((m) => ({ ...m })));
-    const result = nextEchoToolCallingResult(provider, lastUserText);
+    const result = nextEchoToolCallingResult(provider, lastUserText, onDelta);
     if (result.text && onDelta) {
       // Synthesize a single streamed delta so callers exercise their
       // streaming pipelines in echo-backed tests.
@@ -4190,9 +4209,15 @@ export function getEchoAuxTextRequests(): AuxTextRequest[] {
 
 export async function generateAuxText(
   config: RuntimeConfig,
-  request: AuxTextRequest
+  request: AuxTextRequest,
+  // Optional per-call override, same contract as generateToolCallingResponse:
+  // a caller that resolved a per-agent provider passes it here so the aux
+  // side-call (which can carry transcript content) goes to the provider that
+  // serves the agent, not the global config provider. config.provider is
+  // never mutated.
+  providerOverride?: ProviderConfig
 ): Promise<AuxTextResult> {
-  const provider = normalizeProvider(config.provider);
+  const provider = normalizeProvider(providerOverride ?? config.provider);
   const maxTokens = request.maxTokens ?? 1024;
   if (provider.name === "echo") {
     echoAuxTextRequests.push({ ...request });

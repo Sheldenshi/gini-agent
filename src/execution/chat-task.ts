@@ -165,6 +165,7 @@ const NAVIGATION_TOOLS = new Set(["browser_navigate", "browser_back"]);
 const PAGE_ACTION_TOOLS = new Set([
   "browser_click",
   "browser_type",
+  "browser_fill_form",
   "browser_press",
   "browser_select_option",
   "browser_upload_file",
@@ -1812,6 +1813,15 @@ async function runLoop(
   let navWithoutAction = 0;
   let loopStallReason: "repeat" | "navigation" | undefined;
 
+  // The current turn's most recent pre-tool-call narration, CLEANED of any
+  // leading `<route>` directive. This — never a re-scan of workingMessages —
+  // is what the partial-result exit below surfaces: workingMessages includes
+  // the packed prior context, so scanning it for "the last assistant text"
+  // could resurrect a PRIOR turn's answer as this turn's partial result, and
+  // raw assistant content can still carry the route directive that must
+  // never reach task.summary.
+  let lastTurnNarration = "";
+
   // Graceful partial exit for unrecoverable context exhaustion: the provider
   // call kept overflowing even after compaction (overflow retry below), or
   // in-turn compaction bailed out. Completes the task with the latest
@@ -1821,12 +1831,7 @@ async function runLoop(
   // window, so the tool-less summary turn the iteration-cap path makes would
   // itself overflow.
   const completeWithPartialResult = async (note: string): Promise<Task> => {
-    const lastAssistantMessage = [...workingMessages]
-      .reverse()
-      .find((m) => m.role === "assistant" && typeof m.content === "string" && m.content.trim().length > 0);
-    const partialText =
-      typeof lastAssistantMessage?.content === "string" ? lastAssistantMessage.content.trim() : "";
-    const finalText = partialText ? `${partialText}\n\n${note}` : note;
+    const finalText = lastTurnNarration ? `${lastTurnNarration}\n\n${note}` : note;
     const exhausted = await mutateState(config.instance, (state) => {
       const item = findTask(state, taskId);
       // Respect a prior terminal status (a cancel may have raced this exit).
@@ -1842,8 +1847,11 @@ async function runLoop(
       return item;
     });
     if (exhausted.status === "completed") {
-      const block = emitAssistantTextStart(emitCtx, finalText);
-      if (block?.id) finalizeAssistantText(emitCtx, block.id, finalText);
+      // The narration (when any) already reached the chat as a settled
+      // assistant_text block in the iteration that produced it, so only the
+      // note is emitted here — exactly once, as a system note. Re-emitting
+      // finalText as a block would duplicate the narration and render the
+      // note twice.
       emitSystemNote(emitCtx, note);
       emitPhase(emitCtx, "Completed");
     }
@@ -2096,11 +2104,18 @@ async function runLoop(
         if (span) {
           let summaryText: string;
           try {
-            const aux = await generateAuxText(config, {
-              system: COMPACTION_SUMMARY_SYSTEM,
-              user: renderMessagesForCompaction(workingMessages.slice(span.start, span.end)),
-              maxTokens: COMPACTION_SUMMARY_MAX_TOKENS
-            });
+            // Same per-agent provider override as the main model call: the
+            // rendered middle span is transcript content, so it goes to the
+            // provider serving this agent, not the global config provider.
+            const aux = await generateAuxText(
+              config,
+              {
+                system: COMPACTION_SUMMARY_SYSTEM,
+                user: renderMessagesForCompaction(workingMessages.slice(span.start, span.end)),
+                maxTokens: COMPACTION_SUMMARY_MAX_TOKENS
+              },
+              effective.providerSource === "agent" ? effective.provider : undefined
+            );
             accumulatedCost = addCost(accumulatedCost, aux.cost);
             summaryText = aux.text.trim();
           } catch (error) {
@@ -2133,9 +2148,14 @@ async function runLoop(
             message: `In-turn compaction replaced ${span.end - span.start} message(s) with a summary.`,
             data: { iterations, compactionsThisTurn, projectedPromptTokens, afterTokens, savedTokens }
           });
-          if (savedTokens < projectedPromptTokens * COMPACTION_MIN_SAVINGS_FRACTION) {
+          if (
+            afterTokens > compactionHighWaterTokens &&
+            savedTokens < projectedPromptTokens * COMPACTION_MIN_SAVINGS_FRACTION
+          ) {
             // The protected head/tail is what fills the window — further
-            // compactions cannot help.
+            // compactions cannot help. Small savings that nonetheless got
+            // the projection back under the high-water mark are fine: the
+            // next call fits, so the turn proceeds.
             return completeWithPartialResult(
               "Stopped early: compacting the conversation could not reclaim enough context window space. This is a partial result."
             );
@@ -2187,11 +2207,45 @@ async function runLoop(
         const tighterBudget = Math.max(0, Math.floor(liveMessageBudget / 2 ** attempt));
         const keepRecent = attempt >= MAX_CONTEXT_OVERFLOW_ATTEMPTS - 1 ? 0 : KEEP_RECENT_TOOL_RESULTS;
         const compacted = elideOldToolResultsToBudget(workingMessages, tighterBudget, keepRecent);
+        // The calibration base must describe the payload the NEXT attempt
+        // actually sends. Without this recompute, the gap below would
+        // compare the retry's reported usage against the stale pre-elision
+        // estimate, clamp to 0, and loosen the budget for the following
+        // iteration — re-triggering the very overflow this retry recovered
+        // from.
+        estimatedPromptTokens = estimateToolCallingMessagesTokens(workingMessages) + toolSchemaTokens;
         appendTrace(config.instance, taskId, {
           type: "warning",
           message: `Provider rejected the prompt as too long; compacted ${compacted} tool result(s) and retrying.`,
           data: { iterations, attempt, tighterBudget, keepRecent, compacted }
         });
+        // Discard the failed attempt's partial stream. A provider can
+        // stream text before throwing the overflow; without a reset the
+        // retry's text would accrete onto the failed attempt's in the
+        // route buffer, the task partial, and the in-flight assistant
+        // block. Drain the flush chain first so routeSurfacedLen reflects
+        // everything the failed attempt surfaced, then trim exactly that
+        // much off partialSummary. The in-flight block id is kept: the
+        // retry's first flush overwrites the block with its own full text.
+        await flushChain;
+        if (routeSurfacedLen > 0) {
+          const surfaced = routeSurfacedLen;
+          await mutateState(config.instance, (state) => {
+            const item = state.tasks.find((t) => t.id === taskId);
+            if (item?.partialSummary) {
+              item.partialSummary = item.partialSummary.slice(0, Math.max(0, item.partialSummary.length - surfaced));
+            }
+          });
+        }
+        pending = "";
+        routeRawText = "";
+        routeStrippedPrefix = 0;
+        routeSurfacedLen = 0;
+        inFlightAssistantText = "";
+        // Re-arm route detection on a first-call retry: the retry's stream
+        // may repeat the leading directive, which must be stripped again
+        // (switchTurnToThread is idempotent for an already-switched turn).
+        routeResolved = !isFirstModelCall;
       }
     }
     // Drain any in-flight streamed flush, then flush the remaining buffer so
@@ -2350,6 +2404,11 @@ async function runLoop(
         return stale ?? ({ id: taskId, status: "cancelled" } as unknown as Task);
       }
     }
+
+    // Track this turn's latest narration for the partial-result exit (see
+    // lastTurnNarration above). Only non-empty cleaned text advances it, so
+    // a narration-less tool iteration keeps the most recent narration.
+    if (cleanedTurnText.trim()) lastTurnNarration = cleanedTurnText.trim();
 
     // Tool-call path: append the assistant message (with tool_calls), then
     // dispatch each call. Synchronous tools resolve immediately; gated
