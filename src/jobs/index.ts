@@ -788,8 +788,8 @@ export async function runDueJobs(config: RuntimeConfig): Promise<void> {
       // ONLY the dispatched buckets' sub-state (per-bucket at-least-once). The
       // legacy single-turn path below is untouched when there are no buckets.
       if (hook.buckets) {
-        const { dispatchedRouteKeys } = await dispatchFanOut(config, job, run, "schedule", hook.buckets);
-        await persistFanOutState(config, job.id, hook.state, dispatchedRouteKeys);
+        const { dispatchedRouteKeys, attemptedRouteKeys } = await dispatchFanOut(config, job, run, "schedule", hook.buckets);
+        await persistFanOutState(config, job.id, hook.state, dispatchedRouteKeys, attemptedRouteKeys);
         await finalizeFanOutRun(config, job, run, dispatchedRouteKeys);
         if (hook.onDispatched) await hook.onDispatched();
         continue;
@@ -1078,11 +1078,15 @@ async function dispatchFanOut(
   run: JobRunRecord,
   trigger: "schedule" | "manual" | "replay",
   buckets: Record<string, string[]>
-): Promise<{ dispatchedRouteKeys: string[] }> {
+): Promise<{ dispatchedRouteKeys: string[]; attemptedRouteKeys: string[] }> {
   const dispatchedRouteKeys: string[] = [];
+  const attemptedRouteKeys: string[] = [];
   for (const [routeKey, bucketContext] of Object.entries(buckets)) {
     // Empty bucket → no worker (zero-idle-turn discipline).
     if (bucketContext.length === 0) continue;
+    // A non-empty bucket is an attempted dispatch — its cursor must roll back to
+    // the old slice if the dispatch does not complete (per-bucket at-least-once).
+    attemptedRouteKeys.push(routeKey);
     try {
       // Resolve the route. An unmapped routeKey falls back to the job's own
       // session so the bucket still gets delivered (audited so a missing route is
@@ -1171,30 +1175,40 @@ async function dispatchFanOut(
       });
     }
   }
-  return { dispatchedRouteKeys };
+  return { dispatchedRouteKeys, attemptedRouteKeys };
 }
 
-// Merge ONLY the dispatched buckets' sub-state into the job's hookState, leaving a
-// failed (un-dispatched) bucket's prior sub-state intact so it re-detects next
-// tick (per-bucket at-least-once). Domain-agnostic contract: a routed handler
-// returns its new `state` keyed by routeKey at the top level — each top-level key
-// IS a bucket's routeKey. We start from the OLD hookState (every failed bucket's
-// cursor preserved) and overwrite only the dispatched routeKeys with their NEW
-// sub-state. A routeKey present in newState but not dispatched keeps its old slice;
-// a routeKey absent from newState is left as-is.
+// Commit the handler's new hookState while preserving per-bucket at-least-once.
+// Domain-agnostic contract: a routed handler returns its new `state` keyed by
+// routeKey at the top level — each top-level key IS a bucket's routeKey. The
+// handler legitimately advances a watch's cursor on a SILENT result too (seeding
+// a baseline, dropping all mail as automated/self, a triage tick that only
+// claimed mail) — those routeKeys carry a fresh cursor but open no bucket, so they
+// are neither dispatched nor attempted. We adopt EVERY fresh top-level slice from
+// the handler (matching the legacy whole-blob write), then roll back ONLY the
+// routeKeys that were ATTEMPTED (had a non-empty bucket this tick) but FAILED to
+// dispatch back to their OLD slice — so a failed dispatch re-detects next tick
+// while every silent advance commits.
 async function persistFanOutState(
   config: RuntimeConfig,
   jobId: string,
   newState: Record<string, unknown> | undefined,
-  dispatchedRouteKeys: string[]
+  dispatchedRouteKeys: string[],
+  attemptedRouteKeys: string[]
 ): Promise<void> {
-  if (newState === undefined || dispatchedRouteKeys.length === 0) return;
+  if (newState === undefined) return;
+  const dispatched = new Set(dispatchedRouteKeys);
+  const failedRouteKeys = attemptedRouteKeys.filter((routeKey) => !dispatched.has(routeKey));
   await mutateState(config.instance, (state) => {
     const job = state.jobs.find((candidate) => candidate.id === jobId);
     if (!job) return;
-    const merged: Record<string, unknown> = { ...(job.hookState ?? {}) };
-    for (const routeKey of dispatchedRouteKeys) {
-      if (routeKey in newState) merged[routeKey] = newState[routeKey];
+    const oldState: Record<string, unknown> = { ...(job.hookState ?? {}) };
+    const merged: Record<string, unknown> = { ...oldState, ...newState };
+    // Roll back attempted-but-failed buckets to their old slice (or drop the key
+    // if it had no old slice) so their cursor does not advance over un-delivered mail.
+    for (const routeKey of failedRouteKeys) {
+      if (routeKey in oldState) merged[routeKey] = oldState[routeKey];
+      else delete merged[routeKey];
     }
     job.hookState = merged;
   });
@@ -1297,8 +1311,8 @@ export async function runJobNow(
   // Routed (fan-out) path mirrors runDueJobs: one worker per non-empty bucket,
   // per-bucket at-least-once commit, then finalize the ONE per-tick run.
   if (hook.buckets) {
-    const { dispatchedRouteKeys } = await dispatchFanOut(config, job, run, trigger, hook.buckets);
-    await persistFanOutState(config, job.id, hook.state, dispatchedRouteKeys);
+    const { dispatchedRouteKeys, attemptedRouteKeys } = await dispatchFanOut(config, job, run, trigger, hook.buckets);
+    await persistFanOutState(config, job.id, hook.state, dispatchedRouteKeys, attemptedRouteKeys);
     await finalizeFanOutRun(config, job, run, dispatchedRouteKeys);
     if (hook.onDispatched) await hook.onDispatched();
     return { jobId: job.id, runId: run.id, fanOut: true, dispatchedRouteKeys };

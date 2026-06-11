@@ -292,6 +292,50 @@ describe("recurring-job fan-out", () => {
     expect(readState(config.instance).jobRuns.find((r) => r.jobId === job.id)?.status).toBe("completed");
   });
 
+  test("a silent watch's advanced cursor commits even when a sibling bucket dispatches", async () => {
+    const config = buildConfig(workspaceRoot, "fanout-silent");
+    const provider = normalizeProvider(config.provider);
+    setEchoToolCallingResponse({ provider, text: "done", toolCalls: [], finishReason: "stop" });
+    const sessionA = "session_a";
+    await createSession(config, sessionA);
+
+    // The handler dispatches ONE bucket (alpha) and silently advances a SECOND
+    // routeKey's cursor (gamma) without emitting any bucket for it — exactly what
+    // detect does when it seeds a baseline / drops all mail as automated / a triage
+    // tick only claimed mail. gamma's fresh cursor must still commit.
+    __registerHookForTest("test-fanout-silent", async () => ({
+      kind: "context",
+      buckets: {
+        alpha: [{ text: "alpha item", untrusted: false }]
+      },
+      state: { alpha: { cursor: "a-new" }, gamma: { cursor: "g-new" } }
+    }));
+
+    const job = await createScheduledJob(config, {
+      name: "fanout-silent",
+      intervalSeconds: 60,
+      prompt: "handle",
+      preRunHook: { handlerId: "test-fanout-silent", config: {} }
+    });
+    await setRoutes(config, job.id, {
+      alpha: { chatSessionId: sessionA }
+    });
+    // Seed prior cursors so we can prove gamma advanced (not stayed at its old value).
+    await mutateState(config.instance, (state) => {
+      const j = state.jobs.find((x) => x.id === job.id)!;
+      j.hookState = { alpha: { cursor: "a-old" }, gamma: { cursor: "g-old" } };
+    });
+
+    await runJobNow(config, job.id, "manual");
+
+    // alpha dispatched; gamma silently advanced — BOTH slices committed.
+    expect(tasksInSession(config, sessionA)).toHaveLength(1);
+    expect(readState(config.instance).jobs.find((j) => j.id === job.id)?.hookState).toEqual({
+      alpha: { cursor: "a-new" },
+      gamma: { cursor: "g-new" }
+    });
+  });
+
   test("a flat items result with no routes takes exactly the legacy single dispatch", async () => {
     const config = buildConfig(workspaceRoot, "fanout-legacy");
     const provider = normalizeProvider(config.provider);
