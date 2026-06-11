@@ -2668,12 +2668,12 @@ function str(value: unknown): string | undefined {
 // navigation boundary via the response content-type and return extracted
 // text (bounded to the snapshot char budget) instead of a DOM snapshot.
 // The bytes come from the navigation response when it can be buffered,
-// falling back to a context-request re-fetch of the same gated URL (the
+// falling back to a native-fetch re-fetch of the same gated URL (the
 // URL has already passed the SSRF gate + domain policy + post-redirect
-// re-checks). Extraction reuses the shared attachment extractor (lazy
-// pdfjs-dist); when bytes or extraction are unavailable the result still
-// flags `pdf: true` with an honest note so the model stops
-// re-snapshotting.
+// re-checks; the re-fetch re-runs those gates on every redirect hop).
+// Extraction reuses the shared attachment extractor (lazy pdfjs-dist);
+// when bytes or extraction are unavailable the result still flags
+// `pdf: true` with an honest note so the model stops re-snapshotting.
 
 // Cap on PDF bytes handed to the extractor. Injectable for tests.
 const PDF_EXTRACT_MAX_BYTES_DEFAULT = 20 * 1024 * 1024;
@@ -2713,6 +2713,101 @@ function isPdfBytes(bytes: Uint8Array): boolean {
   return PDF_MAGIC.every((b, i) => bytes[i] === b);
 }
 
+// Timeout for each native re-fetch request so a hung server can't stall
+// the turn; redirect hops each get their own budget.
+const PDF_REFETCH_TIMEOUT_MS = 15_000;
+// Bound on manual redirect hops the re-fetch will follow.
+const PDF_REFETCH_MAX_REDIRECTS = 5;
+// Injectable fetch seam so the re-fetch path can be exercised without
+// touching the network. Mirrors the pdfTextExtractor seam above.
+type PdfRefetchFetch = (url: string, init: RequestInit) => Promise<Response>;
+const defaultPdfRefetchFetch: PdfRefetchFetch = (url, init) => fetch(url, init);
+let pdfRefetchFetch: PdfRefetchFetch = defaultPdfRefetchFetch;
+
+// Cookie header for the URL from the browser context, so the native
+// re-fetch carries the same auth the page navigation had (auth-gated
+// PDFs still extract). typeof-guarded so lightweight test fakes without
+// a cookies() implementation degrade to "no cookies".
+async function contextCookieHeader(context: BrowserContext, url: string): Promise<string | undefined> {
+  const cookiesFn = (context as BrowserContext & {
+    cookies?: (urls?: string | string[]) => Promise<Array<{ name: string; value: string }>>;
+  }).cookies;
+  if (typeof cookiesFn !== "function") return undefined;
+  try {
+    const cookies = await cookiesFn.call(context, url);
+    if (!Array.isArray(cookies) || cookies.length === 0) return undefined;
+    return cookies.map((c) => `${c.name}=${c.value}`).join("; ");
+  } catch {
+    return undefined;
+  }
+}
+
+// Native re-fetch of the PDF bytes. Playwright's APIRequestContext
+// (page.request.get) is unusable under Bun: its node:_http_client shim
+// hands a path-only string to new URL() inside _parseSetCookieHeader,
+// and the resulting unhandled rejection escapes the promise chain and
+// kills the whole process. Bun's own fetch is used instead, preserving
+// the trust boundary the context request rode for free: the browser
+// context's cookies for each hop's URL are sent as a Cookie header, and
+// redirects are followed manually with the SSRF gate + domain policy
+// re-run on every hop — the initial URL already passed the
+// post-redirect navigation gates, and per-hop checks keep that
+// invariant for the re-fetch (a redirect must never reach a blocked
+// host). Any failure degrades to { bytes: null } so the caller emits
+// the honest could-not-retrieve note.
+async function refetchPdfBytes(
+  context: BrowserContext,
+  startUrl: string,
+  taskId: string
+): Promise<{ bytes: Uint8Array | null; oversize: boolean }> {
+  let url = startUrl;
+  for (let hop = 0; hop <= PDF_REFETCH_MAX_REDIRECTS; hop++) {
+    const cookie = await contextCookieHeader(context, url);
+    let res: Response;
+    try {
+      res = await pdfRefetchFetch(url, {
+        redirect: "manual",
+        signal: AbortSignal.timeout(PDF_REFETCH_TIMEOUT_MS),
+        ...(cookie ? { headers: { cookie } } : {})
+      });
+    } catch {
+      return { bytes: null, oversize: false };
+    }
+    if (res.status >= 300 && res.status < 400) {
+      const location = res.headers.get("location");
+      if (!location) return { bytes: null, oversize: false };
+      let next: string;
+      try {
+        next = new URL(location, url).toString();
+      } catch {
+        return { bytes: null, oversize: false };
+      }
+      const blocked = safetyCheck(next) ?? domainPolicyBlockReason(next, agentDomainPolicyForTask(taskId));
+      if (blocked) return { bytes: null, oversize: false };
+      url = next;
+      continue;
+    }
+    // Honor the byte cap before buffering when the server declares a
+    // content-length; the caller's shared byteLength check covers
+    // undeclared bodies.
+    const declared = Number(res.headers.get("content-length"));
+    if (Number.isFinite(declared) && declared > pdfExtractMaxBytes) {
+      return { bytes: null, oversize: true };
+    }
+    let body: Uint8Array;
+    try {
+      body = new Uint8Array(await res.arrayBuffer());
+    } catch {
+      return { bytes: null, oversize: false };
+    }
+    // The same magic validation applies to re-fetched bytes (an error
+    // page or HTML redirect target is not a PDF either).
+    return { bytes: isPdfBytes(body) ? body : null, oversize: false };
+  }
+  // Redirect chain exceeded the hop bound.
+  return { bytes: null, oversize: false };
+}
+
 // Build the navigate result for a PDF response. Extracted text rides the
 // standard ok() redaction pass; failures degrade to a structured hint
 // (`pdf: true` + note) rather than an empty snapshot.
@@ -2739,39 +2834,15 @@ async function pdfNavigateResult(
   // resolves successfully with the viewer's HTML wrapper bytes, so the magic
   // check is what routes real navigations to the re-fetch below.
   if (bytes && !isPdfBytes(bytes)) bytes = null;
-  // Re-fetch the bytes through the context's own request API: finalUrl is
-  // the SAME post-redirect URL that already passed safetyCheck + domain
-  // policy above, so the gating is preserved, and page.request rides the
-  // context's cookies/auth.
+  // Re-fetch the bytes with a Bun-native fetch (see refetchPdfBytes):
+  // finalUrl is the SAME post-redirect URL that already passed
+  // safetyCheck + domain policy above, the context's cookies ride along
+  // as a Cookie header, and any further redirects are re-gated per hop.
   let fetchOversize = false;
   if (!bytes) {
-    const requestApi = (session.page as unknown as {
-      request?: {
-        get?: (url: string) => Promise<{
-          headers: () => Record<string, string>;
-          body: () => Promise<Uint8Array>;
-        }>;
-      };
-    }).request;
-    if (requestApi && typeof requestApi.get === "function") {
-      try {
-        const fetched = await requestApi.get(finalUrl);
-        // Honor the byte cap before buffering: a declared content-length
-        // over the cap skips the body read entirely; otherwise the
-        // fetched body falls through to the shared byteLength check.
-        const declared = Number(fetched.headers()["content-length"]);
-        if (Number.isFinite(declared) && declared > pdfExtractMaxBytes) {
-          fetchOversize = true;
-        } else {
-          // The same magic validation applies to re-fetched bytes (an error
-          // page or HTML redirect target is not a PDF either).
-          const body = await fetched.body();
-          bytes = isPdfBytes(body) ? body : null;
-        }
-      } catch {
-        bytes = null;
-      }
-    }
+    const refetched = await refetchPdfBytes(session.context, finalUrl, taskId);
+    bytes = refetched.bytes;
+    fetchOversize = refetched.oversize;
   }
   if (fetchOversize || (bytes && bytes.byteLength > pdfExtractMaxBytes)) {
     return ok({
@@ -5056,6 +5127,11 @@ export const __test = {
   // 20MB buffer. Pass null to restore the default.
   setPdfExtractMaxBytesForTest(value: number | null): void {
     pdfExtractMaxBytes = value ?? PDF_EXTRACT_MAX_BYTES_DEFAULT;
+  },
+  // Stub the native PDF re-fetch so its cookie/redirect/cap logic can be
+  // exercised without touching the network. Pass null to restore.
+  setPdfRefetchFetchForTest(impl: ((url: string, init: RequestInit) => Promise<Response>) | null): void {
+    pdfRefetchFetch = impl ?? defaultPdfRefetchFetch;
   },
   // Register a secret value for a task exactly as browserFillByLocator
   // would, so the safetyCheck registered-secret URL gate can be

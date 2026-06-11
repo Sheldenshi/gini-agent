@@ -4985,12 +4985,6 @@ describe("browserNavigate PDF handling", () => {
   function makePdfPage(opts: {
     contentType?: string;
     body?: (() => Promise<Uint8Array>) | null;
-    request?: {
-      get: (url: string) => Promise<{
-        headers: () => Record<string, string>;
-        body: () => Promise<Uint8Array>;
-      }>;
-    };
   } = {}): Partial<import("playwright-core").Page> {
     const response = {
       status: () => 200,
@@ -5001,16 +4995,27 @@ describe("browserNavigate PDF handling", () => {
       url: () => PDF_URL,
       title: async () => "invoice.pdf",
       goto: (async () => response) as unknown as import("playwright-core").Page["goto"],
-      evaluate: (async () => ({ entries: [], hiddenEmitted: 0, hiddenTotal: 0, hiddenBudget: 0 })) as unknown as import("playwright-core").Page["evaluate"],
-      ...(opts.request ? { request: opts.request } : {})
+      evaluate: (async () => ({ entries: [], hiddenEmitted: 0, hiddenTotal: 0, hiddenBudget: 0 })) as unknown as import("playwright-core").Page["evaluate"]
     } as Partial<import("playwright-core").Page>;
   }
+
+  // Re-fetch tests stub the native fetch seam; the rejecting default
+  // keeps an accidental fall-through from ever leaving the process
+  // (no network in tests).
+  const rejectingFetch = async (): Promise<Response> => {
+    throw new Error("unexpected network fetch in test");
+  };
+
+  beforeEach(() => {
+    browserTest.setPdfRefetchFetchForTest(rejectingFetch);
+  });
 
   afterEach(() => {
     browserTest.clearFakeSessionsForTest();
     browserTest.setInFlightDisconnectsForTest(0);
     browserTest.setPdfTextExtractorForTest(null);
     browserTest.setPdfExtractMaxBytesForTest(null);
+    browserTest.setPdfRefetchFetchForTest(null);
   });
 
   test("returns extracted text for an application/pdf response instead of a DOM snapshot", async () => {
@@ -5069,27 +5074,30 @@ describe("browserNavigate PDF handling", () => {
     expect(extractorCalls).toBe(0);
   });
 
-  test("re-fetches PDF bytes via the context request API when the response body is unavailable", async () => {
+  test("re-fetches PDF bytes via native fetch when the response body is unavailable, carrying context cookies", async () => {
     // Chrome's PDF viewer intercepts main-frame PDF responses, so
     // response.body() throws (or returns viewer HTML — see the next test)
-    // on real PDF navigations — the page.request re-fetch of the
-    // already-gated final URL is the path real PDFs take.
+    // on real PDF navigations — the native re-fetch of the already-gated
+    // final URL is the path real PDFs take. The browser context's cookies
+    // for the URL ride along as a Cookie header so auth-gated PDFs work.
     browserTest.setPdfTextExtractorForTest(async (bytes) => ({ text: `extracted:${bytes.byteLength}` }));
     let fetchedUrl: string | undefined;
-    browserTest.installFakeSessionWithPageForTest("pdf-refetch", makePdfPage({
+    let sentCookie: string | null | undefined;
+    browserTest.setPdfRefetchFetchForTest(async (url, init) => {
+      fetchedUrl = url;
+      sentCookie = new Headers(init.headers).get("cookie");
+      return new Response(new TextEncoder().encode("%PDF-1.4 real bytes"), { status: 200 });
+    });
+    browserTest.installFakeSessionWithPageAndContextForTest("pdf-refetch", makePdfPage({
       body: async () => {
         throw new Error("Protocol error (Network.getResponseBody): No resource with given identifier found");
-      },
-      request: {
-        get: async (url) => {
-          fetchedUrl = url;
-          return {
-            headers: () => ({}),
-            body: async () => new TextEncoder().encode("%PDF-1.4 real bytes")
-          };
-        }
       }
-    }));
+    }), {
+      cookies: (async () => [
+        { name: "session", value: "abc123" },
+        { name: "tenant", value: "t-9" }
+      ]) as unknown as import("playwright-core").BrowserContext["cookies"]
+    });
 
     const raw = await browserNavigate("pdf-refetch", { url: PDF_URL });
     const parsed = JSON.parse(raw) as { success: boolean; pdf?: boolean; pdfText?: string };
@@ -5098,6 +5106,7 @@ describe("browserNavigate PDF handling", () => {
     // The extractor ran on the re-fetched bytes ("%PDF-1.4 real bytes" = 19).
     expect(parsed.pdfText).toBe("extracted:19");
     expect(fetchedUrl).toBe(PDF_URL);
+    expect(sentCookie).toBe("session=abc123; tenant=t-9");
   });
 
   test("re-fetches when the response body is the PDF viewer's HTML wrapper, not PDF bytes", async () => {
@@ -5106,17 +5115,12 @@ describe("browserNavigate PDF handling", () => {
     // routes this case to the re-fetch — the throw/empty checks never fire.
     browserTest.setPdfTextExtractorForTest(async (bytes) => ({ text: `extracted:${bytes.byteLength}` }));
     let fetchedUrl: string | undefined;
+    browserTest.setPdfRefetchFetchForTest(async (url) => {
+      fetchedUrl = url;
+      return new Response(new TextEncoder().encode("%PDF-1.4 real bytes"), { status: 200 });
+    });
     browserTest.installFakeSessionWithPageForTest("pdf-viewer-html", makePdfPage({
-      body: async () => new TextEncoder().encode("<!DOCTYPE html><html><body>viewer</body></html>"),
-      request: {
-        get: async (url) => {
-          fetchedUrl = url;
-          return {
-            headers: () => ({}),
-            body: async () => new TextEncoder().encode("%PDF-1.4 real bytes")
-          };
-        }
-      }
+      body: async () => new TextEncoder().encode("<!DOCTYPE html><html><body>viewer</body></html>")
     }));
 
     const raw = await browserNavigate("pdf-viewer-html", { url: PDF_URL });
@@ -5129,20 +5133,70 @@ describe("browserNavigate PDF handling", () => {
     expect(fetchedUrl).toBe(PDF_URL);
   });
 
+  test("follows a re-fetch redirect to an allowed URL and extracts from the target", async () => {
+    browserTest.setPdfTextExtractorForTest(async (bytes) => ({ text: `extracted:${bytes.byteLength}` }));
+    const REDIRECT_TARGET = "https://203.0.113.6/storage/invoice-final.pdf";
+    const fetchedUrls: string[] = [];
+    browserTest.setPdfRefetchFetchForTest(async (url) => {
+      fetchedUrls.push(url);
+      if (url === PDF_URL) {
+        return new Response(null, { status: 302, headers: { location: REDIRECT_TARGET } });
+      }
+      return new Response(new TextEncoder().encode("%PDF-1.4 real bytes"), { status: 200 });
+    });
+    browserTest.installFakeSessionWithPageForTest("pdf-redirect-ok", makePdfPage({
+      body: async () => {
+        throw new Error("intercepted");
+      }
+    }));
+
+    const raw = await browserNavigate("pdf-redirect-ok", { url: PDF_URL });
+    const parsed = JSON.parse(raw) as { success: boolean; pdf?: boolean; pdfText?: string };
+    expect(parsed.success).toBe(true);
+    expect(parsed.pdf).toBe(true);
+    expect(parsed.pdfText).toBe("extracted:19");
+    expect(fetchedUrls).toEqual([PDF_URL, REDIRECT_TARGET]);
+  });
+
+  test("aborts the re-fetch when a redirect hop targets a blocked host", async () => {
+    // A redirect must never reach a host the navigation gates block —
+    // the loopback target here would expose the runtime's own API.
+    let extractorCalls = 0;
+    browserTest.setPdfTextExtractorForTest(async () => {
+      extractorCalls++;
+      return { text: "should not run" };
+    });
+    const fetchedUrls: string[] = [];
+    browserTest.setPdfRefetchFetchForTest(async (url) => {
+      fetchedUrls.push(url);
+      return new Response(null, { status: 302, headers: { location: "http://127.0.0.1:8787/api/runtime/approvals" } });
+    });
+    browserTest.installFakeSessionWithPageForTest("pdf-redirect-blocked", makePdfPage({
+      body: async () => {
+        throw new Error("intercepted");
+      }
+    }));
+
+    const raw = await browserNavigate("pdf-redirect-blocked", { url: PDF_URL });
+    const parsed = JSON.parse(raw) as { success: boolean; pdf?: boolean; note?: string };
+    expect(parsed.success).toBe(true);
+    expect(parsed.pdf).toBe(true);
+    expect(parsed.note).toContain("could not retrieve PDF bytes");
+    // The blocked hop was never requested.
+    expect(fetchedUrls).toEqual([PDF_URL]);
+    expect(extractorCalls).toBe(0);
+  });
+
   test("notes that the bytes could not be retrieved when body and re-fetch both return HTML", async () => {
     let extractorCalls = 0;
     browserTest.setPdfTextExtractorForTest(async () => {
       extractorCalls++;
       return { text: "should not run" };
     });
+    browserTest.setPdfRefetchFetchForTest(async () =>
+      new Response(new TextEncoder().encode("<!DOCTYPE html><html><body>error page</body></html>"), { status: 200 }));
     browserTest.installFakeSessionWithPageForTest("pdf-html-twice", makePdfPage({
-      body: async () => new TextEncoder().encode("<!DOCTYPE html><html><body>viewer</body></html>"),
-      request: {
-        get: async () => ({
-          headers: () => ({}),
-          body: async () => new TextEncoder().encode("<!DOCTYPE html><html><body>error page</body></html>")
-        })
-      }
+      body: async () => new TextEncoder().encode("<!DOCTYPE html><html><body>viewer</body></html>")
     }));
 
     const raw = await browserNavigate("pdf-html-twice", { url: PDF_URL });
@@ -5155,18 +5209,13 @@ describe("browserNavigate PDF handling", () => {
 
   test("does not re-fetch when the response body is already valid PDF bytes", async () => {
     browserTest.setPdfTextExtractorForTest(async (bytes) => ({ text: `extracted:${bytes.byteLength}` }));
-    let requestGetCalls = 0;
+    let fetchCalls = 0;
+    browserTest.setPdfRefetchFetchForTest(async () => {
+      fetchCalls++;
+      return new Response(new TextEncoder().encode("%PDF-1.4 should not be fetched"), { status: 200 });
+    });
     browserTest.installFakeSessionWithPageForTest("pdf-no-refetch", makePdfPage({
-      body: async () => new TextEncoder().encode("%PDF-1.4 direct bytes"),
-      request: {
-        get: async () => {
-          requestGetCalls++;
-          return {
-            headers: () => ({}),
-            body: async () => new TextEncoder().encode("%PDF-1.4 should not be fetched")
-          };
-        }
-      }
+      body: async () => new TextEncoder().encode("%PDF-1.4 direct bytes")
     }));
 
     const raw = await browserNavigate("pdf-no-refetch", { url: PDF_URL });
@@ -5174,23 +5223,23 @@ describe("browserNavigate PDF handling", () => {
     expect(parsed.success).toBe(true);
     // "%PDF-1.4 direct bytes" = 21 — the body() bytes, not the re-fetch.
     expect(parsed.pdfText).toBe("extracted:21");
-    expect(requestGetCalls).toBe(0);
+    expect(fetchCalls).toBe(0);
   });
 
   test("notes that the PDF bytes could not be retrieved when both body and re-fetch fail", async () => {
+    // A rejecting fetch (network error / AbortSignal timeout) must
+    // degrade to the honest note — never crash the process.
     let extractorCalls = 0;
     browserTest.setPdfTextExtractorForTest(async () => {
       extractorCalls++;
       return { text: "should not run" };
     });
+    browserTest.setPdfRefetchFetchForTest(async () => {
+      throw new Error("The operation timed out");
+    });
     browserTest.installFakeSessionWithPageForTest("pdf-no-bytes", makePdfPage({
       body: async () => {
         throw new Error("intercepted");
-      },
-      request: {
-        get: async () => {
-          throw new Error("net::ERR_FAILED");
-        }
       }
     }));
 
@@ -5211,18 +5260,20 @@ describe("browserNavigate PDF handling", () => {
       return { text: "should not run" };
     });
     browserTest.setPdfExtractMaxBytesForTest(8);
+    // A minimal Response-shaped fake: a real Response buffers its body at
+    // construction, which would hide whether the cap short-circuited the
+    // arrayBuffer() read.
+    browserTest.setPdfRefetchFetchForTest(async () => ({
+      status: 200,
+      headers: new Headers({ "content-length": "100" }),
+      arrayBuffer: async () => {
+        bodyReads++;
+        return new Uint8Array(100).buffer;
+      }
+    }) as unknown as Response);
     browserTest.installFakeSessionWithPageForTest("pdf-refetch-cap", makePdfPage({
       body: async () => {
         throw new Error("intercepted");
-      },
-      request: {
-        get: async () => ({
-          headers: () => ({ "content-length": "100" }),
-          body: async () => {
-            bodyReads++;
-            return new Uint8Array(100);
-          }
-        })
       }
     }));
 
