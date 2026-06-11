@@ -96,13 +96,17 @@ setBrowserRecording(config.browserRecording === true);
 // link is long-lasting (same deviceId-keyed URL on reconnect), so a tunnel that
 // was "connected" at shutdown is brought back AUTOMATICALLY: this flips it to
 // "connecting" (never a stale "connected" the first GET could read) and kicks off
-// a background reconnect that reuses the stored relay session and waits for the
-// web child to come back. Awaited BEFORE Bun.serve binds for the synchronous
-// status flip; the reconnect itself runs in the background (it probes the local
-// port with retry, so it tolerates serve binding a moment later). The .catch
+// a background reconnect that reuses the stored relay session and rebuilds the
+// tunnel as soon as this process owns the gateway port — NOT after the web child
+// recompiles, since the relay URL is a remote client's only channel to watch the
+// restart finish. The status flip is awaited BEFORE Bun.serve binds (so no GET
+// reads a stale "connected"); the background rebuild waits on `gatewayReady`,
+// resolved the instant Bun.serve binds below, so the public URL is never
+// forwarded to a stale/foreign listener still holding config.port. The .catch
 // keeps the never-crash-boot guarantee. See ADR tunnel-connectivity.md.
+const gatewayReady = Promise.withResolvers<void>();
 const tunnelReconcileStartedMs = performance.now();
-await reconcileTunnelOnStartup(config).catch((error) => {
+await reconcileTunnelOnStartup(config, { gatewayReady: gatewayReady.promise }).catch((error) => {
   appendLog(config.instance, "tunnel.reconcile.error", {
     error: error instanceof Error ? error.message : String(error)
   });
@@ -262,6 +266,15 @@ const server = Bun.serve({
   // Bun.serve websocket handler for the bridged client sockets above.
   websocket: webSocketProxyHandler
 });
+
+// The gateway port is now bound by this process, so the tunnel resume kicked off
+// above may expose it through the relay. Bun.serve binds synchronously and throws
+// on failure, so reaching the line after it means the port is ours; a failed bind
+// throws before this and leaves gatewayReady unresolved, so a doomed boot never
+// publishes the public URL to a foreign listener. Resolve immediately after the
+// bind, ahead of the bookkeeping below, so reachability returns the instant the
+// port is ours.
+gatewayReady.resolve();
 
 // Record the live port so clients (CLI status, autostart web shim, BFF
 // lazy-read in web/src/lib/runtime.ts) can discover it without having to

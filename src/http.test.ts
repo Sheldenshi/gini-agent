@@ -867,6 +867,31 @@ describe("runtime api", () => {
     expect(String(value.message)).toContain("Next.js");
   });
 
+  // The web-down banner is reachable over the relay on bootstrap paths (exempt
+  // from the session gate) during the web child's post-restart startup window.
+  // A non-loopback (relay) caller must get only the bare name/message — never the
+  // instance, port, or web-URL hint — so the banner can't leak deployment details.
+  test("the web-down banner withholds deployment details from a relay caller", async () => {
+    const config = testConfig("banner-relay-redaction");
+    const handler = createHandler(config);
+
+    const relayHost = "sub.gini-relay.lilaclabs.ai";
+    const response = await handler(
+      new Request(`https://${relayHost}/favicon.ico`, { headers: { host: relayHost } })
+    );
+    expect(response.status).toBe(200);
+    const value = (await response.json()) as {
+      name?: string;
+      instance?: unknown;
+      port?: unknown;
+      ui_url_hint?: unknown;
+    };
+    expect(value.name).toBe("gini-runtime");
+    expect(value.instance).toBeUndefined();
+    expect(value.port).toBeUndefined();
+    expect(value.ui_url_hint).toBeUndefined();
+  });
+
   // The web reverse proxy: non-/api traffic and the /api/runtime/* BFF
   // namespace route to the Next.js server, while native /api/* stays
   // bearer-gated. With no web server running in tests, the proxy falls back

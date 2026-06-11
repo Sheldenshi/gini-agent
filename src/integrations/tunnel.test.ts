@@ -210,20 +210,31 @@ function depsLogin(over: Partial<TunnelDeps> = {}): Partial<TunnelDeps> {
 
 describe("tunnel integration", () => {
   let config: RuntimeConfig;
-  let prevTunnelPort: string | undefined;
+  // Snapshot every env knob the tunnel module reads and CLEAR it for each test, so
+  // a value left set in the ambient environment (or leaked by a prior test) can't
+  // change a test's outcome — e.g. an ambient GINI_TUNNEL_RESUME_WAIT_MS=0 would
+  // make the override poll time out immediately. Tests that need a specific value
+  // set it themselves; afterEach restores the original.
+  const TUNNEL_ENV_KEYS = ["GINI_TUNNEL_PORT", "GINI_TUNNEL_RESUME_WAIT_MS", "GINI_TUNNEL_RESUME_POLL_MS"] as const;
+  let prevEnv: Record<string, string | undefined> = {};
 
   beforeEach(() => {
     config = testConfig(`t-${Math.random().toString(36).slice(2)}`);
-    prevTunnelPort = process.env.GINI_TUNNEL_PORT;
+    prevEnv = {};
+    for (const key of TUNNEL_ENV_KEYS) {
+      prevEnv[key] = process.env[key];
+      delete process.env[key];
+    }
     setTunnelDeps(deps());
   });
 
   afterEach(() => {
     setTunnelDeps(); // restore the real gini-relay seams
-    // Restore GINI_TUNNEL_PORT even if a port-override test failed mid-assertion,
-    // so env state never leaks into a later test.
-    if (prevTunnelPort === undefined) delete process.env.GINI_TUNNEL_PORT;
-    else process.env.GINI_TUNNEL_PORT = prevTunnelPort;
+    // Restore env even if a test failed mid-assertion, so state never leaks.
+    for (const key of TUNNEL_ENV_KEYS) {
+      if (prevEnv[key] === undefined) delete process.env[key];
+      else process.env[key] = prevEnv[key];
+    }
     rmSync(`${ROOT}/instances/${config.instance}`, { recursive: true, force: true });
   });
 
@@ -844,6 +855,176 @@ describe("tunnel integration", () => {
     expect(readState(config.instance).audit.some((a) => a.action === "tunnel.reconcile")).toBe(true);
   });
 
+  // Regression (relay update "stuck on restarting"): a client connected through
+  // the relay has exactly ONE channel to the instance — the public URL the frpc
+  // child fronts. A restart kills that child, so the resume must bring it back.
+  // The web child the gateway reverse-proxies may still be (re)compiling at that
+  // instant, but the tunnel only fronts the GATEWAY port — so once this process
+  // owns that port (gatewayReady), reachability is restored WITHOUT blocking the
+  // rebuild on the web child. If the resume waited on web-readiness the remote
+  // browser would stay blind for the whole restart window and its update gate
+  // could never poll the restart to completion.
+  test("reconcileTunnelOnStartup resume restores reachability without waiting for the web child", async () => {
+    const ready = Promise.withResolvers<void>();
+    let built = 0;
+    let probed = 0;
+    setTunnelDeps(
+      deps({
+        // The tunnel fronts this process's own gateway port.
+        resolveLocalPort: (c) => c.port,
+        // The web child is still down at resume time (mid-recompile after the
+        // restart). The tunnel must come back anyway — it fronts the gateway,
+        // not the web child, so this must never be consulted on the resume.
+        probeLocalPort: () => {
+          probed += 1;
+          return Promise.resolve(false);
+        },
+        buildTunnel: () => {
+          built += 1;
+          return fakeChild();
+        }
+      })
+    );
+    await seedConnectedRecord(config);
+    await reconcileTunnelOnStartup(config, { gatewayReady: ready.promise });
+    ready.resolve();
+    await awaitTunnelSettled(config.instance);
+    const settled = getTunnel(config);
+    expect(settled.status).toBe("connected");
+    // Same deviceId-keyed subdomain — the link is stable across the restart.
+    expect(settled.url).toBe("https://subdom7.relay.test");
+    expect(built).toBe(1);
+    // gatewayReady (the gateway-bind proof) sufficed — the web child was never
+    // probed, so a slow recompile can't keep the remote client blind.
+    expect(probed).toBe(0);
+  });
+
+  // Security: reconcileTunnelOnStartup runs before Bun.serve binds config.port,
+  // so the resume must NOT expose the relay URL until THIS process owns the port —
+  // otherwise the stable public URL could forward to a stale/foreign listener
+  // still holding it. The frpc rebuild waits on `gatewayReady`; until it resolves
+  // the record stays "connecting" and no tunnel is built.
+  test("reconcileTunnelOnStartup resume waits for the gateway port before exposing the tunnel", async () => {
+    const ready = Promise.withResolvers<void>();
+    let built = 0;
+    setTunnelDeps(
+      deps({
+        resolveLocalPort: (c) => c.port,
+        buildTunnel: () => {
+          built += 1;
+          return fakeChild();
+        }
+      })
+    );
+    await seedConnectedRecord(config);
+    await reconcileTunnelOnStartup(config, { gatewayReady: ready.promise });
+    // The resume parked on gatewayReady (runConnect's first await): the status is
+    // "connecting" and no frpc child has been built yet.
+    expect(getTunnel(config).status).toBe("connecting");
+    expect(built).toBe(0);
+    // The gateway binds → the resume proceeds and the tunnel comes up.
+    ready.resolve();
+    await awaitTunnelSettled(config.instance);
+    expect(getTunnel(config).status).toBe("connected");
+    expect(built).toBe(1);
+  });
+
+  // If a cancel/disconnect lands while the resume is parked on gatewayReady, it
+  // bails without building the tunnel and without clobbering the cancel's idle.
+  test("reconcileTunnelOnStartup resume bails if cancelled while waiting for the gateway port", async () => {
+    const ready = Promise.withResolvers<void>();
+    let built = 0;
+    setTunnelDeps(
+      deps({
+        resolveLocalPort: (c) => c.port,
+        buildTunnel: () => {
+          built += 1;
+          return fakeChild();
+        }
+      })
+    );
+    await seedConnectedRecord(config);
+    await reconcileTunnelOnStartup(config, { gatewayReady: ready.promise });
+    const settled = awaitTunnelSettled(config.instance);
+    const cancelled = await cancelTunnel(config);
+    expect(cancelled.status).toBe("idle");
+    // The port binds, but the resume was superseded — it must not expose anything.
+    ready.resolve();
+    await settled;
+    expect(built).toBe(0);
+    expect(getTunnel(config).status).toBe("idle");
+  });
+
+  // Security (GINI_TUNNEL_PORT override): the tunnel can be pointed at a port this
+  // process does NOT bind (resolveLocalPort ≠ config.port). gatewayReady proves
+  // only config.port, so it can't vouch for the override — the resume must instead
+  // verify that port's identity (a bounded, cancellable poll, since the override
+  // target may still be coming up after a restart) before exposing the stable
+  // public URL. It polls the local port and connects once it answers.
+  test("reconcileTunnelOnStartup resume polls an overridden tunnel port, then connects", async () => {
+    // Fast poll; the wait budget stays at its 60s default (beforeEach cleared any
+    // ambient GINI_TUNNEL_RESUME_WAIT_MS), so the three probes land well inside it.
+    process.env.GINI_TUNNEL_RESUME_POLL_MS = "1";
+    const ready = Promise.withResolvers<void>();
+    ready.resolve();
+    let probes = 0;
+    // resolveLocalPort returns 4321 (the deps() sentinel) ≠ config.port.
+    setTunnelDeps(deps({ probeLocalPort: () => Promise.resolve(++probes >= 3) }));
+    await seedConnectedRecord(config);
+    // gatewayReady is resolved but ignored for the override — verification is by
+    // probe, not the gateway bind.
+    await reconcileTunnelOnStartup(config, { gatewayReady: ready.promise });
+    await awaitTunnelSettled(config.instance);
+    expect(getTunnel(config).status).toBe("connected");
+    expect(probes).toBeGreaterThanOrEqual(3);
+  });
+
+  // If the overridden port never verifies within the budget, the resume settles
+  // idle and builds nothing — it must NOT forward the relay URL to an unverified
+  // (possibly foreign) listener, even though gatewayReady has resolved.
+  test("reconcileTunnelOnStartup resume settles idle when an overridden port never verifies", async () => {
+    process.env.GINI_TUNNEL_RESUME_WAIT_MS = "0"; // give up after the first failed probe
+    const ready = Promise.withResolvers<void>();
+    ready.resolve();
+    let built = 0;
+    let probed = 0;
+    setTunnelDeps(
+      deps({
+        probeLocalPort: () => {
+          probed += 1;
+          return Promise.resolve(false);
+        },
+        buildTunnel: () => {
+          built += 1;
+          return fakeChild();
+        }
+      })
+    );
+    await seedConnectedRecord(config);
+    await reconcileTunnelOnStartup(config, { gatewayReady: ready.promise });
+    await awaitTunnelSettled(config.instance);
+    expect(probed).toBeGreaterThanOrEqual(1);
+    expect(built).toBe(0);
+    expect(getTunnel(config).status).toBe("idle");
+  });
+
+  // A resume cancelled while polling an overridden port bails without clobbering
+  // the idle the cancel wrote (covers the supervisor-superseded guard in the poll).
+  test("reconcileTunnelOnStartup resume bails when cancelled while polling an overridden port", async () => {
+    process.env.GINI_TUNNEL_RESUME_POLL_MS = "5";
+    setTunnelDeps(deps({ probeLocalPort: () => Promise.resolve(false) }));
+    await seedConnectedRecord(config);
+    await reconcileTunnelOnStartup(config);
+    // Capture the resume's settled promise BEFORE cancel tears down the
+    // supervisor, then await it: the poll wakes, sees it was superseded, and
+    // bails without clobbering the idle the cancel wrote.
+    const settled = awaitTunnelSettled(config.instance);
+    const cancelled = await cancelTunnel(config);
+    expect(cancelled.status).toBe("idle");
+    await settled;
+    expect(getTunnel(config).status).toBe("idle");
+  });
+
   // Resume is non-interactive: with no stored session it must NOT open a browser
   // or mint a login on a headless restart — it settles idle for a manual reconnect.
   test("reconcileTunnelOnStartup resume settles idle (no login) when there is no stored session", async () => {
@@ -868,74 +1049,41 @@ describe("tunnel integration", () => {
     expect(opened).toEqual([]);
   });
 
-  // Resume waits for the web child to come back (it may still be compiling right
-  // after a restart): it polls the local port and connects once it answers.
-  test("reconcileTunnelOnStartup resume waits for the web child then connects", async () => {
-    const prevPoll = process.env.GINI_TUNNEL_RESUME_POLL_MS;
-    process.env.GINI_TUNNEL_RESUME_POLL_MS = "1";
-    try {
-      let probes = 0;
-      setTunnelDeps(deps({ probeLocalPort: () => Promise.resolve(++probes >= 3) }));
-      await seedConnectedRecord(config);
-      await reconcileTunnelOnStartup(config);
-      await awaitTunnelSettled(config.instance);
-      expect(getTunnel(config).status).toBe("connected");
-      expect(probes).toBeGreaterThanOrEqual(3);
-    } finally {
-      if (prevPoll === undefined) delete process.env.GINI_TUNNEL_RESUME_POLL_MS;
-      else process.env.GINI_TUNNEL_RESUME_POLL_MS = prevPoll;
-    }
-  });
-
-  // Resume gives up cleanly (settles idle, never spawns frpc) if the web child
-  // never becomes reachable within the budget.
-  test("reconcileTunnelOnStartup resume settles idle when the web never becomes ready", async () => {
-    const prevWait = process.env.GINI_TUNNEL_RESUME_WAIT_MS;
-    process.env.GINI_TUNNEL_RESUME_WAIT_MS = "0";
-    try {
-      let built = 0;
-      setTunnelDeps(
-        deps({
-          probeLocalPort: () => Promise.resolve(false),
-          buildTunnel: () => {
-            built += 1;
-            return fakeChild();
-          }
-        })
-      );
-      await seedConnectedRecord(config);
-      await reconcileTunnelOnStartup(config);
-      await awaitTunnelSettled(config.instance);
-      expect(getTunnel(config).status).toBe("idle");
-      expect(built).toBe(0);
-    } finally {
-      if (prevWait === undefined) delete process.env.GINI_TUNNEL_RESUME_WAIT_MS;
-      else process.env.GINI_TUNNEL_RESUME_WAIT_MS = prevWait;
-    }
-  });
-
-  // A resume cancelled while it waits for the web child bails without clobbering
-  // the idle the cancel wrote (covers the supervisor-superseded guard in the wait).
-  test("reconcileTunnelOnStartup resume bails when cancelled during the web wait", async () => {
-    const prevPoll = process.env.GINI_TUNNEL_RESUME_POLL_MS;
-    process.env.GINI_TUNNEL_RESUME_POLL_MS = "5";
-    try {
-      setTunnelDeps(deps({ probeLocalPort: () => Promise.resolve(false) }));
-      await seedConnectedRecord(config);
-      await reconcileTunnelOnStartup(config);
-      // Capture the resume's settled promise BEFORE cancel tears down the
-      // supervisor, then await it — deterministic, no fixed sleep. The resume
-      // wakes from its poll, sees it was superseded, and bails without clobbering
-      // the idle the cancel wrote.
-      const settled = awaitTunnelSettled(config.instance);
-      const cancelled = await cancelTunnel(config);
-      expect(cancelled.status).toBe("idle");
-      await settled;
-      expect(getTunnel(config).status).toBe("idle");
-    } finally {
-      if (prevPoll === undefined) delete process.env.GINI_TUNNEL_RESUME_POLL_MS;
-      else process.env.GINI_TUNNEL_RESUME_POLL_MS = prevPoll;
-    }
+  // A resume cancelled mid-rebuild (the frpc start is in flight) bails without
+  // clobbering the idle the cancel wrote, and stops the child it spawned so it
+  // isn't orphaned (covers the post-start supervisor-superseded guard).
+  test("reconcileTunnelOnStartup resume bails when cancelled mid-rebuild", async () => {
+    const startGate = Promise.withResolvers<void>();
+    const startEntered = Promise.withResolvers<void>();
+    let stopped = 0;
+    const child: TunnelChild = {
+      start: () => {
+        startEntered.resolve();
+        return startGate.promise.then(() => child);
+      },
+      stop: () => {
+        stopped += 1;
+        return Promise.resolve(0);
+      },
+      exited: Promise.withResolvers<number>().promise
+    };
+    setTunnelDeps(deps({ buildTunnel: () => child }));
+    await seedConnectedRecord(config);
+    await reconcileTunnelOnStartup(config);
+    // Wait until the resume has actually entered frpc start (deterministic — no
+    // reliance on microtask ordering) so the cancel below lands mid-rebuild.
+    await startEntered.promise;
+    // Capture the settled promise BEFORE cancel tears the supervisor down so the
+    // await is deterministic.
+    const settled = awaitTunnelSettled(config.instance);
+    const cancelled = await cancelTunnel(config);
+    expect(cancelled.status).toBe("idle");
+    // Release the gated start: the resume sees it was superseded, stops the
+    // child it spawned, and bails without clobbering the cancel's idle.
+    startGate.resolve();
+    await settled;
+    expect(getTunnel(config).status).toBe("idle");
+    expect(stopped).toBeGreaterThanOrEqual(1);
   });
 
   // A "connected" record for a provider that is no longer enabled does NOT resume
