@@ -111,7 +111,13 @@ export type HookOutcome =
   | { kind: "shortCircuit"; summary?: string; state?: Record<string, unknown> }
   | {
       kind: "context";
+      // Flat carrier: a single turn's worth of rendered context (the legacy shape).
       context: string[];
+      // Routed carrier: per-routeKey rendered context for a fan-out consumer. When
+      // present, the consumer dispatches one turn per bucket; `context` is empty.
+      // Each bucket is rendered through the SAME fence path as the flat carrier, so
+      // the prompt-injection hardening is identical per bucket.
+      buckets?: Record<string, string[]>;
       onDispatched?: () => void | Promise<void>;
       state?: Record<string, unknown>;
     }
@@ -181,9 +187,25 @@ export async function runHook(
   }
   if (raced.kind === "error") return { kind: "error", message: raced.message, transient: false };
   if (raced.kind === "context") {
+    // Routed (fan-out) carrier: render EACH bucket through the same fence path as
+    // the flat carrier, so a routed consumer gets identical per-bucket hardening.
+    // Flat (legacy) carrier: render `items` into `context` exactly as before.
+    if (raced.buckets) {
+      const buckets: Record<string, string[]> = {};
+      for (const [routeKey, items] of Object.entries(raced.buckets)) {
+        buckets[routeKey] = renderHookContext(items);
+      }
+      return {
+        kind: "context",
+        context: [],
+        buckets,
+        ...(raced.onDispatched ? { onDispatched: raced.onDispatched } : {}),
+        ...(raced.state !== undefined ? { state: raced.state } : {})
+      };
+    }
     return {
       kind: "context",
-      context: renderHookContext(raced.items),
+      context: renderHookContext(raced.items ?? []),
       ...(raced.onDispatched ? { onDispatched: raced.onDispatched } : {}),
       ...(raced.state !== undefined ? { state: raced.state } : {})
     };

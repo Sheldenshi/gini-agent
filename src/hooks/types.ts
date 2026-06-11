@@ -81,6 +81,19 @@ export type HookResult =
   | { kind: "shortCircuit"; summary?: string; state?: Record<string, unknown> }
   // additionalContext analog: run the turn with these items injected.
   //
+  // The injected context arrives in ONE of two carriers, mutually exclusive:
+  //   - `items`: a FLAT list injected into a single turn (today's shape — when a
+  //     handler returns `items` alone, the consumer's behavior is byte-identical
+  //     to before buckets existed).
+  //   - `buckets`: a ROUTED map keyed by an opaque routeKey, each carrying its own
+  //     item list. A fan-out consumer (the jobs scheduler) dispatches ONE turn per
+  //     non-empty bucket into that route's destination (zero turns for an empty
+  //     bucket). The routeKey is domain-free here — a string the handler tags items
+  //     with; the routeKey -> destination mapping lives in the consumer's config
+  //     (JobRecord.routes), never in the handler. A consumer that doesn't fan out
+  //     ignores `buckets` and uses `items`.
+  // A handler sets exactly ONE of the two carriers.
+  //
   // `onDispatched` is an OPTIONAL post-delivery commit thunk: the consumer
   // awaits it ONLY after the turn has successfully dispatched — never if dispatch
   // throws. A handler whose items represent about-to-be-DELIVERED work puts that
@@ -95,7 +108,8 @@ export type HookResult =
   // `onDispatched` thunk; the thunk remains for handlers with side effects.
   | {
       kind: "context";
-      items: HookContextItem[];
+      items?: HookContextItem[];
+      buckets?: Record<string, HookContextItem[]>;
       onDispatched?: () => void | Promise<void>;
       state?: Record<string, unknown>;
     }

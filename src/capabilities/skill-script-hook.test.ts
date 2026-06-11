@@ -103,9 +103,11 @@ describe("skill-script hook handler", () => {
     });
     expect(result.kind).toBe("context");
     if (result.kind === "context") {
+      // The skill-script handler always returns the flat `items` carrier (never
+      // routed buckets), so narrow off the now-optional field before indexing.
       expect(result.items).toHaveLength(1);
-      expect(result.items[0]!.text).toBe("echo:from:alice");
-      expect(result.items[0]!.untrusted).toBe(true);
+      expect(result.items![0]!.text).toBe("echo:from:alice");
+      expect(result.items![0]!.untrusted).toBe(true);
       // State round-trip: in n=4 -> out n=5.
       expect(result.state).toEqual({ n: 5 });
     }
