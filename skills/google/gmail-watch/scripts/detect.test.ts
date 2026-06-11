@@ -698,6 +698,73 @@ describe("detect — thread mode", () => {
     expect(r3.kind).toBe("shortCircuit");
   });
 
+  // A gws error BODY (exit 0) on a `threads get` — a missing/inaccessible thread
+  // yields `{"error":{...}}`, not an empty thread. It must surface as a watch
+  // fault (status:"error" + a lastError), NOT seed-to-now / short-circuit ok.
+  function threadErrorSpawn(body: Record<string, unknown>): GwsSpawn {
+    return async (args) => {
+      const joined = args.join(" ");
+      if (joined.includes("auth status")) return PREAMBLE + '{"token_valid":true}';
+      if (joined.includes("getProfile")) return PREAMBLE + '{"emailAddress":"me@example.com"}';
+      if (joined.includes("threads get")) return PREAMBLE + JSON.stringify(body);
+      return PREAMBLE + "{}";
+    };
+  }
+  const NOT_FOUND_BODY = { error: { code: 404, message: "Requested entity was not found.", reason: "notFound" } };
+
+  test("a 404 error body on a steady-state thread tick reports error, cursor unchanged", async () => {
+    const r = await run(
+      { query: "thread:t-x", threadId: "t-x", state: { cursor: "5000", seen: ["m1"] } },
+      threadErrorSpawn(NOT_FOUND_BODY)
+    );
+    // Surfaced as a fault, NOT swallowed as an empty thread.
+    expect(r.kind).toBe("shortCircuit");
+    expect(r.state.status).toBe("error");
+    expect(r.state.lastError && r.state.lastError.length > 0).toBe(true);
+    // Cursor/seen preserved — NOT advanced, NOT seeded to now().
+    expect(r.state.cursor).toBe("5000");
+    expect(r.state.seen).toEqual(["m1"]);
+  });
+
+  test("a 404 error body on the FIRST (seeding) thread tick reports error, no baseline cursor", async () => {
+    const r = await run(
+      { query: "thread:t-x", threadId: "t-x", state: null },
+      threadErrorSpawn(NOT_FOUND_BODY)
+    );
+    expect(r.kind).toBe("shortCircuit");
+    expect(r.state.status).toBe("error");
+    expect(r.state.lastError && r.state.lastError.length > 0).toBe(true);
+    // No baseline cursor was written (seeding a bad thread must NOT baseline to now).
+    expect(r.state.cursor).toBeUndefined();
+    expect(r.state.seen).toBeUndefined();
+  });
+
+  test("a genuine empty thread still seeds/short-circuits ok (no regression)", async () => {
+    const emptyThread: GwsSpawn = async (args) => {
+      const joined = args.join(" ");
+      if (joined.includes("auth status")) return PREAMBLE + '{"token_valid":true}';
+      if (joined.includes("getProfile")) return PREAMBLE + '{"emailAddress":"me@example.com"}';
+      if (joined.includes("threads get")) return threadResponse("t-e", []);
+      return PREAMBLE + "{}";
+    };
+    const r = await run({ query: "thread:t-e", threadId: "t-e", state: null }, emptyThread);
+    expect(r.kind).toBe("shortCircuit");
+    expect(r.state.status).toBe("ok");
+    expect(r.state.lastError).toBeUndefined();
+    // An empty (but valid) thread baselines to now() as before.
+    expect(Number(r.state.cursor)).toBeGreaterThan(0);
+  });
+
+  test("a thread error body's lastError is scrubbed (no raw paths leak)", async () => {
+    const r = await run(
+      { query: "thread:t-x", threadId: "t-x", state: { cursor: "5000", seen: [] } },
+      threadErrorSpawn({ error: { code: 500, message: "boom reading /Users/alice/.config/gws/token.json", reason: "backendError" } })
+    );
+    expect(r.state.status).toBe("error");
+    expect(r.state.lastError).not.toContain("/Users/alice");
+    expect(r.state.lastError).toContain("<path>");
+  });
+
   test("a same-second-as-cursor message visible on a later tick is still drafted", async () => {
     // Gmail internalDate is second-granular: our outbound and the ticket bot's
     // auto-ack land in the same epoch second. The bot's message is visible only
@@ -776,6 +843,26 @@ describe("run — health in state", () => {
     expect(r.kind).toBe("shortCircuit");
     expect(r.state.status).toBe("error");
     expect(r.state.lastError).toBe("transport blew up reading <path>");
+    expect(r.state.cursor).toBe("7000");
+    expect(r.state.seen).toEqual(["m2"]);
+  });
+
+  test("a list error body (exit 0) reports status:error, cursor/seen unchanged", async () => {
+    // gws can return a Google API error as a JSON body on a `messages list` too.
+    // It is a fault, not an empty window — surface it, don't seed/advance.
+    const listError: GwsSpawn = async (args) => {
+      const joined = args.join(" ");
+      if (joined.includes("auth status")) return PREAMBLE + '{"token_valid":true}';
+      if (joined.includes("getProfile")) return PREAMBLE + '{"emailAddress":"me@example.com"}';
+      if (joined.includes("messages list")) {
+        return PREAMBLE + JSON.stringify({ error: { code: 400, message: "Invalid query.", reason: "invalidArgument" } });
+      }
+      return PREAMBLE + "{}";
+    };
+    const r = await run({ query: "is:unread", state: { cursor: "7000", seen: ["m2"] } }, listError);
+    expect(r.kind).toBe("shortCircuit");
+    expect(r.state.status).toBe("error");
+    expect(r.state.lastError && r.state.lastError.length > 0).toBe(true);
     expect(r.state.cursor).toBe("7000");
     expect(r.state.seen).toEqual(["m2"]);
   });

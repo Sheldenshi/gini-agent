@@ -280,6 +280,32 @@ function parseGwsJson(stdout: string): Record<string, unknown> | undefined {
   }
 }
 
+// gws returns a Google API error as a JSON BODY with exit 0 (e.g. a `threads
+// get` for a missing thread yields `{"error":{"code":404,"message":"...","reason":
+// "notFound"}}`). That is NOT an empty result — the parse helpers below would see
+// no `messages` array and silently treat it as "no new mail", leaving a watch
+// pointed at a bad id permanently, silently dead. Detect the error body at each
+// detection entry point and THROW so the gws-fault path in run() handles it
+// identically to a transport throw: status:"error" + scrubbed lastError, cursor/
+// seen UNCHANGED (no baseline, no advance), recovering on the next clean tick.
+// A normal result (even an empty thread / no-match list) has no `error` object
+// and flows through untouched.
+function gwsErrorBody(doc: Record<string, unknown> | undefined): { code?: unknown; message?: unknown; reason?: unknown } | undefined {
+  const error = doc?.error;
+  return error && typeof error === "object" ? (error as Record<string, unknown>) : undefined;
+}
+
+// Throw a scrubbed Error when `stdout` is a gws error BODY; a no-op otherwise.
+// Called on the raw detection response (list / threads get) before any parse so
+// an error body never reaches the "no messages => empty" path.
+function throwOnGwsErrorBody(stdout: string): void {
+  const error = gwsErrorBody(parseGwsJson(stdout));
+  if (!error) return;
+  const message = typeof error.message === "string" ? error.message : "gws returned an error";
+  const code = typeof error.code === "number" || typeof error.code === "string" ? `${error.code} ` : "";
+  throw new Error(scrubError(`gws error: ${code}${message}`));
+}
+
 interface MessageListWindow {
   ids: string[];
   pageLimitHit: boolean;
@@ -536,7 +562,11 @@ export async function detect(
     }
   }
 
-  const window = parseMessageWindow(await gwsSpawn(buildListArgs(query)));
+  const listOut = await gwsSpawn(buildListArgs(query));
+  // A gws error body (exit 0) is a fault, not an empty window — surface it via
+  // the throw path so the cursor/seen are preserved and the watch reports error.
+  throwOnGwsErrorBody(listOut);
+  const window = parseMessageWindow(listOut);
 
   // Regime 1: SEEDING — baseline the cursor at the newest match, draft nothing.
   if (isSeeding) {
@@ -673,7 +703,13 @@ async function detectThread(
 ): Promise<DetectResult> {
   const stateIn: DetectState = args.state ?? {};
   const seenIn = new Set(stateIn.seen ?? []);
-  const messages = parseThreadMessages(await gwsSpawn(buildThreadGetArgs(args.threadId!)))
+  const threadOut = await gwsSpawn(buildThreadGetArgs(args.threadId!));
+  // A `threads get` for a missing/inaccessible thread returns an error body (exit
+  // 0), NOT an empty thread — surface it via the throw path so a bad thread id
+  // reports error (no baseline-to-now on seeding, no advance) instead of looking
+  // healthy forever.
+  throwOnGwsErrorBody(threadOut);
+  const messages = parseThreadMessages(threadOut)
     .sort((a, b) => (Number(a.internalDate) || 0) - (Number(b.internalDate) || 0));
   const newest = messages[messages.length - 1];
 
