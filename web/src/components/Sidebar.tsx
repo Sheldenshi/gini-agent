@@ -31,7 +31,7 @@ import { CreateAgentDialog } from "@/components/CreateAgentDialog";
 import { TunnelMenu } from "@/components/tunnel/TunnelMenu";
 import { useUpdateGate } from "@/components/UpdateGate";
 import type { AgentRow, ChatSession } from "@/lib/view-types";
-import type { JobRecord } from "@runtime/types";
+import type { JobRecord, JobRoute } from "@runtime/types";
 
 function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
   const pathname = usePathname();
@@ -229,6 +229,21 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
               </div>
               <ul className={cn("flex flex-col gap-0.5", jobsCollapsed && "hidden")}>
                 {recurringJobs.map((job) => {
+                  const routeEntries = fanoutRoutes(job);
+                  if (routeEntries) {
+                    return (
+                      <FanoutJobRow
+                        key={job.id}
+                        job={job}
+                        routeEntries={routeEntries}
+                        sessions={allSessions.data}
+                        selectedSession={selectedSession}
+                        onChat={onChat}
+                        isUnread={isUnread}
+                        selectChannel={selectChannel}
+                      />
+                    );
+                  }
                   const channelSession = (allSessions.data ?? []).find((s) => s.id === job.chatSessionId);
                   const active = onChat && selectedSession === job.chatSessionId;
                   const unread = !active && channelSession ? isUnread(channelSession) : false;
@@ -319,6 +334,119 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
       <UpdateReminder />
       <CreateAgentDialog open={createOpen} onOpenChange={setCreateOpen} />
     </div>
+  );
+}
+
+// A fan-out email-watch job routes each detection bucket to its OWN per-concern
+// channel (`job.routes[routeKey].chatSessionId`); the job's shared
+// `chatSessionId` is a dead, empty session no route writes to. The sidebar
+// special-cases the gmail-watch marker to surface those concern channels
+// directly (the generic job machinery stays generic). Returns the route entries
+// when this is a fan-out email-watch job, else null (render as today).
+function fanoutRoutes(job: JobRecord): [string, JobRoute][] | null {
+  const isEmailWatch = job.preRunHook?.config?.skill === "gmail-watch";
+  if (!isEmailWatch) return null;
+  const entries = Object.entries(job.routes ?? {});
+  return entries.length > 0 ? entries : null;
+}
+
+// One "Recurring jobs" row for a fan-out email-watch job: the job name is an
+// expand/collapse toggle (it is NOT a link to the dead shared session), and its
+// per-concern channels nest underneath as clickable rows with unread dots.
+function FanoutJobRow({
+  job,
+  routeEntries,
+  sessions,
+  selectedSession,
+  onChat,
+  isUnread,
+  selectChannel
+}: {
+  job: JobRecord;
+  routeEntries: [string, JobRoute][];
+  sessions: ChatSession[] | undefined;
+  selectedSession: string | null;
+  onChat: boolean;
+  isUnread: (session: ChatSession) => boolean;
+  selectChannel: (sessionId: string) => void;
+}) {
+  const [collapsed, toggle] = useSectionCollapsed(`job:${job.id}`);
+  const byId = useMemo(() => {
+    const map = new Map<string, ChatSession>();
+    for (const s of sessions ?? []) map.set(s.id, s);
+    return map;
+  }, [sessions]);
+  const anyConcernUnread = routeEntries.some(([, route]) => {
+    const session = byId.get(route.chatSessionId);
+    return session ? isUnread(session) : false;
+  });
+
+  return (
+    <li>
+      <button
+        type="button"
+        onClick={toggle}
+        aria-expanded={!collapsed}
+        className="group flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors hover:bg-sidebar-accent/50"
+      >
+        <ChevronDown
+          aria-hidden
+          className={cn(
+            "size-3.5 shrink-0 text-sidebar-foreground/55 transition-transform",
+            collapsed && "-rotate-90"
+          )}
+        />
+        <span
+          className={cn(
+            "min-w-0 flex-1 truncate text-[13px]",
+            anyConcernUnread ? "font-semibold text-sidebar-accent-foreground" : "font-medium text-sidebar-foreground"
+          )}
+        >
+          {job.name}
+        </span>
+        {collapsed && anyConcernUnread ? (
+          <span aria-hidden className="size-[7px] shrink-0 rounded-full bg-sidebar-primary" />
+        ) : null}
+      </button>
+      <ul className={cn("flex flex-col gap-0.5 pl-[18px]", collapsed && "hidden")}>
+        {routeEntries.map(([routeKey, route]) => {
+          const session = byId.get(route.chatSessionId);
+          const active = onChat && selectedSession === route.chatSessionId;
+          const unread = !active && session ? isUnread(session) : false;
+          const title = session?.title ?? routeKey;
+          return (
+            <li key={routeKey}>
+              <button
+                type="button"
+                onClick={() => selectChannel(route.chatSessionId)}
+                className={cn(
+                  "group flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors",
+                  active ? "bg-sidebar-accent" : "hover:bg-sidebar-accent/50"
+                )}
+              >
+                <span
+                  aria-hidden
+                  className="w-3.5 shrink-0 text-center text-sm font-medium text-sidebar-foreground/55"
+                >
+                  #
+                </span>
+                <span
+                  className={cn(
+                    "min-w-0 flex-1 truncate text-[13px]",
+                    active || unread ? "font-semibold text-sidebar-accent-foreground" : "font-medium text-sidebar-foreground"
+                  )}
+                >
+                  {title}
+                </span>
+                {unread ? (
+                  <span aria-hidden className="size-[7px] shrink-0 rounded-full bg-sidebar-primary" />
+                ) : null}
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+    </li>
   );
 }
 
