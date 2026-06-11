@@ -126,13 +126,57 @@ const EMAIL_WATCH_TRIAGE_PROMPT = [
 // no tool required.
 const TRIAGE_WORKER_TOOLSETS = ["email", "terminal"];
 
+// The resolution of a watcher's account to the gws config dir detection targets.
+// `configDir` is the dir GOOGLE_WORKSPACE_CLI_CONFIG_DIR is set to for this
+// watch's gws calls (omitted => default gws, back-compat); `account` is the email
+// to persist on the record; `warning` is a visible mismatch notice when the
+// watcher named an account that isn't registered.
+export interface AccountResolution {
+  configDir?: string;
+  account?: string;
+  warning?: string;
+}
+
+// Resolve a watcher's `accountEmail` to the gws account detection should target,
+// against the registered Google accounts (each `{ email, configDir, signedIn }`).
+// Rules:
+//   - zero registered accounts => default gws (no configDir, no warning), so a
+//     single-account install with no registry keeps working unchanged;
+//   - accountEmail UNSET => bind to the single registered+signed-in account (the
+//     common case: the user's one Google account), so existing watchers poll the
+//     real inbox. Ambiguous (multiple signed-in) or none signed-in => default gws
+//     with no warning — account selection is a later phase;
+//   - accountEmail SET and matches a registered account (case-insensitive) => use
+//     that account's configDir + email;
+//   - accountEmail SET but NOT registered => default gws + a visible warning, so
+//     the watcher never silently watches the wrong inbox.
+export function resolveWatchAccount(
+  accountEmail: string | undefined,
+  accounts: { email: string; configDir: string; signedIn: boolean }[]
+): AccountResolution {
+  if (accounts.length === 0) return {};
+  if (!accountEmail) {
+    const signedIn = accounts.filter((a) => a.signedIn);
+    if (signedIn.length === 1) return { configDir: signedIn[0]!.configDir, account: signedIn[0]!.email };
+    return {};
+  }
+  const wanted = accountEmail.toLowerCase();
+  const match = accounts.find((a) => a.email.toLowerCase() === wanted);
+  if (match) return { configDir: match.configDir, account: match.email };
+  return {
+    warning: `Watched account "${accountEmail}" is not a registered Google account; detection is using the default gws session and may be watching the wrong inbox.`
+  };
+}
+
 // The declarative watch entry for one enabled watcher inside the shared job's
 // hook config: a stable watcher id (so the detection script keys per-watch state
-// by it) + the Gmail query (and an optional account, recorded for the
-// multi-account future). The explicitly watched sender rides along so the
-// detection script can bypass its automated-sender heuristic for exactly that
-// address.
-function buildWatch(watcher: EmailWatcherRecord): Record<string, unknown> {
+// by it) + the Gmail query, the resolved account + its gws configDir (so
+// detection polls exactly that account's inbox), and the explicitly watched
+// sender (so detection can bypass its automated-sender heuristic for exactly that
+// address). `resolution` carries the account→configDir mapping computed once per
+// rebuild from the google-accounts registry.
+function buildWatch(watcher: EmailWatcherRecord, resolution: AccountResolution): Record<string, unknown> {
+  const account = resolution.account ?? watcher.accountEmail;
   return {
     watcherId: watcher.id,
     // The fan-out routing key for this concern's detection bucket. 1:1 with the
@@ -140,7 +184,8 @@ function buildWatch(watcher: EmailWatcherRecord): Record<string, unknown> {
     // watcher id; the matching JobRoute is keyed the same in buildJobRoutes.
     routeKey: watcher.id,
     query: watcher.query,
-    ...(watcher.accountEmail ? { account: watcher.accountEmail } : {}),
+    ...(account ? { account } : {}),
+    ...(resolution.configDir ? { configDir: resolution.configDir } : {}),
     ...(watcher.sender ? { sender: watcher.sender } : {}),
     ...(watcher.objective ? { objective: watcher.objective } : {}),
     ...(watcher.threadId ? { threadId: watcher.threadId } : {}),
@@ -437,7 +482,10 @@ export async function addEmailWatcher(
 
   try {
     await rebuildSharedJobWatches(config, owningAgentId);
-    return watcher;
+    // The rebuild resolves + persists the watcher's account (an unset account
+    // binds to the single registered one) and any mismatch warning; return the
+    // resolved record so the caller's confirmation states the watched account.
+    return getEmailWatcher(config, watcher.id) ?? watcher;
   } catch (error) {
     await removeEmailWatcher(config, watcher.id);
     throw error;
@@ -541,11 +589,19 @@ async function rebuildSharedJobWatches(config: RuntimeConfig, agentId: string | 
   // snapshot — so a concurrent add's watcher isn't dropped across this yield.
   const triageEnabled = isTriageEnabled(state, agentId);
   const triageChannelId = triageEnabled ? await ensureTriageChannel(config, agentId) : undefined;
+  // Resolve each watcher's account → gws configDir once per rebuild, against the
+  // registered Google accounts (a cheap registry read + one `gws auth status`
+  // per dir). resolveWatchAccount is a pure function of (accountEmail, accounts),
+  // so it's applied per LIVE watcher inside the mutateState below from this
+  // captured snapshot — no drift across the yield.
+  const accounts = await readRegisteredAccounts();
   await mutateState(config.instance, (s) => {
     const job = s.jobs.find((j) => j.id === jobId);
     const sessionId = job?.chatSessionId;
     const liveEnabled = enabledWatchersForAgent(s, agentId);
-    const watches = triageEnabled ? [...liveEnabled.map(buildWatch), buildTriageWatch()] : liveEnabled.map(buildWatch);
+    const resolutions = new Map(liveEnabled.map((w) => [w.id, resolveWatchAccount(w.accountEmail, accounts)]));
+    const buildOne = (w: EmailWatcherRecord) => buildWatch(w, resolutions.get(w.id) ?? {});
+    const watches = triageEnabled ? [...liveEnabled.map(buildOne), buildTriageWatch()] : liveEnabled.map(buildOne);
     const routes = buildJobRoutes(liveEnabled, sessionId);
     const triageRoute = triageEnabled ? buildTriageRoute(triageChannelId, sessionId) : undefined;
     if (triageRoute) routes[TRIAGE_ROUTE_KEY] = triageRoute;
@@ -556,15 +612,46 @@ async function rebuildSharedJobWatches(config: RuntimeConfig, agentId: string | 
       job.routes = routes;
       job.updatedAt = now();
     }
-    // Keep every enabled watcher pointing at the live shared job + session.
+    // Keep every enabled watcher pointing at the live shared job + session, and
+    // persist the resolved account + any mismatch warning so list/API surface the
+    // exact inbox each watch targets.
     for (const w of s.emailWatchers) {
-      if (w.enabled && w.agentId === agentId && (w.jobId !== jobId || w.chatSessionId !== sessionId)) {
+      if (!w.enabled || w.agentId !== agentId) continue;
+      let changed = false;
+      if (w.jobId !== jobId || w.chatSessionId !== sessionId) {
         w.jobId = jobId;
         if (sessionId) w.chatSessionId = sessionId;
-        w.updatedAt = now();
+        changed = true;
       }
+      const resolution = resolutions.get(w.id) ?? {};
+      // Bind the resolved account onto the record (unset accountEmail defaults to
+      // the single registered account); leave a hand-set address untouched when
+      // it didn't resolve, so the warning explains the mismatch.
+      if (resolution.account && w.accountEmail !== resolution.account) {
+        w.accountEmail = resolution.account;
+        changed = true;
+      }
+      if (w.accountWarning !== resolution.warning) {
+        w.accountWarning = resolution.warning;
+        changed = true;
+      }
+      if (changed) w.updatedAt = now();
     }
   });
+}
+
+// The registered Google accounts (each `{ email, configDir, signedIn }`) for
+// account→configDir resolution. Lazily imports the connector orchestration (the
+// same dynamic-import pattern used for src/jobs) to keep this state module free
+// of a static cycle, and degrades to "no accounts" (default-gws back-compat) if
+// the registry read faults, so a watcher rebuild never fails on it.
+async function readRegisteredAccounts(): Promise<{ email: string; configDir: string; signedIn: boolean }[]> {
+  try {
+    const { listAccountsWithStatus } = await import("../integrations/connectors/google-accounts");
+    return await listAccountsWithStatus();
+  } catch {
+    return [];
+  }
 }
 
 // Remove the shared backing job (stops the scheduler firing it AND drops the

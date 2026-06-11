@@ -1937,6 +1937,7 @@ async function emailWatchTool(
       followUpAfterHours: w.followUpAfterHours,
       objective: w.objective,
       accountEmail: w.accountEmail,
+      ...(w.accountWarning ? { accountWarning: w.accountWarning } : {}),
       enabled: w.enabled,
       status: w.status,
       chatSessionId: w.chatSessionId,
@@ -2081,9 +2082,11 @@ async function emailWatchTool(
   appendTrace(config.instance, taskId, {
     type: "tool",
     message: "Created email watcher",
-    data: { watcherId: watcher.id, query: watcher.query, chatSessionId: watcher.chatSessionId }
+    data: { watcherId: watcher.id, query: watcher.query, chatSessionId: watcher.chatSessionId, accountEmail: watcher.accountEmail }
   });
-  return `Watching email (query: ${watcher.query}). Watcher ${watcher.id}; proposed replies will appear in its chat thread (${watcher.chatSessionId}). It polls about once a minute and never sends without your approval.`;
+  const accountLabel = watcher.accountEmail ? ` in ${watcher.accountEmail}` : "";
+  const warning = watcher.accountWarning ? ` Note: ${watcher.accountWarning}` : "";
+  return `Watching email${accountLabel} (query: ${watcher.query}). Watcher ${watcher.id}; proposed replies will appear in its chat thread (${watcher.chatSessionId}). It polls about once a minute and never sends without your approval.${warning}`;
 }
 
 // Explicit on-demand memory recall. Wraps the same `recall()` entrypoint

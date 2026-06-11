@@ -30,13 +30,22 @@ import {
 
 const ROOT = mkdtempSync(join(tmpdir(), "gini-email-watchers-test-"));
 
+// Isolate the machine-global google-accounts registry (resolved under
+// process.env.HOME) so account→configDir resolution sees a CONTROLLED registry,
+// not the developer's real signed-in accounts — otherwise the watch-shape
+// assertions would non-deterministically pick up a live account's configDir.
+const PRIOR_HOME = process.env.HOME;
+
 beforeAll(() => {
   process.env.GINI_STATE_ROOT = ROOT;
   process.env.GINI_LOG_ROOT = `${ROOT}-logs`;
+  process.env.HOME = ROOT;
 });
 
 afterAll(() => {
   closeAllMemoryDbs();
+  if (PRIOR_HOME === undefined) delete process.env.HOME;
+  else process.env.HOME = PRIOR_HOME;
   rmSync(ROOT, { recursive: true, force: true });
   rmSync(`${ROOT}-logs`, { recursive: true, force: true });
 });

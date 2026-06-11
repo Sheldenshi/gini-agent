@@ -1307,9 +1307,18 @@ export interface EmailWatcherRecord {
   // rows; create always stamps it.
   agentId?: string;
   provider: "gmail";
-  // The watched account's address. v1 watches the single signed-in `gws`
-  // identity; recorded for the multi-account future.
+  // The watched account's address. Resolved at rebuild to the account whose gws
+  // config dir detection targets (the single registered+signed-in account when
+  // unset). The detection script polls exactly this account's inbox via that
+  // account's configDir; see ADR email-watch.md.
   accountEmail?: string;
+  // A visible warning when the watcher's accountEmail can't be resolved to a
+  // registered Google account at rebuild — detection then falls back to the
+  // default gws config dir (it may be watching the wrong inbox), so the mismatch
+  // is surfaced here instead of silently watching the wrong account. Cleared once
+  // the account resolves. Not derived from the backing job's hookState (unlike
+  // status/lastError), so a detection tick never clobbers it.
+  accountWarning?: string;
   // Forward-looking per-account credential handle. Unused in v1 (gws holds
   // one identity); recorded so the multi-account phase has a stable key.
   credentialName?: string;
