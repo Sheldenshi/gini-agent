@@ -21,15 +21,16 @@
 // Tasks are keyed by taskId and idle-swept after 5 minutes. Side-effecting
 // actions (click/type/drag/select_option/tabs:new/tabs:switch/tabs:close)
 // skip the approval gate; the snapshot itself is the trace evidence.
-// browser_upload_file is the lone exception — it's approval-gated (high
-// risk) because it can exfiltrate workspace files to a remote site.
+// browser_upload_file and browser_download are the exceptions — both are
+// approval-gated (high risk): upload can exfiltrate workspace files to a
+// remote site, download writes remote bytes onto the local disk.
 import type { Browser, BrowserContext, Locator, Page } from "playwright-core";
-import { existsSync, realpathSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync, statSync, unlinkSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { isIP } from "node:net";
 import { lookup } from "node:dns/promises";
-import { instanceRoot } from "../paths";
+import { downloadsDir, instanceRoot } from "../paths";
 import { launchPersistentChrome } from "./chrome-discovery";
 import { generateVisionAnalysis } from "../provider";
 import { assertInsideWorkspace, readState } from "../state";
@@ -3825,6 +3826,106 @@ export async function browserUploadFileApproved(
   }
 }
 
+// ---------------- Downloads (approval-gated) ----------------
+
+// Size cap for browser_download saves. Checked AFTER the save — Playwright
+// streams the download to disk and the byte count isn't known up front —
+// so an over-cap file is deleted and the tool fails. Injectable for tests
+// via __test.setDownloadMaxBytesForTest.
+const DOWNLOAD_MAX_BYTES_DEFAULT = 50 * 1024 * 1024;
+let downloadMaxBytes = DOWNLOAD_MAX_BYTES_DEFAULT;
+
+// How long to wait for the page to actually start a download after the
+// approved click. Generous because the server decides when the
+// Content-Disposition response begins.
+const DOWNLOAD_EVENT_TIMEOUT_MS = 30_000;
+
+// Reduce a server-suggested filename to a safe basename. The suggested
+// name is attacker-controlled (the remote server picks it), so path
+// separators and traversal segments are stripped down to the final path
+// component, control chars removed, and empty/dot-only results replaced
+// with a generic name. Exported for direct unit testing.
+export function sanitizeDownloadFilename(name: string): string {
+  const base = name.replace(/\\/g, "/").split("/").pop() ?? "";
+  // eslint-disable-next-line no-control-regex
+  const cleaned = base.replace(/[\x00-\x1f\x7f]/g, "").trim();
+  if (cleaned === "" || cleaned === "." || cleaned === "..") return "download";
+  return cleaned.slice(0, 255);
+}
+
+// Unique-ify a save path on collision: invoice.pdf → invoice-1.pdf,
+// invoice-2.pdf, … so repeated downloads never overwrite earlier ones.
+function uniqueDownloadPath(dir: string, filename: string): string {
+  let candidate = join(dir, filename);
+  if (!existsSync(candidate)) return candidate;
+  const dot = filename.lastIndexOf(".");
+  const stem = dot > 0 ? filename.slice(0, dot) : filename;
+  const ext = dot > 0 ? filename.slice(dot) : "";
+  for (let i = 1; ; i++) {
+    candidate = join(dir, `${stem}-${i}${ext}`);
+    if (!existsSync(candidate)) return candidate;
+  }
+}
+
+// Approved-download executor. Called by agent.executeApprovedAction after
+// the user explicitly authorizes a browser.download approval (mirrors
+// browserUploadFileApproved). Clicks the approved element, captures the
+// resulting download via Playwright's download event, and saves it under
+// the instance-scoped downloads dir with a sanitized, collision-safe
+// filename. The saved file is size-capped post-save (over-cap files are
+// deleted). Returns the standard redacted envelope reporting the saved
+// path, size, and the server's suggested filename.
+export async function browserDownloadApproved(
+  taskId: string,
+  ref: string,
+  instance: Instance
+): Promise<string> {
+  try {
+    return await withSession(taskId, async (session) => {
+      // Trust boundary: the approval was granted for the exact stamped
+      // element — no resolveRefForAction self-healing here; a lost stamp
+      // fails loudly (same stance as browser_upload_file; see ADR
+      // browser-fill-secret.md).
+      const target = session.refs.get(ref);
+      if (!target) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
+      if (typeof session.page.waitForEvent !== "function") {
+        return fail("Download capture is not supported by this browser session.");
+      }
+      const downloadPromise = session.page.waitForEvent("download", { timeout: DOWNLOAD_EVENT_TIMEOUT_MS });
+      // Pre-attach a no-op catch: if the click below throws (and we
+      // return its failure), the still-pending wait eventually times out
+      // and must not surface as an unhandled rejection.
+      downloadPromise.catch(() => undefined);
+      await target.locator.click({ timeout: 10_000 });
+      const download = await downloadPromise;
+      const suggested = typeof download.suggestedFilename === "function" ? download.suggestedFilename() : "";
+      const filename = sanitizeDownloadFilename(suggested || "download");
+      const dir = downloadsDir(instance);
+      mkdirSync(dir, { recursive: true });
+      const savedPath = uniqueDownloadPath(dir, filename);
+      await download.saveAs(savedPath);
+      const size = statSync(savedPath).size;
+      if (size > downloadMaxBytes) {
+        try {
+          unlinkSync(savedPath);
+        } catch {
+          // Best-effort cleanup; the failure message below still tells
+          // the model (and the audit trail) the cap fired.
+        }
+        return fail(`Download exceeds the ${Math.floor(downloadMaxBytes / (1024 * 1024))}MB size cap (${size} bytes); the file was deleted.`);
+      }
+      return ok({
+        url: session.page.url(),
+        path: savedPath,
+        suggestedFilename: suggested || null,
+        size
+      }, taskId);
+    });
+  } catch (error) {
+    return fail(error instanceof Error ? error.message : String(error));
+  }
+}
+
 // Internal hooks exported for unit tests. The session manager keeps its
 // state module-local so production callers don't accidentally poke at the
 // shared browser; tests need controlled access to verify the
@@ -4021,6 +4122,11 @@ export const __test = {
   setFakeSessionInFlight(taskId: string, inFlight: number): void {
     const session = sessions.get(taskId);
     if (session) session.inFlight = inFlight;
+  },
+  // Override the browser_download size cap so cap-rejection tests don't
+  // need to materialize a 50MB file. Pass null to restore the default.
+  setDownloadMaxBytesForTest(value: number | null): void {
+    downloadMaxBytes = value ?? DOWNLOAD_MAX_BYTES_DEFAULT;
   },
   // Register a secret value for a task exactly as browserFillByLocator
   // would, so the safetyCheck registered-secret URL gate can be

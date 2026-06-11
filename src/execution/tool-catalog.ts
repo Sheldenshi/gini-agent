@@ -666,6 +666,24 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   },
   {
     toolset: "browser",
+    displayLabel: "Download file",
+    deferred: true,
+    indexSummary: "Download a file by clicking an element; saves under the instance downloads dir (approval-gated).",
+    type: "function",
+    function: {
+      name: "browser_download",
+      description: "Click an element (by its @eN ref) that triggers a file download and save the file under the agent's downloads directory. Use for 'download the invoice PDF' style tasks where a link or button serves a file. Approval-gated: the user confirms before the click runs. The result reports the saved path, file size, and the server's suggested filename. Downloads larger than the size cap are rejected and deleted.",
+      parameters: {
+        type: "object",
+        properties: {
+          ref: { type: "string", description: "Element ref like '@e3' from the latest snapshot whose click triggers the download." }
+        },
+        required: ["ref"]
+      }
+    }
+  },
+  {
+    toolset: "browser",
     displayLabel: "Connect browser to sign in",
     type: "function",
     function: {
@@ -2447,6 +2465,7 @@ export function chatBlockArgsPreviewFor(
     case "browser_hover":
     case "browser_select_option":
     case "browser_upload_file":
+    case "browser_download":
       return truncatePreview(previewValue(safe.ref));
     case "browser_press":
       return truncatePreview(previewValue(safe.key));

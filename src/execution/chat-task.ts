@@ -159,6 +159,7 @@ const PAGE_ACTION_TOOLS = new Set([
   "browser_press",
   "browser_select_option",
   "browser_upload_file",
+  "browser_download",
   "browser_fill_secrets",
   "browser_drag"
 ]);

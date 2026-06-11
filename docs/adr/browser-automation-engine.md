@@ -37,6 +37,16 @@ Verified in agent-browser's source; each stood alone as an improvement to `src/t
 4. **Annotated screenshots sharing the ref namespace**: numbered badges on the `browser_vision` screenshot keyed to the same `@eN` refs, so vision answers can point at elements the model can act on. Badges carry only ref ids, cover only refs the session holds, and skip secret-stamped elements.
 5. **Stable, never-reused tab handles** (`t1`, `t2`, …) instead of positional indices in `browser_tabs`.
 
+## Downloads
+
+`browser_download` captures a page-initiated file download (Playwright's `download` event around a click on an approved `@eN` ref) and saves it under the instance-scoped downloads directory (`paths.downloadsDir` → `~/.gini/instances/<inst>/downloads/`), so downloaded artifacts live and die with the instance like uploads do. Trust contract:
+
+- **Approval-gated like `browser_upload_file`.** The dispatch routes through `resolveApprovalPolicy` as `browser.download` (gated under `strict`, auto-approved under `auto`/`yolo` per [approvalMode](approval-mode.md)), and the approved click runs in `agent.executeApprovedAction` with the same abort contract as upload: a `browser.download` / `browser.download_aborted` audit row at decision time, plus a `browser.download_late_completion` follow-up row if a detached download settles after a cancel.
+- **No ref self-healing.** The approval names the exact stamped element; a lost stamp fails loudly instead of re-resolving (same stance as upload and `browser_fill_secrets`).
+- **Size cap.** Saves above 50 MB (constant, test-injectable) are deleted and the call fails — the cap is enforced post-save because Playwright streams the download and the byte count isn't known up front.
+- **Filename safety.** The server-suggested filename is attacker-controlled: it is reduced to a safe basename (separators/traversal stripped, control chars removed) and unique-ified on collision so downloads never overwrite each other.
+- The result envelope (saved path, size, suggested filename) rides the standard `ok()`/`fail()` secret-redaction pass like every other browser tool result.
+
 ## Revisit triggers
 
 - agent-browser ships a supported programmatic SDK (library entry point with hooks for output filtering and navigation policy).

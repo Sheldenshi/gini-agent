@@ -1379,6 +1379,7 @@ export type AuthorizationAction =
   | "skill.enable"
   | "connector.enable"
   | "browser.upload_file"
+  | "browser.download"
   | "messaging.send"
   | "self.config";
 

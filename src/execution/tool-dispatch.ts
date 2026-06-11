@@ -339,6 +339,12 @@ async function dispatchToolCallInner(
       // explicit, side-effecting, irreversible from the user's
       // perspective. Route through the approval gate like file.write.
       return pendingOrAuto(config, "browser.upload_file", undefined, (reason) => requestBrowserUpload(config, taskId, toolCallId, args, reason));
+    case "browser_download":
+      // Downloading writes remote bytes onto the local disk (the
+      // instance-scoped downloads dir). Route through the approval gate
+      // the same way browser_upload_file does; the approved click runs
+      // in agent.executeApprovedAction's "browser.download" branch.
+      return pendingOrAuto(config, "browser.download", undefined, (reason) => requestBrowserDownload(config, taskId, toolCallId, args, reason));
     // Self-config / self-introspection direct tools. Each maps to a
     // SelfOperation; query tools resolve sync, mutate tools route through the
     // generic self.config approval branch. The tool name IS the op name and
@@ -3024,6 +3030,44 @@ async function requestBrowserUpload(
       type: "approval",
       message: "Approval requested for browser upload (chat-task)",
       data: { approvalId: approval.id, target: resolved.displayPath, ref, toolCallId, destination: currentUrl }
+    });
+    return approval.id;
+  });
+}
+
+// Approval-gated browser_download. Captures the ref the agent wants to
+// click plus the page it is sitting on, so the approval card shows the
+// user where the download will come from. The actual click + download
+// capture runs in agent.executeApprovedAction's "browser.download"
+// branch, which calls browserDownloadApproved with the captured ref.
+async function requestBrowserDownload(
+  config: RuntimeConfig,
+  taskId: string,
+  toolCallId: string,
+  args: Record<string, unknown>,
+  reasonOverride?: string
+): Promise<string> {
+  const ref = requireString(args, "ref");
+  const currentUrl = peekCurrentBrowserUrl(taskId) ?? null;
+  return mutateState(config.instance, (state: RuntimeState) => {
+    const item = findTask(state, taskId);
+    if (isTerminalTaskStatus(item.status)) {
+      throw new TaskAlreadyTerminalError(taskId, item.status);
+    }
+    const approval = createAuthorization(state, {
+      taskId: item.id,
+      action: "browser.download",
+      target: currentUrl ?? ref,
+      risk: "high",
+      reason: reasonOverride ?? "Downloading a file from a remote site onto this machine is a side effect and requires explicit approval.",
+      payload: { ref, currentUrl, toolCallId }
+    });
+    item.approvalIds.push(approval.id);
+    item.updatedAt = now();
+    appendTrace(config.instance, item.id, {
+      type: "approval",
+      message: "Approval requested for browser download (chat-task)",
+      data: { approvalId: approval.id, ref, toolCallId, source: currentUrl }
     });
     return approval.id;
   });

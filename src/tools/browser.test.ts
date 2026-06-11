@@ -1,11 +1,12 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, mock, test } from "bun:test";
-import { mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   __test as browserTest,
   browserClick,
   browserConsole,
   browserDialog,
+  browserDownloadApproved,
   browserDrag,
   browserFillByLocator,
   browserFillForm,
@@ -26,6 +27,7 @@ import {
   hostnameIsLoopback,
   redactSecretValuesFromString,
   safetyCheck,
+  sanitizeDownloadFilename,
   setBrowserInstance,
   withTeardownLock
 } from "./browser";
@@ -4014,6 +4016,184 @@ describe("browserUploadFile", () => {
       WORKSPACE
     );
     expect(JSON.parse(raw).error).toContain("Unknown ref @e99");
+  });
+});
+
+// Approved-download executor. Mirrors the upload suite: fake session +
+// fake page whose waitForEvent hands back a stubbed Playwright Download,
+// so save-path, sanitization, collision, and size-cap behavior run
+// without Chromium.
+describe("browserDownloadApproved", () => {
+  const DL_ROOT = "/tmp/gini-browser-download-tests";
+  let prevStateRoot: string | undefined;
+
+  const downloadsDirFor = (instance: string) => join(DL_ROOT, "instances", instance, "downloads");
+
+  beforeEach(() => {
+    prevStateRoot = process.env.GINI_STATE_ROOT;
+    process.env.GINI_STATE_ROOT = DL_ROOT;
+    rmSync(DL_ROOT, { recursive: true, force: true });
+  });
+
+  afterEach(() => {
+    browserTest.clearFakeSessionsForTest();
+    browserTest.setInFlightDisconnectsForTest(0);
+    browserTest.setDownloadMaxBytesForTest(null);
+    if (prevStateRoot === undefined) delete process.env.GINI_STATE_ROOT;
+    else process.env.GINI_STATE_ROOT = prevStateRoot;
+    rmSync(DL_ROOT, { recursive: true, force: true });
+  });
+
+  // Build a fake page + ref'd locator wired so a click resolves the
+  // download promise with a stubbed Download.
+  function installDownloadSession(
+    taskId: string,
+    download: { suggestedFilename: () => string; saveAs: (p: string) => Promise<void> },
+    opts: { clickThrows?: boolean } = {}
+  ): { clicks: () => number } {
+    let clicks = 0;
+    const fakePage = {
+      ...makeFakePageForRefTools("https://portal.example.com/invoices"),
+      waitForEvent: (() => Promise.resolve(download)) as unknown as import("playwright-core").Page["waitForEvent"]
+    };
+    browserTest.installFakeSessionWithPageForTest(taskId, fakePage);
+    const loc = {
+      click: async () => {
+        if (opts.clickThrows) throw new Error("click failed: element detached");
+        clicks++;
+      }
+    };
+    const refs = new Map<string, unknown>();
+    refs.set("@e2", loc);
+    browserTest.setFakeSessionRefsForTest(taskId, refs);
+    return { clicks: () => clicks };
+  }
+
+  test("clicks the ref, saves under the instance downloads dir, and reports path/size/suggested filename", async () => {
+    const download = {
+      suggestedFilename: () => "invoice.pdf",
+      saveAs: async (p: string) => writeFileSync(p, "PDF-BYTES")
+    };
+    const counter = installDownloadSession("dl-ok", download);
+
+    const raw = await browserDownloadApproved("dl-ok", "@e2", "dl-ok-inst");
+    const parsed = JSON.parse(raw) as { success: boolean; path?: string; size?: number; suggestedFilename?: string };
+    expect(parsed.success).toBe(true);
+    expect(counter.clicks()).toBe(1);
+    expect(parsed.path).toBe(join(downloadsDirFor("dl-ok-inst"), "invoice.pdf"));
+    expect(parsed.size).toBe("PDF-BYTES".length);
+    expect(parsed.suggestedFilename).toBe("invoice.pdf");
+    expect(existsSync(parsed.path!)).toBe(true);
+  });
+
+  test("sanitizes a traversal-laden suggested filename down to its basename", async () => {
+    const download = {
+      suggestedFilename: () => "../../../etc/evil.sh",
+      saveAs: async (p: string) => writeFileSync(p, "x")
+    };
+    installDownloadSession("dl-traversal", download);
+
+    const raw = await browserDownloadApproved("dl-traversal", "@e2", "dl-traversal-inst");
+    const parsed = JSON.parse(raw) as { success: boolean; path?: string };
+    expect(parsed.success).toBe(true);
+    // Saved INSIDE the downloads dir under the stripped basename — the
+    // traversal segments must not escape the directory.
+    expect(parsed.path).toBe(join(downloadsDirFor("dl-traversal-inst"), "evil.sh"));
+  });
+
+  test("unique-ifies the save path when the filename already exists", async () => {
+    const dir = downloadsDirFor("dl-collide-inst");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "report.pdf"), "earlier");
+    const download = {
+      suggestedFilename: () => "report.pdf",
+      saveAs: async (p: string) => writeFileSync(p, "newer")
+    };
+    installDownloadSession("dl-collide", download);
+
+    const raw = await browserDownloadApproved("dl-collide", "@e2", "dl-collide-inst");
+    const parsed = JSON.parse(raw) as { success: boolean; path?: string };
+    expect(parsed.success).toBe(true);
+    expect(parsed.path).toBe(join(dir, "report-1.pdf"));
+    // The earlier file is untouched.
+    expect(existsSync(join(dir, "report.pdf"))).toBe(true);
+  });
+
+  test("rejects and deletes a download over the size cap", async () => {
+    browserTest.setDownloadMaxBytesForTest(4);
+    const download = {
+      suggestedFilename: () => "huge.bin",
+      saveAs: async (p: string) => writeFileSync(p, "way more than four bytes")
+    };
+    installDownloadSession("dl-cap", download);
+
+    const raw = await browserDownloadApproved("dl-cap", "@e2", "dl-cap-inst");
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toMatch(/size cap/);
+    expect(existsSync(join(downloadsDirFor("dl-cap-inst"), "huge.bin"))).toBe(false);
+  });
+
+  test("fails loudly on an unknown ref without self-healing", async () => {
+    // The page exposes getByRole/getByText (the healing surface) — the
+    // approved-download path must NOT consult them. Trust boundary: the
+    // approval named the exact stamped element (see ADR
+    // browser-fill-secret.md).
+    let healingQueried = 0;
+    const fakePage = {
+      ...makeFakePageForRefTools("https://portal.example.com/invoices"),
+      waitForEvent: (() => new Promise(() => undefined)) as unknown as import("playwright-core").Page["waitForEvent"],
+      getByRole: () => {
+        healingQueried++;
+        return { nth: () => ({ count: async () => 1 }) };
+      },
+      getByText: () => {
+        healingQueried++;
+        return { nth: () => ({ count: async () => 1 }) };
+      }
+    } as unknown as Partial<import("playwright-core").Page>;
+    browserTest.installFakeSessionWithPageForTest("dl-bad-ref", fakePage);
+
+    const raw = await browserDownloadApproved("dl-bad-ref", "@e99", "dl-bad-ref-inst");
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toContain("Unknown ref @e99");
+    expect(healingQueried).toBe(0);
+  });
+
+  test("surfaces a click failure as the tool error", async () => {
+    const download = {
+      suggestedFilename: () => "never.pdf",
+      saveAs: async () => undefined
+    };
+    installDownloadSession("dl-click-fail", download, { clickThrows: true });
+
+    const raw = await browserDownloadApproved("dl-click-fail", "@e2", "dl-click-fail-inst");
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toContain("click failed");
+  });
+});
+
+describe("sanitizeDownloadFilename", () => {
+  test("keeps a plain filename", () => {
+    expect(sanitizeDownloadFilename("invoice.pdf")).toBe("invoice.pdf");
+  });
+
+  test("strips directories and traversal (slash and backslash)", () => {
+    expect(sanitizeDownloadFilename("../../etc/passwd")).toBe("passwd");
+    expect(sanitizeDownloadFilename("..\\..\\evil.exe")).toBe("evil.exe");
+  });
+
+  test("falls back to 'download' for empty and dot-only names", () => {
+    expect(sanitizeDownloadFilename("")).toBe("download");
+    expect(sanitizeDownloadFilename(".")).toBe("download");
+    expect(sanitizeDownloadFilename("..")).toBe("download");
+    expect(sanitizeDownloadFilename("a/b/")).toBe("download");
+  });
+
+  test("removes control characters", () => {
+    expect(sanitizeDownloadFilename("re\x00port\x1f.pdf")).toBe("report.pdf");
   });
 });
 
