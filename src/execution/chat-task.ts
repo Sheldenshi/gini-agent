@@ -30,6 +30,7 @@ import { ApprovedActionFailedError, findTask, scheduleAutoRetain } from "../agen
 import { recall } from "../memory";
 import {
   ProviderAuthError,
+  generateAuxText,
   generateToolCallingResponse,
   isAuthExpiredError,
   isContextOverflowError,
@@ -179,6 +180,48 @@ const KEEP_RECENT_TOOL_RESULTS = 6;
 const ELIDED_TOOL_RESULT_MARKER =
   "[Earlier tool result elided to fit the context window. Re-run the tool if you still need its output.]";
 
+// In-turn summarize-and-continue compaction. packPriorContext trims once at
+// turn start and the cheap pre-call elision shrinks OLD tool results, but a
+// long tool loop whose recent results are themselves large can still crowd
+// the window mid-turn. When the calibrated projection for the next call
+// crosses the high-water mark even after elision, the loop summarizes the
+// MIDDLE of the in-turn transcript with an aux model call and replaces it
+// with one synthetic, clearly-marked message. The head (every message present
+// at loop entry plus the first in-turn exchange — the model's original plan)
+// and the recent tail stay verbatim.
+const COMPACTION_HIGH_WATER_FRACTION = 0.85;
+// Tail kept verbatim, in EXCHANGES (an assistant message plus its paired tool
+// results). Deliberately smaller than the elision layer's
+// KEEP_RECENT_TOOL_RESULTS (6): elision is the cheap first pass and protects
+// more; compaction is the harder fallback and must reclaim real space, so
+// only the freshest exchanges the model still needs to act on survive.
+const COMPACTION_KEEP_RECENT_EXCHANGES = 2;
+// Anti-thrash guards: at most this many compactions per turn; bail to the
+// graceful partial exit when a compaction reclaims less than the minimum
+// fraction of the projected size, or when the window refills (re-trigger)
+// within this many iterations of the previous compaction.
+const MAX_COMPACTIONS_PER_TURN = 2;
+const COMPACTION_MIN_SAVINGS_FRACTION = 0.1;
+const COMPACTION_REFILL_ITERATIONS = 2;
+// Bounds for the aux summarization side-call: the rendered middle span is
+// char-capped before it reaches the aux model; the summary is token-capped.
+const COMPACTION_SUMMARY_INPUT_CAP_CHARS = 64_000;
+const COMPACTION_SUMMARY_MESSAGE_CAP_CHARS = 4_000;
+const COMPACTION_SUMMARY_MAX_TOKENS = 1024;
+const COMPACTION_SUMMARY_SYSTEM =
+  "You compress an AI agent's in-progress tool activity. Summarize the " +
+  "following tool calls and results into a compact plain-text brief that " +
+  "preserves: what was attempted, key facts and values discovered, errors " +
+  "hit, and any identifiers (URLs, ids, file paths, element refs) needed to " +
+  "continue the task. No preamble.";
+// Marks the synthetic replacement message so transcript readers know the
+// span was summarized, not authored by the user. The message lives only in
+// the in-memory workingMessages (and the toolCallState snapshot if the turn
+// pauses for approval) — mirroring PRIOR_HISTORY_ELISION_NOTE, which is also
+// a per-turn artifact. The durable chat transcript keeps the original
+// tool_transcript rows, so next-turn replay is unaffected.
+export const IN_TURN_COMPACTION_NOTE_PREFIX = "[Context compacted]";
+
 // Extract the provider-reported prompt token count from a model-call usage
 // record. Anthropic reports `input_tokens` (Bedrock Converse usage is
 // normalized to the same key in provider.ts); OpenAI-compatible providers
@@ -239,6 +282,57 @@ export function elideOldToolResultsToBudget(
     if (estimateToolCallingMessagesTokens(messages) <= budget) break;
   }
   return elided;
+}
+
+// Group-aligned middle span of the in-turn transcript eligible for
+// summarization: messages[start..end). A group is an assistant message plus
+// its trailing role:"tool" results — they must travel together, since
+// splitting them would orphan tool_call ids and 400 the provider; any other
+// message is its own group. Protected and therefore OUTSIDE the span:
+// everything before `initialCount` (the head packed at loop entry), the
+// first in-turn group (the model's original plan and its first results), and
+// the last `keepRecentExchanges` groups. Returns undefined when nothing is
+// summarizable. Exported for unit testing.
+export function compactionMiddleSpan(
+  messages: ToolCallingMessage[],
+  initialCount: number,
+  keepRecentExchanges: number
+): { start: number; end: number } | undefined {
+  const groupStarts: number[] = [];
+  for (let i = Math.max(0, initialCount); i < messages.length; i++) {
+    if (messages[i]!.role === "tool") continue; // rides with the preceding assistant group
+    groupStarts.push(i);
+  }
+  if (groupStarts.length <= 1 + keepRecentExchanges) return undefined;
+  const start = groupStarts[1]!;
+  const end = groupStarts[groupStarts.length - keepRecentExchanges]!;
+  return end > start ? { start, end } : undefined;
+}
+
+// Render a middle-span slice into bounded plain text for the aux summarizer.
+// Per-message and total caps keep the side-call input from blowing the aux
+// model's own window. Exported for unit testing.
+export function renderMessagesForCompaction(messages: ToolCallingMessage[]): string {
+  const parts: string[] = [];
+  let total = 0;
+  for (const message of messages) {
+    const calls = (message.tool_calls ?? [])
+      .map((call) => `${call.function.name}(${call.function.arguments ?? ""})`)
+      .join("; ");
+    const content =
+      typeof message.content === "string" ? message.content : JSON.stringify(message.content ?? "");
+    let line = `${message.role}${calls ? ` -> ${calls}` : ""}: ${content}`;
+    if (line.length > COMPACTION_SUMMARY_MESSAGE_CAP_CHARS) {
+      line = `${line.slice(0, COMPACTION_SUMMARY_MESSAGE_CAP_CHARS)} [truncated]`;
+    }
+    if (total + line.length > COMPACTION_SUMMARY_INPUT_CAP_CHARS) {
+      parts.push("[remaining messages omitted from summary input]");
+      break;
+    }
+    parts.push(line);
+    total += line.length;
+  }
+  return parts.join("\n");
 }
 
 // Resolve the effective iteration cap from config, falling back to the
@@ -1591,6 +1685,14 @@ async function runLoop(
 
   let iterations = iterationsSoFar;
   let workingMessages = messages.slice();
+  // In-turn compaction bookkeeping. `initialMessageCount` marks the head
+  // packed at loop entry (system + prior context + the user ask; on an
+  // approval resume it also covers everything before the pause — protecting
+  // more than strictly required, never less). The counters drive the
+  // anti-thrash guards.
+  const initialMessageCount = workingMessages.length;
+  let compactionsThisTurn = 0;
+  let lastCompactionIteration: number | undefined;
   // Carry the running cost across approval resumes by seeding from the
   // task's existing cost row (set by a prior runLoop entry). Each model
   // call adds into this accumulator and we write it back on every
@@ -1943,8 +2045,104 @@ async function runLoop(
     }
     // Estimate of the exact payload going to the provider (post-elision
     // messages + tool schemas) — the comparison base for the calibration gap
-    // updated from this call's reported usage below.
-    const estimatedPromptTokens = estimateToolCallingMessagesTokens(workingMessages) + toolSchemaTokens;
+    // updated from this call's reported usage below. `let`: in-turn
+    // compaction below replaces messages and re-estimates.
+    let estimatedPromptTokens = estimateToolCallingMessagesTokens(workingMessages) + toolSchemaTokens;
+
+    // In-turn summarize-and-continue compaction. When the calibrated
+    // projection for THIS call crosses the high-water mark, prune cheap
+    // first (a harder elision pass targeting the high-water line); only if
+    // that cannot bring the projection under the mark is the middle of the
+    // in-turn transcript summarized via an aux model call. Anti-thrash
+    // guards bail to the graceful partial exit rather than grinding:
+    // re-trigger right after a compaction, a compaction that reclaims
+    // almost nothing, or no aux model available. When the per-turn
+    // compaction cap is reached (or nothing is summarizable) the call
+    // proceeds anyway — the reactive overflow retry below is the backstop.
+    {
+      const compactionHighWaterTokens = Math.floor(contextWindowTokens * COMPACTION_HIGH_WATER_FRACTION);
+      if (estimatedPromptTokens + promptTokenEstimateGap > compactionHighWaterTokens) {
+        // Cheap pruning first. The regular pre-call elision above only
+        // targets the (looser) live-message budget, so ask it to prune down
+        // to the high-water line before resorting to summarization. When
+        // enough old results are elidable this resolves the trigger with no
+        // aux call at all.
+        const highWaterMessageBudget = Math.max(
+          0,
+          compactionHighWaterTokens - toolSchemaTokens - promptTokenEstimateGap
+        );
+        elideOldToolResultsToBudget(workingMessages, highWaterMessageBudget);
+        estimatedPromptTokens = estimateToolCallingMessagesTokens(workingMessages) + toolSchemaTokens;
+      }
+      const projectedPromptTokens = estimatedPromptTokens + promptTokenEstimateGap;
+      if (projectedPromptTokens > compactionHighWaterTokens) {
+        if (
+          lastCompactionIteration !== undefined &&
+          iterations - lastCompactionIteration <= COMPACTION_REFILL_ITERATIONS
+        ) {
+          appendTrace(config.instance, taskId, {
+            type: "warning",
+            message: "Context window refilled immediately after in-turn compaction; exiting with partial result.",
+            data: { iterations, lastCompactionIteration, projectedPromptTokens, compactionHighWaterTokens }
+          });
+          return completeWithPartialResult(
+            "Stopped early: the context window refilled immediately after compaction. This is a partial result."
+          );
+        }
+        const span =
+          compactionsThisTurn < MAX_COMPACTIONS_PER_TURN
+            ? compactionMiddleSpan(workingMessages, initialMessageCount, COMPACTION_KEEP_RECENT_EXCHANGES)
+            : undefined;
+        if (span) {
+          let summaryText: string;
+          try {
+            const aux = await generateAuxText(config, {
+              system: COMPACTION_SUMMARY_SYSTEM,
+              user: renderMessagesForCompaction(workingMessages.slice(span.start, span.end)),
+              maxTokens: COMPACTION_SUMMARY_MAX_TOKENS
+            });
+            accumulatedCost = addCost(accumulatedCost, aux.cost);
+            summaryText = aux.text.trim();
+          } catch (error) {
+            // No usable aux model — compaction is impossible, and pruning
+            // already failed to bring the projection under the mark.
+            appendTrace(config.instance, taskId, {
+              type: "warning",
+              message: "In-turn compaction summarization failed; exiting with partial result.",
+              data: { iterations, error: error instanceof Error ? error.message : String(error) }
+            });
+            return completeWithPartialResult(
+              "Stopped early: the conversation outgrew the model's context window and no summarization model was available. This is a partial result."
+            );
+          }
+          const summaryMessage: ToolCallingMessage = {
+            role: "user",
+            content:
+              `${IN_TURN_COMPACTION_NOTE_PREFIX} Earlier tool calls and results from this turn were ` +
+              `replaced by this summary to fit the context window (the full transcript is still stored):\n` +
+              summaryText
+          };
+          workingMessages.splice(span.start, span.end - span.start, summaryMessage);
+          compactionsThisTurn += 1;
+          lastCompactionIteration = iterations;
+          estimatedPromptTokens = estimateToolCallingMessagesTokens(workingMessages) + toolSchemaTokens;
+          const afterTokens = estimatedPromptTokens + promptTokenEstimateGap;
+          const savedTokens = projectedPromptTokens - afterTokens;
+          appendTrace(config.instance, taskId, {
+            type: "warning",
+            message: `In-turn compaction replaced ${span.end - span.start} message(s) with a summary.`,
+            data: { iterations, compactionsThisTurn, projectedPromptTokens, afterTokens, savedTokens }
+          });
+          if (savedTokens < projectedPromptTokens * COMPACTION_MIN_SAVINGS_FRACTION) {
+            // The protected head/tail is what fills the window — further
+            // compactions cannot help.
+            return completeWithPartialResult(
+              "Stopped early: compacting the conversation could not reclaim enough context window space. This is a partial result."
+            );
+          }
+        }
+      }
+    }
 
     // Provider call with bounded compact-and-retry on context overflow. A
     // prompt the provider rejects as too long is recoverable: shrink the
