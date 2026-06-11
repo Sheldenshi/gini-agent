@@ -704,6 +704,60 @@ describe("chat session waiting-approval placeholder", () => {
     expect(Object.keys(readState(config.instance).providerAuthFailures ?? {})).toEqual(["codex"]);
   });
 
+  test("failTask records the needs-reauth state even when the task already went terminal", async () => {
+    // A concurrent cancel (user Stop racing a just-rejected 401) or a sibling
+    // approval denial can flip the task terminal before failTask's mutation
+    // runs. The task-lifecycle idempotency guard must still skip the status
+    // flip and the task.failed audit — but the credential record is
+    // independent of task lifecycle and must land regardless, or Settings
+    // keeps claiming "Connected" against a dead credential (issue #233).
+    const config = {
+      ...buildConfig(workspaceRoot, "chat-fail-auth-terminal"),
+      provider: { name: "openai" as const, model: "gpt-5.4-mini" }
+    };
+    const session = await createChat(config, { title: "auth-fail-terminal" });
+    const taskId = "task_authfail_terminal";
+    await mutateState(config.instance, (state) => {
+      const task: Task = {
+        id: taskId,
+        title: "chat turn",
+        input: "do it",
+        status: "cancelled",
+        instance: state.instance,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        tracePath: "",
+        auditIds: [],
+        approvalIds: [],
+        skillIds: [],
+        chatSessionId: session.id,
+        currentStep: "Cancelled"
+      };
+      state.tasks.push(task);
+      const record = state.chatSessions.find((s) => s.id === session.id);
+      if (record) record.taskIds.push(task.id);
+    });
+
+    await failTask(config, taskId, new ProviderAuthError("openai", "Incorrect API key provided"));
+
+    const state = readState(config.instance);
+    // The credential record landed despite the terminal short-circuit.
+    expect(state.providerAuthFailures?.openai).toMatchObject({
+      provider: "openai",
+      detail: "Incorrect API key provided",
+      taskId
+    });
+    expect(
+      state.audit.find((a) => a.action === "provider.auth.needs_reauth" && a.target === "openai")
+    ).toBeDefined();
+    // The task-lifecycle guard still holds: status untouched, no failure
+    // bookkeeping on the already-terminal task.
+    const task = state.tasks.find((t) => t.id === taskId);
+    expect(task?.status).toBe("cancelled");
+    expect(task?.authErrorProvider).toBeUndefined();
+    expect(state.audit.find((a) => a.action === "task.failed" && a.target === taskId)).toBeUndefined();
+  });
+
   test("ProviderAuthError names the provider that served the turn, not the active one", async () => {
     // The model-call site tags the failure with the provider it actually used.
     // failTask must trust that over re-resolving the (possibly since-changed)

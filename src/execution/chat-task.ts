@@ -2610,6 +2610,17 @@ async function runLoop(
     const authProvider = error instanceof ProviderAuthError ? error.provider : undefined;
     const message = authProvider ? redactSecrets(rawMessage) : rawMessage;
     const exhausted = await mutateState(config.instance, (state) => {
+      // Mirror failTask: persist the needs-reauth record BEFORE the terminal
+      // guard — credential state is independent of task lifecycle, and a
+      // concurrent cancel that flipped the task terminal first must not drop
+      // the record (issue #233). recordProviderAuthFailure dedups its own
+      // transition audit. (If findTask throws on a removed row, the whole
+      // mutation is discarded — writeState only runs when the callback
+      // returns — which matches the pre-existing removed-task behavior.)
+      // `message` is already redacted.
+      if (authProvider) {
+        recordProviderAuthFailure(state, { provider: authProvider, detail: message, taskId });
+      }
       const item = findTask(state, taskId);
       // Respect a prior terminal status.
       if (isTerminalTaskStatus(item.status)) return item;
@@ -2622,11 +2633,6 @@ async function runLoop(
           : `Chat task exceeded ${cap} model iterations.`;
       if (authProvider) {
         item.authErrorProvider = authProvider;
-        // Mirror failTask: persist the needs-reauth record so persistent
-        // surfaces reflect the dead credential (issue #233). This failure
-        // path settles the task itself rather than routing through failTask,
-        // so it must write the record too. `message` is already redacted.
-        recordProviderAuthFailure(state, { provider: authProvider, detail: message, taskId });
       }
       // Preserve the accumulated cost from the loop so the audit row
       // reflects all model calls leading up to the failed summary turn.
