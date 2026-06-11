@@ -15,7 +15,7 @@
 // helpers are imported lazily (dynamic import) so this state module doesn't close
 // a static cycle with src/jobs (which imports src/state).
 
-import type { EmailWatcherRecord, EmailWatcherStatus, RuntimeConfig, RuntimeState } from "../types";
+import type { EmailWatcherRecord, EmailWatcherStatus, JobRoute, RuntimeConfig, RuntimeState } from "../types";
 import { id, now } from "./ids";
 import { addAudit } from "./audit";
 import { createChatSession, deleteChatSession, renameChatSession } from "./records";
@@ -84,6 +84,10 @@ const EMAIL_WATCH_JOB_PROMPT = [
 function buildWatch(watcher: EmailWatcherRecord): Record<string, unknown> {
   return {
     watcherId: watcher.id,
+    // The fan-out routing key for this concern's detection bucket. 1:1 with the
+    // watcher (each concern owns its own channel + route), so routeKey = the
+    // watcher id; the matching JobRoute is keyed the same in buildJobRoutes.
+    routeKey: watcher.id,
     query: watcher.query,
     ...(watcher.accountEmail ? { account: watcher.accountEmail } : {}),
     ...(watcher.sender ? { sender: watcher.sender } : {}),
@@ -91,6 +95,41 @@ function buildWatch(watcher: EmailWatcherRecord): Record<string, unknown> {
     ...(watcher.threadId ? { threadId: watcher.threadId } : {}),
     ...(watcher.followUpAfterHours !== undefined ? { followUpAfterHours: watcher.followUpAfterHours } : {})
   };
+}
+
+// The per-concern system-prompt persona, layered over the shared drafting
+// playbook. Returns undefined when the watcher set no persona (the worker then
+// runs the shared playbook only).
+function personaPrompt(watcher: EmailWatcherRecord): string | undefined {
+  if (!watcher.persona) return undefined;
+  return `${EMAIL_WATCH_JOB_PROMPT}\n\n${watcher.persona}`;
+}
+
+// Build the shared job's fan-out routing table: one JobRoute per enabled watcher,
+// keyed by the watcher id (= its detection routeKey). Each route dispatches THIS
+// concern's drafting worker into its OWN channel (falling back to the shared
+// session for a watcher that hasn't provisioned a channel yet — e.g. before the
+// per-concern channel migration runs), carrying the shared drafting prompt plus
+// the watcher's optional persona/toolset constraints. Domain-agnostic on the
+// scheduler side: the email layer supplies the declarative route data; the
+// generic fan-out dispatcher consumes it (see ADR job-pre-run-hooks.md).
+function buildJobRoutes(
+  enabledWatchers: EmailWatcherRecord[],
+  fallbackSessionId: string | undefined
+): Record<string, JobRoute> {
+  const routes: Record<string, JobRoute> = {};
+  for (const watcher of enabledWatchers) {
+    const chatSessionId = watcher.channelId ?? fallbackSessionId;
+    if (!chatSessionId) continue;
+    const persona = personaPrompt(watcher);
+    routes[watcher.id] = {
+      chatSessionId,
+      prompt: EMAIL_WATCH_JOB_PROMPT,
+      ...(persona ? { systemPrompt: persona } : {}),
+      ...(watcher.toolsets ? { toolsets: watcher.toolsets } : {})
+    };
+  }
+  return routes;
 }
 
 // Build the shared backing job's pre-run hook config: the generic skill-script
@@ -239,6 +278,11 @@ export async function addEmailWatcher(
   const owningAgentId = input.agentId ?? readState(config.instance).activeAgentId;
   const shared = await ensureSharedJobAndSession(config, owningAgentId);
 
+  // Provision this concern's OWN channel before the rebuild, so the route built
+  // for it targets the dedicated channel (not the shared session). The shared
+  // session stays the fallback for legacy/unmigrated watchers.
+  const channel = await createConcernChannel(config, owningAgentId);
+
   const watcher = await mutateState(config.instance, (state) =>
     createEmailWatcher(state, {
       agentId: owningAgentId,
@@ -250,6 +294,7 @@ export async function addEmailWatcher(
       ...(threadId ? { threadId } : {}),
       ...(followUpAfterHours !== undefined ? { followUpAfterHours } : {}),
       chatSessionId: shared.chatSessionId,
+      channelId: channel.id,
       jobId: shared.jobId,
       enabled: true,
       status: "ok"
@@ -263,6 +308,21 @@ export async function addEmailWatcher(
     await removeEmailWatcher(config, watcher.id);
     throw error;
   }
+}
+
+// Create a per-concern email-watch channel for one agent: a `channel`-kind chat
+// session stamped with the email-watch feature marker so identity-based orphan
+// cleanup can sweep it once its watcher is removed. The fan-out scheduler
+// dispatches this concern's drafting worker into it.
+async function createConcernChannel(
+  config: RuntimeConfig,
+  agentId: string | undefined
+): Promise<{ id: string }> {
+  return mutateState(config.instance, (state) => {
+    const created = createChatSession(state, EMAIL_WATCH_TITLE, undefined, agentId, "job", "channel");
+    created.feature = "email-watch";
+    return { id: created.id };
+  });
 }
 
 // Ensure an agent has a shared email-watch backing job + chat session, returning
@@ -339,10 +399,14 @@ async function rebuildSharedJobWatches(config: RuntimeConfig, agentId: string | 
 
   const sessionId = state.jobs.find((j) => j.id === jobId)?.chatSessionId;
   const watches = enabled.map(buildWatch);
+  const routes = buildJobRoutes(enabled, sessionId);
   await mutateState(config.instance, (s) => {
     const job = s.jobs.find((j) => j.id === jobId);
     if (job?.preRunHook) {
       (job.preRunHook.config as { watches?: unknown }).watches = watches;
+      // Fan-out routing table, rebuilt in lockstep with the watch list so each
+      // concern's detection bucket dispatches into its own channel.
+      job.routes = routes;
       job.updatedAt = now();
     }
     // Keep every enabled watcher pointing at the live shared job + session.
@@ -418,18 +482,25 @@ export function createEmailWatcher(
 // Overlay the watcher's displayed health from the shared backing job's hookState.
 // The detection script (run by the generic skill-script handler, which can't
 // write watcher state) records each watch's last-tick health in the opaque state
-// blob, keyed by watcher id — hookState.byWatcher[watcherId].status
-// ("ok"|"needs_auth"|"error") and .lastError (scrubbed) — which the job persists
-// each tick. status/lastError on the record are thus DERIVED-on-read from the
-// shared job's per-watcher state; `enabled` stays the separate lifecycle flag. A
-// watcher with no backing job (legacy, pre-first-tick) or no per-watcher state
-// yet keeps its stored status.
+// blob, keyed by routeKey (= watcher id) at the TOP level — hookState[watcherId]
+// .status ("ok"|"needs_auth"|"error") and .lastError (scrubbed) — which the job
+// persists each tick. status/lastError on the record are thus DERIVED-on-read
+// from the per-watcher state; `enabled` stays the separate lifecycle flag. A
+// legacy `hookState.byWatcher[watcherId]` blob (written before the per-route
+// flattening) is still read until the next tick rewrites it flat. A watcher with
+// no backing job (legacy, pre-first-tick) or no per-watcher state yet keeps its
+// stored status.
 function withDerivedHealth(watcher: EmailWatcherRecord, state: RuntimeState): EmailWatcherRecord {
   if (!watcher.jobId) return watcher;
   const job = state.jobs.find((j) => j.id === watcher.jobId);
-  const byWatcher = job?.hookState?.byWatcher;
-  if (!byWatcher || typeof byWatcher !== "object") return watcher;
-  const perWatcher = (byWatcher as Record<string, unknown>)[watcher.id];
+  const hookState = job?.hookState;
+  if (!hookState || typeof hookState !== "object") return watcher;
+  const legacyByWatcher = (hookState as { byWatcher?: unknown }).byWatcher;
+  const perWatcher =
+    (hookState as Record<string, unknown>)[watcher.id] ??
+    (legacyByWatcher && typeof legacyByWatcher === "object"
+      ? (legacyByWatcher as Record<string, unknown>)[watcher.id]
+      : undefined);
   if (!perWatcher || typeof perWatcher !== "object") return watcher;
   const status = (perWatcher as { status?: unknown }).status;
   if (status !== "ok" && status !== "needs_auth" && status !== "error") return watcher;
@@ -497,6 +568,10 @@ export async function removeEmailWatcher(config: RuntimeConfig, watcherId: strin
     return item!;
   });
   await rebuildSharedJobWatches(config, removed.agentId);
+  // The removed watcher's per-concern channel is now referenced by nothing —
+  // reclaim it via the identity-based orphan sweep (a live sibling's channel is
+  // still referenced by its own channelId, so it's never touched).
+  await healEmailWatchOrphans(config, removed.agentId);
   return removed;
 }
 
@@ -574,6 +649,11 @@ export async function backfillEmailWatcherJobs(config: RuntimeConfig): Promise<n
   // the rebuild below pushes the healed queries into the shared job's watch
   // list in the same pass.
   await healLegacyWatcherQueries(config);
+  // Give every pre-existing enabled watcher its OWN per-concern channel (run
+  // once). The per-agent rebuild below then writes routes that target each
+  // concern's channel; until a watcher has one its route falls back to the
+  // shared session, so no delivery or cursor is ever lost.
+  await migrateWatchersToPerConcernChannels(config);
   // Group enabled watchers by owning agent — each agent shares one job.
   const enabled = readState(config.instance).emailWatchers.filter((w) => w.enabled);
   const agentIds = new Set<string | undefined>(enabled.map((w) => w.agentId));
@@ -624,6 +704,32 @@ async function healLegacyWatcherQueries(config: RuntimeConfig): Promise<void> {
       }
     }
     state.emailWatcherQueryHealedAt = now();
+  });
+}
+
+// Give every pre-existing enabled watcher its OWN per-concern channel exactly
+// ONCE (gated by the emailWatcherChannelsMigratedAt marker, stamped in the same
+// write). The single-channel model shared one "Email watch" session across all of
+// an agent's watchers; the fan-out model routes each concern's drafting worker
+// into its own channel. SAFEST PATH: the migration only ADDS a channel per
+// watcher (and the per-agent rebuild then points that watcher's route at it). It
+// never moves a cursor (the per-route state in hookState is untouched) and never
+// deletes the shared session while any route can still fall back to it — a watcher
+// that hasn't yet got a channel keeps routing to the shared session, so no draft
+// is ever lost. Idempotent: a re-run after the marker is set returns early, and an
+// already-migrated watcher (channelId set) is skipped even within the first pass.
+async function migrateWatchersToPerConcernChannels(config: RuntimeConfig): Promise<void> {
+  if (readState(config.instance).emailWatcherChannelsMigratedAt) return;
+  await mutateState(config.instance, (state) => {
+    if (state.emailWatcherChannelsMigratedAt) return;
+    for (const w of state.emailWatchers) {
+      if (!w.enabled || w.channelId) continue;
+      const channel = createChatSession(state, EMAIL_WATCH_TITLE, undefined, w.agentId, "job", "channel");
+      channel.feature = "email-watch";
+      w.channelId = channel.id;
+      w.updatedAt = now();
+    }
+    state.emailWatcherChannelsMigratedAt = now();
   });
 }
 
@@ -678,8 +784,11 @@ async function dedupSharedJobs(config: RuntimeConfig, agentId: string | undefine
   });
 }
 
-// Every session an enabled OR disabled watcher points at, plus the shared session
-// — the in-use set the orphan sweep must never delete.
+// Every session an enabled OR disabled watcher points at — its shared-session
+// fallback AND its per-concern channel — plus the shared session. The in-use set
+// the orphan sweep must never delete: a live concern's channel is referenced by
+// its watcher's channelId, so it's never swept while the watcher exists; a removed
+// watcher's channel falls out of this set and is reclaimed by the identity sweep.
 function referencedSessionIds(
   state: RuntimeState,
   agentId: string | undefined,
@@ -687,7 +796,9 @@ function referencedSessionIds(
 ): Set<string> {
   const referenced = new Set<string>();
   for (const w of state.emailWatchers) {
-    if (w.agentId === agentId && w.chatSessionId) referenced.add(w.chatSessionId);
+    if (w.agentId !== agentId) continue;
+    if (w.chatSessionId) referenced.add(w.chatSessionId);
+    if (w.channelId) referenced.add(w.channelId);
   }
   if (sharedSessionId) referenced.add(sharedSessionId);
   return referenced;

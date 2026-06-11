@@ -244,7 +244,7 @@ describe("shared backing job lifecycle", () => {
   }
   function watches(config: ReturnType<typeof buildConfig>) {
     const job = sharedJob(config);
-    return (job?.preRunHook?.config as { watches?: { watcherId: string; query: string; sender?: string }[] }).watches ?? [];
+    return (job?.preRunHook?.config as { watches?: { watcherId: string; routeKey?: string; query: string; sender?: string }[] }).watches ?? [];
   }
 
   test("first add provisions ONE shared job + session and stamps jobId", async () => {
@@ -264,7 +264,7 @@ describe("shared backing job lifecycle", () => {
     expect(job?.intervalSeconds).toBe(60);
     // The shared job's watch list carries this enabled watcher, including the
     // explicitly watched sender (the detection script's heuristic bypass key).
-    expect(watches(config)).toEqual([{ watcherId: watcher.id, query: watcher.query, sender: "dave@x.com" }]);
+    expect(watches(config)).toEqual([{ watcherId: watcher.id, routeKey: watcher.id, query: watcher.query, sender: "dave@x.com" }]);
   });
 
   test("a sender add stores the sender; a raw-query add does not", async () => {
@@ -310,11 +310,20 @@ describe("shared backing job lifecycle", () => {
       (j) => (j.preRunHook?.config as { skill?: string })?.skill === "gmail-watch"
     );
     expect(jobs).toHaveLength(1);
-    const sessions = readState(config.instance).chatSessions.filter((s) => s.title === "Email watch");
-    expect(sessions).toHaveLength(1);
+    // ONE shared session bound to the job (each concern also has its OWN channel,
+    // which is why we target the job-bound session, not every "Email watch" title).
+    expect(jobs[0]!.chatSessionId).toBe(w1.chatSessionId);
     // Both watches are listed.
     const list = watches(config);
     expect(new Set(list.map((w) => w.watcherId))).toEqual(new Set([w1.id, w2.id]));
+    // Each concern got its OWN per-concern channel, and the shared job routes each
+    // bucket into that channel.
+    expect(w1.channelId).toBeString();
+    expect(w2.channelId).toBeString();
+    expect(w1.channelId).not.toBe(w2.channelId);
+    const routes = jobs[0]!.routes ?? {};
+    expect(routes[w1.id]?.chatSessionId).toBe(w1.channelId!);
+    expect(routes[w2.id]?.chatSessionId).toBe(w2.channelId!);
   });
 
   test("removing one of several rebuilds watches but keeps the shared job + session", async () => {
@@ -379,13 +388,12 @@ describe("shared backing job lifecycle", () => {
       (j) => (j.preRunHook?.config as { skill?: string })?.skill === "gmail-watch"
     );
     expect(jobs).toHaveLength(1);
-    const sessions = readState(config.instance).chatSessions.filter((s) => s.title === "Email watch");
-    expect(sessions).toHaveLength(1);
-    // Both watchers point at the one shared job + session.
+    // Both watchers point at the one shared job + its bound shared session (each
+    // also has its own per-concern channel, so we target the job-bound session).
     expect(w1.jobId).toBe(jobs[0]!.id);
     expect(w2.jobId).toBe(jobs[0]!.id);
-    expect(w1.chatSessionId).toBe(sessions[0]!.id);
-    expect(w2.chatSessionId).toBe(sessions[0]!.id);
+    expect(w1.chatSessionId).toBe(jobs[0]!.chatSessionId);
+    expect(w2.chatSessionId).toBe(jobs[0]!.chatSessionId);
     // Both senders are in the shared watch list.
     expect(new Set(watches(config).map((w) => w.watcherId))).toEqual(new Set([w1.id, w2.id]));
   });
@@ -416,8 +424,11 @@ describe("shared backing job lifecycle", () => {
       (j) => (j.preRunHook?.config as { skill?: string })?.skill === "gmail-watch"
     );
     expect(jobs).toHaveLength(1);
-    const sessions = readState(config.instance).chatSessions.filter((s) => s.title === "Email watch");
-    expect(sessions).toHaveLength(1);
+    // Exactly one shared session — the one bound to the surviving shared job.
+    expect(jobs[0]!.chatSessionId).toBeString();
+    expect(
+      readState(config.instance).chatSessions.filter((s) => s.id === jobs[0]!.chatSessionId)
+    ).toHaveLength(1);
     // Both the legacy and the freshly-added watcher end up on the one shared job.
     expect(getEmailWatcher(config, legacy.id)?.jobId).toBe(jobs[0]!.id);
     expect(getEmailWatcher(config, added.id)?.jobId).toBe(jobs[0]!.id);
@@ -573,14 +584,21 @@ describe("shared backing job lifecycle", () => {
     // The adopted job's name was renamed to the canonical "Email watch" so the
     // sidebar (which renders job.name) no longer shows "Email watch: <sender>".
     expect(gmailJobs[0]!.name).toBe("Email watch");
-    // Exactly ONE MARKED email-watch session, titled exactly "Email watch"
-    // (adopted title renamed + marker backfilled); the orphan job's session + the
-    // marker-carrying truly-orphan channel swept by identity.
+    // The SHARED session (job-bound) was adopted, renamed to the canonical title,
+    // and marker-backfilled — distinct from the two per-concern channels, which are
+    // referenced by the live watchers and so survive the identity sweep.
+    const sharedSession = state.chatSessions.find((s) => s.id === sharedSessionId);
+    expect(sharedSession?.title).toBe("Email watch");
+    expect(sharedSession?.feature).toBe("email-watch");
+    const concernChannelIds = new Set(
+      [w1, w2].map((w) => getEmailWatcher(config, w.id)?.channelId).filter((id): id is string => Boolean(id))
+    );
+    expect(concernChannelIds.size).toBe(2);
+    // The MARKED email-watch sessions are exactly the shared session + the two
+    // live concern channels; the orphan job's session + the truly-orphan channel
+    // were swept by identity.
     const emailSessions = state.chatSessions.filter((s) => s.feature === "email-watch");
-    expect(emailSessions).toHaveLength(1);
-    expect(emailSessions[0]!.id).toBe(sharedSessionId);
-    expect(emailSessions[0]!.title).toBe("Email watch");
-    expect(emailSessions[0]!.feature).toBe("email-watch");
+    expect(new Set(emailSessions.map((s) => s.id))).toEqual(new Set([sharedSessionId, ...concernChannelIds]));
     expect(state.chatSessions.some((s) => s.id === orphanSession.id)).toBe(false);
     expect(state.chatSessions.some((s) => s.id === trulyOrphanChannel.id)).toBe(false);
     // The decoy — titled like an email-watch channel but WITHOUT the marker — is
@@ -598,7 +616,9 @@ describe("shared backing job lifecycle", () => {
     const after = readState(config.instance);
     expect(after.jobs).toHaveLength(jobsBefore);
     expect(after.chatSessions).toHaveLength(sessionsBefore);
-    expect(after.chatSessions.filter((s) => s.feature === "email-watch")).toHaveLength(1);
+    // Shared session + the two live per-concern channels survive; nothing else
+    // is created or swept on the idempotent second pass.
+    expect(after.chatSessions.filter((s) => s.feature === "email-watch")).toHaveLength(3);
   });
 });
 
@@ -664,5 +684,126 @@ describe("derived watcher health (per-watcher byWatcher state)", () => {
     const watcher = await addEmailWatcher(config, { sender: "nina@x.com" });
     // No hookState written yet (pre-first-tick) => stored status is surfaced.
     expect(getEmailWatcher(config, watcher.id)?.status).toBe("ok");
+  });
+
+  test("health derives from the flat per-route hookState key (the current shape)", async () => {
+    const config = buildConfig("ew-health-flat");
+    const watcher = await addEmailWatcher(config, { sender: "owen@x.com" });
+    // The current detect.ts writes per-route state at the TOP level of hookState
+    // (keyed by routeKey = watcher id), NOT nested under byWatcher.
+    await mutateState(config.instance, (state) => {
+      const job = state.jobs.find((j) => j.id === watcher.jobId);
+      if (job) job.hookState = { [watcher.id]: { cursor: "9", seen: [], status: "needs_auth" } };
+    });
+    expect(getEmailWatcher(config, watcher.id)?.status).toBe("needs_auth");
+  });
+});
+
+describe("per-concern channels + fan-out routes", () => {
+  test("add provisions a per-concern channel and a route targeting it", async () => {
+    const config = buildConfig("ew-concern-add");
+    const watcher = await addEmailWatcher(config, { sender: "pat@x.com" });
+    expect(watcher.channelId).toBeString();
+    // The channel is its OWN session, distinct from the shared job session.
+    const job = readState(config.instance).jobs.find((j) => j.id === watcher.jobId);
+    expect(watcher.channelId).not.toBe(job?.chatSessionId);
+    // The shared job's route table dispatches this concern's bucket into its channel.
+    expect(job?.routes?.[watcher.id]?.chatSessionId).toBe(watcher.channelId);
+    expect(job?.routes?.[watcher.id]?.prompt).toContain("email-watch agent");
+    // The per-concern channel carries the email-watch feature marker.
+    const channel = readState(config.instance).chatSessions.find((s) => s.id === watcher.channelId);
+    expect(channel?.feature).toBe("email-watch");
+    expect(channel?.kind).toBe("channel");
+  });
+
+  test("a persona watcher routes with a layered systemPrompt; toolsets pass through", async () => {
+    const config = buildConfig("ew-concern-persona");
+    const watcher = await addEmailWatcher(config, { sender: "quinn@x.com" });
+    await mutateState(config.instance, (state) => {
+      const w = state.emailWatchers.find((x) => x.id === watcher.id);
+      if (w) {
+        w.persona = "Be terse and formal.";
+        w.toolsets = ["gmail"];
+      }
+    });
+    // Re-stamp the persona/toolsets into the route via a rebuild (an enable no-op
+    // is the simplest rebuild trigger that re-runs buildJobRoutes).
+    await setEmailWatcherEnabled(config, watcher.id, true);
+    const job = readState(config.instance).jobs.find((j) => j.id === watcher.jobId);
+    const route = job?.routes?.[watcher.id];
+    expect(route?.systemPrompt).toContain("Be terse and formal.");
+    expect(route?.systemPrompt).toContain("email-watch agent"); // layered over the shared playbook
+    expect(route?.toolsets).toEqual(["gmail"]);
+  });
+
+  test("removing a concern drops its route and reclaims its channel", async () => {
+    const config = buildConfig("ew-concern-remove");
+    const keep = await addEmailWatcher(config, { sender: "rita@x.com" });
+    const drop = await addEmailWatcher(config, { sender: "sam@x.com" });
+    const dropChannelId = drop.channelId!;
+    await removeEmailWatcher(config, drop.id);
+    const state = readState(config.instance);
+    const job = state.jobs.find((j) => j.id === keep.jobId);
+    // The removed concern's route is gone; the surviving concern's stays.
+    expect(job?.routes?.[drop.id]).toBeUndefined();
+    expect(job?.routes?.[keep.id]?.chatSessionId).toBe(keep.channelId);
+    // The removed concern's channel was reclaimed; the survivor's was NOT swept.
+    expect(state.chatSessions.some((s) => s.id === dropChannelId)).toBe(false);
+    expect(state.chatSessions.some((s) => s.id === keep.channelId)).toBe(true);
+  });
+
+  test("disabling a concern drops its route but keeps its channel for re-enable", async () => {
+    const config = buildConfig("ew-concern-disable");
+    const watcher = await addEmailWatcher(config, { sender: "tom@x.com" });
+    const channelId = watcher.channelId!;
+    await setEmailWatcherEnabled(config, watcher.id, false);
+    // Disabling the last enabled watcher tears the shared job down, so re-enable to
+    // re-provision and confirm the SAME concern channel is reused (never swept).
+    await setEmailWatcherEnabled(config, watcher.id, true);
+    const reenabled = getEmailWatcher(config, watcher.id);
+    expect(reenabled?.channelId).toBe(channelId);
+    const job = readState(config.instance).jobs.find((j) => j.id === reenabled?.jobId);
+    expect(job?.routes?.[watcher.id]?.chatSessionId).toBe(channelId);
+    expect(readState(config.instance).chatSessions.some((s) => s.id === channelId)).toBe(true);
+  });
+
+  test("channel migration backfills an enabled watcher that predates per-concern channels (once)", async () => {
+    const config = buildConfig("ew-concern-migrate");
+    const watcher = await addEmailWatcher(config, { sender: "uma@x.com" });
+    // Simulate a pre-migration install: strip the channel + the run-once marker,
+    // leaving the watcher routing to the shared session only.
+    await mutateState(config.instance, (state) => {
+      const w = state.emailWatchers.find((x) => x.id === watcher.id);
+      if (w) w.channelId = undefined;
+      state.emailWatcherChannelsMigratedAt = undefined;
+      const job = state.jobs.find((j) => j.id === watcher.jobId);
+      if (job) job.routes = {};
+    });
+    await backfillEmailWatcherJobs(config);
+    const migrated = getEmailWatcher(config, watcher.id);
+    expect(migrated?.channelId).toBeString();
+    const job = readState(config.instance).jobs.find((j) => j.id === migrated?.jobId);
+    expect(job?.routes?.[watcher.id]?.chatSessionId).toBe(migrated?.channelId);
+    expect(readState(config.instance).emailWatcherChannelsMigratedAt).toBeString();
+
+    // Idempotent: a second backfill neither re-migrates nor mints a new channel.
+    const channelId = migrated?.channelId;
+    await backfillEmailWatcherJobs(config);
+    expect(getEmailWatcher(config, watcher.id)?.channelId).toBe(channelId);
+  });
+
+  test("an unmigrated watcher routes to the shared session until it gets a channel", async () => {
+    const config = buildConfig("ew-concern-fallback");
+    const watcher = await addEmailWatcher(config, { sender: "vera@x.com" });
+    const sharedSessionId = readState(config.instance).jobs.find((j) => j.id === watcher.jobId)?.chatSessionId;
+    // Drop the channel WITHOUT running migration (marker stays set) — the route
+    // must fall back to the shared session, never losing delivery.
+    await mutateState(config.instance, (state) => {
+      const w = state.emailWatchers.find((x) => x.id === watcher.id);
+      if (w) w.channelId = undefined;
+    });
+    await setEmailWatcherEnabled(config, watcher.id, true); // rebuild routes
+    const job = readState(config.instance).jobs.find((j) => j.id === watcher.jobId);
+    expect(job?.routes?.[watcher.id]?.chatSessionId).toBe(sharedSessionId);
   });
 });
