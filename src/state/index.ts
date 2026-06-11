@@ -207,6 +207,7 @@ export {
   setEmailWatcherEnabled,
   setEmailWatcherObjective,
   validateObjective,
+  validateThreadId,
   removeEmailWatcher,
   backfillEmailWatcherJobs
 } from "./email-watchers";

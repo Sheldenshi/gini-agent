@@ -171,6 +171,21 @@ export function validateObjective(value: unknown): string {
   return trimmed;
 }
 
+// Gmail thread ids are opaque hex-ish tokens. Restrict to that charset (the
+// jsonParam serializer also shell-escapes, but a validated threadId can never
+// reach the shell as a crafted value): it's a single config field with no
+// legitimate need for spaces or quotes, unlike query/sender. Throws with the
+// "Invalid input:" prefix the gateway maps to a 400.
+export function validateThreadId(value: unknown): string {
+  if (typeof value !== "string") throw new Error("Invalid input: threadId must be a string.");
+  const trimmed = value.trim();
+  if (trimmed.length === 0) throw new Error("Invalid input: threadId must be a non-empty string.");
+  if (!/^[A-Za-z0-9_-]+$/.test(trimmed)) {
+    throw new Error("Invalid input: threadId may only contain letters, digits, '-' and '_'.");
+  }
+  return trimmed;
+}
+
 // Build the Gmail query for a watcher: a raw query wins; a thread watch gets
 // a human-readable `thread:<id>` LABEL (threadId is authoritative for
 // detection, the query is display-only there); otherwise `from:<sender>`;
@@ -200,10 +215,7 @@ export async function addEmailWatcher(
 ): Promise<EmailWatcherRecord> {
   // Validate BEFORE provisioning so a rejected input can't leave an orphan
   // shared job/session behind.
-  const threadId = input.threadId?.trim();
-  if (input.threadId !== undefined && !threadId) {
-    throw new Error("Invalid input: threadId must be a non-empty string.");
-  }
+  const threadId = input.threadId !== undefined ? validateThreadId(input.threadId) : undefined;
   const objective = input.objective !== undefined ? validateObjective(input.objective) : undefined;
   const followUpAfterHours = input.followUpAfterHours;
   if (followUpAfterHours !== undefined) {

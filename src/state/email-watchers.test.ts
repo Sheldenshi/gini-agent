@@ -22,7 +22,8 @@ import {
   setEmailWatcherEnabled,
   setEmailWatcherObjective,
   updateEmailWatcher,
-  validateObjective
+  validateObjective,
+  validateThreadId
 } from ".";
 
 const ROOT = mkdtempSync(join(tmpdir(), "gini-email-watchers-test-"));
@@ -132,10 +133,23 @@ describe("thread-keyed watchers", () => {
     expect(watches[0]?.threadId).toBe("t-123");
   });
 
-  test("a blank threadId is rejected before provisioning", async () => {
+  test("a blank or out-of-charset threadId is rejected before provisioning", async () => {
     const config = buildConfig("ew-thread-blank");
     await expect(addEmailWatcher(config, { threadId: "  " })).rejects.toThrow("Invalid input: threadId");
+    // A threadId carrying shell metacharacters never reaches the gws sink — the
+    // charset gate rejects it (threadIds are opaque hex-ish tokens).
+    await expect(addEmailWatcher(config, { threadId: "x'; touch /tmp/PWNED; '" })).rejects.toThrow(
+      "Invalid input: threadId may only contain"
+    );
     expect(readState(config.instance).emailWatchers).toHaveLength(0);
+  });
+
+  test("validateThreadId accepts the gmail token charset and rejects the rest", () => {
+    expect(validateThreadId(" 18f_ab-CD ")).toBe("18f_ab-CD");
+    expect(() => validateThreadId(42)).toThrow("Invalid input: threadId must be a string");
+    expect(() => validateThreadId("   ")).toThrow("Invalid input: threadId must be a non-empty string");
+    expect(() => validateThreadId("a'b")).toThrow("Invalid input: threadId may only contain");
+    expect(() => validateThreadId("a b")).toThrow("Invalid input: threadId may only contain");
   });
 
   test("followUpAfterHours requires a thread watch and a positive number", async () => {

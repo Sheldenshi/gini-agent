@@ -191,11 +191,12 @@ export async function defaultGwsSpawn(args: string[]): Promise<string> {
 
 // ── gws arg builders + parsers (ported verbatim) ─────────────────────────────
 
-// Single-quote a JSON params object for the gws CLI. The values are integers /
-// fixed query strings the engine builds (never raw email content), so no
-// untrusted bytes reach the shell here.
+// Single-quote a JSON params object for the gws CLI. Fields like threadId and
+// query can carry arbitrary text, so shell-escape every embedded single quote
+// ('\'' closes, escapes a literal quote, reopens) — a bare close-quote here
+// would let a crafted value break out and run an injected command.
 function jsonParam(obj: Record<string, unknown>): string {
-  return `'${JSON.stringify(obj)}'`;
+  return `'${JSON.stringify(obj).replace(/'/g, `'\\''`)}'`;
 }
 
 function buildAuthStatusArgs(): string[] {

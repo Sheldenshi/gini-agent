@@ -502,6 +502,28 @@ describe("detect — thread mode", () => {
     expect(calls[0]).toContain('"metadataHeaders":["From","Subject","Date"]');
   });
 
+  test("a single-quote-bearing threadId is shell-neutralized in the spawned --params arg", async () => {
+    // The serialized --params is single-quoted for `zsh -lc`. A crafted threadId
+    // carrying a single quote must not break out of that quoting and inject a
+    // command — every embedded quote is shell-escaped to '\''.
+    const evil = `x'; touch /tmp/PWNED; '`;
+    let paramsArg = "";
+    const spawn: GwsSpawn = async (args) => {
+      const i = args.indexOf("--params");
+      if (i >= 0) paramsArg = args[i + 1]!;
+      return threadResponse(evil, []);
+    };
+    await detect({ query: `thread:${evil}`, threadId: evil, state: null }, spawn, "me@example.com");
+    // The arg is `'<body>'` where every single quote inside <body> is the
+    // escape sequence '\'' (close-quote, literal-quote, reopen-quote). Replay
+    // what the shell does — drop the outer quotes, turn each '\'' back into one
+    // literal quote — and the result is exactly the original JSON: the crafted
+    // value can't break out and the injected command never becomes a token.
+    expect(paramsArg.startsWith("'") && paramsArg.endsWith("'")).toBe(true);
+    const shellValue = paramsArg.slice(1, -1).split(`'\\''`).join("'");
+    expect(JSON.parse(shellValue).id).toBe(evil);
+  });
+
   test("seeding baselines at the newest thread message, drafts nothing", async () => {
     const spawn = threadSpawn("t-1", [
       { id: "m1", internalDate: "1000", from: "support@x.com", subject: "case opened" },
