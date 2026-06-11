@@ -27,6 +27,10 @@ interface Meta {
   subject?: string;
   date?: string;
   snippet?: string;
+  // Optional headers for the cross-account dedup tests: the RFC Message-ID
+  // (stable across accounts) and the To recipient (drives dedup precedence).
+  to?: string;
+  messageId?: string;
 }
 
 const PREAMBLE = "Using keyring backend: keyring\n";
@@ -59,7 +63,9 @@ function metadataResponse(meta: Meta): string {
         headers: [
           { name: "From", value: meta.from ?? "" },
           { name: "Subject", value: meta.subject ?? "" },
-          { name: "Date", value: meta.date ?? "" }
+          { name: "Date", value: meta.date ?? "" },
+          ...(meta.to !== undefined ? [{ name: "To", value: meta.to }] : []),
+          ...(meta.messageId !== undefined ? [{ name: "Message-ID", value: meta.messageId }] : [])
         ]
       }
     })
@@ -765,8 +771,8 @@ describe("detect — thread mode", () => {
     expect(calls[0]).toContain("gmail users threads get");
     expect(calls[0]).toContain('"id":"t-1"');
     expect(calls[0]).toContain('"format":"metadata"');
-    // Metadata only — never bodies.
-    expect(calls[0]).toContain('"metadataHeaders":["From","Subject","Date"]');
+    // Metadata only — never bodies. To + Message-ID ride for cross-account dedup.
+    expect(calls[0]).toContain('"metadataHeaders":["From","Subject","Date","To","Message-ID"]');
   });
 
   test("a single-quote-bearing threadId is shell-neutralized in the spawned --params arg", async () => {
@@ -1804,5 +1810,236 @@ describe("runWatches — multi-watch (one shared job)", () => {
     // No cross-account leak: alice's list never ran under bob's dir and vice versa.
     expect(seen.dirs).not.toContain("alice:/dir/gacct_b");
     expect(seen.dirs).not.toContain("bob:/dir/gacct_a");
+  });
+});
+
+describe("runWatches — cross-account Message-ID dedup", () => {
+  function listQuery(joined: string): string | undefined {
+    return joined.match(/"q":"([^"]*)"/)?.[1];
+  }
+
+  // A two-account spawn: a list/get response routed by the configDir the call ran
+  // under (each account targets its own dir) AND the watch's query. The SAME
+  // underlying email appears in each account with a DIFFERENT gmail id but the
+  // SAME Message-ID — the exact cross-account-duplicate shape detection must
+  // collapse. `byDir` maps a configDir to its { query -> ids } + metadata.
+  function twoAccountSpawn(
+    byDir: Record<string, { byQuery: Record<string, string[]>; metaById: Record<string, Meta> }>
+  ): GwsSpawn {
+    return async (args: string[], configDir?: string) => {
+      const dir = configDir ?? "<default>";
+      const acct = byDir[dir];
+      const joined = args.join(" ");
+      if (joined.includes("auth status")) return PREAMBLE + '{"token_valid":true}';
+      if (joined.includes("getProfile")) return PREAMBLE + '{"emailAddress":"me@example.com"}';
+      if (!acct) return PREAMBLE + "{}";
+      if (joined.includes("messages list")) {
+        const q = (listQuery(joined) ?? "").replace(/ after:\d+$/, "");
+        return listResponse(acct.byQuery[q] ?? []);
+      }
+      if (joined.includes("messages get")) {
+        const hit = getArgId(joined);
+        return hit && acct.metaById[hit] ? metadataResponse(acct.metaById[hit]!) : PREAMBLE + "{}";
+      }
+      return PREAMBLE + "{}";
+    };
+  }
+
+  test("the same Message-ID across two accounts drafts exactly once (To-recipient wins)", async () => {
+    // One email To alice@x.com lands in both inboxes: alice's copy is gmail id A1,
+    // bob's copy is B1 — but both carry Message-ID <mid-1>. alice is the
+    // To-recipient, so alice's watch drafts; bob's is suppressed.
+    const spawn = twoAccountSpawn({
+      "/dir/gacct_a": {
+        byQuery: { "in:inbox": ["A1"] },
+        metaById: { A1: { id: "A1", internalDate: "3000", from: "Carol <carol@x.com>", subject: "hi", to: "alice@x.com", messageId: "<mid-1>" } }
+      },
+      "/dir/gacct_b": {
+        byQuery: { "in:inbox": ["B1"] },
+        metaById: { B1: { id: "B1", internalDate: "3000", from: "Carol <carol@x.com>", subject: "hi", to: "alice@x.com", messageId: "<mid-1>" } }
+      }
+    });
+    const r = await runWatches(
+      {
+        watches: [
+          { watcherId: "w-a", routeKey: "w-a", query: "in:inbox", account: "alice@x.com", configDir: "/dir/gacct_a" },
+          { watcherId: "w-b", routeKey: "w-b", query: "in:inbox", account: "bob@x.com", configDir: "/dir/gacct_b" }
+        ],
+        state: { "w-a": { cursor: "1000", seen: [] }, "w-b": { cursor: "1000", seen: [] } }
+      },
+      spawn
+    );
+    expect(r.kind).toBe("context");
+    // alice (the To-recipient) drafts; bob's bucket is suppressed entirely.
+    expect(draftedIds(r.buckets!["w-a"])).toEqual(["A1"]);
+    expect(r.buckets!["w-b"]).toBeUndefined();
+    // The LOSER's cursor still advanced over its own copy, so it won't re-draft.
+    expect(r.state["w-b"]!.cursor).toBe("3000");
+    expect(r.state["w-a"]!.cursor).toBe("3000");
+  });
+
+  test("the loser records seen + does NOT re-draft on the next tick", async () => {
+    const byDir = {
+      "/dir/gacct_a": {
+        byQuery: { "in:inbox": ["A1"] },
+        metaById: { A1: { id: "A1", internalDate: "3000", from: "Carol <carol@x.com>", subject: "hi", to: "alice@x.com", messageId: "<mid-1>" } }
+      },
+      "/dir/gacct_b": {
+        byQuery: { "in:inbox": ["B1"] },
+        metaById: { B1: { id: "B1", internalDate: "3000", from: "Carol <carol@x.com>", subject: "hi", to: "alice@x.com", messageId: "<mid-1>" } }
+      }
+    };
+    const spawn = twoAccountSpawn(byDir);
+    const watches = [
+      { watcherId: "w-a", routeKey: "w-a", query: "in:inbox", account: "alice@x.com", configDir: "/dir/gacct_a" },
+      { watcherId: "w-b", routeKey: "w-b", query: "in:inbox", account: "bob@x.com", configDir: "/dir/gacct_b" }
+    ];
+    const r1 = await runWatches(
+      { watches, state: { "w-a": { cursor: "1000", seen: [] }, "w-b": { cursor: "1000", seen: [] } } },
+      spawn
+    );
+    expect(draftedIds(r1.buckets!["w-a"])).toEqual(["A1"]);
+    expect(r1.buckets!["w-b"]).toBeUndefined();
+    // Feed the returned state back: the loser's advanced cursor + seen mean B1 is
+    // no longer "new", so the next tick re-drafts nothing (no double reply later).
+    const r2 = await runWatches({ watches, state: r1.state }, spawn);
+    expect(r2.kind).toBe("shortCircuit");
+    expect(allBucketItems(r2.buckets)).toHaveLength(0);
+  });
+
+  test("precedence falls back to account email ascending when neither is the To-recipient", async () => {
+    // The email is To a third party, so neither account is the To-recipient — the
+    // deterministic tie-break (account email ascending) picks alice over bob
+    // regardless of watch order.
+    const spawn = twoAccountSpawn({
+      "/dir/gacct_a": {
+        byQuery: { "in:inbox": ["A1"] },
+        metaById: { A1: { id: "A1", internalDate: "3000", from: "Carol <carol@x.com>", subject: "hi", to: "list@x.com", messageId: "<mid-2>" } }
+      },
+      "/dir/gacct_b": {
+        byQuery: { "in:inbox": ["B1"] },
+        metaById: { B1: { id: "B1", internalDate: "3000", from: "Carol <carol@x.com>", subject: "hi", to: "list@x.com", messageId: "<mid-2>" } }
+      }
+    });
+    const r = await runWatches(
+      {
+        watches: [
+          { watcherId: "w-b", routeKey: "w-b", query: "in:inbox", account: "bob@x.com", configDir: "/dir/gacct_b" },
+          { watcherId: "w-a", routeKey: "w-a", query: "in:inbox", account: "alice@x.com", configDir: "/dir/gacct_a" }
+        ],
+        state: { "w-a": { cursor: "1000", seen: [] }, "w-b": { cursor: "1000", seen: [] } }
+      },
+      spawn
+    );
+    expect(r.kind).toBe("context");
+    // alice@x.com < bob@x.com, so alice wins the tie-break regardless of watch order.
+    expect(draftedIds(r.buckets!["w-a"])).toEqual(["A1"]);
+    expect(r.buckets!["w-b"]).toBeUndefined();
+  });
+
+  test("distinct Message-IDs across accounts are NOT deduped (each drafts)", async () => {
+    // Two genuinely different emails (different Message-IDs), one per account —
+    // not a cross-account duplicate, so both draft.
+    const spawn = twoAccountSpawn({
+      "/dir/gacct_a": {
+        byQuery: { "in:inbox": ["A1"] },
+        metaById: { A1: { id: "A1", internalDate: "3000", from: "Carol <carol@x.com>", subject: "a", to: "alice@x.com", messageId: "<mid-a>" } }
+      },
+      "/dir/gacct_b": {
+        byQuery: { "in:inbox": ["B1"] },
+        metaById: { B1: { id: "B1", internalDate: "3000", from: "Dave <dave@x.com>", subject: "b", to: "bob@x.com", messageId: "<mid-b>" } }
+      }
+    });
+    const r = await runWatches(
+      {
+        watches: [
+          { watcherId: "w-a", routeKey: "w-a", query: "in:inbox", account: "alice@x.com", configDir: "/dir/gacct_a" },
+          { watcherId: "w-b", routeKey: "w-b", query: "in:inbox", account: "bob@x.com", configDir: "/dir/gacct_b" }
+        ],
+        state: { "w-a": { cursor: "1000", seen: [] }, "w-b": { cursor: "1000", seen: [] } }
+      },
+      spawn
+    );
+    expect(r.kind).toBe("context");
+    expect(draftedIds(r.buckets!["w-a"])).toEqual(["A1"]);
+    expect(draftedIds(r.buckets!["w-b"])).toEqual(["B1"]);
+  });
+
+  test("single-account behavior is unchanged (no Message-ID dedup when one account sees a message)", async () => {
+    // One account, two distinct messages each with its own Message-ID — the dedup
+    // pass groups by Message-ID but finds only one account per group, so it never
+    // suppresses anything. Both drafts survive.
+    const spawn: GwsSpawn = async (args, configDir) => {
+      void configDir;
+      const joined = args.join(" ");
+      if (joined.includes("auth status")) return PREAMBLE + '{"token_valid":true}';
+      if (joined.includes("getProfile")) return PREAMBLE + '{"emailAddress":"me@example.com"}';
+      if (joined.includes("messages list")) {
+        const q = (listQuery(joined) ?? "").replace(/ after:\d+$/, "");
+        if (q.startsWith("from:alice")) return listResponse(["m1"]);
+        return listResponse(["m2"]);
+      }
+      if (joined.includes("messages get")) {
+        const hit = getArgId(joined);
+        const byId: Record<string, Meta> = {
+          m1: { id: "m1", internalDate: "3000", from: "Alice <alice@x.com>", subject: "a", to: "me@example.com", messageId: "<mid-1>" },
+          m2: { id: "m2", internalDate: "4000", from: "Bob <bob@x.com>", subject: "b", to: "me@example.com", messageId: "<mid-2>" }
+        };
+        return hit && byId[hit] ? metadataResponse(byId[hit]!) : PREAMBLE + "{}";
+      }
+      return PREAMBLE + "{}";
+    };
+    const r = await runWatches(
+      {
+        watches: [
+          { watcherId: "w-alice", routeKey: "w-alice", query: "from:alice@x.com", sender: "alice@x.com", configDir: "/dir/gacct_a" },
+          { watcherId: "w-bob", routeKey: "w-bob", query: "from:bob@x.com", sender: "bob@x.com", configDir: "/dir/gacct_a" }
+        ],
+        state: { "w-alice": { cursor: "1000", seen: [] }, "w-bob": { cursor: "1000", seen: [] } }
+      },
+      spawn
+    );
+    expect(r.kind).toBe("context");
+    expect(draftedIds(r.buckets!["w-alice"])).toEqual(["m1"]);
+    expect(draftedIds(r.buckets!["w-bob"])).toEqual(["m2"]);
+  });
+
+  test("within-account targeted-vs-triage dedup (by gmail id) still works", async () => {
+    // Regression guard for the existing within-account precedence: a targeted
+    // watch and a triage watch on the SAME account list the SAME gmail id; the
+    // targeted watch claims it and triage drops it (unchanged by the Message-ID
+    // dedup, which fires only across DISTINCT accounts).
+    const spawn: GwsSpawn = async (args) => {
+      const joined = args.join(" ");
+      if (joined.includes("auth status")) return PREAMBLE + '{"token_valid":true}';
+      if (joined.includes("getProfile")) return PREAMBLE + '{"emailAddress":"me@example.com"}';
+      if (joined.includes("messages list")) {
+        const q = (listQuery(joined) ?? "").replace(/ after:\d+$/, "");
+        if (q.startsWith("from:alice")) return listResponse(["m1"]);
+        return listResponse(["m2", "m1"]);
+      }
+      if (joined.includes("messages get")) {
+        const hit = getArgId(joined);
+        const byId: Record<string, Meta> = {
+          m1: { id: "m1", internalDate: "3000", from: "Alice <alice@x.com>", subject: "a", to: "me@example.com", messageId: "<mid-1>" },
+          m2: { id: "m2", internalDate: "4000", from: "Carol <carol@x.com>", subject: "c", to: "me@example.com", messageId: "<mid-2>" }
+        };
+        return hit && byId[hit] ? metadataResponse(byId[hit]!) : PREAMBLE + "{}";
+      }
+      return PREAMBLE + "{}";
+    };
+    const r = await runWatches(
+      {
+        watches: [
+          { watcherId: "w-alice", routeKey: "w-alice", query: "from:alice@x.com", sender: "alice@x.com" },
+          { watcherId: "w-triage", routeKey: "triage", query: "in:inbox" }
+        ],
+        state: { "w-alice": { cursor: "1000", seen: [] }, triage: { cursor: "1000", seen: [] } }
+      },
+      spawn
+    );
+    expect(r.kind).toBe("context");
+    expect(draftedIds(r.buckets!["w-alice"])).toEqual(["m1"]);
+    expect(draftedIds(r.buckets!["triage"])).toEqual(["m2"]);
   });
 });

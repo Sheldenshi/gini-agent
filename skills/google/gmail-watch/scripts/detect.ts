@@ -172,6 +172,15 @@ interface EmailMetadata {
   subject?: string;
   date?: string;
   snippet?: string;
+  // The RFC 5322 `Message-ID` header: STABLE across accounts (the same email
+  // delivered to two watched inboxes keeps this id but gets a DIFFERENT Gmail
+  // message id per account). Cross-account dedup keys on it so two account-scoped
+  // watches never both draft the one underlying email.
+  messageId?: string;
+  // The `To` header (raw, comma-separated). Used only for cross-account dedup
+  // precedence: the watch whose account address appears in To is the actual
+  // recipient and wins. Never emitted in the match item.
+  to?: string;
   // The extracted readable body, fetched ONLY for a surviving matched item right
   // before it's drafted (never on the metadata-only detection path). Rides into
   // the SAME untrusted match item the runner fences — it's a longer snippet, not
@@ -272,7 +281,7 @@ function buildGetArgs(messageId: string): string[] {
       userId: "me",
       id: messageId,
       format: "metadata",
-      metadataHeaders: ["From", "Subject", "Date"]
+      metadataHeaders: ["From", "Subject", "Date", "To", "Message-ID"]
     })
   ];
 }
@@ -302,7 +311,7 @@ function buildThreadGetArgs(threadId: string): string[] {
       userId: "me",
       id: threadId,
       format: "metadata",
-      metadataHeaders: ["From", "Subject", "Date"]
+      metadataHeaders: ["From", "Subject", "Date", "To", "Message-ID"]
     })
   ];
 }
@@ -404,6 +413,8 @@ function metadataFromDoc(doc: Record<string, unknown>, id: string): EmailMetadat
       if (key === "from") meta.from = value;
       else if (key === "subject") meta.subject = value;
       else if (key === "date") meta.date = value;
+      else if (key === "to") meta.to = value;
+      else if (key === "message-id") meta.messageId = value;
     }
   }
   return meta;
@@ -578,6 +589,11 @@ export function buildMatchItem(meta: EmailMetadata): ResultItem {
     // The containing thread, when known — the drafting turn reads the FULL
     // thread (the ground truth of the conversation), not just this message.
     ...(meta.threadId ? { threadId: meta.threadId } : {}),
+    // The RFC Message-ID + To header ride the item so the cross-watch pass in
+    // runWatches can dedup the same underlying email across accounts (Message-ID
+    // is stable across inboxes) and pick the To-recipient account as the drafter.
+    ...(meta.messageId ? { messageId: meta.messageId } : {}),
+    ...(meta.to ? { to: meta.to } : {}),
     snippet: meta.snippet ?? "",
     // The extracted email body, fetched for this surviving match — the drafting
     // turn drafts from it directly instead of re-fetching by a hand-typed id.
@@ -587,21 +603,35 @@ export function buildMatchItem(meta: EmailMetadata): ResultItem {
   return { text: `New email from ${from} — ${payload}`, untrusted: true };
 }
 
-// The Gmail message id embedded in a match item, for cross-watch precedence
-// dedup. Only untrusted match items carry the `{...,"id":...}` payload buildMatchItem
+// The dedup-relevant fields embedded in a match item, for cross-watch precedence.
+// Only untrusted match items carry the `{...,"id":...}` payload buildMatchItem
 // emits; trusted items (objective / backlog notice / follow-up) have none and
-// return undefined (they're never deduped — they're per-concern context, not mail).
-export function matchItemId(item: ResultItem): string | undefined {
-  if (!item.untrusted) return undefined;
+// return an empty object (they're never deduped — they're per-concern context,
+// not mail). `id` is the per-account Gmail message id (within-account dedup);
+// `messageId` is the RFC Message-ID stable across accounts (cross-account dedup);
+// `to` is the recipient header (precedence: the To-recipient account drafts).
+export function matchItemFields(item: ResultItem): { id?: string; messageId?: string; to?: string } {
+  if (!item.untrusted) return {};
   const start = item.text.indexOf("{");
-  if (start < 0) return undefined;
+  if (start < 0) return {};
   try {
     const doc = JSON.parse(item.text.slice(start));
-    const id = doc && typeof doc === "object" ? (doc as { id?: unknown }).id : undefined;
-    return typeof id === "string" ? id : undefined;
+    if (!doc || typeof doc !== "object") return {};
+    const d = doc as { id?: unknown; messageId?: unknown; to?: unknown };
+    return {
+      id: typeof d.id === "string" ? d.id : undefined,
+      messageId: typeof d.messageId === "string" ? d.messageId : undefined,
+      to: typeof d.to === "string" ? d.to : undefined
+    };
   } catch {
-    return undefined;
+    return {};
   }
+}
+
+// The Gmail message id embedded in a match item, for the within-account
+// targeted-vs-broad precedence dedup. Thin wrapper over matchItemFields.
+export function matchItemId(item: ResultItem): string | undefined {
+  return matchItemFields(item).id;
 }
 
 // The user's standing objective for a watch, as ONE TRUSTED item
@@ -1130,6 +1160,11 @@ export async function runWatches(args: DetectArgsMulti, gwsSpawn: GwsSpawn): Pro
   // watch is assigned; a broad watch's already-claimed matches are dropped.
   const ordered = [...watches].sort((a, b) => Number(isTargeted(b)) - Number(isTargeted(a)));
   const claimedIds = new Set<string>();
+  // The account identity per routeKey (the watch's resolved account, else its
+  // self-address) — the key the cross-account Message-ID dedup groups on so two
+  // watches on the SAME account aren't deduped against each other (within-account
+  // dedup by Gmail id already handles that) and the To-recipient account wins.
+  const accountByRoute = new Map<string, string | undefined>();
 
   for (const watch of ordered) {
     const routeKey = watchRouteKey(watch);
@@ -1176,6 +1211,9 @@ export async function runWatches(args: DetectArgsMulti, gwsSpawn: GwsSpawn): Pro
       continue;
     }
     stateOut[routeKey] = result.state;
+    // Record which account this route belongs to (resolved account, else the
+    // signed-in self-address) for the cross-account Message-ID dedup below.
+    accountByRoute.set(routeKey, (watch.account ?? auth.selfEmail)?.toLowerCase());
     if (result.kind === "context" && result.items) {
       // Precedence: a broad (non-targeted) watch drops match items already claimed
       // by a targeted watch this tick; a targeted watch claims its own. Trusted
@@ -1203,6 +1241,14 @@ export async function runWatches(args: DetectArgsMulti, gwsSpawn: GwsSpawn): Pro
     }
   }
 
+  // Cross-account thread dedup: the SAME underlying email delivered to two watched
+  // inboxes has different Gmail ids but the same RFC Message-ID, so two
+  // account-scoped watches would both draft → double reply. Collapse each shared
+  // Message-ID to ONE drafting watch; the losing watches already advanced their own
+  // cursor/seen over their copy (so they won't re-draft next tick), so dropping the
+  // item is all that's needed. Within-account dedup (above) is untouched.
+  dedupCrossAccountByMessageId(buckets, accountByRoute);
+
   const routeKeys = Object.keys(buckets);
   if (routeKeys.length === 0) {
     // Every bucket empty: a silent tick (zero idle turns). Surface any backlog
@@ -1211,6 +1257,71 @@ export async function runWatches(args: DetectArgsMulti, gwsSpawn: GwsSpawn): Pro
     return { kind: "shortCircuit", summary, state: stateOut };
   }
   return { kind: "context", buckets, state: stateOut };
+}
+
+// Whether the message's `To` header addresses the given account (case-insensitive
+// substring of the bare address into the raw To header — To can be a display-name
+// + comma-separated list, so an address-token containment is the robust check).
+function toRecipientIs(toHeader: string | undefined, account: string | undefined): boolean {
+  if (!toHeader || !account) return false;
+  return toHeader.toLowerCase().includes(account.toLowerCase());
+}
+
+// Across ALL buckets in the tick, dedup the same underlying email (same RFC
+// Message-ID, different per-account Gmail ids) so only ONE account-scoped watch
+// drafts it. Groups untrusted match items by Message-ID; a group spanning 2+
+// DISTINCT accounts is a cross-account duplicate. The winner is deterministic:
+// prefer the watch whose account is the message's To-recipient, then tie-break by
+// account email ascending, then routeKey ascending. Every other item with that
+// Message-ID is removed from its bucket (and a bucket left with no surviving match
+// is dropped). Mutates `buckets` in place. A Message-ID seen on only one account
+// (or absent) is left untouched, so single-account behavior is unchanged.
+function dedupCrossAccountByMessageId(
+  buckets: Record<string, ResultItem[]>,
+  accountByRoute: Map<string, string | undefined>
+): void {
+  // messageId -> the candidate items carrying it, each with its route + account.
+  interface Candidate { routeKey: string; account: string | undefined; to: string | undefined; item: ResultItem }
+  const groups = new Map<string, Candidate[]>();
+  for (const [routeKey, items] of Object.entries(buckets)) {
+    const account = accountByRoute.get(routeKey);
+    for (const item of items) {
+      const { messageId, to } = matchItemFields(item);
+      if (!messageId) continue;
+      const list = groups.get(messageId) ?? [];
+      list.push({ routeKey, account, to, item });
+      groups.set(messageId, list);
+    }
+  }
+
+  // The items to drop: the losers of every cross-account-duplicate group.
+  const losers = new Set<ResultItem>();
+  for (const candidates of groups.values()) {
+    const accounts = new Set(candidates.map((c) => c.account ?? ""));
+    // Only a Message-ID matched across 2+ DISTINCT accounts is a cross-account
+    // duplicate; a single account's copies are already within-account-deduped.
+    if (accounts.size < 2) continue;
+    const winner = [...candidates].sort((a, b) => {
+      const aTo = toRecipientIs(a.to, a.account);
+      const bTo = toRecipientIs(b.to, b.account);
+      if (aTo !== bTo) return aTo ? -1 : 1; // To-recipient account wins
+      const byAccount = (a.account ?? "").localeCompare(b.account ?? "");
+      if (byAccount !== 0) return byAccount; // account email ascending
+      return a.routeKey.localeCompare(b.routeKey); // then routeKey ascending
+    })[0]!;
+    for (const c of candidates) {
+      if (c.item !== winner.item) losers.add(c.item);
+    }
+  }
+  if (losers.size === 0) return;
+
+  for (const routeKey of Object.keys(buckets)) {
+    const kept = buckets[routeKey]!.filter((i) => !losers.has(i));
+    // A bucket reduced to no surviving MATCH spawns no worker — drop it (mirrors
+    // the within-account precedence rule that only opens a bucket on a real match).
+    if (kept.some((i) => i.untrusted)) buckets[routeKey] = kept;
+    else delete buckets[routeKey];
+  }
 }
 
 async function main(): Promise<void> {
