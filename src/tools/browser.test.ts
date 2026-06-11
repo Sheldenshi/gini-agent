@@ -916,7 +916,7 @@ describe("snapshot walker — hidden interactive elements", () => {
     }
   });
 
-  test("caps hidden entries at 50 and appends [...hidden truncated] marker", async () => {
+  test("caps hidden entries at 50 and appends counted [...hidden truncated] marker", async () => {
     const hiddenChildren: FakeEl[] = [];
     for (let i = 0; i < 100; i++) {
       // Each child is a hidden <button> — interactive but offsetParent-less
@@ -930,9 +930,11 @@ describe("snapshot walker — hidden interactive elements", () => {
       const result = await browserTest.snapshotForTest(page, false);
       const hiddenLines = result.text.split("\n").filter((line) => line.includes("[hidden]"));
       expect(hiddenLines.length).toBeLessThanOrEqual(50);
-      // We planted 100, so cap must have engaged.
+      // We planted 100, so cap must have engaged. The marker carries the
+      // omitted count (100 planted - 50 emitted) so the model can tell how
+      // much is left.
       expect(hiddenLines.length).toBe(50);
-      expect(result.text).toContain("[...hidden truncated]");
+      expect(result.text).toContain("[...hidden truncated +50 more hidden]");
     } finally {
       restore();
     }
@@ -1050,7 +1052,7 @@ describe("snapshot walker — cursor-interactive clickables", () => {
     }
   });
 
-  test("caps clickable emissions at 75 and appends [...clickable truncated] marker", async () => {
+  test("caps clickable emissions at 75 and appends counted [...clickable truncated] marker", async () => {
     const children: FakeEl[] = [];
     for (let i = 0; i < 80; i++) {
       // onclick (not cursor) so ancestor dedupe can't interfere with the count.
@@ -1062,7 +1064,46 @@ describe("snapshot walker — cursor-interactive clickables", () => {
       const result = await browserTest.snapshotForTest(makeFakePage(), false);
       const clickableLines = result.text.split("\n").filter((line) => line.includes(" clickable "));
       expect(clickableLines.length).toBe(75);
-      expect(result.text).toContain("[...clickable truncated]");
+      // Marker carries the omitted count (80 planted - 75 emitted).
+      expect(result.text).toContain("[...clickable truncated +5 more clickables]");
+    } finally {
+      restore();
+    }
+  });
+});
+
+// Char-budget truncation: when the assembled snapshot lines exceed
+// SNAPSHOT_CHAR_BUDGET, the [...truncated] marker carries the count of
+// entries that never made it into the text, so the model can weigh
+// scrolling on against stopping.
+describe("snapshot walker — char-budget truncation count", () => {
+  const makeEl = makeWalkerEl;
+  const installFakeDom = installWalkerDom;
+  const makeFakePage = (): import("playwright-core").Page =>
+    ({
+      evaluate: <A, R>(fn: (arg: A) => R | Promise<R>, arg?: A): Promise<R> => Promise.resolve(fn(arg as A)),
+      locator: (sel: string) => ({ __sel: sel } as unknown)
+    } as unknown as import("playwright-core").Page);
+
+  test("[...truncated] marker reports the omitted-entry count", async () => {
+    // 400 visible buttons with ~100-char names → ~110 chars per line,
+    // well past the 32k char budget, so the walker clips mid-list.
+    const children: WalkerFakeEl[] = [];
+    for (let i = 0; i < 400; i++) {
+      children.push(makeEl({ tagName: "BUTTON", textContent: `button-${i}-${"x".repeat(90)}` }));
+    }
+    const body = makeEl({ tagName: "BODY", children });
+    const restore = installFakeDom(body);
+    try {
+      const result = await browserTest.snapshotForTest(makeFakePage(), false);
+      expect(result.truncated).toBe(true);
+      const match = /\[\.\.\.truncated \+(\d+) more entries\]/.exec(result.text);
+      expect(match).not.toBeNull();
+      // Emitted lines + reported omitted count must account for every
+      // planted entry.
+      const emitted = result.text.split("\n").filter((line) => line.includes(" button ")).length;
+      expect(emitted).toBeGreaterThan(0);
+      expect(emitted + Number(match![1])).toBe(400);
     } finally {
       restore();
     }

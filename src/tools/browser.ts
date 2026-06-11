@@ -1689,15 +1689,19 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
     }
   }
   let text = lines.join("\n");
-  if (truncated) text += "\n[...truncated]";
+  // Each truncation marker carries the omitted count so the model gets a
+  // scroll-vs-stop signal (how much more is out there) instead of a bare
+  // "there was more". Every entry renders exactly one line, so the
+  // char-budget count is entries-not-emitted.
+  if (truncated) text += `\n[...truncated +${entries.length - lines.length} more entries]`;
   // Separate marker for hidden-budget truncation so the model can tell
   // "more interactive elements exist on the page, just hidden" apart
   // from "snapshot text was clipped at the char budget".
-  if (hiddenTotal > hiddenEmitted) text += "\n[...hidden truncated]";
+  if (hiddenTotal > hiddenEmitted) text += `\n[...hidden truncated +${hiddenTotal - hiddenEmitted} more hidden]`;
   // Same idea for the clickable cap: tells the model more cursor-detected
   // clickables exist beyond SNAPSHOT_CLICKABLE_BUDGET, distinct from
   // char-budget clipping.
-  if (clickableTotal > clickableEmitted) text += "\n[...clickable truncated]";
+  if (clickableTotal > clickableEmitted) text += `\n[...clickable truncated +${clickableTotal - clickableEmitted} more clickables]`;
   // Defense in depth: redact any literal occurrence of a known
   // data-gini-secret value from the assembled snapshot text. The
   // walker's element-local redaction only catches the stamped
