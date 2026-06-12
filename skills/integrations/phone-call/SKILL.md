@@ -83,6 +83,34 @@ skill_run({ skill: "phone-call", script: "analyze-call", args: {
 
 Use after `check-call` reports `completed: true` when you need structured answers instead of reading the transcript — e.g. "Did they confirm the reservation?" → `true`. Each question is a `[question, answerType]` pair (`"string"`, `"boolean"`, `"number"`); a bare string question defaults to `"string"`. Returns `{ ok, answers }` with one answer per question, in order. Each analysis costs Bland credits, so prefer the transcript/summary for simple cases.
 
+## Background watching
+
+The workflow above is synchronous — right for short errand calls where the user is waiting on the result. When the user doesn't want to wait, or the call may run long, hand the waiting to a scheduled job with a `call-watch` pre-run hook: the hook polls Bland with zero model turns while the call is in progress, and wakes the job's turn exactly once, when the call finishes.
+
+1. Place the call with `place-call` as usual and note the `callId`.
+2. Create the watcher job:
+
+```
+create_job({
+  name: "call-watch <callId>",
+  intervalSeconds: 30,
+  oneShot: false,        // must stay false — the silent in-progress ticks would auto-pause a one-shot job before the call finishes
+  timeoutSeconds: 120,
+  preRunHook: {
+    handlerId: "skill-script",
+    config: { skill: "phone-call", script: "call-watch", callId: "<callId>" }
+  },
+  prompt: "A phone call placed in the background has finished. The call result (status, summary, transcript) is in the fenced context items above — report the summary and the key transcript exchanges. Then find this job by name with list_jobs and delete_job it; the call is done and the watcher is no longer needed."
+})
+```
+
+3. Tell the user the call is underway and the result will arrive in the job's chat thread, then end your turn — do not poll with `check-call`.
+
+Notes:
+
+- The report lands in the job's own chat thread (scheduled jobs deliberately do not post into the main chat).
+- `call-watch` is the job's hook script, not for direct `skill_run` use. A failed call (never answered, rejected) also wakes the turn, so the user always hears the outcome.
+
 ## Writing a good task prompt
 
 The `task` is the agent's script for the whole conversation. Include the goal, context the callee will ask about, constraints, and fallbacks. Example:
