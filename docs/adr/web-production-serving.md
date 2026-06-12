@@ -34,12 +34,16 @@ Only the update and install flows ever **create** prod dirs:
 - `scripts/install.sh` runs the same build after installing web
   dependencies, so a fresh install serves production from first boot.
 
-Security constraint: `next start` defaults to binding `0.0.0.0`. Every prod
-exec passes `-H 127.0.0.1` — the BFF trusts a loopback `Host` for its
+Security constraint: `next start` *and* `next dev` both default to binding
+`0.0.0.0`. Every serving exec — both shim branches and both `webLaunchPlan`
+commands — passes `-H 127.0.0.1`: the BFF trusts a loopback `Host` for its
 owner-bearer injection (see [BFF Trust Boundary](bff-trust-boundary.md)),
-so an all-interfaces bind would hand owner access to any LAN peer. The dev
-path already binds loopback; the port comes from the `PORT` env (launchd
-plist) or `-p` (`gini start`), both of which `next start` honors.
+so an all-interfaces bind would hand owner access to any LAN peer.
+Existing installs heal automatically: the plist stamp hashes
+`ProgramArguments` (which embed the shim), so the startup reconcile
+re-stamps and reloads installed web plists with the loopback-binding shim.
+The port comes from the `PORT` env (launchd plist) or `-p` (`gini start`),
+which both modes honor.
 
 ## Context
 

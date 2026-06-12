@@ -402,8 +402,8 @@ describe("resolveLaunchSpec", () => {
     // could drive the web dev server while the gateway runs under a
     // different Bun.
     const shim = pair.web.programArguments[pair.web.programArguments.length - 1] ?? "";
-    expect(shim).toContain(`exec "/opt/bun/bin/bun" run dev`);
-    expect(shim).not.toMatch(/exec bun run dev$/m);
+    expect(shim).toContain(`exec "/opt/bun/bin/bun" run dev -- -H 127.0.0.1`);
+    expect(shim).not.toMatch(/exec bun run dev/m);
   });
 
   test("buildWebShim rejects bunPath with shell-special characters", async () => {
@@ -468,8 +468,9 @@ describe("resolveLaunchSpecPair", () => {
     expect(shim).toContain("/api/status");
     // Shim execs the resolved absolute bunPath (not bare `bun`) so a
     // shell-provided bun on the launchd PATH can't run a different
-    // binary than the gateway.
-    expect(shim).toContain(`exec "/opt/bun/bin/bun" run dev`);
+    // binary than the gateway — and binds loopback (`next dev` defaults
+    // to 0.0.0.0 like `next start`).
+    expect(shim).toContain(`exec "/opt/bun/bin/bun" run dev -- -H 127.0.0.1`);
     // Polls the gateway port file under the state root.
     expect(shim).toContain("instances/main/runtime.port");
   });
@@ -495,8 +496,9 @@ describe("resolveLaunchSpecPair", () => {
     // a loopback Host for owner-bearer injection.
     expect(shim).toContain(`export GINI_DIST_DIR=".next-prod-$sha"`);
     expect(shim).toContain(`exec "/opt/bun/bin/bun" run start -- -H 127.0.0.1`);
-    // Dev fallback survives as the unconditional last exec.
-    expect(shim.trimEnd().endsWith(`exec "/opt/bun/bin/bun" run dev`)).toBe(true);
+    // Dev fallback survives as the unconditional last exec — and it must
+    // bind loopback too (`next dev` also defaults to 0.0.0.0).
+    expect(shim.trimEnd().endsWith(`exec "/opt/bun/bin/bun" run dev -- -H 127.0.0.1`)).toBe(true);
   });
 
   test("gateway and web share the same workingDirectory", async () => {

@@ -574,19 +574,20 @@ function buildWebShim(instance: Instance, bunPath: string): string {
     // falls back to `next dev`, which always compiles the current source.
     // Mirrors webLaunchPlan in src/cli/process.ts; both paths must agree.
     //
-    // SECURITY: `-H 127.0.0.1` is mandatory on `next start` — it defaults
-    // to binding 0.0.0.0, and the BFF trusts a loopback Host for its
-    // owner-bearer injection (see the binding comment in
-    // src/cli/process.ts), so an all-interfaces bind would hand owner
-    // access to any LAN peer. The port comes from the plist's PORT env,
-    // which `next start` honors. GINI_DIST_DIR is exported to override the
-    // plist's dev dist dir (`.next-<instance>`) with the prod bundle.
+    // SECURITY: `-H 127.0.0.1` is mandatory on BOTH branches — `next
+    // start` and `next dev` alike default to binding 0.0.0.0, and the BFF
+    // trusts a loopback Host for its owner-bearer injection (see the
+    // binding comment in src/cli/process.ts), so an all-interfaces bind
+    // would hand owner access to any LAN peer. The port comes from the
+    // plist's PORT env, which both honor. GINI_DIST_DIR is exported on the
+    // prod branch to override the plist's dev dist dir (`.next-<instance>`)
+    // with the prod bundle.
     `sha=$(git rev-parse --short=12 HEAD 2>/dev/null || true)`,
     `if [ -n "$sha" ] && [ -f ".next-prod-$sha/BUILD_ID" ]; then`,
     `  export GINI_DIST_DIR=".next-prod-$sha"`,
     `  exec "${bunPath}" run start -- -H 127.0.0.1`,
     `fi`,
-    `exec "${bunPath}" run dev`
+    `exec "${bunPath}" run dev -- -H 127.0.0.1`
   ].join("\n");
 }
 
