@@ -18,13 +18,22 @@
 //   2. Probe the web (Next.js) child at /api/runtime/__healthz via
 //      isSupervisedWebChild (verifies service:"gini-web" + matching instance,
 //      so we don't mistake some other local process on the port for ours).
-//   3. If the runtime is dead/hung -> `launchctl kickstart -k` the gateway.
-//      KeepAlive should respawn it, but on macOS 26 launchd frequently defers
-//      the auto-respawn indefinitely; the explicit kickstart forces it.
-//   4. If web is dead/hung -> capture the web log tails, build + write a
-//      redacted crash report into the pending/ queue, THEN kickstart -k the web
-//      service. The report is offered to the user on the next restart and filed
-//      only on consent — the watchdog never files anything itself.
+//   3. If the runtime is dead/hung for TWO consecutive ticks -> `launchctl
+//      kickstart -k` the gateway. KeepAlive should respawn it, but on macOS 26
+//      launchd frequently defers the auto-respawn indefinitely; the explicit
+//      kickstart forces it.
+//   4. If web is dead/hung for TWO consecutive ticks -> capture the web log
+//      tails, build + write a redacted crash report into the pending/ queue,
+//      THEN kickstart -k the web service. The report is offered to the user on
+//      the next restart and filed only on consent — the watchdog never files
+//      anything itself.
+//
+// The two-strike rule exists because a single 2s-timeout probe can
+// false-negative a healthy-but-busy service: a post-update Next.js rebuild
+// pegs the CPU, the probe times out, and a first-tick `kickstart -k` (a
+// force-kill with no drain) kills the mid-compile web server — extending the
+// very outage the watchdog exists to shorten. `--once` keeps the threshold at
+// 1 so a single diagnostic tick can still revive.
 //
 // A tick never throws and the loop never exits on its own; exitCode stays 0 so
 // a `--once` run (or a killed loop) reads as a clean probe to launchd. Every
@@ -55,9 +64,20 @@ import {
 // localhost health endpoint while keeping the watchdog snappy.
 const PROBE_TIMEOUT_MS = 2000;
 // Steady-state pause between probe ticks. 10s bounds dead-gateway detection
-// latency (tick + 2s probe timeout keeps revival well under 30s) without
-// spinning the CPU on localhost probes.
+// latency without spinning the CPU on localhost probes. Reviving waits for
+// two consecutive failed ticks (REVIVE_FAILURE_THRESHOLD), so a genuinely
+// dead service is revived after roughly two ticks plus two probe timeouts
+// (~10s + 2*2s ≈ 14-24s depending on where in the interval it died) — still
+// under the 30s target — while a one-tick probe miss never hard-kills a
+// healthy-but-busy service.
 export const WATCHDOG_TICK_INTERVAL_MS = 10_000;
+// Consecutive failed ticks a service must accumulate before the loop revives
+// it (and, for web, queues the crash report). A single failed probe is not
+// proof of death: a CPU-pegged host can time out the 2s probe while the
+// service is healthy, and `kickstart -k` is a force-kill with no drain.
+// `--once` overrides this to 1 — a single diagnostic tick must still be able
+// to revive.
+const REVIVE_FAILURE_THRESHOLD = 2;
 // How many trailing lines of each web log to carry into the crash report.
 // Bounded so a long log doesn't bloat the report.
 const WEB_LOG_TAIL_LINES = 50;
@@ -183,7 +203,15 @@ export async function watchdog(ctx: CliContext, deps: WatchdogDeps = {}): Promis
   const clock = deps.clock ?? (() => new Date());
   const sleep = deps.sleep ?? defaultSleep;
   const intervalMs = deps.intervalMs ?? WATCHDOG_TICK_INTERVAL_MS;
-  const maxTicks = hasFlag(ctx.cliArgs, "--once") ? 1 : deps.maxTicks ?? Number.POSITIVE_INFINITY;
+  const once = hasFlag(ctx.cliArgs, "--once");
+  const maxTicks = once ? 1 : deps.maxTicks ?? Number.POSITIVE_INFINITY;
+  // Loop mode requires two consecutive failed ticks before reviving (see
+  // REVIVE_FAILURE_THRESHOLD); a `--once` run has exactly one tick, so it
+  // keeps the threshold at 1 to stay able to revive at all.
+  const reviveThreshold = once ? 1 : REVIVE_FAILURE_THRESHOLD;
+  // Per-service consecutive-failure streaks across ticks. Reset to 0 on any
+  // healthy probe so only an UNBROKEN run of failures reaches the threshold.
+  const failStreak: Record<"gateway" | "web", number> = { gateway: 0, web: 0 };
 
   // A kickstart shellout (or an injected one) that throws must not flip the
   // tick to a non-zero exit. Swallow it here — the next tick retries, and the
@@ -251,12 +279,19 @@ export async function watchdog(ctx: CliContext, deps: WatchdogDeps = {}): Promis
 
       const actions: string[] = [];
 
-      // Runtime dead/hung -> kickstart the gateway. KeepAlive should already
-      // respawn it, but macOS 26 frequently defers that; the explicit kick forces
-      // a stop+start. No crash report here: an in-process uncaughtException already
-      // queues a report via the runtime crash handler, and a hung-but-not-crashed
-      // runtime has no error to attribute.
-      if (!runtimeOk) {
+      // Advance/reset the streaks before deciding anything: a revive (and the
+      // web crash report below) only fires once a service has failed
+      // reviveThreshold consecutive ticks.
+      failStreak.gateway = runtimeOk ? 0 : failStreak.gateway + 1;
+      failStreak.web = webOk ? 0 : failStreak.web + 1;
+
+      // Runtime dead/hung past the threshold -> kickstart the gateway.
+      // KeepAlive should already respawn it, but macOS 26 frequently defers
+      // that; the explicit kick forces a stop+start. No crash report here: an
+      // in-process uncaughtException already queues a report via the runtime
+      // crash handler, and a hung-but-not-crashed runtime has no error to
+      // attribute.
+      if (failStreak.gateway >= reviveThreshold) {
         actions.push(await reviveService("gateway"));
       }
 
@@ -272,12 +307,15 @@ export async function watchdog(ctx: CliContext, deps: WatchdogDeps = {}): Promis
       // new episode and may queue a new report.
       if (webOk) webOutageReported = false;
 
-      // Web dead/hung -> build a crash report from the web log tails, queue it into
-      // pending/, then kickstart the web service. The web has no in-process crash
-      // handler (decision: web crash coverage is the watchdog), so this is the only
-      // place a web outage gets captured. The queued report is offered to the user
-      // on the next restart and filed only on consent — nothing is filed here.
-      if (!webOk) {
+      // Web dead/hung past the threshold -> build a crash report from the web
+      // log tails, queue it into pending/, then kickstart the web service. The
+      // web has no in-process crash handler (decision: web crash coverage is the
+      // watchdog), so this is the only place a web outage gets captured. The
+      // queued report is offered to the user on the next restart and filed only
+      // on consent — nothing is filed here. The report shares the two-strike
+      // gate with the revive: a one-tick probe miss is not an outage worth
+      // capturing.
+      if (failStreak.web >= reviveThreshold) {
         if (shouldReportWebCrash && !webOutageReported) {
           try {
             const logTail = [
@@ -310,7 +348,7 @@ export async function watchdog(ctx: CliContext, deps: WatchdogDeps = {}): Promis
 
       // Best-effort log line; a logging failure must not flip the tick's exit.
       try {
-        appendLog(instance, "watchdog.tick", { webOk, runtimeOk, webProbeFailed, shouldReportWebCrash, actions });
+        appendLog(instance, "watchdog.tick", { webOk, runtimeOk, webProbeFailed, shouldReportWebCrash, failStreak: { ...failStreak }, actions });
       } catch {
         // Logging is observability, not control flow — swallow.
       }

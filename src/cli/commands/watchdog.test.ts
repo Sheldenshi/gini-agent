@@ -10,11 +10,15 @@
 //   - missing port files -> treated as down (kickstart fired), no report, exit 0
 //   - a deregistered core service -> re-bootstrap (enable) instead of kickstart,
 //     only under launchd; a failed/throwing re-enable is swallowed, exit 0
-//   - loop mode: ticks are paced by the injectable sleep, recover mid-loop,
-//     and `--once` forces a single tick
+//   - loop mode: ticks are paced by the injectable sleep, revive requires TWO
+//     consecutive failed ticks (a one-tick probe miss never hard-kills a
+//     healthy-but-busy service), streaks reset on a healthy probe, and
+//     `--once` forces a single tick with the threshold back at 1
 //
 // Single-tick tests run via `--once` so the loop (the launchd default) never
-// spins; loop tests bound it with deps.maxTicks.
+// spins; loop tests bound it with deps.maxTicks. The `--once` single-tick
+// tests double as the threshold-1 pin: a down service is revived (and a web
+// report queued) on the one and only tick.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
@@ -354,9 +358,9 @@ describe("watchdog", () => {
     expect(process.exitCode).toBe(0);
   });
 
-  test("loop: a gateway that dies mid-loop is kickstarted on the tick that sees it, and the loop keeps going", async () => {
+  test("loop: a gateway dead for two consecutive ticks is kickstarted on the second, and the loop keeps going", async () => {
     writePorts();
-    const results = [true, false, true];
+    const results = [true, false, false, true];
     let probes = 0;
     const kicks: PlistKind[] = [];
     await watchdog(ctxFor([]), {
@@ -372,14 +376,74 @@ describe("watchdog", () => {
       },
       isLoadedImpl: () => true,
       supervisorImpl: () => "launchd",
-      maxTicks: 3,
+      maxTicks: 4,
       intervalMs: 7,
       sleep: async () => {}
     });
-    expect(probes).toBe(3);
-    // Exactly one revive: the dead tick kicked the gateway, the healthy
-    // ticks before and after did nothing.
+    expect(probes).toBe(4);
+    // Exactly one revive: the first dead tick only opened the streak, the
+    // second confirmed it and kicked the gateway, and the healthy ticks
+    // before and after did nothing.
     expect(kicks).toEqual(["gateway"]);
+    expect(process.exitCode).toBe(0);
+  });
+
+  test("loop: a single failed tick never revives (two-strike), and a recovery resets the streak", async () => {
+    writePorts();
+    // Failures never run back-to-back: each one is followed by a healthy
+    // probe that resets the streak, so the threshold of 2 is never reached.
+    const results = [false, true, false, true];
+    let probes = 0;
+    const kicks: PlistKind[] = [];
+    await watchdog(ctxFor([]), {
+      probeRuntime: async () => {
+        const result = results[probes] ?? true;
+        probes += 1;
+        return result;
+      },
+      probeWeb: async () => true,
+      kickstartImpl: (_instance, kind) => {
+        kicks.push(kind);
+        return okLaunchctl;
+      },
+      isLoadedImpl: () => true,
+      supervisorImpl: () => "launchd",
+      maxTicks: 4,
+      sleep: async () => {}
+    });
+    expect(probes).toBe(4);
+    expect(kicks).toEqual([]);
+    expect(process.exitCode).toBe(0);
+  });
+
+  test("loop: web crash report waits for the second consecutive failed tick too", async () => {
+    writePorts();
+    const webResults = [false, false];
+    let probes = 0;
+    const kicks: PlistKind[] = [];
+    let reportsAtFirstKick = -1;
+    await watchdog(ctxFor([]), {
+      probeRuntime: async () => true,
+      probeWeb: async () => {
+        const result = webResults[probes] ?? true;
+        probes += 1;
+        return result;
+      },
+      kickstartImpl: (_instance, kind) => {
+        if (kicks.length === 0) reportsAtFirstKick = listPendingReports().length;
+        kicks.push(kind);
+        return okLaunchctl;
+      },
+      isLoadedImpl: () => true,
+      supervisorImpl: () => "launchd",
+      maxTicks: 2,
+      sleep: async () => {}
+    });
+    // No report (and no kick) after tick 1; both fire together on tick 2 —
+    // the report is written just before the kick.
+    expect(kicks).toEqual(["web"]);
+    expect(reportsAtFirstKick).toBe(1);
+    expect(listPendingReports().length).toBe(1);
     expect(process.exitCode).toBe(0);
   });
 
@@ -530,8 +594,8 @@ describe("watchdog", () => {
 
   test("loop: a sustained web outage queues ONE report per episode, not one per tick", async () => {
     writePorts();
-    // Four ticks: down, down (same episode), recovered, down (new episode).
-    const webResults = [false, false, true, false];
+    // Seven ticks: down x3 (one episode), recovered, down x3 (new episode).
+    const webResults = [false, false, false, true, false, false, false];
     let probes = 0;
     await watchdog(ctxFor([]), {
       probeRuntime: async () => true,
@@ -543,12 +607,13 @@ describe("watchdog", () => {
       kickstartImpl: () => okLaunchctl,
       isLoadedImpl: () => true,
       supervisorImpl: () => "launchd",
-      maxTicks: 4,
+      maxTicks: 7,
       sleep: async () => {}
     });
-    expect(probes).toBe(4);
-    // Tick 1 reports, tick 2 is the same episode (suppressed), tick 3 clears
-    // the episode, tick 4 is a fresh outage and reports again.
+    expect(probes).toBe(7);
+    // Tick 2 (second consecutive failure) reports, tick 3 is the same episode
+    // (suppressed), tick 4 clears the episode, tick 6 confirms a fresh outage
+    // and reports again, tick 7 is suppressed.
     expect(listPendingReports().length).toBe(2);
     expect(process.exitCode).toBe(0);
   });
