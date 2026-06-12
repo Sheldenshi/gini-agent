@@ -1225,9 +1225,9 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
           cronTimezone: { type: ["string", "null"], description: "Optional new IANA timezone identifier (only valid with cronExpression). Pass null to clear (only legal when also clearing cronExpression)." },
           oneShot: { type: "boolean", description: "Optional. If true the job is auto-paused after its first run." },
           skillNames: {
-            type: "array",
+            type: ["array", "null"],
             items: { type: "string" },
-            description: "Optional new skill attachments (FULL replacement — supply every skill the job should keep; pass [] to clear). Attached skills' full instructions are loaded into every run, so each fire follows the skill's recipe instead of rediscovering CLI usage. Call list_jobs first to see the job's current skillNames."
+            description: "Optional new skill attachments (FULL replacement — supply every skill the job should keep; pass [] (or null) to clear). Attached skills' full instructions are loaded into every run, so each fire follows the skill's recipe instead of rediscovering CLI usage. Call list_jobs first to see the job's current skillNames."
           },
           status: { type: "string", enum: ["active", "paused"], description: "Optional pause/resume. 'paused' stops the scheduler from firing the job; 'active' resumes it." },
           autoApproveCommands: { type: "array", items: { type: "string" }, description: "Optional new list of auto-approve shell patterns for unattended fires." },

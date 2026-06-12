@@ -309,11 +309,13 @@ describe("buildToolCatalog", () => {
     expect(createProps.skillNames?.description).toContain("loaded into every run");
     expect(createProps.skillNames?.description).toContain("google-calendar + google-gmail");
     const updateTool = catalog.find((t) => t.function.name === "update_job");
-    const updateProps = updateTool?.function.parameters.properties as Record<string, { description?: string }>;
+    const updateProps = updateTool?.function.parameters.properties as Record<string, { type?: unknown; description?: string }>;
     expect(updateProps.skillNames).toBeDefined();
-    // update is full-replacement; [] clears.
+    // update is full-replacement; [] or null clears (updateJob treats null
+    // as clear), so the schema must admit null alongside array.
+    expect(updateProps.skillNames?.type).toEqual(["array", "null"]);
     expect(updateProps.skillNames?.description).toContain("FULL replacement");
-    expect(updateProps.skillNames?.description).toContain("[] to clear");
+    expect(updateProps.skillNames?.description).toContain("[] (or null) to clear");
   });
 
   test("set_provider's model-facing schema offers bedrock + awsRegion + azure routing; baseUrl is documented as ignored for anthropic/bedrock", () => {

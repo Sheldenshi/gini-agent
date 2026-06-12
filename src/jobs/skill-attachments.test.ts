@@ -1,6 +1,7 @@
 // Job skill attachments (ADR job-skill-attachments.md). Covers:
 //   - create/update validation: valid names persist; unknown/disabled names
-//     reject with the bad entry named; the 8-name cap; [] / null clear.
+//     reject with the bad entry named; the 8-name cap; duplicates dedupe;
+//     [] / null clear.
 //   - fire-time injection: the dispatched prompt carries the fenced skill
 //     block (single-turn AND routed fan-out paths), the spawned task is
 //     stamped with the resolved skill ids, and the inline trace is written.
@@ -136,6 +137,32 @@ describe("job skill attachments", () => {
         skillNames: []
       });
       expect(job.skillNames).toBeUndefined();
+    });
+
+    test("duplicate skill names persist deduped and inline once per unique name", async () => {
+      const config = buildConfig(workspaceRoot, "attach-create-dupe");
+      const provider = normalizeProvider(config.provider);
+      setEchoToolCallingResponse({ provider, text: "done", toolCalls: [], finishReason: "stop" });
+      const session = "session_attach_dupe";
+      await createSession(config, session);
+      await mutateState(config.instance, (state) => {
+        pushSkill(state, { name: "google-calendar", body: "calendar recipe" });
+      });
+      const job = await createScheduledJob(config, {
+        name: "dupes",
+        prompt: "go",
+        intervalSeconds: 60,
+        chatSessionId: session,
+        skillNames: ["google-calendar", "google-calendar"]
+      });
+      expect(job.skillNames).toEqual(["google-calendar"]);
+
+      await runJobNow(config, job.id, "manual");
+
+      const task = readState(config.instance).tasks.find((t) => t.jobId === job.id);
+      expect(task).toBeDefined();
+      const occurrences = task!.input.split('<skill name="google-calendar"').length - 1;
+      expect(occurrences).toBe(1);
     });
 
     test("an unknown skill name rejects, naming the bad entry", async () => {

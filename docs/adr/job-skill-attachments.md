@@ -41,8 +41,9 @@ The contract:
 - **Fire-time resilience: skip, never fail.** A skill that has gone
   missing/disabled/inactive (connector no longer healthy) between create and
   fire is **skipped with a per-task trace event naming it** — the fire
-  proceeds and the model can still `read_skill`. A stale attachment must
-  never kill a schedule.
+  proceeds without that skill's instructions (`read_skill` rejects
+  missing/disabled/inactive skills too, so the skip is final for the fire).
+  A stale attachment must never kill a schedule.
 - **Size cap.** Inlined bodies share a 32,000-character budget per fire. The
   overflowing skill is truncated with an in-prompt note pointing at
   `read_skill` for the full body, plus a trace warning.

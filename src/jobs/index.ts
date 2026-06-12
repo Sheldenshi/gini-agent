@@ -64,9 +64,11 @@ const MAX_JOB_SKILL_NAMES = 8;
 const MAX_INLINED_SKILL_CHARS = 32_000;
 
 // Shape validation for the skillNames field, shared by create and update.
-// Registry resolution happens separately inside the mutateState callback
-// (assertSkillNamesResolve) so it serializes with skill enable/disable
-// writes.
+// Duplicate names are dropped (first occurrence wins) before the cap is
+// enforced, so a repeated name can never inline a body twice or burn a cap
+// slot. Registry resolution happens separately inside the mutateState
+// callback (assertSkillNamesResolve) so it serializes with skill
+// enable/disable writes.
 function parseSkillNamesInput(value: unknown): string[] {
   if (!Array.isArray(value)) {
     throw new Error(`Invalid input: skillNames must be an array of strings (got ${typeof value})`);
@@ -76,7 +78,7 @@ function parseSkillNamesInput(value: unknown): string[] {
     if (typeof entry !== "string" || entry.length === 0) {
       throw new Error("Invalid input: skillNames entries must be non-empty strings");
     }
-    cleaned.push(entry);
+    if (!cleaned.includes(entry)) cleaned.push(entry);
   }
   if (cleaned.length > MAX_JOB_SKILL_NAMES) {
     throw new Error(`Invalid input: skillNames may list at most ${MAX_JOB_SKILL_NAMES} skills (got ${cleaned.length})`);
@@ -894,11 +896,14 @@ export async function runDueJobs(config: RuntimeConfig): Promise<void> {
 // jobs WITH attachments:
 //   - each name re-resolves with read_skill semantics (resolveEnabledSkill)
 //     plus the isSkillActive connector gate; a name that no longer resolves
-//     is SKIPPED — the fire proceeds and the model can still read_skill —
-//     and reported in `skipped` for the per-task trace.
+//     is SKIPPED — the fire proceeds without that skill's instructions
+//     (read_skill rejects missing/disabled/inactive skills too, so the skip
+//     is final for the fire) — and reported in `skipped` for the per-task
+//     trace.
 //   - inlined bodies share the MAX_INLINED_SKILL_CHARS budget; a skill that
 //     overflows it is truncated with an in-prompt note pointing at
-//     read_skill and reported in `truncated`.
+//     read_skill (valid here: a truncated skill is enabled and active) and
+//     reported in `truncated`.
 // See ADR job-skill-attachments.md.
 interface JobSkillAttachments {
   // The prompt block to inline, or undefined when every skill was skipped.
