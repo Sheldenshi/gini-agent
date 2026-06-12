@@ -5,7 +5,7 @@
 // flow is exercised end-to-end through a real chat turn, not here.
 
 import { describe, expect, test } from "bun:test";
-import { buildAnalyzeBody } from "../analyze-call";
+import { buildAnalyzeBody, isQuestionEntry } from "../analyze-call";
 
 describe("buildAnalyzeBody", () => {
   test("normalizes bare-string questions to [question, \"string\"] pairs", () => {
@@ -51,5 +51,17 @@ describe("buildAnalyzeBody", () => {
       questions: [["Q?", "string"]],
       goal: "Book a dinner reservation"
     });
+  });
+});
+
+describe("isQuestionEntry", () => {
+  test("accepts bare strings and [question, answerType] pairs", () => {
+    expect(["Who answered?", ["How many seats?", "number"]].every(isQuestionEntry)).toBe(true);
+  });
+
+  test("rejects entries that are neither strings nor string-headed arrays", () => {
+    expect(isQuestionEntry({})).toBe(false);
+    expect(isQuestionEntry(123)).toBe(false);
+    expect(isQuestionEntry([123, "string"])).toBe(false);
   });
 });

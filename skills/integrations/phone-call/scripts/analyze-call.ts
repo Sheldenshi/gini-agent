@@ -42,6 +42,11 @@ export function buildAnalyzeBody(args: Pick<Args, "goal" | "questions">): Record
   return body;
 }
 
+// A question entry is either a bare string or a [question, answerType] pair.
+export function isQuestionEntry(entry: unknown): entry is Question {
+  return typeof entry === "string" || (Array.isArray(entry) && typeof entry[0] === "string");
+}
+
 // ── Imperative shell ─────────────────────────────────────────────────────────
 
 async function readStdinJson<T>(): Promise<T> {
@@ -70,6 +75,9 @@ async function main(): Promise<void> {
   if (!args.callId) emit({ ok: false, error: "callId is required." }, 1);
   if (!Array.isArray(args.questions) || args.questions.length === 0) {
     emit({ ok: false, error: "questions must be a non-empty array." }, 1);
+  }
+  if (!args.questions.every(isQuestionEntry)) {
+    emit({ ok: false, error: "Each question must be a string or a [question, answerType] pair." }, 1);
   }
 
   const controller = new AbortController();
