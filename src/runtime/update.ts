@@ -142,8 +142,10 @@ export interface UpdateRuntimeOptions {
 // Two interleaved updates would race `git reset --hard` against each
 // other's bun installs / build and could leave a half-installed tree, so a
 // second caller is rejected with a stable message that the HTTP layer maps
-// to 409 (statusFromErrorMessage in src/http.ts). Module-level (process-
-// local): the gateway is the only process that serves concurrent updates.
+// to 409 (statusFromErrorMessage in src/http.ts). Module-level, so
+// process-local: it serializes the gateway's own update entry points but
+// not a concurrent CLI `gini update` from another process, which still
+// races against the same ~/.gini/runtime.
 let updateInFlight: Promise<GiniUpdateResult> | null = null;
 
 export function updateRuntime(runtimeDir = installedRuntimeDir(), options: UpdateRuntimeOptions = {}): Promise<GiniUpdateResult> {
