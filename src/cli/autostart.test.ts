@@ -452,7 +452,7 @@ describe("resolveLaunchSpecPair", () => {
     rmSync(home, { recursive: true, force: true });
   });
 
-  test("web spec is a sh -c shim that gates on /api/status before exec'ing bun run dev", async () => {
+  test("web spec is a sh -c shim that gates on /api/status before exec'ing Next.js", async () => {
     const { resolveLaunchSpecPair } = await import("./autostart");
     const pair = resolveLaunchSpecPair({
       instance: "main",
@@ -472,6 +472,31 @@ describe("resolveLaunchSpecPair", () => {
     expect(shim).toContain(`exec "/opt/bun/bin/bun" run dev`);
     // Polls the gateway port file under the state root.
     expect(shim).toContain("instances/main/runtime.port");
+  });
+
+  test("web shim serves the sha-keyed prod bundle on loopback, with dev fallback", async () => {
+    const { resolveLaunchSpecPair } = await import("./autostart");
+    const pair = resolveLaunchSpecPair({
+      instance: "main",
+      homeOverride: home,
+      bunPathOverride: "/opt/bun/bin/bun",
+      projectRootOverride: "/repo/gini",
+      cwdOverride: "/tmp/neutral",
+      readSecretsFile: () => null
+    });
+    const shim = pair.web.programArguments[2]!;
+    // The prod pick is keyed on the CURRENT checkout's short sha and gated on
+    // next build's completion marker, so a stale or aborted bundle can never
+    // be served.
+    expect(shim).toContain("git rev-parse --short=12 HEAD");
+    expect(shim).toContain(`[ -f ".next-prod-$sha/BUILD_ID" ]`);
+    // The prod branch must override the plist's dev dist dir and — SECURITY —
+    // pass -H 127.0.0.1: `next start` defaults to 0.0.0.0 and the BFF trusts
+    // a loopback Host for owner-bearer injection.
+    expect(shim).toContain(`export GINI_DIST_DIR=".next-prod-$sha"`);
+    expect(shim).toContain(`exec "/opt/bun/bin/bun" run start -- -H 127.0.0.1`);
+    // Dev fallback survives as the unconditional last exec.
+    expect(shim.trimEnd().endsWith(`exec "/opt/bun/bin/bun" run dev`)).toBe(true);
   });
 
   test("gateway and web share the same workingDirectory", async () => {

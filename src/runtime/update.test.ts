@@ -1,9 +1,16 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ChildProcess } from "node:child_process";
 import { spawnSync } from "node:child_process";
-import { currentVersionInfo, formatInstallFailure, scheduleRuntimeRestart } from "./update";
+import {
+  buildWebProdBundle,
+  currentVersionInfo,
+  formatInstallFailure,
+  resolveWebProdDistDir,
+  scheduleRuntimeRestart,
+  WEB_PROD_DIST_PREFIX
+} from "./update";
 
 function scratch(tag: string): string {
   const dir = `/tmp/gini-runtime-update-tests/${tag}-${process.pid}-${Math.floor(Math.random() * 1_000_000)}`;
@@ -69,6 +76,114 @@ describe("runtime update install failures", () => {
     const message = formatInstallFailure("bun install in web/", null);
 
     expect(message).toBe("gini update: bun install in web/ failed (exit null).");
+  });
+});
+
+// buildWebProdBundle / resolveWebProdDistDir: the sha-keyed production web
+// bundle lifecycle. The build subprocess is injected (no real `next build`);
+// the dist dirs and BUILD_ID markers are real files in a scratch runtime dir.
+describe("web production bundle", () => {
+  const SHA = "abc123def456";
+
+  function makeRuntimeDir(): string {
+    const dir = scratch("web-prod");
+    mkdirSync(join(dir, "web"), { recursive: true });
+    return dir;
+  }
+
+  function markBuilt(runtimeDir: string, distDir: string): void {
+    mkdirSync(join(runtimeDir, "web", distDir), { recursive: true });
+    writeFileSync(join(runtimeDir, "web", distDir, "BUILD_ID"), "build-id\n");
+  }
+
+  // Records build invocations; `status` controls the simulated exit code.
+  function makeBuildRecorder(status = 0) {
+    const calls: Array<{ cmd: string; args: string[]; cwd?: string; distDir?: string }> = [];
+    const spawnImpl = ((cmd: string, args: readonly string[], options: { cwd?: string; env?: Record<string, string> }) => {
+      calls.push({ cmd, args: [...args], cwd: options.cwd, distDir: options.env?.GINI_DIST_DIR });
+      return { status, stdout: "", stderr: status === 0 ? "" : "next build exploded" };
+    }) as unknown as typeof spawnSync;
+    return { calls, spawnImpl };
+  }
+
+  test("builds into the sha-keyed dist dir via bun run build", () => {
+    const runtimeDir = makeRuntimeDir();
+    const { calls, spawnImpl } = makeBuildRecorder();
+    const result = buildWebProdBundle(runtimeDir, SHA, "pipe", { spawnImpl });
+    expect(result).toEqual({ distDir: `${WEB_PROD_DIST_PREFIX}${SHA}`, built: true });
+    expect(calls.length).toBe(1);
+    expect(calls[0]!.cmd).toBe("bun");
+    expect(calls[0]!.args).toEqual(["run", "build"]);
+    expect(calls[0]!.cwd).toBe(join(runtimeDir, "web"));
+    expect(calls[0]!.distDir).toBe(`${WEB_PROD_DIST_PREFIX}${SHA}`);
+  });
+
+  test("skips the build when the sha dir already carries a BUILD_ID (idempotent re-update)", () => {
+    const runtimeDir = makeRuntimeDir();
+    markBuilt(runtimeDir, `${WEB_PROD_DIST_PREFIX}${SHA}`);
+    const { calls, spawnImpl } = makeBuildRecorder();
+    const result = buildWebProdBundle(runtimeDir, SHA, "pipe", { spawnImpl });
+    expect(result).toEqual({ distDir: `${WEB_PROD_DIST_PREFIX}${SHA}`, built: false });
+    expect(calls.length).toBe(0);
+  });
+
+  test("GCs other prod dist dirs on success, leaving the current bundle and dev dirs alone", () => {
+    const runtimeDir = makeRuntimeDir();
+    markBuilt(runtimeDir, `${WEB_PROD_DIST_PREFIX}${SHA}`);
+    markBuilt(runtimeDir, `${WEB_PROD_DIST_PREFIX}0ldsha0000000`);
+    // A dev dist dir must never be GC'd — it belongs to `next dev` fallback.
+    mkdirSync(join(runtimeDir, "web", ".next-default"), { recursive: true });
+    const { spawnImpl } = makeBuildRecorder();
+    buildWebProdBundle(runtimeDir, SHA, "pipe", { spawnImpl });
+    expect(existsSync(join(runtimeDir, "web", `${WEB_PROD_DIST_PREFIX}${SHA}`))).toBe(true);
+    expect(existsSync(join(runtimeDir, "web", `${WEB_PROD_DIST_PREFIX}0ldsha0000000`))).toBe(false);
+    expect(existsSync(join(runtimeDir, "web", ".next-default"))).toBe(true);
+  });
+
+  test("a failed build throws (so updateRuntime aborts before scheduling a restart) and GCs nothing", () => {
+    const runtimeDir = makeRuntimeDir();
+    markBuilt(runtimeDir, `${WEB_PROD_DIST_PREFIX}0ldsha0000000`);
+    const { spawnImpl } = makeBuildRecorder(1);
+    expect(() => buildWebProdBundle(runtimeDir, SHA, "pipe", { spawnImpl })).toThrow(/bun run build in web\/ failed/);
+    // The old (still-servable-by-the-old-process) bundle survives a failure.
+    expect(existsSync(join(runtimeDir, "web", `${WEB_PROD_DIST_PREFIX}0ldsha0000000`))).toBe(true);
+  });
+
+  // resolveWebProdDistDir reads the real `git rev-parse --short=12 HEAD`, so
+  // these tests commit into a scratch repo and key the dist dir off that sha.
+  function initRepoWithCommit(path: string): string {
+    initRepo(path, "https://github.com/Lilac-Labs/gini-agent");
+    spawnSync("git", [
+      "-C", path,
+      "-c", "user.email=test@example.invalid",
+      "-c", "user.name=test",
+      "commit", "--allow-empty", "-m", "init", "--quiet"
+    ]);
+    return spawnSync("git", ["-C", path, "rev-parse", "--short=12", "HEAD"], { encoding: "utf8" }).stdout.trim();
+  }
+
+  test("resolveWebProdDistDir returns the dir matching the current HEAD's short sha", () => {
+    const repo = scratch("resolve-hit");
+    const sha12 = initRepoWithCommit(repo);
+    markBuilt(repo, `${WEB_PROD_DIST_PREFIX}${sha12}`);
+    expect(resolveWebProdDistDir(repo)).toBe(`${WEB_PROD_DIST_PREFIX}${sha12}`);
+  });
+
+  test("resolveWebProdDistDir returns null without a BUILD_ID (aborted build must not be served)", () => {
+    const repo = scratch("resolve-no-marker");
+    const sha12 = initRepoWithCommit(repo);
+    mkdirSync(join(repo, "web", `${WEB_PROD_DIST_PREFIX}${sha12}`), { recursive: true });
+    expect(resolveWebProdDistDir(repo)).toBeNull();
+  });
+
+  test("resolveWebProdDistDir returns null when only a STALE-sha bundle exists or outside a git repo", () => {
+    const repo = scratch("resolve-stale");
+    initRepoWithCommit(repo);
+    markBuilt(repo, `${WEB_PROD_DIST_PREFIX}0ldsha0000000`);
+    expect(resolveWebProdDistDir(repo)).toBeNull();
+    // No .git at all (fresh tarball-style dir) -> dev fallback.
+    const plain = scratch("resolve-plain");
+    expect(resolveWebProdDistDir(plain)).toBeNull();
   });
 });
 

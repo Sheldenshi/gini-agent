@@ -299,9 +299,10 @@ export function resolveLaunchSpecPair(options: ResolveLaunchOptions): LaunchSpec
   // gateway port before starting Next.js. Without the gate, the web
   // process boots before the gateway, the BFF's first requests fail
   // (ECONNREFUSED), and the user sees a broken UI for the first ~5s
-  // after every login. The shim's `exec bun run dev …` collapses the
-  // shell into Next.js so the launchd-tracked PID is the dev server,
-  // not the wrapper.
+  // after every login. The shim's final `exec` (next start from the
+  // sha-keyed prod bundle when one matches the checkout, next dev
+  // otherwise — see buildWebShim) collapses the shell into Next.js so
+  // the launchd-tracked PID is the server, not the wrapper.
   //
   // Web env intentionally omits secretsEnv (see comment above the
   // gateway env block) — the BFF doesn't talk to providers.
@@ -324,7 +325,9 @@ export function resolveLaunchSpecPair(options: ResolveLaunchOptions): LaunchSpec
     // autostarted instances (e.g. `dev` and `main`) corrupt each
     // other's compile caches. Same slug rule as process.ts: only
     // [A-Za-z0-9_-] in the dist-dir path; anything else gets replaced
-    // with `_` because Next.js rejects non-relative paths.
+    // with `_` because Next.js rejects non-relative paths. This is the
+    // DEV-fallback dist dir: when the shim serves the sha-keyed production
+    // bundle it exports GINI_DIST_DIR=.next-prod-<sha> over this value.
     GINI_DIST_DIR: `.next-${options.instance.replace(/[^a-zA-Z0-9_-]/g, "_")}`
   };
   // sh -c arg vector. We exec `bun run dev` from the web/ subdir, after
@@ -478,13 +481,14 @@ function isGiniAgentCheckout(dir: string, fileExists: (path: string) => boolean)
   }
 }
 
-// Build the sh -c body that gates `bun run dev` on the gateway becoming
+// Build the sh -c body that gates the Next.js launch on the gateway becoming
 // healthy. Polls the runtime port file (written by src/server.ts on boot)
 // and then /api/status until it returns 200 OR a 60s budget elapses. We
 // poll the port file rather than guessing the port from instance hashing
-// because the runtime walks ports under contention. Final `exec bun run
-// dev` replaces the shell with Next.js so launchd tracks the dev server's
-// PID directly.
+// because the runtime walks ports under contention. The final exec — `bun
+// run start` from the sha-keyed production bundle when one matches the
+// current checkout, `bun run dev` otherwise (see step 4 below) — replaces
+// the shell with Next.js so launchd tracks the server's PID directly.
 //
 // HOME is set by launchd from EnvironmentVariables; we expand it inline so
 // the script doesn't depend on a parent process env. The instance dir
@@ -559,7 +563,29 @@ function buildWebShim(instance: Instance, bunPath: string): string {
     `mkdir -p "$instance_root" 2>/dev/null || true`,
     `echo $$ > "$instance_root/web.pid"`,
     `if [ -n "$PORT" ]; then echo "$PORT" > "$instance_root/web.port"; fi`,
-    // 4) Hand off to Next.js. exec so launchd tracks dev server PID.
+    // 4) Hand off to Next.js — production when a sha-keyed bundle exists,
+    // dev otherwise. exec so launchd tracks the server PID either way.
+    //
+    // The update/install flows build web/.next-prod-<sha12> (<sha12> =
+    // `git rev-parse --short=12 HEAD`); we serve `next start` from it iff
+    // it matches the CURRENT checkout and carries a BUILD_ID (next build's
+    // completion marker). Keying by sha makes a stale build impossible to
+    // serve — any non-matching checkout (worktree, fresh clone, moved HEAD)
+    // falls back to `next dev`, which always compiles the current source.
+    // Mirrors webLaunchPlan in src/cli/process.ts; both paths must agree.
+    //
+    // SECURITY: `-H 127.0.0.1` is mandatory on `next start` — it defaults
+    // to binding 0.0.0.0, and the BFF trusts a loopback Host for its
+    // owner-bearer injection (see the binding comment in
+    // src/cli/process.ts), so an all-interfaces bind would hand owner
+    // access to any LAN peer. The port comes from the plist's PORT env,
+    // which `next start` honors. GINI_DIST_DIR is exported to override the
+    // plist's dev dist dir (`.next-<instance>`) with the prod bundle.
+    `sha=$(git rev-parse --short=12 HEAD 2>/dev/null || true)`,
+    `if [ -n "$sha" ] && [ -f ".next-prod-$sha/BUILD_ID" ]; then`,
+    `  export GINI_DIST_DIR=".next-prod-$sha"`,
+    `  exec "${bunPath}" run start -- -H 127.0.0.1`,
+    `fi`,
     `exec "${bunPath}" run dev`
   ].join("\n");
 }
