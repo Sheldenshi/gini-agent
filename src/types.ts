@@ -1760,6 +1760,14 @@ export interface JobRecord {
   status: JobStatus;
   deliveryTargets: string[];
   context: string[];
+  // Skill attachments: names of enabled skills whose full bodies are inlined
+  // into every fire's dispatched prompt, so each run follows the skill's
+  // recipe deterministically instead of relying on the model calling
+  // read_skill. Validated at create/update time (every name must resolve to
+  // an enabled skill); a skill that has gone missing/disabled/inactive by
+  // fire time is skipped with a trace event — never fails the fire. See ADR
+  // job-skill-attachments.md.
+  skillNames?: string[];
   retryLimit: number;
   timeoutSeconds: number;
   costBudget?: number;
