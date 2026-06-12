@@ -2788,14 +2788,17 @@ describe("runtime api", () => {
     expect(after?.status).toBe("pending");
   });
 
-  test("POST /api/setup-requests/<id>/complete refuses fill_secret slot values shorter than 4 chars", async () => {
+  test("POST /api/setup-requests/<id>/complete refuses sub-floor password-kind slot values", async () => {
     // The snapshot post-redactor uses literal substring replacement;
     // single-character (and other very short) values would shred
     // structural tokens like [@e1] in snapshot text. The 4-char
     // floor in src/tools/browser.ts:recordFilledSecret keeps the
-    // redactor safe, and /connect refuses values below that floor
-    // so the registry-skip-for-short-values doesn't leak the
-    // value via subsequent unredacted tool results.
+    // redactor safe. For a password-kind slot a sub-floor value is
+    // both a near-certain typo AND an un-redactable leak risk, so
+    // /connect refuses it (the registry-skip-for-short-values would
+    // otherwise let the value escape via a later unredacted tool
+    // result). Non-password slots take the opposite path — see the
+    // short-PII test below.
     const config = testConfig("complete-fill-secret-too-short");
     const handler = createHandler(config);
     const { createTask, upsertTask, createSetupRequest } = await import("./state");
@@ -2812,7 +2815,7 @@ describe("runtime api", () => {
         reason: "Sign in",
         payload: {
           slots: [
-            { name: "pin", locator: "@e1", label: "PIN", kind: "number" }
+            { name: "pin", locator: "@e1", label: "PIN", kind: "password" }
           ],
           reason: "Sign in",
           toolCallId: "call_fill",
@@ -2842,6 +2845,73 @@ describe("runtime api", () => {
     expect(body.message).toContain("pin");
     const after = readState(config.instance).setupRequests.find((a) => a.id === approval.id);
     expect(after?.status).toBe("pending");
+  });
+
+  test("POST /api/setup-requests/<id>/complete accepts a sub-floor non-password (PII) slot value", async () => {
+    // fill_secret also collects identity/PII fields — a real call
+    // asks for date of birth + last name. Short last names ("Shi",
+    // "Ng", "Li") are valid and must fill. The redaction floor is a
+    // redactor-safety constraint, not an input-validation gate, so a
+    // text-kind slot below the floor is accepted and filled (it is
+    // simply not redaction-registered, which is fine for a non-
+    // credential). Pin the boundary so the floor never silently
+    // re-broadens to block PII again.
+    const config = testConfig("complete-fill-secret-short-pii");
+    const handler = createHandler(config);
+    const { createTask, upsertTask, createSetupRequest } = await import("./state");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "short PII test");
+      upsertTask(state, task);
+      return task.id;
+    });
+    const approval = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        taskId,
+        action: "browser.fill_secret",
+        target: "https://example.com",
+        reason: "Look up account",
+        payload: {
+          slots: [
+            { name: "lastname", locator: "@e43", label: "Last Name", kind: "text" }
+          ],
+          reason: "Look up account",
+          toolCallId: "call_fill",
+          approvedUrl: "https://example.com"
+        }
+      })
+    );
+    const filled: Array<{ locator: string; value: string }> = [];
+    const { __test: browserTest } = await import("./tools/browser");
+    browserTest.installFakeSessionWithPageForTest(taskId, {
+      url: () => "https://example.com",
+      close: () => Promise.resolve(),
+      // browserFillByLocator resolves an @-ref to a literal
+      // [data-gini-ref] selector, then calls page.locator(sel).fill().
+      locator: (selector: string) => ({
+        fill: (value: string) => {
+          filled.push({ locator: selector, value });
+          return Promise.resolve();
+        },
+        evaluate: () => Promise.resolve()
+      })
+    } as unknown as Partial<import("playwright-core").Page>);
+    const response = await rawCall(
+      handler,
+      config,
+      `/api/setup-requests/${approval.id}/complete`,
+      {
+        method: "POST",
+        body: JSON.stringify({ secrets: { lastname: "Shi" } })
+      },
+      config.token
+    );
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.ok).toBe(true);
+    expect(body.filledSlots).toEqual(["lastname"]);
+    expect(filled).toEqual([{ locator: '[data-gini-ref="e43"]', value: "Shi" }]);
+    const after = readState(config.instance).setupRequests.find((a) => a.id === approval.id);
+    expect(after?.status).toBe("completed");
   });
 
   test("POST /api/setup-requests/<id>/complete: distinct 409 when live session exists but page navigated to a different origin", async () => {
