@@ -118,7 +118,7 @@ ngrok http <gateway-port>                              # random https://<id>.ngr
 ngrok http <gateway-port> --url https://you.ngrok.app  # reserved domain (paid)
 ```
 
-The agent prints the public URL; add exactly that origin to `GINI_TRUSTED_ORIGINS` and restart the gateway. With a random URL you must update the variable every time the agent restarts — a reserved domain avoids the churn.
+The agent prints the public URL; add exactly that origin to `GINI_TRUSTED_ORIGINS` and restart the gateway. With a random URL you must update the variable every time the agent restarts — a reserved domain avoids the churn. On the free tier, a browser's first visit hits a one-time ngrok interstitial ("You are about to visit …") before reaching Gini — click Visit Site; non-browser clients can suppress it by sending a `ngrok-skip-browser-warning` request header.
 
 Confirm at the ngrok layer (the agent's console shows the live URL and each request) and end-to-end with the same `404 → 302 /pair` probe as above.
 
