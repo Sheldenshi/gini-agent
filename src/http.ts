@@ -2716,7 +2716,8 @@ function pairingClaimAllowed(request: Request): boolean {
 // names), so their ABSENCE is a reliable "not a browser" signal — an XSS on the
 // /pair page can therefore never coax the token into the body. We also require
 // an explicit opt-in header (so a pre-Sec-Fetch browser that merely lacks the
-// headers is still excluded) and a trusted front (relay/loopback). This single
+// headers is still excluded) and a trusted front (relay, loopback, or a
+// runtime-managed tunnel's connected host). This single
 // gate authorises BOTH the no-Origin CSRF exemption on the POST device routes
 // AND the in-body bind secret / session token — keeping the browser flow
 // (cookie-only, no body token) byte-for-byte unchanged. See ADR

@@ -2154,6 +2154,37 @@ describe("spawnUrlChild", () => {
     }
   });
 
+  test("a discovery-phase kill escalates to SIGKILL for a TERM-trapping agent", async () => {
+    // ngrok/cloudflared bring the remote tunnel up BEFORE printing the URL
+    // line — a TERM-trapping agent killed during discovery may already be
+    // forwarding, so the discovery failure path must escalate like stop().
+    const prev = process.env.GINI_TUNNEL_KILL_ESCALATION_MS;
+    process.env.GINI_TUNNEL_KILL_ESCALATION_MS = "5";
+    try {
+      const out = new TransformStream<Uint8Array, Uint8Array>();
+      const exited = Promise.withResolvers<number>();
+      const signals: (number | undefined)[] = [];
+      const proc: SpawnedTunnelProc = {
+        stdout: out.readable,
+        stderr: null,
+        exited: exited.promise,
+        kill: (signal?: number) => {
+          signals.push(signal);
+          if (signal === 9) exited.resolve(137);
+        }
+      };
+      // The agent never prints a URL: the discovery timeout kills it, and
+      // the TERM-trapping process must still die via the escalation.
+      await expect(spawnUrlChild(() => proc, ["agent"], /never-matches/, 10)).rejects.toThrow(/did not report a public URL/);
+      for (let i = 0; signals.length < 2 && i < 1000; i += 1) await Bun.sleep(1);
+      expect(signals).toEqual([undefined, 9]);
+      expect(await exited.promise).toBe(137);
+    } finally {
+      if (prev === undefined) delete process.env.GINI_TUNNEL_KILL_ESCALATION_MS;
+      else process.env.GINI_TUNNEL_KILL_ESCALATION_MS = prev;
+    }
+  });
+
   test("the default spawn wrapper drives a real process end to end", async () => {
     const pending = spawnUrlChild(
       defaultTunnelProcSpawn,
@@ -2409,6 +2440,26 @@ describe("makeDefaultDrivers", () => {
       credentialsFile: undefined,
       hostname: "a.example"
     });
+  });
+
+  test("parseCloudflareConfig handles quoted YAML scalars and rejects quote residue", () => {
+    // The file is hand-authored: quoted scalars are ordinary YAML. The quotes
+    // must not leak into the id (silent quick-tunnel fallback) or the
+    // hostname (a published https://"host" whose trust entry never matches
+    // the real edge Host).
+    expect(
+      parseCloudflareConfig('tunnel: "abc-123"\ncredentials-file: "/cred dir/abc-123.json"\ningress:\n  - hostname: \'a.example\'\n    service: x')
+    ).toEqual({
+      id: "abc-123",
+      credentialsFile: "/cred dir/abc-123.json",
+      hostname: "a.example"
+    });
+    // Mismatched quotes keep their residue and must fail the shape checks
+    // (quick-tunnel fallback), never connect with a garbage URL.
+    expect(parseCloudflareConfig('tunnel: "abc-123\'\ningress:\n  - hostname: a.example\n    service: x')).toBeNull();
+    expect(parseCloudflareConfig("tunnel: abc-123\ningress:\n  - hostname: \"a.example'\n    service: x")).toBeNull();
+    // A wildcard ingress hostname stays valid.
+    expect(parseCloudflareConfig("tunnel: abc-123\ningress:\n  - hostname: '*.example.com'\n    service: x")?.hostname).toBe("*.example.com");
   });
 
   test("cloudflared: a config without credentials-file defaults to ~/.cloudflared/<id>.json", async () => {

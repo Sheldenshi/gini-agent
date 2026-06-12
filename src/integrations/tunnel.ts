@@ -139,12 +139,29 @@ export interface NamedCloudflareTunnel {
   hostname: string;
 }
 
+// Strip one layer of MATCHED surrounding quotes: the file is hand-authored
+// and YAML allows `tunnel: "id"`. Capturing the quotes into the value would
+// silently fall back to a quick tunnel (quoted id fails the shape check) or
+// publish `https://"host"` — a connected record whose trust entry never
+// matches the real edge Host. Mismatched quotes are left in place so the
+// shape checks below reject the value.
+function unquoteYamlScalar(value: string | undefined): string | undefined {
+  if (!value) return value;
+  const match = /^"(.*)"$|^'(.*)'$/.exec(value);
+  return match ? (match[1] ?? match[2]) : value;
+}
+
 export function parseCloudflareConfig(body: string | null): NamedCloudflareTunnel | null {
   if (!body) return null;
-  const id = /^tunnel:\s*([A-Za-z0-9-]+)\s*$/m.exec(body)?.[1];
-  const credentialsFile = /^credentials-file:\s*(\S+)\s*$/m.exec(body)?.[1];
-  const hostname = /^\s*-\s*hostname:\s*(\S+)\s*$/m.exec(body)?.[1];
-  if (!id || !hostname) return null;
+  const id = unquoteYamlScalar(/^tunnel:\s*(\S+)\s*$/m.exec(body)?.[1]);
+  const credentialsFile = unquoteYamlScalar(/^credentials-file:\s*(.+?)\s*$/m.exec(body)?.[1]);
+  const hostname = unquoteYamlScalar(/^\s*-\s*hostname:\s*(\S+)\s*$/m.exec(body)?.[1]);
+  // Shape checks AFTER unquoting: the id rides into cloudflared's argv and
+  // the hostname into the published https URL + origin trust, so anything
+  // that still carries quote/space residue must reject to the quick-tunnel
+  // fallback rather than connect with a URL that can never serve.
+  if (!id || !/^[A-Za-z0-9-]+$/.test(id)) return null;
+  if (!hostname || !/^[A-Za-z0-9*.-]+$/.test(hostname)) return null;
   return { id, credentialsFile, hostname };
 }
 
@@ -236,7 +253,25 @@ export async function spawnUrlChild(
   onSpawn?: (kill: () => void) => void
 ): Promise<ManualDriverResult> {
   const proc = spawn(argv);
-  onSpawn?.(() => proc.kill());
+  // TERM -> KILL escalation shared by EVERY kill path — the onSpawn cancel
+  // handle, the discovery-failure path below, and the returned child's
+  // stop(). ngrok/cloudflared bring the remote tunnel up BEFORE printing the
+  // URL line, so even a discovery-phase agent may already be forwarding; a
+  // stubborn one that traps TERM must not survive a cancel/shutdown/timeout.
+  // proc.exited (the process, not its pipes) is guaranteed to settle after
+  // the KILL, clearing the timer.
+  let killTimer: ReturnType<typeof setTimeout> | undefined;
+  const clearKillTimer = (): void => clearTimeout(killTimer);
+  const killProc = (): void => {
+    proc.kill();
+    // One escalation timer is enough — a second kill would only re-send the
+    // TERM the agent is already ignoring.
+    if (killTimer === undefined) {
+      killTimer = setTimeout(() => proc.kill(9), killEscalationMs());
+      void proc.exited.then(clearKillTimer);
+    }
+  };
+  onSpawn?.(killProc);
   const settled = Promise.withResolvers<string>();
   const tail: string[] = [];
 
@@ -291,19 +326,15 @@ export async function spawnUrlChild(
       url,
       child: {
         start: () => Promise.resolve(0),
-        // TERM -> KILL escalation: a stubborn agent that traps TERM must not
-        // survive a disconnect/cancel. proc.exited (the process, not its
-        // pipes) is guaranteed to settle after the KILL.
         stop: () => {
-          proc.kill();
-          const killTimer = setTimeout(() => proc.kill(9), killEscalationMs());
-          return proc.exited.finally(() => clearTimeout(killTimer));
+          killProc();
+          return proc.exited;
         },
         exited: proc.exited
       }
     };
   } catch (error) {
-    proc.kill();
+    killProc();
     throw error;
   } finally {
     clearTimeout(timer);
