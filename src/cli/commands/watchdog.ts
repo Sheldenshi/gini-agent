@@ -239,7 +239,9 @@ export async function watchdog(ctx: CliContext, deps: WatchdogDeps = {}): Promis
   // keeps the threshold at 1 to stay able to revive at all.
   const reviveThreshold = once ? 1 : REVIVE_FAILURE_THRESHOLD;
   // Per-service consecutive-failure streaks across ticks. Reset to 0 on any
-  // healthy probe so only an UNBROKEN run of failures reaches the threshold.
+  // healthy probe so only an UNBROKEN run of failures reaches the threshold,
+  // and after each revive so a sustained outage re-kicks every threshold
+  // ticks (giving the kicked service a boot window) rather than every tick.
   const failStreak: Record<"gateway" | "web", number> = { gateway: 0, web: 0 };
 
   // A kickstart shellout (or an injected one) that throws must not flip the
@@ -332,6 +334,12 @@ export async function watchdog(ctx: CliContext, deps: WatchdogDeps = {}): Promis
           actions.push("suppressed:update:gateway");
         } else {
           actions.push(await reviveService("gateway"));
+          // Reset the streak after a revive: the freshly kicked service needs
+          // a full threshold window to boot before it can be judged dead
+          // again. Without this, a recovering service that takes more than
+          // one tick to come up is re-`kickstart -k`'d every tick at streak
+          // 3, 4, ... — each kick restarting the very boot it's waiting for.
+          failStreak.gateway = 0;
         }
       }
 
@@ -387,6 +395,10 @@ export async function watchdog(ctx: CliContext, deps: WatchdogDeps = {}): Promis
             }
           }
           actions.push(await reviveService("web"));
+          // Same post-revive reset as the gateway above: give the kicked web
+          // service a full threshold window to boot instead of re-killing it
+          // every tick while it compiles/starts.
+          failStreak.web = 0;
         }
       }
 

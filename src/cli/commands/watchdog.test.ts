@@ -416,6 +416,64 @@ describe("watchdog", () => {
     expect(process.exitCode).toBe(0);
   });
 
+  test("loop: a sustained gateway outage re-kicks every threshold ticks, not every tick", async () => {
+    writePorts();
+    // The streak resets after each revive, so the kicked gateway gets a full
+    // threshold window to boot: kicks land on ticks 3 and 5, not 3-4-5
+    // (without the post-revive reset, streak 3/4/5 would re-kick every tick
+    // and keep restarting the very boot the watchdog is waiting for).
+    const results = [true, false, false, false, false];
+    let probes = 0;
+    const kicks: PlistKind[] = [];
+    await watchdog(ctxFor([]), {
+      probeRuntime: async () => {
+        const result = results[probes] ?? false;
+        probes += 1;
+        return result;
+      },
+      probeWeb: async () => true,
+      kickstartImpl: (_instance, kind) => {
+        kicks.push(kind);
+        return okLaunchctl;
+      },
+      isLoadedImpl: () => true,
+      supervisorImpl: () => "launchd",
+      maxTicks: 5,
+      sleep: async () => {}
+    });
+    expect(probes).toBe(5);
+    expect(kicks).toEqual(["gateway", "gateway"]);
+    expect(process.exitCode).toBe(0);
+  });
+
+  test("loop: the web streak resets after a revive too", async () => {
+    writePorts();
+    // Three consecutive web failures: tick 2 reaches the threshold (report +
+    // kick), the reset makes tick 3 streak 1 again — no second kick.
+    const webResults = [false, false, false];
+    let probes = 0;
+    const kicks: PlistKind[] = [];
+    await watchdog(ctxFor([]), {
+      probeRuntime: async () => true,
+      probeWeb: async () => {
+        const result = webResults[probes] ?? true;
+        probes += 1;
+        return result;
+      },
+      kickstartImpl: (_instance, kind) => {
+        kicks.push(kind);
+        return okLaunchctl;
+      },
+      isLoadedImpl: () => true,
+      supervisorImpl: () => "launchd",
+      maxTicks: 3,
+      sleep: async () => {}
+    });
+    expect(probes).toBe(3);
+    expect(kicks).toEqual(["web"]);
+    expect(process.exitCode).toBe(0);
+  });
+
   test("loop: web crash report waits for the second consecutive failed tick too", async () => {
     writePorts();
     const webResults = [false, false];

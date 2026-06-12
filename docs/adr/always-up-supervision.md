@@ -58,7 +58,10 @@ The model rests on four pieces:
   (`/api/runtime/__healthz`, verified to be *our* `gini-web` on the
   matching instance), and revives whichever has been down for **two
   consecutive ticks** (the loop keeps a per-service failure streak, reset
-  by any healthy probe; `--once` revives on its single tick). One failed
+  by any healthy probe AND after each revive — so a sustained outage
+  re-kicks every two ticks, giving the kicked service a boot window,
+  instead of re-killing it every tick; `--once` revives on its single
+  tick). One failed
   probe is not proof of death: the 2s probe timeout false-negatives a
   healthy service on a CPU-pegged host (observed live during a post-update
   rebuild), and a revive is a `kickstart -k` — a force-kill with no drain —
@@ -240,8 +243,10 @@ launchd instances so foreground/conductor/tmux runs are unaffected.
   the gateway down for two consecutive ticks it `kickstart -k`s the
   gateway; with web down for two consecutive ticks it `kickstart -k`s web
   (and queues a web crash report for consent-gated filing — see the crash
-  ADR). A single failed tick takes no action, and a healthy probe resets
-  the service's failure streak. With a fresh update-in-progress marker on
+  ADR). A single failed tick takes no action; a healthy probe resets the
+  service's failure streak, and so does each revive (a still-down service
+  is re-kicked every two ticks, never on consecutive ticks). With a fresh
+  update-in-progress marker on
   disk it takes no revive action regardless of streaks (logging
   `suppressed:update:<kind>` instead); a stale marker (>15 min) does not
   suppress. The loop paces itself at
