@@ -538,6 +538,36 @@ describe("isSkillActive with an externally satisfied credential", () => {
     const skill = newSkill({ requiredCredentials: ["google-workspace-oauth"] });
     expect(isSkillActive(state, skill)).toBe(false);
   });
+
+  test("a usable record satisfies the gate even when a disabled record shares the name", () => {
+    // Two records share the required name: an explicit operator-off and a
+    // configured + healthy one. Any usable record satisfies the credential
+    // before record-presence semantics are consulted, so the disabled
+    // sibling neither blocks activation nor matters to the hook (the
+    // registry is empty here — activation can only come from the usable
+    // record, not external satisfaction).
+    const state = createEmptyState("dev");
+    state.connectors = [
+      newConnector({
+        id: "id_off",
+        name: "google-workspace-oauth",
+        type: "oauth2",
+        provider: "google-oauth-desktop",
+        status: "disabled",
+        health: "healthy"
+      }),
+      newConnector({
+        id: "id_on",
+        name: "google-workspace-oauth",
+        type: "oauth2",
+        provider: "google-oauth-desktop",
+        status: "configured",
+        health: "healthy"
+      })
+    ];
+    const skill = newSkill({ requiredCredentials: ["google-workspace-oauth"] });
+    expect(isSkillActive(state, skill)).toBe(true);
+  });
 });
 
 describe("bindingsForCredentials", () => {

@@ -258,6 +258,12 @@ export interface ProviderDescriptor {
   // runtime gate with it: the fallthrough applies only when NO connector
   // record with the credential name exists — an existing record of any
   // status (including disabled) keeps the record-based gate.
+  // Mapping caveat: the web routes a required credential name to its
+  // provider via `credentialTemplate.name`, which exists only for modules
+  // declaring secret envBindings — while the runtime maps via
+  // canonicalCredentialName, where an explicit module `credentialName`
+  // suffices. A future hook-implementing provider must declare envBindings
+  // too, or this bit will never reach the activation pills.
   externallySatisfied?: boolean;
   probeIntervalMs?: number;
   // Defaults the Add Connector dialog prefills when this provider is picked
@@ -279,9 +285,12 @@ export function useProviders() {
     queryFn: () => api<ProviderDescriptor[]>("/connectors/providers"),
     // The registry itself is built at runtime startup, but the payload also
     // carries the live `externallySatisfied` bit (machine-global account
-    // registry), so cap staleness at the same 60s cadence the connectors
-    // query idles at.
-    staleTime: 60_000
+    // registry), so poll at the same 60s cadence the connectors query idles
+    // at. staleTime alone never refetches an idle page — without the
+    // interval, accounts added/removed out-of-band (e.g. from a chat-driven
+    // OAuth flow) would leave the activation pills stale indefinitely.
+    staleTime: 60_000,
+    refetchInterval: 60_000
   });
 }
 
