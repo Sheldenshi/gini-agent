@@ -88,7 +88,7 @@ All three manual tunnels follow the same recipe. The examples below use `<gatewa
 3. **Pair the device.** A browser arriving on a trusted non-loopback origin is redirected to `/pair` and must be approved once — from the loopback UI, or from the "Pair requests" panel of any **already-paired** session; see ADR [device-pairing-auth.md](adr/device-pairing-auth.md). A paired session is owner-equivalent (it can approve future pairing requests and mint pairing codes), so pair only devices you fully trust. Non-browser clients are never redirected to `/pair` — the native `/api/*` surface is bearer-gated instead, and the origin gate applies only to web-bound paths. A remote non-browser client should still pair: the mobile app runs the pairing handshake natively, and any other client can claim a pairing code against the tunnel origin — mint the code on the host (`gini pairing`), then from the remote device:
 
    ```bash
-   curl -X POST https://<origin>/api/pairing/claim \
+   curl -X POST <origin>/api/pairing/claim \
      -H "content-type: application/json" \
      -d '{"code":"<code>","deviceName":"my laptop"}'
    ```
