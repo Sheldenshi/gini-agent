@@ -89,7 +89,7 @@ describe("TunnelSelectionPanel", () => {
 
   test("non-selected rows render a disabled Connect button", () => {
     renderPanel();
-    const tailscaleConnect = within(row("Tailscale")).getByRole("button", { name: "Connect" });
+    const tailscaleConnect = screen.getByRole("button", { name: "Connect Tailscale" });
     expect((tailscaleConnect as HTMLButtonElement).disabled).toBe(true);
   });
 
@@ -148,9 +148,10 @@ describe("TunnelSelectionPanel", () => {
   test("idle + selected: clicking the row's Connect routes onConnect with the id", async () => {
     const user = userEvent.setup();
     renderPanel();
-    await user.click(within(row("Gini Relay")).getByRole("button", { name: "Connect" }));
+    await user.click(screen.getByRole("button", { name: "Connect Gini Relay" }));
     expect(handlers.onConnect).toHaveBeenCalledWith("gini-relay");
-    // The Connect click stops propagation, so the row's onClick must not fire.
+    // The action cluster sits beside the radio, not inside it — clicking
+    // Connect must not also select.
     expect(handlers.onSelect).not.toHaveBeenCalled();
   });
 
@@ -158,10 +159,9 @@ describe("TunnelSelectionPanel", () => {
     const user = userEvent.setup();
     renderPanel({ status: "connecting" });
     expect(screen.queryByText("Connecting...")).not.toBeNull();
-    const cancel = within(row("Gini Relay")).getByRole("button", { name: "Cancel" });
+    const cancel = screen.getByRole("button", { name: "Cancel Gini Relay connect" });
     await user.click(cancel);
     expect(handlers.onCancel).toHaveBeenCalledTimes(1);
-    // stopPropagation means the row select does not fire.
     expect(handlers.onSelect).not.toHaveBeenCalled();
   });
 
@@ -177,12 +177,10 @@ describe("TunnelSelectionPanel", () => {
   test("connected: the selected row shows Disconnect (not Connect) and routes onDisconnect", async () => {
     const user = userEvent.setup();
     renderPanel({ status: "connected", url: "https://g31.example" });
-    const giniRow = row("Gini Relay");
-    expect(within(giniRow).queryByRole("button", { name: "Connect" })).toBeNull();
-    const disconnect = within(giniRow).getByRole("button", { name: "Disconnect" });
+    expect(screen.queryByRole("button", { name: "Connect Gini Relay" })).toBeNull();
+    const disconnect = screen.getByRole("button", { name: "Disconnect Gini Relay" });
     await user.click(disconnect);
     expect(handlers.onDisconnect).toHaveBeenCalledTimes(1);
-    // stopPropagation means the row select does not fire.
     expect(handlers.onSelect).not.toHaveBeenCalled();
   });
 
@@ -220,36 +218,43 @@ describe("TunnelSelectionPanel", () => {
     expect(screen.queryByRole("button", { name: "Remote Access" })).not.toBeNull();
   });
 
-  test("a disabled row's info toggle reveals its setup steps (sibling of the row, so it stays interactive)", async () => {
+  test("a disabled row's (i) opens that provider's details sheet (the trigger stays interactive)", async () => {
     const user = userEvent.setup();
     renderPanel();
     expect(screen.queryByText("Set up Tailscale")).toBeNull();
     const toggle = screen.getByRole("button", { name: "Tailscale setup instructions" });
-    // The toggle must NOT live inside the aria-disabled row — AT and real
-    // pointer semantics treat descendants of a disabled widget as inert.
+    // The trigger sits in the row's action cluster, NEXT TO Connect, but must
+    // NOT live inside the aria-disabled radio — AT and real pointer semantics
+    // treat descendants of a disabled widget as inert.
     expect(toggle.closest('[aria-disabled="true"]')).toBeNull();
+    expect(toggle.getAttribute("aria-haspopup")).toBe("dialog");
     await user.click(toggle);
-    expect(screen.queryByText("Set up Tailscale")).not.toBeNull();
-    expect(screen.queryByText("Install Tailscale")).not.toBeNull();
-    expect(screen.queryByText("tailscale up")).not.toBeNull();
-    expect(screen.queryByText(/availability is re-checked/)).not.toBeNull();
-    // The toggle must not select the (disabled) row.
+    // A full slide-over sheet, scoped to this one provider.
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).queryByText("Set up Tailscale")).not.toBeNull();
+    expect(within(dialog).queryByText(/requires Tailscale network/)).not.toBeNull();
+    expect(within(dialog).queryByText("Install Tailscale")).not.toBeNull();
+    expect(within(dialog).queryByText("tailscale up")).not.toBeNull();
+    expect(within(dialog).queryByText(/availability is re-checked/)).not.toBeNull();
+    // Scoped: no other provider's steps leak into the sheet.
+    expect(within(dialog).queryByText("Install ngrok")).toBeNull();
+    // Opening details must not select the (disabled) row.
     expect(handlers.onSelect).not.toHaveBeenCalled();
   });
 
-  test("only one provider's setup fold is open at a time; toggling again closes it", async () => {
+  test("closing the sheet and opening another provider's swaps the details", async () => {
     const user = userEvent.setup();
     renderPanel();
     await user.click(screen.getByRole("button", { name: "Tailscale setup instructions" }));
     expect(screen.queryByText("Set up Tailscale")).not.toBeNull();
-    await user.click(screen.getByRole("button", { name: "ngrok setup instructions" }));
+    await user.keyboard("{Escape}");
     expect(screen.queryByText("Set up Tailscale")).toBeNull();
-    expect(screen.queryByText("Set up ngrok")).not.toBeNull();
     await user.click(screen.getByRole("button", { name: "ngrok setup instructions" }));
-    expect(screen.queryByText("Set up ngrok")).toBeNull();
+    expect(screen.queryByText("Set up ngrok")).not.toBeNull();
+    expect(screen.queryByText("Set up Tailscale")).toBeNull();
   });
 
-  test("an ENABLED provider's setup fold uses the 'how this works' heading and omits the re-check hint", async () => {
+  test("an ENABLED provider's details sheet uses the 'how this works' heading and omits the re-check hint", async () => {
     const user = userEvent.setup();
     render(
       <TunnelSelectionPanel

@@ -118,7 +118,7 @@ describe("TunnelMenu", () => {
     await user.click(screen.getByRole("button", { name: "Edit selection" }));
     expect(screen.queryByText("Choose how Gini is exposed")).not.toBeNull();
     // The selected provider's row shows Disconnect (not Connect) while connected.
-    expect(screen.queryByRole("button", { name: "Disconnect" })).not.toBeNull();
+    expect(screen.queryByRole("button", { name: "Disconnect Gini Relay" })).not.toBeNull();
     expect(actions.disconnect).not.toHaveBeenCalled();
   });
 
@@ -128,7 +128,7 @@ describe("TunnelMenu", () => {
     render(<TunnelMenu />);
     await open(user, "Tunnel connected");
     await user.click(screen.getByRole("button", { name: "Edit selection" }));
-    await user.click(screen.getByRole("button", { name: "Disconnect" }));
+    await user.click(screen.getByRole("button", { name: "Disconnect Gini Relay" }));
     expect(actions.disconnect).toHaveBeenCalledTimes(1);
   });
 
@@ -185,7 +185,7 @@ describe("TunnelMenu", () => {
     render(<TunnelMenu />);
     await open(user, "Open tunnel");
     await user.click(screen.getByText("Gini Relay"));
-    await user.click(screen.getAllByRole("button", { name: "Connect" })[0]);
+    await user.click(screen.getByRole("button", { name: "Connect Gini Relay" }));
     expect(actions.select).toHaveBeenCalledWith("gini-relay");
     expect(actions.connect).toHaveBeenCalled();
   });
