@@ -4,13 +4,13 @@ import { useState } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
-import { RiskPill, StatusPill } from "@/components/StatusPill";
+import { StatusPill } from "@/components/StatusPill";
 import { api } from "@/lib/api";
 import { useAuthorizations, useInvalidate } from "@/lib/queries";
 import type { Authorization, AuthorizationRequestedBlock } from "@runtime/types";
 
 // Agent-actor gate: the user approves or denies; the runtime performs the
-// side effect. Renders with a risk pill and Approve/Deny buttons. See
+// side effect. Renders with Approve/Deny buttons. See
 // docs/adr/authorization-vs-setup-request.md.
 export function BlockAuthorizationRequested({ block }: { block: AuthorizationRequestedBlock }) {
   const invalidate = useInvalidate();
@@ -37,7 +37,6 @@ export function BlockAuthorizationRequested({ block }: { block: AuthorizationReq
     <div className={cardClass}>
       <div className="flex flex-wrap items-center gap-2">
         <span className="font-mono text-xs text-foreground">{block.action}</span>
-        <RiskPill value={block.risk} />
         {!isPending && authorization ? <StatusPill value={authorization.status} /> : null}
         <button
           type="button"
