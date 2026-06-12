@@ -6,16 +6,20 @@ import { TailscaleLogo, NgrokLogo, CloudflareLogo } from "./tunnel-logos";
 import { PROVIDER_DOC_URLS } from "./provider-docs";
 import type { TunnelProviderId } from "./types";
 
-const GUIDES: Array<{
-  id: TunnelProviderId;
-  name: string;
-  Icon: React.ComponentType<{ className?: string; "aria-hidden"?: boolean }>;
-}> = [
-  { id: "gini-relay", name: "Gini Relay", Icon: Globe },
-  { id: "tailscale", name: "Tailscale", Icon: TailscaleLogo },
-  { id: "ngrok", name: "ngrok", Icon: NgrokLogo },
-  { id: "cloudflare", name: "Cloudflare", Icon: CloudflareLogo }
-];
+const GUIDE_META: Record<
+  TunnelProviderId,
+  { name: string; Icon: React.ComponentType<{ className?: string; "aria-hidden"?: boolean }> }
+> = {
+  "gini-relay": { name: "Gini Relay", Icon: Globe },
+  tailscale: { name: "Tailscale", Icon: TailscaleLogo },
+  ngrok: { name: "ngrok", Icon: NgrokLogo },
+  cloudflare: { name: "Cloudflare", Icon: CloudflareLogo }
+};
+
+// Derived from the exhaustive record so a new provider id fails compilation
+// here (like PROVIDER_DOC_URLS / PROVIDER_ICON) instead of silently missing
+// from the footer grid.
+const GUIDES = (Object.keys(GUIDE_META) as TunnelProviderId[]).map((id) => ({ id, ...GUIDE_META[id] }));
 
 // Per-provider remote-access guides for the sidebar footer: each entry opens
 // ONLY that provider's guide (docs/remote-access/<id>.md) in a slide-over —

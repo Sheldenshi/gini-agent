@@ -102,10 +102,6 @@ import { completeBrowserConnectSetup, connectBrowser, disconnectBrowser, getBrow
 import { hermesParityChecks } from "./runtime/parity";
 import { acknowledgeNotification, checkRelay, configureRelay, listRelays, queueNotification, sendQueuedNotifications } from "./integrations/relay";
 import { cancelTunnel, connectTunnel, disconnectTunnel, getTunnel, PROVIDER_UNAVAILABLE, refreshProviderDetection, selectProvider } from "./integrations/tunnel";
-
-// Error codes deliberately published in error bodies (see the route-table
-// catch). Everything else stays message-only.
-const PUBLIC_ERROR_CODES = new Set<string>([PROVIDER_UNAVAILABLE]);
 import { isLoopbackHost, isRelayHost, isRuntimeTunnelHost, webBoundRequestAllowed } from "./lib/origin-trust";
 import { cookieValue, serializeCookie } from "./lib/cookies";
 import { RateLimiter } from "./lib/rate-limit";
@@ -128,6 +124,10 @@ import { clearWebTargetCache, resolveWebPort } from "./web-target";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import { homedir } from "node:os";
 import type { Server, ServerWebSocket } from "bun";
+
+// Error codes deliberately published in error bodies (see the route-table
+// catch). Everything else stays message-only.
+const PUBLIC_ERROR_CODES = new Set<string>([PROVIDER_UNAVAILABLE]);
 
 type Handler = (request: Request, params: Record<string, string>) => Response | Promise<Response>;
 
