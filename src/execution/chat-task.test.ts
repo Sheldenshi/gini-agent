@@ -5,6 +5,13 @@
 //   - one tool call → result fed back → final answer
 //   - approval-gated tool call → task pauses with toolCallState
 //   - resume after approval → task completes
+//
+// HOME is pointed at a unique mkdtemp dir per test (same pattern as
+// src/state/google-accounts.test.ts): the loop reads the machine-global
+// Google account registry (buildConnectedAccountsBlock(readGoogleAccounts())
+// in the system prompt; isSkillActive via credentialExternallySatisfied), so
+// a developer machine with registered accounts would otherwise shift the
+// system-prompt size and skill activity these tests depend on.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -60,6 +67,31 @@ import {
   renderMessagesForCompaction
 } from "./chat-task";
 import type { EffectiveContext } from "./effective-context";
+
+let scratchHome: string;
+let prevHome: string | undefined;
+let prevEmbedding: string | undefined;
+
+beforeEach(() => {
+  scratchHome = mkdtempSync(join(tmpdir(), "gini-chat-task-home-"));
+  prevHome = process.env.HOME;
+  process.env.HOME = scratchHome;
+  // Pin embeddings to echo: the local provider is unavailable under bun
+  // test, and the fallback chain otherwise picks the openai provider on
+  // machines with ~/.codex/auth.json (resolved via os.homedir(), which
+  // ignores the HOME override above) — turning every memory embed in the
+  // loop into a real network call.
+  prevEmbedding = process.env.GINI_EMBEDDING_PROVIDER;
+  process.env.GINI_EMBEDDING_PROVIDER = "echo";
+});
+
+afterEach(() => {
+  if (prevHome === undefined) delete process.env.HOME;
+  else process.env.HOME = prevHome;
+  if (prevEmbedding === undefined) delete process.env.GINI_EMBEDDING_PROVIDER;
+  else process.env.GINI_EMBEDDING_PROVIDER = prevEmbedding;
+  rmSync(scratchHome, { recursive: true, force: true });
+});
 
 function buildConfig(workspaceRoot: string, instance: string, opts: Partial<RuntimeConfig> = {}): RuntimeConfig {
   return {
@@ -4202,7 +4234,7 @@ describe("chat-task loop", () => {
 
   // In-turn compaction happy path. Token geometry under the echo provider
   // (32k window, high-water 27,200): the always-on tool schemas + system
-  // prompt occupy ~13.8k tokens, so six ~2.4k-token read_skill results cross
+  // prompt occupy ~15.4k tokens, so six ~2.2k-token read_skill results cross
   // the high-water mark before the 7th call — and pruning can't help (all
   // six results sit inside the elision layer's protected-recent window). The
   // loop must summarize the middle exchanges via ONE aux call, splice in the
@@ -4218,7 +4250,7 @@ describe("chat-task loop", () => {
     });
 
     for (let i = 0; i < 7; i++) {
-      await seedBulkSkill(config, `bulk-skill-${i}`, `BODY-${i} ${"x".repeat(9_600)}`);
+      await seedBulkSkill(config, `bulk-skill-${i}`, `BODY-${i} ${"x".repeat(8_600)}`);
       setEchoToolCallingResponse({
         provider,
         text: "",
@@ -4351,7 +4383,7 @@ describe("chat-task loop", () => {
     // Exchange 0 is the protected head, exchanges 1–2 the summarizable
     // middle, exchanges 3–4 the protected tail.
     const bodies = [
-      `BODY-0 ${"x".repeat(9_600)}`,
+      `BODY-0 ${"x".repeat(8_000)}`,
       `BODY-1 ${"x".repeat(4_000)}`,
       `BODY-2 ${"x".repeat(4_000)}`,
       `BODY-3 ${"x".repeat(19_000)}`,
@@ -4402,7 +4434,7 @@ describe("chat-task loop", () => {
     // Same geometry as the happy path (compaction fires before call 7) plus
     // a 7th huge read that immediately refills the reclaimed space.
     for (let i = 0; i < 7; i++) {
-      const chars = i === 6 ? 36_000 : 9_600;
+      const chars = i === 6 ? 36_000 : 8_600;
       await seedBulkSkill(config, `bulk-skill-${i}`, `BODY-${i} ${"x".repeat(chars)}`);
       setEchoToolCallingResponse({
         provider,
@@ -4450,12 +4482,12 @@ describe("chat-task loop", () => {
         finishReason: "tool_calls"
       });
     };
-    // Twelve ~2.4k-token reads. The high-water mark trips after every sixth
+    // Twelve ~2.2k-token reads. The high-water mark trips after every sixth
     // accumulated full result, so compactions land at iterations 7 and 10 —
     // three iterations apart, wide enough that the refill guard stays quiet
     // — and the third trigger at iteration 13 hits the cap.
     for (let i = 0; i < 12; i++) {
-      await seedBulkSkill(config, `bulk-skill-${i}`, `BODY-${i} ${"x".repeat(9_600)}`);
+      await seedBulkSkill(config, `bulk-skill-${i}`, `BODY-${i} ${"x".repeat(8_600)}`);
       queueRead(i);
     }
     setEchoAuxTextResponse({ text: "SUMMARY-ONE" });
@@ -4499,7 +4531,7 @@ describe("chat-task loop", () => {
     });
 
     for (let i = 0; i < 7; i++) {
-      await seedBulkSkill(config, `bulk-skill-${i}`, `BODY-${i} ${"x".repeat(9_600)}`);
+      await seedBulkSkill(config, `bulk-skill-${i}`, `BODY-${i} ${"x".repeat(8_600)}`);
       setEchoToolCallingResponse({
         provider,
         text: "",
