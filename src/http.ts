@@ -1846,7 +1846,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     // row without a runtime restart; plain polling GETs never spawn detection.
     ["GET", /^\/api\/tunnel$/, async (request) => {
       if (new URL(request.url).searchParams.get("detect") === "1") {
-        await refreshProviderDetection().catch(() => {});
+        await refreshProviderDetection(true).catch(() => {});
       }
       return json(getTunnel(config));
     }],

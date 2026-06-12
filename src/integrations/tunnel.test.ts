@@ -1502,6 +1502,67 @@ describe("manual tunnel drivers", () => {
     expect(isRuntimeTunnelHost("machine.tail-test.ts.net")).toBe(false);
   });
 
+  test("connecting DIRECTLY to a different provider tears down the old childless manual front", async () => {
+    const tailscale = scriptedDriver();
+    const ngrok = scriptedDriver({
+      connect: () => Promise.resolve({ url: "https://xy.ngrok-free.app", child: fakeChild() })
+    });
+    setTunnelDeps(deps({ drivers: fakeDrivers({ tailscale, ngrok }) }));
+    await connectTunnel(config, "tailscale");
+    await awaitTunnelSettled(config.instance);
+    expect(getTunnel(config).status).toBe("connected");
+    // No selectProvider step — the explicit-provider connect path must run
+    // the old provider's teardown itself, or serve keeps running while the
+    // record describes ngrok.
+    await connectTunnel(config, "ngrok");
+    await awaitTunnelSettled(config.instance);
+    expect(tailscale.disconnects).toBe(1);
+    expect(getTunnel(config)).toMatchObject({ selectedProvider: "ngrok", status: "connected" });
+    expect(isRuntimeTunnelHost("machine.tail-test.ts.net")).toBe(false);
+  });
+
+  test("switching away from an ERROR-state manual provider still cleans its provider-side state", async () => {
+    // A partial connect (serve up, then failure) leaves an error record with
+    // provider-side state live — the switch teardown must include it.
+    const tailscale = scriptedDriver({ connect: () => Promise.reject(new Error("dns lookup failed")) });
+    setTunnelDeps(deps({ drivers: fakeDrivers({ tailscale }) }));
+    await connectTunnel(config, "tailscale");
+    await awaitTunnelSettled(config.instance);
+    expect(getTunnel(config).status).toBe("error");
+    await selectProvider(config, "gini-relay");
+    expect(tailscale.disconnects).toBe(1);
+  });
+
+  test("a selection write never clobbers a connect that landed during its teardown await", async () => {
+    const disconnectGate = Promise.withResolvers<void>();
+    const tailscale = scriptedDriver({ disconnect: () => disconnectGate.promise });
+    setTunnelDeps(deps({ drivers: fakeDrivers({ tailscale }) }));
+    await connectTunnel(config, "tailscale");
+    await awaitTunnelSettled(config.instance);
+    // The switch to gini-relay parks on the old provider's disconnect; a new
+    // tailscale connect lands and publishes during that await. The selection's
+    // idle write must yield to the live record (the later user action wins).
+    const switching = selectProvider(config, "gini-relay");
+    await connectTunnel(config, "tailscale");
+    await awaitTunnelSettled(config.instance);
+    expect(getTunnel(config).status).toBe("connected");
+    disconnectGate.resolve();
+    await switching;
+    expect(getTunnel(config)).toMatchObject({ selectedProvider: "tailscale", status: "connected" });
+  });
+
+  test("an explicit detect refresh bypasses the TTL; plain refreshes stay cached", async () => {
+    const tailscale = scriptedDriver();
+    setTunnelDeps(deps({ drivers: fakeDrivers({ tailscale }) }));
+    await refreshProviderDetection();
+    expect(tailscale.detects).toBe(1);
+    // Within the TTL a plain refresh is a cache hit, but the explicit
+    // panel-open/CLI path re-probes — the (i) fold promises availability is
+    // re-checked each time the panel opens.
+    await refreshProviderDetection(true);
+    expect(tailscale.detects).toBe(2);
+  });
+
   test("disconnect while idle never runs provider-side teardown (protects a pre-existing serve config)", async () => {
     const tailscale = scriptedDriver();
     setTunnelDeps(deps({ drivers: fakeDrivers({ tailscale }) }));
@@ -1738,10 +1799,16 @@ describe("spawnUrlChild", () => {
       /url=(\S+)/,
       5_000
     );
-    const result = await pending;
-    expect(result.url).toBe("https://real.example.test");
-    // stop() kills the real child and resolves with its exit code.
-    await result.child!.stop();
+    let child: TunnelChild | undefined;
+    try {
+      const result = await pending;
+      child = result.child;
+      expect(result.url).toBe("https://real.example.test");
+    } finally {
+      // stop() kills the real child even when an assertion threw, so a failed
+      // run can't leave the `sleep 30` process behind.
+      await child?.stop();
+    }
   });
 });
 
@@ -1858,8 +1925,9 @@ describe("makeDefaultDrivers", () => {
 
       const cfPending = drivers.cloudflare.connect(7342);
       // The cloudflare connect awaits the config read before spawning — poll
-      // for the spawn instead of assuming it happened synchronously.
-      while (procs.length < 2) await Bun.sleep(1);
+      // for the spawn (bounded; the assertion below fails loudly on timeout).
+      for (let i = 0; procs.length < 2 && i < 1000; i += 1) await Bun.sleep(1);
+      expect(procs.length).toBe(2);
       procs[1]!.emitErr("INF |  https://ab-cd.trycloudflare.com  |");
       expect((await cfPending).url).toBe("https://ab-cd.trycloudflare.com");
       expect(spawned[1]).toEqual(["cloudflared", "--config", "/dev/null", "tunnel", "--url", "http://127.0.0.1:7342"]);
@@ -1890,7 +1958,8 @@ describe("makeDefaultDrivers", () => {
       };
       const drivers = makeDefaultDrivers(runScript({}).run, spawn, async () => CONFIG);
       const pending = drivers.cloudflare.connect(7342);
-      while (procs.length < 1) await Bun.sleep(1);
+      for (let i = 0; procs.length < 1 && i < 1000; i += 1) await Bun.sleep(1);
+      expect(procs.length).toBe(1);
       procs[0]!.emitErr("2026-06-12T00:00:00Z INF Registered tunnel connection connIndex=0");
       const result = await pending;
       // The stable named-tunnel hostname (SSE-capable), NOT a trycloudflare URL.
@@ -1911,7 +1980,9 @@ describe("makeDefaultDrivers", () => {
   test("defaultReadCloudflareConfig returns text when readable and null otherwise", async () => {
     const prevHome = process.env.HOME;
     try {
-      // A HOME with no ~/.cloudflared -> null.
+      // A HOME with no ~/.cloudflared -> null. Clear it first: a leftover dir
+      // from a prior run must not turn this into the readable case.
+      rmSync("/tmp/gini-no-cloudflared-home", { recursive: true, force: true });
       process.env.HOME = "/tmp/gini-no-cloudflared-home";
       expect(await defaultReadCloudflareConfig()).toBeNull();
       // A HOME with a config.yml -> its text.

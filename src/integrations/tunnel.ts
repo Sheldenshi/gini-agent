@@ -586,6 +586,13 @@ function teardown(instance: Instance): void {
 // registry is cleared first, so each child's exit watcher sees its entry is gone
 // and writes no spurious "error" record during shutdown. Best-effort and awaited
 // so the drain can wait on a clean teardown.
+//
+// NOTE: a connected CHILDLESS tunnel (tailscale serve) is deliberately NOT
+// torn down here — serve persisting in tailscaled across a runtime restart is
+// what makes the boot resume seamless (the same ts.net URL keeps answering
+// while the gateway restarts), mirroring how frpc relay state outlives a
+// non-graceful exit. The reconcile resumes or settles the record on the next
+// boot; an operator who wants the front gone disconnects before stopping.
 export async function stopAllTunnels(): Promise<void> {
   const entries = [...supervisors.values()];
   supervisors.clear();
@@ -629,10 +636,12 @@ export function isManualProviderId(id: string): id is ManualProviderId {
 
 // Probe every manual driver and update the availability cache. Concurrent
 // callers share one in-flight probe; results within the TTL are reused so a
-// panel-open burst doesn't stack subprocess spawns. A driver that throws stays
-// at its default-disabled entry.
-export function refreshProviderDetection(): Promise<void> {
-  if (Date.now() - detectionAt < DETECTION_TTL_MS) return Promise.resolve();
+// polling burst doesn't stack subprocess spawns. `force` (the explicit
+// `?detect=1` panel-open / CLI-status path) bypasses the TTL — the panel
+// promises "availability is re-checked each time it opens" — but still
+// shares an in-flight probe. A driver that throws stays default-disabled.
+export function refreshProviderDetection(force = false): Promise<void> {
+  if (!force && Date.now() - detectionAt < DETECTION_TTL_MS) return Promise.resolve();
   if (detectionInFlight) return detectionInFlight;
   detectionInFlight = (async () => {
     const next = defaultDetection();
@@ -745,19 +754,22 @@ export async function selectProvider(config: RuntimeConfig, provider: string): P
   }
   // Switching providers drops to "idle", so stop any live child / pending login
   // first — otherwise the old tunnel would keep running while the record reads
-  // idle (an orphaned child). No-op when nothing is live.
+  // idle (an orphaned child). No-op when nothing is live. Capture the entry
+  // being torn down so the idle write below can detect a connect that claims
+  // the instance during the teardown awaits.
+  const torndown = supervisors.get(config.instance);
   teardown(config.instance);
   // A live MANUAL tunnel may have provider-side state that outlives any child
   // of ours (tailscale serve persists in tailscaled) — tear that down too, or
-  // the old front would keep serving while the record reads idle. Best-effort
-  // and idempotent. Claim the provider-side epoch first: if a concurrent
-  // connect publishes while this disconnect is in flight, the epoch moves and
-  // we skip the (now stale) teardown rather than yanking the new front.
+  // the old front would keep serving while the record reads idle. `error`
+  // counts as live: a partial connect can leave provider-side state up.
+  // Best-effort and idempotent; the epoch bump invalidates any stale deferred
+  // teardown still in flight from a superseded run.
   if (
     current &&
     current.selectedProvider &&
     current.selectedProvider !== entry.id &&
-    (current.status === "connected" || current.status === "connecting") &&
+    current.status !== "idle" &&
     isManualProviderId(current.selectedProvider)
   ) {
     bumpProviderSideEpoch(config.instance);
@@ -768,6 +780,11 @@ export async function selectProvider(config: RuntimeConfig, provider: string): P
     }
   }
   return mutateState(config.instance, (state) => {
+    // A connect claimed the instance during the teardown awaits — leave its
+    // live record intact; the user's later action (the connect) wins over
+    // this earlier-started selection write.
+    const live = supervisors.get(config.instance);
+    if (live && live !== torndown) return toState(state.tunnel ?? null);
     applyTunnel(state, {
       ...(state.tunnel ?? {}),
       selectedProvider: entry.id,
@@ -810,6 +827,29 @@ export async function connectTunnel(config: RuntimeConfig, provider?: string): P
   }
   if (!entry.enabled) {
     throw new Error(`Tunnel provider ${entry.name} is not available${entry.requires ? ` (requires ${entry.requires})` : ""}.`);
+  }
+
+  // Connecting DIRECTLY to a different provider (the explicit-provider path —
+  // no selectProvider step ran, so its switch teardown didn't either): a live
+  // OLD childless manual front must be torn down, or tailscale serve would
+  // keep serving while the record describes the new provider. `error` counts
+  // as live — a partial connect can leave provider-side state up. Best-effort,
+  // and awaited BEFORE the supervisor claim below so this connect stays the
+  // newest claim (last connect wins) when others interleave with the await.
+  const previous = readState(config.instance).tunnel;
+  if (
+    previous &&
+    previous.selectedProvider &&
+    previous.selectedProvider !== entry.id &&
+    previous.status !== "idle" &&
+    isManualProviderId(previous.selectedProvider)
+  ) {
+    bumpProviderSideEpoch(config.instance);
+    try {
+      await deps.drivers[previous.selectedProvider].disconnect?.();
+    } catch {
+      // never block the new connect on the old provider's teardown.
+    }
   }
 
   // Tear down any previous in-flight login / live child, then claim a fresh
