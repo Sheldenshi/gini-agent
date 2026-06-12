@@ -402,6 +402,155 @@ describe("cron lifecycle", () => {
     expect(audit?.actor).toBe("agent");
   });
 
+  test("create_job dispatch with deliverTo \"chat\" binds the job to the originating session", async () => {
+    const config = testConfig("jobs-create-tool-deliverto-chat");
+    const { taskId, sessionId } = await mutateState(config.instance, (state) => {
+      state.chatSessions.unshift({
+        id: "session_deliverto_chat",
+        instance: state.instance,
+        title: "Test chat",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        messageIds: [],
+        taskIds: [],
+        runIds: []
+      });
+      const at = new Date().toISOString();
+      state.runs.unshift({
+        id: "run_deliverto_chat",
+        instance: state.instance,
+        kind: "conversation_turn",
+        status: "running",
+        title: "test",
+        input: "test",
+        createdAt: at,
+        updatedAt: at,
+        conversationId: "session_deliverto_chat",
+        planStepIds: [],
+        childRunIds: [],
+        approvalIds: []
+      });
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, "run_deliverto_chat");
+      upsertTask(state, task);
+      return { taskId: task.id, sessionId: "session_deliverto_chat" };
+    });
+
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "create_job",
+      "call_create_job_deliverto_chat",
+      JSON.stringify({ name: "in-chat-reminder", intervalSeconds: 120, prompt: "Remind me.", oneShot: true, deliverTo: "chat" })
+    );
+    expect(result.kind).toBe("sync");
+
+    const stateAfter = readState(config.instance);
+    expect(stateAfter.jobs).toHaveLength(1);
+    // The job delivers into the ORIGINATING conversation — no dedicated
+    // channel session is minted.
+    expect(stateAfter.jobs[0]?.chatSessionId).toBe(sessionId);
+    expect(stateAfter.chatSessions).toHaveLength(1);
+    // The originating session stays a normal chat: no kind/title mutation.
+    const session = stateAfter.chatSessions[0]!;
+    expect(session.kind).toBeUndefined();
+    expect(session.title).toBe("Test chat");
+  });
+
+  test("create_job dispatch with explicit deliverTo \"channel\" still mints a dedicated chat session", async () => {
+    const config = testConfig("jobs-create-tool-deliverto-channel");
+    const { taskId, sessionId } = await mutateState(config.instance, (state) => {
+      state.chatSessions.unshift({
+        id: "session_deliverto_channel",
+        instance: state.instance,
+        title: "Test chat",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        messageIds: [],
+        taskIds: [],
+        runIds: []
+      });
+      const at = new Date().toISOString();
+      state.runs.unshift({
+        id: "run_deliverto_channel",
+        instance: state.instance,
+        kind: "conversation_turn",
+        status: "running",
+        title: "test",
+        input: "test",
+        createdAt: at,
+        updatedAt: at,
+        conversationId: "session_deliverto_channel",
+        planStepIds: [],
+        childRunIds: [],
+        approvalIds: []
+      });
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, "run_deliverto_channel");
+      upsertTask(state, task);
+      return { taskId: task.id, sessionId: "session_deliverto_channel" };
+    });
+
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "create_job",
+      "call_create_job_deliverto_channel",
+      JSON.stringify({ name: "channel-report", intervalSeconds: 60, prompt: "Report.", deliverTo: "channel" })
+    );
+    expect(result.kind).toBe("sync");
+
+    const stateAfter = readState(config.instance);
+    expect(stateAfter.jobs).toHaveLength(1);
+    // Same behavior as omitting deliverTo: a fresh dedicated channel.
+    expect(stateAfter.jobs[0]?.chatSessionId).toBeDefined();
+    expect(stateAfter.jobs[0]?.chatSessionId).not.toBe(sessionId);
+    const newSession = stateAfter.chatSessions.find((s) => s.id === stateAfter.jobs[0]!.chatSessionId);
+    expect(newSession?.title).toBe("channel-report");
+  });
+
+  test("create_job dispatch rejects deliverTo \"chat\" from a non-chat-bound task", async () => {
+    const config = testConfig("jobs-create-tool-deliverto-nochat");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "create_job",
+      "call_create_job_deliverto_nochat",
+      JSON.stringify({ name: "orphan", intervalSeconds: 60, prompt: "x", deliverTo: "chat" })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      expect(result.result).toContain("Error:");
+      expect(result.result).toContain("requires invocation from a chat conversation");
+    }
+    // No job persisted.
+    expect(readState(config.instance).jobs).toHaveLength(0);
+  });
+
+  test("create_job dispatch rejects an invalid deliverTo value", async () => {
+    const config = testConfig("jobs-create-tool-deliverto-invalid");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    await expect(
+      dispatchToolCall(
+        config,
+        taskId,
+        "create_job",
+        "call_create_job_deliverto_bad",
+        JSON.stringify({ name: "bad", intervalSeconds: 60, prompt: "x", deliverTo: "inbox" })
+      )
+    ).rejects.toThrow(/deliverTo must be one of/);
+    expect(readState(config.instance).jobs).toHaveLength(0);
+  });
+
   test("create_job dispatch from an imperative task leaves chatSessionId undefined", async () => {
     const config = testConfig("jobs-create-tool-cli");
     // An imperative task — no runId, no conversation — looks like a CLI

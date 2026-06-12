@@ -1121,9 +1121,10 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     }
   },
   {
-    // Schedule a real cron/job. The job's output is delivered as an
-    // assistant message back into the originating chat session when it
-    // fires. Low-risk: no approval gate — the user can pause/delete the
+    // Schedule a real cron/job. The job's output is delivered into a
+    // dedicated job channel by default, or into the originating chat
+    // session with deliverTo "chat" (see the dispatcher for the binding
+    // logic). Low-risk: no approval gate — the user can pause/delete the
     // job at any time, and gating reminders behind an approval dialog
     // would defeat the UX (`remind me in 2 minutes` should not pop a
     // modal). Always exposed (like read_skill / spawn_subagent) so a
@@ -1133,7 +1134,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "create_job",
-      description: "Schedule a recurring or one-shot job that runs a prompt. The job's response is delivered as an assistant message back to this chat session when it fires. Provide EITHER `intervalSeconds` OR `cronExpression` (with `cronTimezone`), never both. Use `intervalSeconds` for 'in N minutes' or 'every N hours' (from-now timing). Use `cronExpression` + `cronTimezone` for wall-clock or weekday patterns ('daily at 9am', 'weekdays at 8:30'). Set oneShot=true for single-fire reminders. When a scheduled job needs to run UNATTENDED (e.g. recurring with no human present at fire-time), set `approvalMode: \"yolo\"` for tasks that need broad action, or use `autoApproveCommands` for narrow shell-pattern opt-ins — otherwise the job may stall at a gated approval forever (the instance default is \"auto\", which auto-approves file writes and safe shell commands but still gates dangerous patterns like rm -rf, sudo, pipe-to-sh, chmod 777, and destructive git operations). `dangerouslyAutoApprove: true` is a deprecated alias for `approvalMode: \"yolo\"` kept for back-compat. The default `timeoutSeconds` is 600 (10 min) — drop it lower for trivial reminders, or raise it (e.g. 1800+) when the prompt invokes external CLIs like codex or claude-code that can take several minutes.",
+      description: "Schedule a recurring or one-shot job that runs a prompt. By default each fire's output is delivered into a dedicated job channel — a fresh chat thread listed under Recurring jobs — keeping this conversation uncluttered; pass `deliverTo: \"chat\"` to deliver each fire into THIS conversation instead. Choosing the destination: for a RECURRING job created from chat where the user has NOT already said where the output should go, FIRST call `ask_user` with options \"Job channel\" (recommended — keeps this conversation uncluttered; appears under Recurring jobs) and \"This chat\" (each fire posts into this conversation); when you have reason to think a dispatchable messaging bridge is configured, check `list_messaging_bridges` and include one option per bridge (\"Send to <name>\"), which maps to `deliveryTargets`. For ONE-SHOT reminders skip the question and pass `deliverTo: \"chat\"` (a reminder belongs in the conversation that set it) unless the user said otherwise. When the user already specified a destination, don't ask. Provide EITHER `intervalSeconds` OR `cronExpression` (with `cronTimezone`), never both. Use `intervalSeconds` for 'in N minutes' or 'every N hours' (from-now timing). Use `cronExpression` + `cronTimezone` for wall-clock or weekday patterns ('daily at 9am', 'weekdays at 8:30'). Set oneShot=true for single-fire reminders. When a scheduled job needs to run UNATTENDED (e.g. recurring with no human present at fire-time), set `approvalMode: \"yolo\"` for tasks that need broad action, or use `autoApproveCommands` for narrow shell-pattern opt-ins — otherwise the job may stall at a gated approval forever (the instance default is \"auto\", which auto-approves file writes and safe shell commands but still gates dangerous patterns like rm -rf, sudo, pipe-to-sh, chmod 777, and destructive git operations). `dangerouslyAutoApprove: true` is a deprecated alias for `approvalMode: \"yolo\"` kept for back-compat. The default `timeoutSeconds` is 600 (10 min) — drop it lower for trivial reminders, or raise it (e.g. 1800+) when the prompt invokes external CLIs like codex or claude-code that can take several minutes.",
       parameters: {
         type: "object",
         properties: {
@@ -1171,6 +1172,11 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
           timeoutSeconds: {
             type: "number",
             description: "Wall-clock seconds before the spawned task is killed. Default 600 (10 min) — enough for typical git/gh + multi-file scan jobs. Drop lower (e.g. 60-120) for trivial reminders; raise (e.g. 1800-3600) when the prompt invokes external CLIs like codex or claude-code that can run several minutes. The model will be terminated mid-thought if this is too low."
+          },
+          deliverTo: {
+            type: "string",
+            enum: ["channel", "chat"],
+            description: "Where each fire's output is delivered. \"channel\" (default): a dedicated job channel — a fresh chat thread listed under Recurring jobs. \"chat\": the conversation this tool call was made from (only valid when invoked from a chat conversation). Pass \"chat\" for one-shot reminders; for recurring jobs ask the user first when they haven't said (see tool description)."
           },
           deliveryTargets: {
             type: "array",

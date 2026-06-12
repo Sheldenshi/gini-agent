@@ -1436,6 +1436,17 @@ async function createJobTool(
     }
     timeoutSeconds = args.timeoutSeconds;
   }
+  // Delivery binding: "channel" (default) mints a dedicated job channel
+  // for chat-bound invocations; "chat" binds the job's fires to the
+  // originating conversation instead (validated against the resolved
+  // session below).
+  let deliverTo: "channel" | "chat" | undefined;
+  if (args.deliverTo !== undefined && args.deliverTo !== null) {
+    if (args.deliverTo !== "channel" && args.deliverTo !== "chat") {
+      throw new Error("Invalid input: deliverTo must be one of \"channel\" | \"chat\".");
+    }
+    deliverTo = args.deliverTo;
+  }
   const deliveryTargets = parseDeliveryTargets(config, args.deliveryTargets);
 
   // Walk task -> run -> conversation to determine whether the agent is
@@ -1457,14 +1468,22 @@ async function createJobTool(
   }
   // The agent's caller is "chat-bound" when its task is attached to a run
   // whose conversation still exists. That's the trigger to mint a fresh
-  // chat thread for the job to deliver into.
-  let invokedFromChat = false;
+  // chat thread for the job to deliver into — or, with deliverTo "chat",
+  // the session the job binds to directly.
+  let originatingSessionId: string | undefined;
   if (task?.runId) {
     const run = state.runs.find((item) => item.id === task.runId);
     if (run?.conversationId) {
       const session = state.chatSessions.find((item) => item.id === run.conversationId);
-      if (session) invokedFromChat = true;
+      if (session) originatingSessionId = session.id;
     }
+  }
+  const invokedFromChat = originatingSessionId !== undefined;
+  // deliverTo "chat" is only meaningful when there IS an originating
+  // conversation to deliver into. Imperative/CLI tasks have none, so
+  // surface a tool error instead of silently creating a session-less job.
+  if (deliverTo === "chat" && !invokedFromChat) {
+    return `Error: create_job deliverTo "chat" requires invocation from a chat conversation, and this task has no originating chat session. Omit deliverTo (or pass "channel") instead.`;
   }
 
   // Pass `parentTaskId` so `createScheduledJob`'s own `mutateState`
@@ -1490,8 +1509,11 @@ async function createJobTool(
       // Dedicated chat thread for chat-driven jobs. Title defaults to
       // the job name — the chat IS bound to that job's delivery, so the
       // job name is the natural label in the session list. (createChatSession
-      // truncates to 80 chars.)
-      createDedicatedSession: invokedFromChat ? { title: name } : undefined,
+      // truncates to 80 chars.) With deliverTo "chat" we skip the dedicated
+      // thread and bind the job to the originating conversation instead;
+      // the session itself stays a normal chat (no kind/title mutation).
+      createDedicatedSession: invokedFromChat && deliverTo !== "chat" ? { title: name } : undefined,
+      chatSessionId: deliverTo === "chat" ? originatingSessionId : undefined,
       oneShot,
       parentTaskId: taskId,
       dangerouslyAutoApprove,
@@ -1514,7 +1536,8 @@ async function createJobTool(
     throw err;
   }
   // The job's chatSessionId is the freshly-minted dedicated thread when
-  // invokedFromChat, or undefined for imperative/CLI invocations.
+  // invokedFromChat (the originating conversation with deliverTo "chat"),
+  // or undefined for imperative/CLI invocations.
   const chatSessionId = job.chatSessionId;
 
   await mutateState(config.instance, (current) => {

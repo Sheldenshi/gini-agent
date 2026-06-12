@@ -220,6 +220,18 @@ an agent chat; the difference is purely the `kind`/`origin` tags that
 drive the rail grouping and the unread-until-opened behavior job
 sessions already had.
 
+The delivery binding is user-chosen at creation. The `create_job` tool
+takes `deliverTo: "channel" | "chat"` — `"channel"` (the default) mints
+the dedicated channel session above; `"chat"` binds
+`JobRecord.chatSessionId` to the originating conversation instead, so
+each fire posts into the chat that created the job (the session stays a
+normal agent chat — no kind/title mutation). `"chat"` is only valid for
+chat-bound invocations; an imperative/CLI task gets a tool error. The
+tool description instructs the agent to put the choice to the user via
+the `ask_user` choices card for recurring jobs (channel recommended,
+this-chat, plus one option per dispatchable bridge when configured),
+and to default one-shot reminders to `"chat"` without asking.
+
 Beyond the channel itself, a finished job run's reply can reach
 messaging bridges two ways (`src/jobs/finalize.ts`): the session's
 origin mirror (`outboundMirror`/`source`, set when the job was created
