@@ -1175,7 +1175,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
           deliveryTargets: {
             type: "array",
             items: { type: "string" },
-            description: "Optional messaging-bridge names to deliver the job's final output to (in addition to its chat thread, if it has one), e.g. [\"telegram\"]. Use when the user asks for the job's output to reach a messaging app. Each entry must match exactly one configured Telegram or Discord bridge by name (or id/kind, case-insensitive) and is stored as the bridge id; unknown or ambiguous entries are rejected with the dispatchable bridge names so you can relay the fix."
+            description: "Optional messaging-bridge names to deliver the job's final output to (in addition to its chat thread, if it has one), e.g. [\"telegram\"]. Use when the user asks for the job's output to reach a messaging app. Each entry must match exactly one configured Telegram or Discord bridge by exact id, or by name or kind (case-insensitive), and is stored as the bridge id; unknown or ambiguous entries are rejected with the dispatchable bridge names so you can relay the fix."
           }
         },
         required: ["name", "prompt"]
@@ -1228,7 +1228,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
           autoApproveCommands: { type: "array", items: { type: "string" }, description: "Optional new list of auto-approve shell patterns for unattended fires." },
           dangerouslyAutoApprove: { type: "boolean", description: "Optional. If true the scheduled task bypasses ALL approval gates at fire-time." },
           timeoutSeconds: { type: "number", description: "Optional. Wall-clock seconds before the spawned task is killed." },
-          deliveryTargets: { type: "array", items: { type: "string" }, description: "Optional new list of messaging-bridge names that receive the job's final output in addition to its chat thread, e.g. [\"telegram\"]. Pass [] to clear. Each entry must match exactly one configured Telegram or Discord bridge by name (or id/kind, case-insensitive) and is stored as the bridge id; unknown or ambiguous entries are rejected." }
+          deliveryTargets: { type: "array", items: { type: "string" }, description: "Optional new list of messaging-bridge names that receive the job's final output in addition to its chat thread, e.g. [\"telegram\"]. Pass [] to clear. Each entry must match exactly one configured Telegram or Discord bridge by exact id, or by name or kind (case-insensitive), and is stored as the bridge id; unknown or ambiguous entries are rejected." }
         },
         required: ["jobId"]
       }

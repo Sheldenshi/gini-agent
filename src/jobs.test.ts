@@ -2357,12 +2357,16 @@ describe("job deliveryTargets delivery", () => {
   // finalizeJobRunFromTask. `session: "none"` seeds a job with no
   // chatSessionId at all (the POST /api/jobs / non-chat-task shape);
   // `session: "vanished"` points chatSessionId at a session that no
-  // longer exists (deleted mid-flight).
+  // longer exists (deleted mid-flight). Failed tasks carry `error`
+  // (falling back to `summary` when omitted) — a failed task with no
+  // summary at all mirrors the real failTask shape (src/agent.ts),
+  // which only sets task.error.
   async function seedJobRun(
     config: RuntimeConfig,
     options: {
       deliveryTargets: string[];
-      summary: string;
+      summary?: string;
+      error?: string;
       sessionId?: string;
       status?: "completed" | "failed";
       session?: "none" | "vanished";
@@ -2387,7 +2391,7 @@ describe("job deliveryTargets delivery", () => {
       const t = createTask(state.instance, "scheduled", undefined, undefined, undefined, undefined);
       t.status = options.status ?? "completed";
       t.summary = options.summary;
-      if (t.status === "failed") t.error = options.summary;
+      if (t.status === "failed") t.error = options.error ?? options.summary;
       t.jobId = "job_delivery";
       upsertTask(state, t);
       const session = state.chatSessions.find((s) => s.id === sessionId);
@@ -2813,6 +2817,141 @@ describe("job deliveryTargets delivery", () => {
       expect(log).toContain("not configured");
       const audit = readState(config.instance).audit.find((a) => a.action === "job.delivery.failed");
       expect(audit?.evidence?.reason).toContain("not configured");
+    } finally {
+      resetMessagingDeps();
+    }
+  });
+
+  test("a session-less failed run with no summary delivers the task error", async () => {
+    const config = testConfig("jobs-delivery-sessionless-failed-error");
+    const { addMessagingBridge, setMessagingDeps, resetMessagingDeps } = await import("./integrations/messaging");
+    const { finalizeJobRunFromTask } = await import("./jobs/finalize");
+    const sendCalls: Array<{ channelId: string; content: string }> = [];
+    setMessagingDeps({ discordClientFactory: discordStub(sendCalls) });
+    try {
+      await addMessagingBridge(config, {
+        name: "disc",
+        kind: "discord",
+        deliveryTargets: ["chan-1"],
+        botToken: "TOK"
+      });
+      // Failed tasks carry task.error, not task.summary (src/agent.ts
+      // failTask). A summary-only fallback would deliver nothing here
+      // and the user would hear silence about the broken briefing.
+      const task = await seedJobRun(config, {
+        deliveryTargets: ["disc"],
+        error: "calendar fetch errored: 503",
+        status: "failed",
+        session: "none"
+      });
+      await finalizeJobRunFromTask(config, task);
+      expect(sendCalls).toHaveLength(1);
+      expect(sendCalls[0]?.content).toContain("calendar fetch errored: 503");
+    } finally {
+      resetMessagingDeps();
+    }
+  });
+
+  test("a failed run with summary '[SILENT]' still delivers — suppression applies only to completed runs", async () => {
+    const config = testConfig("jobs-delivery-failed-silent");
+    const { addMessagingBridge, setMessagingDeps, resetMessagingDeps } = await import("./integrations/messaging");
+    const { finalizeJobRunFromTask } = await import("./jobs/finalize");
+    const sendCalls: Array<{ channelId: string; content: string }> = [];
+    setMessagingDeps({ discordClientFactory: discordStub(sendCalls) });
+    try {
+      await addMessagingBridge(config, {
+        name: "disc",
+        kind: "discord",
+        deliveryTargets: ["chan-1"],
+        botToken: "TOK"
+      });
+      // The [SILENT] contract (src/execution/chat.ts) honors the token
+      // only for successfully COMPLETED tasks — a failure must still
+      // surface a signal even when the model emitted the sentinel.
+      const task = await seedJobRun(config, {
+        deliveryTargets: ["disc"],
+        summary: "[SILENT]",
+        status: "failed",
+        session: "none"
+      });
+      await finalizeJobRunFromTask(config, task);
+      expect(sendCalls).toHaveLength(1);
+    } finally {
+      resetMessagingDeps();
+    }
+  });
+
+  test("a legacy name entry resolves past a non-dispatchable demo bridge to the telegram bridge of the same name", async () => {
+    const config = testConfig("jobs-delivery-demo-shadow");
+    const { addMessagingBridge, setMessagingDeps, resetMessagingDeps } = await import("./integrations/messaging");
+    const { finalizeJobRunFromTask } = await import("./jobs/finalize");
+    const sendCalls: Array<{ chatId: string | number; text: string }> = [];
+    setMessagingDeps({
+      telegramClientFactory: () =>
+        ({
+          async getMe() {
+            return { id: 1, is_bot: true, first_name: "Gini" };
+          },
+          async sendMessage(chatId: string | number, text: string) {
+            sendCalls.push({ chatId, text });
+            return { message_id: 1, chat: { id: chatId }, date: 0 };
+          }
+        }) as unknown as import("./integrations/telegram").TelegramClient
+    });
+    try {
+      await addMessagingBridge(config, {
+        name: "briefings",
+        kind: "telegram",
+        deliveryTargets: ["42"],
+        botToken: "TOK"
+      });
+      // Bridges are unshifted into state, so this demo bridge sits in
+      // front of the telegram one. A name-tier match over the full
+      // bridge list would hit the demo bridge first and fail as
+      // non-dispatchable; resolution must pre-filter to dispatchable
+      // kinds, the way parseDeliveryTargets does at create/update.
+      await addMessagingBridge(config, { name: "briefings", kind: "demo" });
+      const task = await seedJobRun(config, {
+        deliveryTargets: ["briefings"],
+        summary: "Shadowed name briefing",
+        session: "none"
+      });
+      await finalizeJobRunFromTask(config, task);
+      expect(sendCalls).toHaveLength(1);
+      expect(String(sendCalls[0]?.chatId)).toBe("42");
+      // The default Telegram send path renders MarkdownV2, so assert on
+      // text free of escape-prone characters.
+      expect(sendCalls[0]?.text).toContain("Shadowed name briefing");
+      expect(readState(config.instance).audit.some((a) => a.action === "job.delivery.failed")).toBe(false);
+    } finally {
+      resetMessagingDeps();
+    }
+  });
+
+  test("finalizing the same terminal task twice sends exactly once", async () => {
+    const config = testConfig("jobs-delivery-idempotent");
+    const { addMessagingBridge, setMessagingDeps, resetMessagingDeps } = await import("./integrations/messaging");
+    const { finalizeJobRunFromTask } = await import("./jobs/finalize");
+    const sendCalls: Array<{ channelId: string; content: string }> = [];
+    setMessagingDeps({ discordClientFactory: discordStub(sendCalls) });
+    try {
+      await addMessagingBridge(config, {
+        name: "disc",
+        kind: "discord",
+        deliveryTargets: ["chan-1"],
+        botToken: "TOK"
+      });
+      // The runFinalized gate: once the run is terminal, a repeat
+      // finalize (duplicate task event, restart replay) must not
+      // re-deliver to bridges.
+      const task = await seedJobRun(config, {
+        deliveryTargets: ["disc"],
+        summary: "Once-only briefing.",
+        session: "none"
+      });
+      await finalizeJobRunFromTask(config, task);
+      await finalizeJobRunFromTask(config, task);
+      expect(sendCalls).toHaveLength(1);
     } finally {
       resetMessagingDeps();
     }

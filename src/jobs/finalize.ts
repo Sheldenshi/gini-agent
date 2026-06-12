@@ -14,6 +14,7 @@
 import type { RuntimeConfig, RuntimeState, Task } from "../types";
 import { addAudit, appendEvent, appendLog, isTerminalTaskStatus, mutateState, now, readState } from "../state";
 import { syncChatTaskResult } from "../execution/chat";
+import { providerAuthFailureText, providerDisplayLabel, providerReauth } from "../provider";
 // `sendMessagingOutput` is imported lazily inside the bridge-dispatch
 // helpers to avoid closing a static import cycle. The runtime graph would be:
 //   agent.ts -> jobs/finalize.ts -> integrations/messaging.ts -> agent.ts
@@ -207,8 +208,15 @@ function resolveJobReplyText(state: RuntimeState, chatSessionId: string, task: T
 // Reply text for deliveryTargets dispatch. Prefer the synced assistant
 // chat message; when none exists — session-less jobs never sync one,
 // and a vanished session or sync error leaves a sessionful job without
-// one — fall back to the task summary under the same exact-[SILENT]
-// suppression.
+// one — mirror the content selection syncChatTaskResult
+// (src/execution/chat.ts) applies. Completed runs deliver the task
+// summary under exact-[SILENT] suppression; failed/cancelled runs are
+// never suppressed (the chat-side contract honors [SILENT] only for
+// successfully completed tasks) and fall through summary → error →
+// currentStep, because failed tasks carry task.error rather than
+// task.summary (src/agent.ts failTask) and would otherwise deliver
+// nothing at all. Provider auth failures render the same actionable,
+// provider-named line the chat surface shows.
 function resolveJobDeliveryText(
   state: RuntimeState,
   chatSessionId: string | undefined,
@@ -218,7 +226,15 @@ function resolveJobDeliveryText(
     const message = findSyncedAssistantMessage(state, chatSessionId, task);
     if (message) return suppressSilentReply(message.content);
   }
-  return suppressSilentReply(task.summary);
+  if (task.status === "completed") return suppressSilentReply(task.summary);
+  const text = task.authErrorProvider
+    ? providerAuthFailureText(
+        providerDisplayLabel(task.authErrorProvider),
+        providerReauth(task.authErrorProvider)
+      )
+    : task.summary ?? task.error ?? task.currentStep ?? `Task is ${task.status}.`;
+  const trimmed = text.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
 }
 
 // Returns the bridge id when the mirror send actually landed, undefined
@@ -307,7 +323,11 @@ async function recordDeliveryFailure(
         target: details.jobId,
         risk: "low",
         taskId: details.taskId,
-        evidence: { target: details.target, bridgeId: details.bridgeId, reason: details.reason }
+        evidence: {
+          target: details.target,
+          ...(details.bridgeId !== undefined ? { bridgeId: details.bridgeId } : {}),
+          reason: details.reason
+        }
       },
       { jobId: details.jobId }
     );
@@ -320,11 +340,15 @@ async function recordDeliveryFailure(
 // summary is delivered instead (see resolveJobDeliveryText). Entries
 // are persisted as bridge ids by create_job/update_job, so the id tier
 // matches first; the name/kind tiers remain for jobs saved before
-// entries were normalized to ids. A fire-time miss therefore means the
-// bridge was removed after the job was saved. Only telegram / discord
-// bridges are dispatchable today; sendMessagingOutput picks the target
-// itself (first agent-filter-permitted entry of bridge.deliveryTargets,
-// else bridge.deliveryTargets[0], else the literal "local"). The bridge
+// entries were normalized to ids, and for raw entries written through
+// POST /api/jobs, which persists the strings unvalidated by design
+// (src/jobs/index.ts keeps that path permissive). A fire-time miss
+// therefore means the bridge was removed after the job was saved, or
+// the entry never matched a bridge in the first place. Only telegram /
+// discord bridges are dispatchable today; sendMessagingOutput picks the
+// target itself (first agent-filter-permitted entry of
+// bridge.deliveryTargets, else bridge.deliveryTargets[0], else the
+// literal "local"). The bridge
 // the origin mirror confirmed delivering to (`mirroredBridgeId`) is
 // skipped, as are duplicate entries resolving to the same bridge.
 // Resolution failures and send failures — thrown OR recorded as a
@@ -348,21 +372,26 @@ async function dispatchJobReplyToDeliveryTargets(
   // mirror failed.
   const dispatchedBridgeIds = new Set<string>();
   if (mirroredBridgeId !== undefined) dispatchedBridgeIds.add(mirroredBridgeId);
+  // Restrict resolution to dispatchable kinds BEFORE the id → name →
+  // kind tier chain — the same pre-filter parseDeliveryTargets
+  // (src/execution/tool-dispatch.ts) applies at create/update — so a
+  // legacy name entry can't first-match a non-dispatchable (e.g. demo)
+  // bridge while a dispatchable bridge of the same name exists.
+  const dispatchable = state.messagingBridges.filter(
+    (candidate) => candidate.kind === "telegram" || candidate.kind === "discord"
+  );
   for (const entry of job.deliveryTargets) {
     const lower = entry.toLowerCase();
     const bridge =
-      state.messagingBridges.find((candidate) => candidate.id === entry) ??
-      state.messagingBridges.find((candidate) => candidate.name.toLowerCase() === lower) ??
-      state.messagingBridges.find((candidate) => candidate.kind.toLowerCase() === lower);
-    if (!bridge || (bridge.kind !== "telegram" && bridge.kind !== "discord")) {
+      dispatchable.find((candidate) => candidate.id === entry) ??
+      dispatchable.find((candidate) => candidate.name.toLowerCase() === lower) ??
+      dispatchable.find((candidate) => candidate.kind.toLowerCase() === lower);
+    if (!bridge) {
       await recordDeliveryFailure(config, {
         jobId: job.id,
         taskId: task.id,
         target: entry,
-        bridgeId: bridge?.id,
-        reason: bridge
-          ? `bridge kind '${bridge.kind}' is not dispatchable`
-          : "no matching messaging bridge"
+        reason: "no dispatchable messaging bridge matches"
       });
       continue;
     }
