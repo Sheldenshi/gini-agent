@@ -1385,11 +1385,17 @@ describe("manual tunnel drivers", () => {
     // supervisor entry down (afterwards awaitTunnelSettled has nothing to wait
     // on and would race the abort path).
     const settled = awaitTunnelSettled(config.instance);
-    // Cancel while the driver is mid-connect; then release the driver.
+    // Cancel while the driver is mid-connect; it must return promptly (NOT
+    // wait behind the parked serve op) and instead queue the provider-side
+    // off to land once the in-flight op finishes. Then release the driver.
     await cancelTunnel(config);
+    expect(tailscale.disconnects).toBe(0);
     gate.resolve();
     await settled;
     expect(getTunnel(config).status).toBe("idle");
+    // Cancel's queued off runs as a queue continuation, concurrent with the
+    // abort path `settled` tracks — poll the counter instead of racing it.
+    for (let i = 0; tailscale.disconnects < 1 && i < 1000; i += 1) await Bun.sleep(1);
     expect(tailscale.disconnects).toBe(1);
     expect(isRuntimeTunnelHost("machine.tail-test.ts.net")).toBe(false);
   });
@@ -1429,7 +1435,9 @@ describe("manual tunnel drivers", () => {
     // R1 connects (slow driver); cancel supersedes it; R2 connects and
     // publishes. When R1's driver finally resolves, its abort path must SKIP
     // the provider-side teardown — otherwise the serve config R2 just brought
-    // up would be yanked while the record reads connected.
+    // up would be yanked while the record reads connected. Cancel's OWN
+    // queued off is fine: queue order puts it after R1's serve op and before
+    // R2's, so R2's front is published last and survives.
     const r1Gate = Promise.withResolvers<void>();
     let connects = 0;
     const tailscale = scriptedDriver({
@@ -1444,15 +1452,16 @@ describe("manual tunnel drivers", () => {
 
     await connectTunnel(config, "tailscale"); // R1, parked on r1Gate
     const r1Settled = awaitTunnelSettled(config.instance);
-    await cancelTunnel(config);               // supersede R1 (idle; no teardown — R1 wasn't connected)
-    await connectTunnel(config, "tailscale"); // R2 — its serve op queues behind R1's parked one
+    await cancelTunnel(config);               // supersede R1; queues the provider-side off behind R1's serve op
+    await connectTunnel(config, "tailscale"); // R2 — its serve op queues behind cancel's off
     const r2Settled = awaitTunnelSettled(config.instance);
-    r1Gate.resolve();                          // release the provider-op queue: R1 aborts, then R2 publishes
+    r1Gate.resolve();                          // release the queue: R1 aborts, cancel's off runs, R2 publishes
     await r1Settled;
     await r2Settled;
     expect(getTunnel(config).status).toBe("connected");
-    // R1's abort path must NOT have run the provider-side teardown.
-    expect(tailscale.disconnects).toBe(0);
+    // Exactly cancel's off ran — R1's abort path must NOT have added another
+    // teardown after R2's publish.
+    expect(tailscale.disconnects).toBe(1);
     expect(isRuntimeTunnelHost("machine.tail-test.ts.net")).toBe(true);
   });
 
@@ -1482,6 +1491,83 @@ describe("manual tunnel drivers", () => {
     await settled;
     expect(getTunnel(config).status).toBe("idle");
     expect(stops).toBeGreaterThanOrEqual(1);
+  });
+
+  test("a childless connect that lands after the shutdown teardown turns its own front off", async () => {
+    // Shutdown clears the supervisors WITHOUT bumping the provider-side
+    // epoch, so a serve --bg that lands after the teardown is the abort
+    // path's to clean up: its deferred off must fire (and a failing off is
+    // swallowed).
+    const gate = Promise.withResolvers<void>();
+    const tailscale = scriptedDriver({
+      connect: () => gate.promise.then(() => ({ url: "https://machine.tail-test.ts.net" })),
+      disconnect: () => Promise.reject(new Error("serve off failed"))
+    });
+    setTunnelDeps(deps({ drivers: fakeDrivers({ tailscale }) }));
+    await connectTunnel(config, "tailscale");
+    for (let i = 0; tailscale.connects < 1 && i < 1000; i += 1) await Bun.sleep(1);
+    const settled = awaitTunnelSettled(config.instance);
+    const stopping = stopAllTunnels(); // clears the supervisor synchronously; queues its own off
+    gate.resolve();                    // serve --bg lands AFTER the shutdown teardown
+    await stopping;
+    await settled;
+    // Two idempotent offs, both queue-ordered after the serve op: the
+    // shutdown sweep's and the aborted run's deferred one.
+    for (let i = 0; tailscale.disconnects < 2 && i < 1000; i += 1) await Bun.sleep(1);
+    expect(tailscale.disconnects).toBe(2);
+    expect(isRuntimeTunnelHost("machine.tail-test.ts.net")).toBe(false);
+  });
+
+  test("a publish-window failure stops the live child before folding into the error record", async () => {
+    // The exit watcher is attached AFTER the connected write; a throw in that
+    // window (publish/log machinery) must stop the child it would otherwise
+    // orphan — pendingKill is already cleared and no watcher exists yet.
+    let stops = 0;
+    const child: TunnelChild = {
+      start: () => Promise.resolve(0),
+      stop: () => {
+        stops += 1;
+        // The stop is best-effort — its rejection must be swallowed.
+        return Promise.reject(new Error("kill failed"));
+      },
+      get exited(): Promise<number> {
+        throw new Error("exit watcher unavailable");
+      }
+    };
+    setTunnelDeps(deps({
+      drivers: fakeDrivers({
+        ngrok: scriptedDriver({ connect: () => Promise.resolve({ url: "https://pub.ngrok-free.app", child }) })
+      })
+    }));
+    await connectTunnel(config, "ngrok");
+    await awaitTunnelSettled(config.instance);
+    const state = getTunnel(config);
+    expect(state.status).toBe("error");
+    expect(state.message).toContain("exit watcher unavailable");
+    expect(stops).toBe(1);
+    // The connected write's trust grant must not survive the error fold.
+    expect(isRuntimeTunnelHost("pub.ngrok-free.app")).toBe(false);
+  });
+
+  test("disconnect swallows a live child's stop rejection during teardown", async () => {
+    const exited = Promise.withResolvers<number>();
+    const child: TunnelChild = {
+      start: () => Promise.resolve(0),
+      stop: () => Promise.reject(new Error("kill failed")),
+      exited: exited.promise
+    };
+    setTunnelDeps(deps({
+      drivers: fakeDrivers({
+        ngrok: scriptedDriver({ connect: () => Promise.resolve({ url: "https://abc.ngrok-free.app", child }) })
+      })
+    }));
+    await connectTunnel(config, "ngrok");
+    await awaitTunnelSettled(config.instance);
+    expect(getTunnel(config).status).toBe("connected");
+    // teardown()'s best-effort child stop rejects — the rejection must be
+    // swallowed and the record still settle to idle.
+    const state = await disconnectTunnel(config);
+    expect(state.status).toBe("idle");
   });
 
   test("cancel after a childless manual connect already landed tears down the provider state", async () => {
@@ -1739,6 +1825,25 @@ describe("manual tunnel drivers", () => {
     expect(tailscale.disconnects).toBe(1);
     // And no detection probe was awaited for a record that can't resume.
     expect(tailscale.detects).toBe(0);
+  });
+
+  test("reconcile still resets a stale connecting record when the provider-side off fails", async () => {
+    // The cleanup is best-effort: a failing `serve off` must not leave the
+    // record wedged in "connecting" across boots.
+    const tailscale = scriptedDriver({ disconnect: () => Promise.reject(new Error("serve off failed")) });
+    setTunnelDeps(deps({ drivers: fakeDrivers({ tailscale }) }));
+    await mutateState(config.instance, (state) => {
+      state.tunnel = {
+        instance: config.instance,
+        selectedProvider: "tailscale",
+        status: "connecting",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z"
+      };
+    });
+    const state = await reconcileTunnelOnStartup(config);
+    expect(state.status).toBe("idle");
+    expect(tailscale.disconnects).toBe(1);
   });
 
   test("stopAllTunnels turns childless provider-side state off; the record stays connected for the boot resume", async () => {
@@ -2022,6 +2127,33 @@ describe("spawnUrlChild", () => {
     await expect(pending).rejects.toThrow(/agent exited \(code 9\)/);
   });
 
+  test("stop escalates to SIGKILL when the child survives the TERM kill", async () => {
+    const prev = process.env.GINI_TUNNEL_KILL_ESCALATION_MS;
+    process.env.GINI_TUNNEL_KILL_ESCALATION_MS = "5";
+    try {
+      const out = new TransformStream<Uint8Array, Uint8Array>();
+      void out.writable.getWriter().write(new TextEncoder().encode("url=https://stubborn.example\n"));
+      const exited = Promise.withResolvers<number>();
+      const signals: (number | undefined)[] = [];
+      const proc: SpawnedTunnelProc = {
+        stdout: out.readable,
+        stderr: null,
+        exited: exited.promise,
+        // A TERM-trapping agent: only SIGKILL fells it.
+        kill: (signal?: number) => {
+          signals.push(signal);
+          if (signal === 9) exited.resolve(137);
+        }
+      };
+      const result = await spawnUrlChild(() => proc, ["agent"], /url=(\S+)/, 5_000);
+      expect(await result.child!.stop()).toBe(137);
+      expect(signals).toEqual([undefined, 9]);
+    } finally {
+      if (prev === undefined) delete process.env.GINI_TUNNEL_KILL_ESCALATION_MS;
+      else process.env.GINI_TUNNEL_KILL_ESCALATION_MS = prev;
+    }
+  });
+
   test("the default spawn wrapper drives a real process end to end", async () => {
     const pending = spawnUrlChild(
       defaultTunnelProcSpawn,
@@ -2096,6 +2228,15 @@ describe("makeDefaultDrivers", () => {
       "tailscale status --json",
       "tailscale serve --https=443 off"
     ]);
+  });
+
+  test("tailscale: disconnect throws when serve off exits non-zero (the front may still be live)", async () => {
+    const offFails = runScript({
+      "tailscale serve --https=443 off": { exitCode: 1, stderr: "serve: backend stopped" }
+    });
+    await expect(makeDefaultDrivers(offFails.run).tailscale.disconnect!()).rejects.toThrow(
+      "tailscale serve off failed: serve: backend stopped"
+    );
   });
 
   test("tailscale: connect surfaces serve failures, status failures, bad json, and a missing DNS name", async () => {

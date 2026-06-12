@@ -197,13 +197,16 @@ export interface SpawnedTunnelProc {
   stdout: ReadableStream<Uint8Array> | null;
   stderr: ReadableStream<Uint8Array> | null;
   exited: Promise<number>;
-  kill(): void;
+  kill(signal?: number): void;
 }
 export type TunnelProcSpawn = (argv: string[]) => SpawnedTunnelProc;
 
 export const defaultTunnelProcSpawn: TunnelProcSpawn = (argv) => {
   const proc = Bun.spawn(argv, { stdout: "pipe", stderr: "pipe", stdin: "ignore" });
-  return { stdout: proc.stdout, stderr: proc.stderr, exited: proc.exited, kill: () => proc.kill() };
+  // Forward the signal: the stop escalation sends 9 (SIGKILL), and dropping
+  // the argument would silently downgrade it to the default SIGTERM the
+  // stubborn agent already ignored.
+  return { stdout: proc.stdout, stderr: proc.stderr, exited: proc.exited, kill: (signal) => proc.kill(signal) };
 };
 
 // How long a spawned tunnel agent gets to print its public URL before the
@@ -211,6 +214,13 @@ export const defaultTunnelProcSpawn: TunnelProcSpawn = (argv) => {
 function manualConnectTimeoutMs(): number {
   const v = Number(process.env.GINI_TUNNEL_MANUAL_TIMEOUT_MS);
   return Number.isFinite(v) && v > 0 ? v : 45_000;
+}
+
+// How long stop() waits after SIGTERM before escalating to SIGKILL. Read at
+// call time so tests can tighten it.
+function killEscalationMs(): number {
+  const v = Number(process.env.GINI_TUNNEL_KILL_ESCALATION_MS);
+  return Number.isFinite(v) && v > 0 ? v : 2_000;
 }
 
 // Spawn a tunnel agent and scan its output for the public URL. Resolves with
@@ -281,9 +291,13 @@ export async function spawnUrlChild(
       url,
       child: {
         start: () => Promise.resolve(0),
+        // TERM -> KILL escalation: a stubborn agent that traps TERM must not
+        // survive a disconnect/cancel. proc.exited (the process, not its
+        // pipes) is guaranteed to settle after the KILL.
         stop: () => {
           proc.kill();
-          return proc.exited;
+          const killTimer = setTimeout(() => proc.kill(9), killEscalationMs());
+          return proc.exited.finally(() => clearTimeout(killTimer));
         },
         exited: proc.exited
       }
@@ -380,7 +394,13 @@ export function makeDefaultDrivers(
       // never created — while this form removes only the one 443 proxy that
       // connect() set up.
       disconnect: async () => {
-        await run(["tailscale", "serve", "--https=443", "off"]);
+        const off = await run(["tailscale", "serve", "--https=443", "off"]);
+        if (off.exitCode !== 0) {
+          // Callers treat teardown as best-effort, but a failed off means the
+          // front may STILL BE LIVE — throw so the call sites can log it
+          // instead of silently reporting idle.
+          throw new Error(`tailscale serve off failed: ${(off.stderr || off.stdout).trim()}`);
+        }
       }
     },
     ngrok: {
@@ -390,8 +410,12 @@ export function makeDefaultDrivers(
       // reports ("Valid configuration file at <path>") or via NGROK_AUTHTOKEN.
       detect: async () => {
         const check = await run(["ngrok", "config", "check"], DETECT_TIMEOUT_MS).catch(() => null);
-        if (!check || check.exitCode !== 0) return { enabled: false, requires: DEFAULT_REQUIRES.ngrok };
+        if (!check) return { enabled: false, requires: DEFAULT_REQUIRES.ngrok }; // binary missing
+        // Env-only setups have no config file (the check exits non-zero) yet
+        // the agent runs fine with NGROK_AUTHTOKEN — honor it before the
+        // config-file verdict.
         if ((process.env.NGROK_AUTHTOKEN ?? "").length > 0) return { enabled: true };
+        if (check.exitCode !== 0) return { enabled: false, requires: DEFAULT_REQUIRES.ngrok };
         const path = /Valid configuration file at (.+)/.exec(check.stdout)?.[1]?.trim();
         const body = path ? await readTextFile(path) : null;
         return body && /^\s*authtoken:\s*\S+/m.test(body)
@@ -1212,6 +1236,10 @@ async function runManualConnect(
     appendLog(config.instance, "tunnel.connected", { provider, url: result.url, port });
     if (result.child) watchChildExit(config, provider, sup, result.child);
   } catch (error) {
+    // The throw can come from AFTER the driver connected (a publish/log
+    // failure): stop the live child before dropping the handle, or nothing
+    // could ever stop it (pendingKill is cleared, no exit watcher attached).
+    if (sup.child) void sup.child.stop().catch(() => {});
     sup.child = undefined;
     const message = error instanceof Error ? error.message : String(error);
     if (!isCurrent()) {
@@ -1357,7 +1385,9 @@ async function runConnect(
     // awaiting the login/handshake. If so, stop the child we just started (so it
     // isn't orphaned) and bail without clobbering the record they wrote.
     if (!isCurrent()) {
-      void child?.stop().catch(() => {});
+      void child?.stop().catch(() => {
+        // The child may already be gone; best-effort.
+      });
       sup.child = undefined;
       appendLog(config.instance, "tunnel.connect.aborted", { provider });
       return;
@@ -1500,20 +1530,37 @@ export async function cancelTunnel(config: RuntimeConfig): Promise<TunnelState> 
   const before = readState(config.instance).tunnel ?? null;
   teardown(config.instance);
   // Cancel can land AFTER the background connect already flipped the record to
-  // "connected" (the UI's Cancel races the connect's completion). For a
-  // CHILDLESS manual provider (tailscale serve lives in tailscaled) teardown
-  // stops nothing, so run the provider-side teardown here or the old front
-  // would keep serving while the record reads idle. Best-effort + idempotent.
+  // "connected" (the UI's Cancel races the connect's completion), or DURING
+  // "connecting" when tailscale's serve --bg is already live before the
+  // connected write. For a CHILDLESS manual provider teardown stops nothing,
+  // so run the provider-side teardown here or the old front would keep
+  // serving while the record reads idle — and the in-flight run's abort path
+  // can't do it: cancel's own epoch bump makes that path skip its deferred
+  // off. Queued, so the off lands after any in-flight serve op; best-effort
+  // and idempotent.
   if (
-    before?.status === "connected" &&
+    (before?.status === "connected" || before?.status === "connecting") &&
     before.selectedProvider &&
     isManualProviderId(before.selectedProvider)
   ) {
     bumpProviderSideEpoch(config.instance);
-    try {
-      await driverDisconnect(config.instance, before.selectedProvider);
-    } catch {
-      // never block cancel on a provider-teardown failure.
+    if (before.status === "connected") {
+      // The connect already finished, so the provider-op queue is drained and
+      // this off runs immediately — safe to await for a stronger "idle means
+      // the front is down" guarantee.
+      try {
+        await driverDisconnect(config.instance, before.selectedProvider);
+      } catch {
+        // never block cancel on a provider-teardown failure.
+      }
+    } else {
+      // "connecting": the in-flight serve op may be wedged in its CLI call,
+      // and the queued off can't run until it finishes — awaiting here would
+      // hang the user's Cancel behind the very thing they're cancelling.
+      // Fire-and-forget keeps cancel prompt; queue order still guarantees
+      // the off lands after the in-flight serve op and before any later
+      // connect's serve op.
+      void driverDisconnect(config.instance, before.selectedProvider).catch(() => {});
     }
   }
   return mutateState(config.instance, (state) => {
@@ -1647,7 +1694,9 @@ export async function reconcileTunnelOnStartup(config: RuntimeConfig): Promise<T
   // nothing left to clean it (a crash mid-connect after tailscale's serve
   // --bg) — turn it off best-effort before resetting to idle.
   if (record.status === "connecting" && selected && isManualProviderId(selected)) {
-    await driverDisconnect(config.instance, selected).catch(() => {});
+    await driverDisconnect(config.instance, selected).catch(() => {
+      // Best-effort: the reset to idle proceeds regardless.
+    });
   }
   const provider = selected ? findProvider(selected) : undefined;
   // Only a tunnel that was actually "connected" (with an enabled provider still

@@ -58,7 +58,14 @@ describe("DocReference", () => {
       </DocReference>
     );
     await user.click(screen.getByRole("button", { name: "Remote Access" }));
-    await waitFor(() => expect(screen.queryByText("Remote Access", { selector: "h2, [data-slot=sheet-title]" }) ?? screen.queryAllByText("Remote Access")[1]).not.toBeNull());
+    // toBeTruthy, not toBeNull: the fallback `queryAllByText(...)[1]` yields
+    // undefined when absent, and `undefined` passes a not-null check.
+    await waitFor(() =>
+      expect(
+        screen.queryByText("Remote Access", { selector: "h2, [data-slot=sheet-title]" }) ??
+          screen.queryAllByText("Remote Access")[1]
+      ).toBeTruthy()
+    );
     expect(fetchCalls).toEqual(["/api/runtime/docs/remote-access"]);
     await waitFor(() => expect(screen.queryByText(/gateway port/)).not.toBeNull());
     // The escape hatch keeps the original hosted URL.
