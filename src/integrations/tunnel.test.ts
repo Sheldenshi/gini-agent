@@ -12,7 +12,8 @@
 // frpc child.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   awaitTunnelSettled,
@@ -2026,21 +2027,21 @@ describe("makeDefaultDrivers", () => {
 
   test("defaultReadCloudflareConfig returns text when readable and null otherwise", async () => {
     const prevHome = process.env.HOME;
+    // Unique temp HOMEs so a parallel or leftover run can never collide.
+    const root = mkdtempSync(join(tmpdir(), "gini-cloudflared-home-"));
     try {
-      // A HOME with no ~/.cloudflared -> null. Clear it first: a leftover dir
-      // from a prior run must not turn this into the readable case.
-      rmSync("/tmp/gini-no-cloudflared-home", { recursive: true, force: true });
-      process.env.HOME = "/tmp/gini-no-cloudflared-home";
+      // A HOME with no ~/.cloudflared -> null.
+      process.env.HOME = join(root, "empty");
       expect(await defaultReadCloudflareConfig()).toBeNull();
       // A HOME with a config.yml -> its text.
-      const home = "/tmp/gini-cloudflared-home";
-      rmSync(home, { recursive: true, force: true });
+      const home = join(root, "configured");
       mkdirSync(`${home}/.cloudflared`, { recursive: true });
       await Bun.write(`${home}/.cloudflared/config.yml`, "tunnel: abc\n");
       process.env.HOME = home;
       expect(await defaultReadCloudflareConfig()).toBe("tunnel: abc\n");
     } finally {
       process.env.HOME = prevHome;
+      rmSync(root, { recursive: true, force: true });
     }
   });
 

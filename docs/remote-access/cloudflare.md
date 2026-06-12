@@ -18,7 +18,7 @@ Both modes terminate TLS at Cloudflare's edge, so Cloudflare can observe everyth
    cloudflared tunnel route dns <name> gini.your-domain.com
    ```
 
-   …and a `~/.cloudflared/config.yml` declaring the tunnel (any ingress works — Gini overrides the origin at connect time):
+   …and a `~/.cloudflared/config.yml` declaring the tunnel (the ingress `service` value doesn't matter to Gini — it overrides the origin at connect time; see the dedicated-tunnel note below):
 
    ```yaml
    tunnel: <id>

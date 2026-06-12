@@ -48,6 +48,13 @@ export function isRelayHost(host: string): boolean {
 // an attacker cannot rebind it to this machine. Without this lane, a tunnel the
 // runtime just published would fail closed (404/403) until the operator
 // hand-copied the random URL into GINI_TRUSTED_ORIGINS.
+//
+// isRuntimeTunnelHost matches against EVERY entry rather than threading an
+// instance through the guard call sites. That is sound because a gateway
+// process serves exactly one instance (instances are separate processes, see
+// docs/gateway.md), so in production this map holds at most that one
+// instance's entry; the instance key exists so tests exercising several
+// instances in one process stay isolated.
 const runtimeTunnelHosts = new Map<string, string>();
 
 // Record (url) or clear (null) the connected tunnel host for an instance.

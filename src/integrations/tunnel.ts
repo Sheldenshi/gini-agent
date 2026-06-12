@@ -719,6 +719,13 @@ function findProvider(id: string): TunnelProvider | undefined {
 // (src/lib/origin-trust.ts) exactly while the record says connected — every
 // transition away from connected revokes the front atomically with the state
 // write, so a torn-down tunnel host can't keep riding the trust lane.
+//
+// The sync runs inside the mutateState callback, i.e. before the disk write
+// is durable. That ordering is deliberate: the guard serves from the
+// IN-MEMORY record, which is mutated in the same callback, so trust and the
+// serving state can never diverge from each other — a failed disk write only
+// lags the on-disk copy, and both the trust map and the in-memory record die
+// together on restart, where reconcile rebuilds them from disk as one unit.
 function applyTunnel(
   state: RuntimeState,
   fields: Parameters<typeof createTunnelRecord>[1]
