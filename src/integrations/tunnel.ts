@@ -822,7 +822,12 @@ export async function stopAllTunnels(): Promise<void> {
         // the backstop for that residual.
         stops.push(
           Promise.race([
-            driverDisconnect(instance, record.selectedProvider).catch(() => undefined),
+            driverDisconnect(instance, record.selectedProvider).catch((error) => {
+              appendLog(instance, "tunnel.teardown_failed", {
+                provider: record.selectedProvider,
+                message: error instanceof Error ? error.message : String(error)
+              });
+            }),
             Bun.sleep(2_000)
           ])
         );
@@ -1011,18 +1016,27 @@ export async function selectProvider(config: RuntimeConfig, provider: string): P
   // counts as live: a partial connect can leave provider-side state up.
   // Best-effort and idempotent; the epoch bump invalidates any stale deferred
   // teardown still in flight from a superseded run.
+  // Re-selecting the SAME provider whose record reads "error" also runs the
+  // off: a partial connect can leave provider-side state up, and writing
+  // idle without cleaning it would orphan the front with every later
+  // cleanup gate (disconnect's wasLive, the boot reconcile) blind to it.
   if (
     current &&
     current.selectedProvider &&
-    current.selectedProvider !== entry.id &&
+    (current.selectedProvider !== entry.id || current.status === "error") &&
     current.status !== "idle" &&
     isManualProviderId(current.selectedProvider)
   ) {
     bumpProviderSideEpoch(config.instance);
     try {
       await driverDisconnect(config.instance, current.selectedProvider);
-    } catch {
-      // never block a provider switch on the old provider's teardown.
+    } catch (error) {
+      // Never block a provider switch on the old provider's teardown — but a
+      // failed off can leave the front live, so it must leave a trace.
+      appendLog(config.instance, "tunnel.teardown_failed", {
+        provider: current.selectedProvider,
+        message: error instanceof Error ? error.message : String(error)
+      });
     }
   }
   return mutateState(config.instance, (state) => {
@@ -1108,8 +1122,13 @@ export async function connectTunnel(config: RuntimeConfig, provider?: string): P
     bumpProviderSideEpoch(config.instance);
     try {
       await driverDisconnect(config.instance, previous.selectedProvider);
-    } catch {
-      // never block the new connect on the old provider's teardown.
+    } catch (error) {
+      // Never block the new connect on the old provider's teardown — but a
+      // failed off can leave the front live, so it must leave a trace.
+      appendLog(config.instance, "tunnel.teardown_failed", {
+        provider: previous.selectedProvider,
+        message: error instanceof Error ? error.message : String(error)
+      });
     }
   }
   if (superseded()) return getTunnel(config);
@@ -1258,7 +1277,13 @@ async function runManualConnect(
         void result.child.stop().catch(() => {});
         sup.child = undefined;
       } else if (epochCurrent()) {
-        void driverDisconnect(config.instance, provider).catch(() => {});
+        void driverDisconnect(config.instance, provider).catch((error) => {
+          // Best-effort, but a failed off can leave the front live — trace it.
+          appendLog(config.instance, "tunnel.teardown_failed", {
+            provider,
+            message: error instanceof Error ? error.message : String(error)
+          });
+        });
       }
       appendLog(config.instance, "tunnel.connect.aborted", { provider });
       return;
@@ -1584,8 +1609,9 @@ export async function cancelTunnel(config: RuntimeConfig): Promise<TunnelState> 
   const torndown = supervisors.get(config.instance);
   const before = readState(config.instance).tunnel ?? null;
   teardown(config.instance);
-  // Cancel can land AFTER the background connect already flipped the record to
-  // "connected" (the UI's Cancel races the connect's completion), or DURING
+  // Cancel can land AFTER the background connect already settled — to
+  // "connected" (the UI's Cancel races the connect's completion) or to
+  // "error" (a partial connect can leave provider-side state up) — or DURING
   // "connecting" when tailscale's serve --bg is already live before the
   // connected write. For a CHILDLESS manual provider teardown stops nothing,
   // so run the provider-side teardown here or the old front would keep
@@ -1594,19 +1620,24 @@ export async function cancelTunnel(config: RuntimeConfig): Promise<TunnelState> 
   // off. Queued, so the off lands after any in-flight serve op; best-effort
   // and idempotent.
   if (
-    (before?.status === "connected" || before?.status === "connecting") &&
+    (before?.status === "connected" || before?.status === "connecting" || before?.status === "error") &&
     before.selectedProvider &&
     isManualProviderId(before.selectedProvider)
   ) {
     bumpProviderSideEpoch(config.instance);
-    if (before.status === "connected") {
-      // The connect already finished, so the provider-op queue is drained and
+    if (before.status !== "connecting") {
+      // The run already settled, so the provider-op queue is drained and
       // this off runs immediately — safe to await for a stronger "idle means
       // the front is down" guarantee.
       try {
         await driverDisconnect(config.instance, before.selectedProvider);
-      } catch {
-        // never block cancel on a provider-teardown failure.
+      } catch (error) {
+        // Never block cancel on a provider-teardown failure — but a failed
+        // off can leave the front live, so it must leave a trace.
+        appendLog(config.instance, "tunnel.teardown_failed", {
+          provider: before.selectedProvider,
+          message: error instanceof Error ? error.message : String(error)
+        });
       }
     } else {
       // "connecting": the in-flight serve op may be wedged in its CLI call,
@@ -1615,7 +1646,13 @@ export async function cancelTunnel(config: RuntimeConfig): Promise<TunnelState> 
       // Fire-and-forget keeps cancel prompt; queue order still guarantees
       // the off lands after the in-flight serve op and before any later
       // connect's serve op.
-      void driverDisconnect(config.instance, before.selectedProvider).catch(() => {});
+      const provider = before.selectedProvider;
+      void driverDisconnect(config.instance, provider).catch((error) => {
+        appendLog(config.instance, "tunnel.teardown_failed", {
+          provider,
+          message: error instanceof Error ? error.message : String(error)
+        });
+      });
     }
   }
   return mutateState(config.instance, (state) => {
@@ -1683,8 +1720,13 @@ export async function disconnectTunnel(config: RuntimeConfig): Promise<TunnelSta
     bumpProviderSideEpoch(config.instance);
     try {
       await driverDisconnect(config.instance, selectedBefore);
-    } catch {
-      // never block disconnect on a provider-teardown failure.
+    } catch (error) {
+      // Never block disconnect on a provider-teardown failure — but a failed
+      // off can leave the front live, so it must leave a trace.
+      appendLog(config.instance, "tunnel.teardown_failed", {
+        provider: selectedBefore,
+        message: error instanceof Error ? error.message : String(error)
+      });
     }
   }
   return mutateState(config.instance, (state) => {
@@ -1749,8 +1791,12 @@ export async function reconcileTunnelOnStartup(config: RuntimeConfig): Promise<T
   // nothing left to clean it (a crash mid-connect after tailscale's serve
   // --bg) — turn it off best-effort before resetting to idle.
   if (record.status === "connecting" && selected && isManualProviderId(selected)) {
-    await driverDisconnect(config.instance, selected).catch(() => {
-      // Best-effort: the reset to idle proceeds regardless.
+    await driverDisconnect(config.instance, selected).catch((error) => {
+      // Best-effort: the reset to idle proceeds regardless — but trace it.
+      appendLog(config.instance, "tunnel.teardown_failed", {
+        provider: selected,
+        message: error instanceof Error ? error.message : String(error)
+      });
     });
   }
   const provider = selected ? findProvider(selected) : undefined;

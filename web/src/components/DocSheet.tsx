@@ -50,6 +50,12 @@ export function DocSheet({
   const ref = parseDocsUrl(url);
   const [state, setState] = useState<FetchState>({ loading: false });
   const openedRef = useRef(false);
+  // urlRef tracks the CURRENT url so an in-flight fetch can tell when the
+  // caller swapped url mid-request: its result must be discarded, or a slow
+  // old fetch resolving after the new one would pin the WRONG doc under the
+  // new url (sticky, because the data guard in load() never refetches).
+  const urlRef = useRef(url);
+  urlRef.current = url;
   const [fetchedFor, setFetchedFor] = useState(url);
   if (fetchedFor !== url) {
     setFetchedFor(url);
@@ -59,12 +65,15 @@ export function DocSheet({
 
   async function load() {
     if (state.data || state.loading) return;
+    const requested = url;
     setState({ loading: true });
     try {
       const query = ref!.anchor ? `?section=${encodeURIComponent(ref!.anchor)}` : "";
       const data = await api<DocSection>(`/docs/${ref!.path}${query}`);
+      if (urlRef.current !== requested) return; // url swapped mid-fetch — stale
       setState({ loading: false, data });
     } catch (error) {
+      if (urlRef.current !== requested) return; // stale rejection — same rule
       setState({ loading: false, error: error instanceof Error ? error.message : String(error) });
     }
   }

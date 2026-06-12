@@ -111,6 +111,42 @@ describe("DocSheet", () => {
     ]);
   });
 
+  test("an in-flight fetch for a previous url never commits after a swap", async () => {
+    // Resolve fetches manually so the OLD url's response can land AFTER the
+    // NEW url's — the stale result must be discarded, not displayed (the
+    // per-url cache would otherwise pin the wrong doc for the mount).
+    const pending = new Map<string, (r: Response) => void>();
+    globalThis.fetch = ((input: RequestInfo | URL) => {
+      const url = String(input);
+      fetchCalls.push(url);
+      const { promise, resolve } = Promise.withResolvers<Response>();
+      pending.set(url, resolve);
+      return promise;
+    }) as typeof fetch;
+    const doc = (path: string, title: string, markdown: string) =>
+      new Response(JSON.stringify({ path, title, markdown }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    const { rerender } = render(
+      <DocSheet url="https://gini.lilaclabs.ai/docs/search/brave" open onOpenChange={() => {}} />
+    );
+    await waitFor(() => expect(pending.has("/api/runtime/docs/search/brave")).toBe(true));
+    // Swap while brave's fetch is still in flight.
+    rerender(<DocSheet url="https://gini.lilaclabs.ai/docs/search/exa" open onOpenChange={() => {}} />);
+    await waitFor(() => expect(pending.has("/api/runtime/docs/search/exa")).toBe(true));
+    // Resolve the NEW url first…
+    pending.get("/api/runtime/docs/search/exa")!(doc("search/exa", "Exa", "Exa doc body"));
+    await waitFor(() => expect(screen.queryByText("Exa doc body")).not.toBeNull());
+    // …then the stale one: it must not replace the displayed doc.
+    pending.get("/api/runtime/docs/search/brave")!(doc("search/brave", "Brave", "Brave doc body"));
+    const settle = Promise.withResolvers<void>();
+    setTimeout(settle.resolve, 50);
+    await settle.promise;
+    expect(screen.queryByText("Exa doc body")).not.toBeNull();
+    expect(screen.queryByText("Brave doc body")).toBeNull();
+  });
+
   test("closing via the sheet reports through onOpenChange", async () => {
     const user = userEvent.setup();
     let openState = true;

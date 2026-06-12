@@ -43,6 +43,15 @@ export function TunnelConnectedPopover({
   const url = state.url ?? "";
   const providerName =
     state.providers.find((p) => p.id === state.selectedProvider)?.name ?? "Gini Relay";
+  // The 24/7 stability promise only holds where the URL survives a reconnect:
+  // the relay (deviceId-keyed subdomain), tailscale (machine name), and a
+  // NAMED cloudflare tunnel. ngrok's free tier and cloudflare QUICK tunnels
+  // mint a fresh subdomain on every connect — including the restart resume —
+  // so the copy must not claim the shared link keeps working.
+  const stableUrl =
+    state.selectedProvider === "gini-relay" ||
+    state.selectedProvider === "tailscale" ||
+    (state.selectedProvider === "cloudflare" && !url.includes("trycloudflare.com"));
 
   const copy = async () => {
     try {
@@ -163,7 +172,9 @@ export function TunnelConnectedPopover({
             Anyone you pair with this link can reach your agent.
           </p>
           <p className="text-xs text-muted-foreground">
-            It&rsquo;s a stable link — it stays the same and reconnects automatically after a restart, so you can reach your agent 24/7.
+            {stableUrl
+              ? "It’s a stable link — it stays the same and reconnects automatically after a restart, so you can reach your agent 24/7."
+              : "This link changes on every reconnect (including a gateway restart) — re-share the new one, or use a provider with a stable address for 24/7 access."}
           </p>
         </div>
 

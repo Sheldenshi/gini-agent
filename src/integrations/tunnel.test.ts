@@ -1589,6 +1589,76 @@ describe("manual tunnel drivers", () => {
     expect(state.status).toBe("idle");
   });
 
+  test("cancel on an ERROR record runs the provider-side off (a failing off is swallowed)", async () => {
+    // A partial connect can leave provider-side state up behind an error
+    // record; cancel must clean it rather than write idle over it — and a
+    // failing off must not block the cancel.
+    const tailscale = scriptedDriver({
+      connect: () => Promise.reject(new Error("tailscale status failed: down")),
+      disconnect: () => Promise.reject(new Error("serve off failed"))
+    });
+    setTunnelDeps(deps({ drivers: fakeDrivers({ tailscale }) }));
+    await connectTunnel(config, "tailscale");
+    await awaitTunnelSettled(config.instance);
+    expect(getTunnel(config).status).toBe("error");
+    const state = await cancelTunnel(config);
+    expect(state.status).toBe("idle");
+    expect(tailscale.disconnects).toBe(1);
+  });
+
+  test("re-selecting the SAME provider from an ERROR record cleans provider-side state", async () => {
+    const tailscale = scriptedDriver({
+      connect: () => Promise.reject(new Error("tailscale status failed: down")),
+      disconnect: () => Promise.reject(new Error("serve off failed"))
+    });
+    setTunnelDeps(deps({ drivers: fakeDrivers({ tailscale }) }));
+    await connectTunnel(config, "tailscale");
+    await awaitTunnelSettled(config.instance);
+    expect(getTunnel(config).status).toBe("error");
+    // Same-provider select from error must run the off (and swallow its
+    // failure), not silently clear the error record over a live front.
+    const state = await selectProvider(config, "tailscale");
+    expect(state.status).toBe("idle");
+    expect(state.selectedProvider).toBe("tailscale");
+    expect(tailscale.disconnects).toBe(1);
+  });
+
+  test("disconnect still settles idle when the provider-side off fails", async () => {
+    const tailscale = scriptedDriver({ disconnect: () => Promise.reject(new Error("serve off failed")) });
+    setTunnelDeps(deps({ drivers: fakeDrivers({ tailscale }) }));
+    await connectTunnel(config, "tailscale");
+    await awaitTunnelSettled(config.instance);
+    expect(getTunnel(config).status).toBe("connected");
+    const state = await disconnectTunnel(config);
+    expect(state.status).toBe("idle");
+    expect(tailscale.disconnects).toBe(1);
+  });
+
+  test("switching away still completes when the old provider's off fails", async () => {
+    const tailscale = scriptedDriver({ disconnect: () => Promise.reject(new Error("serve off failed")) });
+    setTunnelDeps(deps({ drivers: fakeDrivers({ tailscale }) }));
+    await connectTunnel(config, "tailscale");
+    await awaitTunnelSettled(config.instance);
+    const state = await selectProvider(config, "gini-relay");
+    expect(state.selectedProvider).toBe("gini-relay");
+    expect(state.status).toBe("idle");
+    expect(tailscale.disconnects).toBe(1);
+  });
+
+  test("a direct connect to another provider still proceeds when the old off fails", async () => {
+    const tailscale = scriptedDriver({ disconnect: () => Promise.reject(new Error("serve off failed")) });
+    const ngrok = scriptedDriver({
+      connect: () => Promise.resolve({ url: "https://xy.ngrok-free.app", child: fakeChild() })
+    });
+    setTunnelDeps(deps({ drivers: fakeDrivers({ tailscale, ngrok }) }));
+    await connectTunnel(config, "tailscale");
+    await awaitTunnelSettled(config.instance);
+    await connectTunnel(config, "ngrok");
+    await awaitTunnelSettled(config.instance);
+    expect(getTunnel(config)).toMatchObject({ selectedProvider: "ngrok", status: "connected" });
+    expect(tailscale.disconnects).toBe(1);
+  });
+
   test("cancel after a childless manual connect already landed tears down the provider state", async () => {
     const tailscale = scriptedDriver();
     setTunnelDeps(deps({ drivers: fakeDrivers({ tailscale }) }));
