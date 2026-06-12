@@ -189,6 +189,16 @@ install_deps() {
   quiet "Dependencies installed" bash -c "cd '$RUNTIME_DIR' && bun install"
   if [ -f "$RUNTIME_DIR/web/package.json" ]; then
     quiet "Web app installed" bash -c "cd '$RUNTIME_DIR/web' && bun install"
+    # Build the sha-keyed production web bundle so the fresh install serves
+    # `next start` from prebuilt assets instead of JIT-compiling every route
+    # under `next dev`. The serving paths (launchd web shim, gini start) pick
+    # web/.next-prod-<sha12> iff <sha12> matches `git rev-parse --short=12
+    # HEAD` and the dir carries a BUILD_ID; the runtime's update flow
+    # (src/runtime/update.ts) rebuilds + GCs these on every update. See ADR
+    # web-production-serving.md.
+    local web_sha
+    web_sha="$(git -C "$RUNTIME_DIR" rev-parse --short=12 HEAD)"
+    quiet "Web app built" bash -c "cd '$RUNTIME_DIR/web' && GINI_DIST_DIR='.next-prod-$web_sha' bun run build"
   fi
 }
 

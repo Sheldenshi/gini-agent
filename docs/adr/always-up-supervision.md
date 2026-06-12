@@ -7,7 +7,10 @@ clean exits, and self-restarts. Three per-instance LaunchAgents under
 `~/Library/LaunchAgents/` enforce this:
 
 - `ai.lilaclabs.gini.<instance>.gateway` — the Bun runtime (`src/server.ts`).
-- `ai.lilaclabs.gini.<instance>.web` — the Next.js dev server (the BFF).
+- `ai.lilaclabs.gini.<instance>.web` — the Next.js server (the BFF). The
+  plist's shim execs `next start` from the sha-keyed production bundle when
+  one matches the current checkout, `next dev` otherwise — see
+  [Web Production Serving](web-production-serving.md).
 - `ai.lilaclabs.gini.<instance>.watchdog` — a long-lived health-probe loop.
 
 The model rests on four pieces:
@@ -53,7 +56,14 @@ The model rests on four pieces:
   the gateway (`/api/status`, where any HTTP response — including a 401 —
   proves the process is answering) and the web child
   (`/api/runtime/__healthz`, verified to be *our* `gini-web` on the
-  matching instance), and revives whichever is down: a service launchd
+  matching instance), and revives whichever has been down for **two
+  consecutive ticks** (the loop keeps a per-service failure streak, reset
+  by any healthy probe; `--once` revives on its single tick). One failed
+  probe is not proof of death: the 2s probe timeout false-negatives a
+  healthy service on a CPU-pegged host (observed live during a post-update
+  rebuild), and a revive is a `kickstart -k` — a force-kill with no drain —
+  so acting on the first miss kills the very service the watchdog protects.
+  The revive itself: a service launchd
   still has registered is `launchctl kickstart -k`ed, while a *core*
   service launchd has **deregistered** is re-bootstrapped via `autostart
   enable` (kickstart is a no-op on a label launchd no longer knows, and
@@ -181,7 +191,11 @@ launchd instances so foreground/conductor/tmux runs are unaffected.
   process probing localhost every 10s. The probe is read-only and
   idempotent — a `kickstart -k` against an already-running healthy job is a
   no-op, so the watchdog overlapping with KeepAlive's own respawn is benign.
-  A dead gateway is revived within one tick plus the 2s probe timeout, even
+  A dead gateway is revived within roughly two ticks plus two 2s probe
+  timeouts (~14-24s, depending on where in the interval it died) — the
+  two-strike rule trades a one-tick-slower revive of a genuinely dead
+  service, still inside the 30s detection target, for never force-killing a
+  healthy-but-busy one on a single timed-out probe — even
   while launchd is deferring its own respawns.
 - Foreground / `gini run` / conductor / tmux instances keep their existing
   behavior end to end: no KeepAlive, PID-kill stop, and the detached
@@ -215,11 +229,13 @@ launchd instances so foreground/conductor/tmux runs are unaffected.
   replaces its process with the new code. On a foreground instance the
   update uses the detached stop+start helper.
 - A `gini watchdog` tick against a healthy instance takes no action; with
-  the gateway down it `kickstart -k`s the gateway; with web down it
-  `kickstart -k`s web (and queues a web crash report for consent-gated
-  filing — see the crash ADR). The loop paces itself at
+  the gateway down for two consecutive ticks it `kickstart -k`s the
+  gateway; with web down for two consecutive ticks it `kickstart -k`s web
+  (and queues a web crash report for consent-gated filing — see the crash
+  ADR). A single failed tick takes no action, and a healthy probe resets
+  the service's failure streak. The loop paces itself at
   `WATCHDOG_TICK_INTERVAL_MS` between ticks and never exits on its own;
-  `gini watchdog --once` runs exactly one tick.
+  `gini watchdog --once` runs exactly one tick and revives on it.
 - Every generated plist's `EnvironmentVariables` carries a `GINI_PLIST_STAMP`.
   The stamp is identical for two plists that differ only in PATH, a secret
   value, `HOME`, `SHELL`, the state/log roots, or the stdout/err paths, and it

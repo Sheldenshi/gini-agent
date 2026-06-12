@@ -11,8 +11,11 @@ gateway API:
   and returns the same version shape.
 - `POST /api/update` runs the same source update path as `gini update`
   against the installer-managed runtime, reinstalls root and web
-  dependencies, and schedules a restart when the checked-out commit
-  changed.
+  dependencies, builds the sha-keyed production web bundle for the new
+  HEAD (see [Web Production Serving](web-production-serving.md)), and
+  schedules a restart when the checked-out commit changed. A failed web
+  build aborts the update like a failed install: no restart is scheduled
+  and the old servers keep running.
 
 The CLI `gini update` keeps the same installer-managed target
 (`~/.gini/runtime`) but no longer asks the operator to run
@@ -80,6 +83,11 @@ installer-origin guardrails rather than adding a browser-only shortcut.
   tagged shape like a transport failure and holds the blur. The
   in-flight state is persisted to `sessionStorage` so the restart-triggered
   reload resumes the blur instead of briefly exposing a half-updated app.
+  The gate's fixed stall deadline is 240s — the POST now contains a full
+  `next build` of the web app on top of git + the installs — and the
+  restart's downtime window itself is short (~1-2s gateway drain +
+  respawn): the restarted web service answers from the prebuilt bundle
+  instead of JIT-compiling routes under `next dev`.
 - The scheduled restart is supervisor-aware. On a launchd-supervised
   instance the runtime self-SIGTERMs (drains, exits 0) and `KeepAlive`
   respawns it with the freshly checked-out code — no detached stop+start
@@ -108,6 +116,9 @@ installer-origin guardrails rather than adding a browser-only shortcut.
   ppid) have both answered, and the blur survives the restart-triggered
   reload rather than briefly exposing the app.
 - `gini update` no longer prints a manual restart instruction.
+- After a non-upToDate update, `web/` contains exactly one `.next-prod-*`
+  dir keyed to the new HEAD's short sha; a failed web build surfaces a
+  structured error and schedules no restart.
 - Existing guardrails still reject missing runtimes and unexpected git
   origins.
 - `bun run typecheck`, `bun test`, and `bun run gini smoke` pass.
