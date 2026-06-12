@@ -13,7 +13,7 @@ metadata:
 
 The loader parses `metadata.gini.requires.approval` (a list of script names — the `script` argument of `skill_run`) into `SkillRecord.requiresApprovalScripts`. When the model calls `skill_run` on a listed script, dispatch creates a pending `Authorization` with the new action `"skill.run"` and pauses the task — **regardless of approval mode**. `auto` and `yolo` do not bypass the gate; like `browser_connect`, the dispatch path skips `pendingOrAuto` entirely and always returns the pending approval. On approve, the executor re-resolves the script handle (the skill may have been disabled since the pause), runs it with the persisted args, audits a `skill.run` row joined to the approval, and resumes the chat task. On deny, the standard denial path fails the task.
 
-The approval row's `reason` carries a compact preview of the script args (truncated around 400 characters) because the card's reason is what the user reads to decide; the full args live on `payload.scriptArgs`.
+The approval row's `reason` carries a compact preview of the script args (truncated around 400 characters) for the Permissions surface and the audit trail; the inline chat card itself stays minimal (a "Confirm <Skill Name>" title with Confirm/Deny — the agent's announce message above it carries the context), and the full args live on `payload.scriptArgs`.
 
 ## Context
 
