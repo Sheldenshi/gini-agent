@@ -5,7 +5,7 @@
 // No network.
 
 import { describe, expect, test } from "bun:test";
-import { buildCallResultItem, evaluateCallWatch, isCallFinished } from "../call-watch";
+import { buildCallResultItem, buildLookupFailureOutput, evaluateCallWatch, isCallFinished } from "../call-watch";
 
 describe("evaluateCallWatch", () => {
   test("done state short-circuits silently with no payload (post-delivery backstop)", () => {
@@ -58,12 +58,37 @@ describe("evaluateCallWatch", () => {
 });
 
 describe("isCallFinished", () => {
-  test("finished on completed flag, failed status, or a populated error_message", () => {
+  test("finished on completed flag, any terminal status, or a populated error_message", () => {
     expect(isCallFinished({ completed: true })).toBe(true);
+    expect(isCallFinished({ completed: false, status: "completed" })).toBe(true);
     expect(isCallFinished({ completed: false, status: "failed" })).toBe(true);
+    expect(isCallFinished({ completed: false, status: "busy" })).toBe(true);
+    expect(isCallFinished({ completed: false, status: "no-answer" })).toBe(true);
+    expect(isCallFinished({ completed: false, status: "canceled" })).toBe(true);
     expect(isCallFinished({ completed: false, error_message: "busy" })).toBe(true);
     expect(isCallFinished({ completed: false, status: "in-progress" })).toBe(false);
+    expect(isCallFinished({ completed: false, status: "unknown" })).toBe(false);
+    expect(isCallFinished({ completed: false })).toBe(false);
     expect(isCallFinished({ completed: false, error_message: "" })).toBe(false);
+  });
+});
+
+describe("buildLookupFailureOutput", () => {
+  test("4xx is terminal: untrusted context item with HTTP status and Bland message, done state", () => {
+    const output = buildLookupFailureOutput(404, "Call not found.");
+    expect(output.kind).toBe("context");
+    expect(output.state).toEqual({ done: true });
+    expect(output.items).toHaveLength(1);
+    expect(output.items?.[0]?.untrusted).toBe(true);
+    expect(output.items?.[0]?.text).toContain("HTTP 404");
+    expect(output.items?.[0]?.text).toContain("Call not found.");
+  });
+
+  test("falls back to the HTTP status when Bland sends no message", () => {
+    const output = buildLookupFailureOutput(401);
+    expect(output.kind).toBe("context");
+    expect(output.state).toEqual({ done: true });
+    expect(output.items?.[0]?.text).toContain("Bland API returned HTTP 401");
   });
 });
 

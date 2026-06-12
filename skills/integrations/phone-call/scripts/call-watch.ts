@@ -10,9 +10,9 @@
 //   stdin:  JSON { callId, state: { done? } | null }
 //   env:    BLAND_API_KEY
 //   stdout: JSON { kind, items?, summary?, state }
-//   exit:   0 on a clean tick; non-zero on a transport/HTTP fault — the
-//           skill-script handler classes a non-zero exit as TRANSIENT, so the
-//           backing job records the failure and retries next tick.
+//   exit:   0 on a clean tick; non-zero on a transport fault or HTTP 5xx —
+//           the skill-script handler classes a non-zero exit as TRANSIENT, so
+//           the backing job records the failure and retries next tick.
 //
 // Per tick:
 //   - state.done        => silent shortCircuit, NO fetch. Backstop after
@@ -24,6 +24,11 @@
 //                          call result (status, answeredBy, callLengthMinutes,
 //                          summary, transcript) + state { done: true }. The
 //                          trusted hook runner fences the item.
+//   - HTTP 4xx          => the lookup is permanently broken (stale callId →
+//                          404, revoked key → 401); retrying would loop
+//                          forever. Terminal context item describing the
+//                          failure + state { done: true }, so the drafting
+//                          turn reports it once and deletes the job.
 //
 // Pure: state rides in on stdin and out on the result; never touches files/DB.
 // Self-contained on purpose (no src/ imports): skill scripts must stay portable.
@@ -59,13 +64,19 @@ const TIMEOUT_MS = 15_000;
 
 // ── Pure helpers (unit-tested) ───────────────────────────────────────────────
 
-// Whether the call has reached a terminal state. `completed` is Bland's
-// finished flag; a failed call (never answered, rejected) can end with
-// status "failed" / error_message instead, and must still wake the drafting
-// turn — otherwise a dead call would poll silently forever.
+// Bland's GET /v1/calls/<id> `status` values that mean the call is over.
+// (The full enum is completed | no-answer | busy | canceled | failed |
+// unknown; "unknown" is NOT terminal — keep polling.)
+const TERMINAL_STATUSES = new Set(["completed", "failed", "busy", "no-answer", "canceled"]);
+
+// Whether the call has reached a terminal state. Any terminal `status` must
+// wake the drafting turn — Bland's `completed` flag can stay false on a dead
+// call (busy, no answer, canceled, failed), and polling one silently forever
+// means the user never hears the outcome. The `completed` flag and a
+// populated error_message stay as belt-and-suspenders.
 export function isCallFinished(payload: Record<string, unknown>): boolean {
   if (payload.completed === true) return true;
-  if (payload.status === "failed") return true;
+  if (typeof payload.status === "string" && TERMINAL_STATUSES.has(payload.status)) return true;
   return typeof payload.error_message === "string" && payload.error_message.length > 0;
 }
 
@@ -84,6 +95,28 @@ export function buildCallResultItem(payload: Record<string, unknown>): ResultIte
   if (typeof payload.summary === "string") details.summary = payload.summary;
   if (typeof payload.concatenated_transcript === "string") details.transcript = payload.concatenated_transcript;
   return { text: `Phone call finished — ${JSON.stringify(details)}`, untrusted: true };
+}
+
+// A 4xx from the call lookup is permanent (stale callId → 404, revoked key →
+// 401): treating it as transient would retry every tick forever with the user
+// never hearing about it. Emit a TERMINAL context item describing the failure
+// + state { done: true }, so the drafting turn reports it once and deletes
+// the job. 5xx and transport faults stay on the transient exit-1 path.
+export function buildLookupFailureOutput(httpStatus: number, blandMessage?: string): CallWatchOutput {
+  const reason =
+    typeof blandMessage === "string" && blandMessage.length > 0
+      ? blandMessage
+      : `Bland API returned HTTP ${httpStatus}`;
+  return {
+    kind: "context",
+    items: [
+      {
+        text: `Phone call status lookup failed permanently (HTTP ${httpStatus}): ${reason}. The call result cannot be retrieved.`,
+        untrusted: true
+      }
+    ],
+    state: { done: true }
+  };
 }
 
 // Decide the tick's hook output from the prior state and (when fetched) the
@@ -150,8 +183,14 @@ async function main(): Promise<void> {
       },
       signal: controller.signal
     });
-    if (!response.ok) fail(`Bland API returned HTTP ${response.status}`);
     const payload = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+    if (!response.ok) {
+      if (response.status >= 400 && response.status < 500) {
+        const message = typeof payload.message === "string" ? payload.message : undefined;
+        emit(buildLookupFailureOutput(response.status, message));
+      }
+      fail(`Bland API returned HTTP ${response.status}`);
+    }
     emit(evaluateCallWatch(args.state, payload));
   } catch (error) {
     if (error instanceof Error && error.name === "AbortError") {

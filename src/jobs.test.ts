@@ -782,6 +782,33 @@ describe("cron lifecycle", () => {
     expect(readState(config.instance).jobs).toHaveLength(0);
   });
 
+  test("create_job dispatch rejects a null preRunHook config", async () => {
+    // `typeof null === "object"`, so a bare typeof check would let
+    // config: null through to a hook that can never resolve its payload.
+    const config = testConfig("jobs-create-tool-prerunhook-null-config");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    await expect(
+      dispatchToolCall(
+        config,
+        taskId,
+        "create_job",
+        "call_create_job_hook_null_config",
+        JSON.stringify({
+          name: "null-hook-config",
+          intervalSeconds: 60,
+          prompt: "x",
+          preRunHook: { handlerId: "skill-script", config: null }
+        })
+      )
+    ).rejects.toThrow(/preRunHook\.config must be an object/);
+    expect(readState(config.instance).jobs).toHaveLength(0);
+  });
+
   test("create_job dispatch persists cronExpression + cronTimezone", async () => {
     // Happy-path cron creation through the tool dispatch surface. The
     // agent should be able to schedule a wall-clock job by name +
