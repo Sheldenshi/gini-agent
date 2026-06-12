@@ -8,11 +8,12 @@ import { Button } from "@/components/ui/button";
 import { DocReference } from "@/components/DocReference";
 import type { TunnelProvider, TunnelProviderId, TunnelState } from "./types";
 
-// Hosted docs URL for the Remote Access guide's manual-tunnels section —
+// Hosted docs URL for the Remote Access guide's native-connects section —
 // rendered inline via DocReference, same pattern as connector docsUrl links.
-// Disabled catalog rows are a dead end without this: the runtime can't drive
-// those providers, but the guide shows how to front Gini with them manually.
-const REMOTE_ACCESS_DOCS_URL = "https://gini.lilaclabs.ai/docs/remote-access#manual-tunnels";
+// Complements each row's (i) setup steps with the long-form per-provider
+// guide (and the manual-fronts fallback for setups the drivers don't cover).
+const REMOTE_ACCESS_DOCS_URL =
+  "https://gini.lilaclabs.ai/docs/remote-access#native-connects-tailscale-ngrok-cloudflare";
 
 const PROVIDER_ICON: Record<TunnelProviderId, LucideIcon> = {
   "gini-relay": Globe,

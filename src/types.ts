@@ -88,8 +88,9 @@ export type RelayStatus = "disabled" | "configured" | "degraded" | "error";
 
 // Tunnel connectivity (see ADR tunnel-connectivity.md). The tunnel gateway
 // exposes a remote URL for this instance through one of several providers.
-// Only "gini-relay" is enabled for now; the rest are catalog placeholders
-// surfaced to the UI with a `requires` explanation of what's missing.
+// "gini-relay" is always enabled; tailscale/ngrok/cloudflare are
+// detection-gated native drivers (a disabled row carries a `requires`
+// reason plus `setup` steps for the panel's info affordance).
 export type TunnelProviderId = "gini-relay" | "tailscale" | "ngrok" | "cloudflare";
 
 // One row in the provider catalog. Drives the selection panel: disabled

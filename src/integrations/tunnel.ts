@@ -129,10 +129,29 @@ const PROVIDER_SETUP: Record<ManualProviderId, string[]> = {
   ],
   cloudflare: [
     "Install cloudflared: brew install cloudflared",
-    "No account needed — Gini runs a quick tunnel (`cloudflared tunnel --url …`) and publishes a random https://<words>.trycloudflare.com URL",
-    "Quick tunnels are for testing: no SSE (live updates need a reload) and the URL changes per connect. For a stable hostname, set up a named tunnel on your own domain — see the Remote Access guide"
+    "Best: set up a named tunnel on your own domain (cloudflared tunnel login / create / route dns — see the Remote Access guide). With a ~/.cloudflared/config.yml present, Gini runs YOUR tunnel pointed at the gateway and publishes your stable hostname — SSE (live updates) works",
+    "No named tunnel? No account needed — Gini falls back to a quick tunnel with a random https://<words>.trycloudflare.com URL. Testing-grade: no SSE (live updates need a reload) and the URL changes per connect"
   ]
 };
+
+// A named Cloudflare tunnel parsed from ~/.cloudflared/config.yml: the tunnel
+// id, its credentials file, and the first ingress hostname (the operator's
+// stable public name for this tunnel). Minimal line-based parse — the file is
+// cloudflared's own simple key/value + ingress-list shape, not arbitrary YAML.
+export interface NamedCloudflareTunnel {
+  id: string;
+  credentialsFile?: string;
+  hostname: string;
+}
+
+export function parseCloudflareConfig(body: string | null): NamedCloudflareTunnel | null {
+  if (!body) return null;
+  const id = /^tunnel:\s*([A-Za-z0-9-]+)\s*$/m.exec(body)?.[1];
+  const credentialsFile = /^credentials-file:\s*(\S+)\s*$/m.exec(body)?.[1];
+  const hostname = /^\s*-\s*hostname:\s*(\S+)\s*$/m.exec(body)?.[1];
+  if (!id || !hostname) return null;
+  return { id, credentialsFile, hostname };
+}
 
 export interface RunResult {
   exitCode: number;
@@ -256,11 +275,23 @@ export async function spawnUrlChild(
   }
 }
 
-// Build the real CLI-backed drivers. Exported with injectable run/spawn seams
-// so tests cover every fold without the tailscale/ngrok/cloudflared binaries.
+// Read the operator's ~/.cloudflared/config.yml (null when absent/unreadable).
+// Exported so tests can exercise the real default read seam.
+export async function defaultReadCloudflareConfig(): Promise<string | null> {
+  try {
+    return await Bun.file(`${process.env.HOME}/.cloudflared/config.yml`).text();
+  } catch {
+    return null;
+  }
+}
+
+// Build the real CLI-backed drivers. Exported with injectable run/spawn/read
+// seams so tests cover every fold without the tailscale/ngrok/cloudflared
+// binaries or a real ~/.cloudflared.
 export function makeDefaultDrivers(
   run: RunCommand = defaultRunCommand,
-  spawn: TunnelProcSpawn = defaultTunnelProcSpawn
+  spawn: TunnelProcSpawn = defaultTunnelProcSpawn,
+  readCloudflareConfig: () => Promise<string | null> = defaultReadCloudflareConfig
 ): Record<ManualProviderId, ManualDriver> {
   const tailscaleDnsName = async (): Promise<string> => {
     const status = await run(["tailscale", "status", "--json"]);
@@ -278,10 +309,15 @@ export function makeDefaultDrivers(
     return name;
   };
 
+  // Detection probes get a tight timeout: boot awaits a detection pass before
+  // Bun.serve binds, and the CLI's start health window is 5,000 ms total
+  // (src/cli/process.ts) — a wedged provider CLI must not eat that budget.
+  const DETECT_TIMEOUT_MS = 2_000;
+
   return {
     tailscale: {
       detect: async () => {
-        const status = await run(["tailscale", "status", "--json"]).catch(() => null);
+        const status = await run(["tailscale", "status", "--json"], DETECT_TIMEOUT_MS).catch(() => null);
         if (status && status.exitCode === 0) {
           try {
             const parsed = JSON.parse(status.stdout) as { BackendState?: string; Self?: { DNSName?: string } };
@@ -309,7 +345,7 @@ export function makeDefaultDrivers(
     },
     ngrok: {
       detect: async () => {
-        const check = await run(["ngrok", "config", "check"]).catch(() => null);
+        const check = await run(["ngrok", "config", "check"], DETECT_TIMEOUT_MS).catch(() => null);
         return check && check.exitCode === 0
           ? { enabled: true }
           : { enabled: false, requires: DEFAULT_REQUIRES.ngrok };
@@ -324,20 +360,46 @@ export function makeDefaultDrivers(
     },
     cloudflare: {
       detect: async () => {
-        const version = await run(["cloudflared", "--version"]).catch(() => null);
+        const version = await run(["cloudflared", "--version"], DETECT_TIMEOUT_MS).catch(() => null);
         return version && version.exitCode === 0
           ? { enabled: true }
           : { enabled: false, requires: DEFAULT_REQUIRES.cloudflare };
       },
-      // --config /dev/null: a named-tunnel ~/.cloudflared/config.yml otherwise
-      // silently breaks quick tunnels (they register but the edge 404s).
-      connect: (port) =>
-        spawnUrlChild(
+      // Prefer the operator's NAMED tunnel when ~/.cloudflared/config.yml
+      // declares one: run it with the GATEWAY as the catch-all origin so the
+      // tunnel's stable DNS-routed hostname serves Gini — and named tunnels
+      // proxy SSE, unlike quick tunnels. `--config /dev/null` is REQUIRED
+      // here too: --url is ignored whenever ingress rules load, so running
+      // with the config would route the hostname to the config's own service
+      // instead of the gateway. Credentials are passed explicitly (the
+      // config's credentials-file, defaulting to ~/.cloudflared/<id>.json).
+      // Without a named tunnel, fall back to an ephemeral quick tunnel.
+      connect: async (port) => {
+        const named = parseCloudflareConfig(await readCloudflareConfig());
+        if (named) {
+          const credFile = named.credentialsFile ?? `${process.env.HOME}/.cloudflared/${named.id}.json`;
+          // Registration is logged, not the public hostname (that's DNS-routed)
+          // — wait for a registered connection, then publish the config's
+          // stable hostname.
+          const result = await spawnUrlChild(
+            spawn,
+            [
+              "cloudflared", "--config", "/dev/null",
+              "tunnel", "--cred-file", credFile,
+              "run", "--url", `http://127.0.0.1:${port}`, named.id
+            ],
+            /(Registered tunnel connection|Connection [a-f0-9-]+ registered)/,
+            manualConnectTimeoutMs()
+          );
+          return { url: `https://${named.hostname}`, child: result.child };
+        }
+        return spawnUrlChild(
           spawn,
           ["cloudflared", "--config", "/dev/null", "tunnel", "--url", `http://127.0.0.1:${port}`],
           /(https:\/\/[a-z0-9-]+\.trycloudflare\.com)/,
           manualConnectTimeoutMs()
-        )
+        );
+      }
     }
   };
 }
@@ -473,6 +535,22 @@ interface Supervisor {
 }
 
 const supervisors = new Map<Instance, Supervisor>();
+
+// Monotonic per-instance epoch for CHILDLESS provider-side state (tailscale
+// serve lives in tailscaled, not in a child we can stop). Every action that
+// may publish or tear down that state bumps the epoch; a DEFERRED teardown
+// (the superseded-connect abort path, which fires after its own awaits) only
+// runs if the epoch hasn't moved since its run began — otherwise a stale
+// `tailscale serve off` could turn off the front a NEWER connect just
+// published, leaving a "connected" record with a dead URL and no child
+// watcher to flip it to error.
+const providerSideEpochs = new Map<Instance, number>();
+
+function bumpProviderSideEpoch(instance: Instance): number {
+  const next = (providerSideEpochs.get(instance) ?? 0) + 1;
+  providerSideEpochs.set(instance, next);
+  return next;
+}
 
 function supervisor(instance: Instance): Supervisor {
   let entry = supervisors.get(instance);
@@ -672,7 +750,9 @@ export async function selectProvider(config: RuntimeConfig, provider: string): P
   // A live MANUAL tunnel may have provider-side state that outlives any child
   // of ours (tailscale serve persists in tailscaled) — tear that down too, or
   // the old front would keep serving while the record reads idle. Best-effort
-  // and idempotent (the superseded connect's abort path may also call it).
+  // and idempotent. Claim the provider-side epoch first: if a concurrent
+  // connect publishes while this disconnect is in flight, the epoch moves and
+  // we skip the (now stale) teardown rather than yanking the new front.
   if (
     current &&
     current.selectedProvider &&
@@ -680,6 +760,7 @@ export async function selectProvider(config: RuntimeConfig, provider: string): P
     (current.status === "connected" || current.status === "connecting") &&
     isManualProviderId(current.selectedProvider)
   ) {
+    bumpProviderSideEpoch(config.instance);
     try {
       await deps.drivers[current.selectedProvider].disconnect?.();
     } catch {
@@ -827,6 +908,12 @@ async function runManualConnect(
   opts: { awaitWebReady?: boolean } = {}
 ): Promise<void> {
   const isCurrent = (): boolean => supervisors.get(config.instance) === sup;
+  // Claim a provider-side epoch for this run. The deferred abort teardown
+  // below only fires while this is still the latest epoch — a NEWER connect
+  // bumps it when it publishes, so a stale `tailscale serve off` can never
+  // turn off the front the newer run just brought up.
+  const epoch = bumpProviderSideEpoch(config.instance);
+  const epochCurrent = (): boolean => providerSideEpochs.get(config.instance) === epoch;
   try {
     const port = deps.resolveLocalPort(config);
     const ready = opts.awaitWebReady
@@ -854,18 +941,23 @@ async function runManualConnect(
     // A cancel/disconnect or a newer connect may have superseded us while the
     // driver was bringing the tunnel up — tear down what we just started
     // instead of publishing it. Childless drivers (tailscale serve) get their
-    // provider-side teardown so the loser doesn't keep serving.
+    // provider-side teardown ONLY while our epoch is still the latest: a newer
+    // connect that already re-published the same provider-side front (serve is
+    // a singleton in tailscaled) must not have it yanked by this stale loser.
     if (!isCurrent()) {
       if (result.child) {
         void result.child.stop().catch(() => {});
         sup.child = undefined;
-      } else {
+      } else if (epochCurrent()) {
         void deps.drivers[provider].disconnect?.().catch(() => {});
       }
       appendLog(config.instance, "tunnel.connect.aborted", { provider });
       return;
     }
 
+    // Publishing: bump the epoch so any STALE superseded run still in flight
+    // sees it is no longer current and skips its deferred teardown.
+    bumpProviderSideEpoch(config.instance);
     await mutateState(config.instance, (state) => {
       applyTunnel(state, {
         ...(state.tunnel ?? {}),
@@ -1166,12 +1258,36 @@ function watchChildExit(
   });
 }
 
-// Abort a pending login: status -> "idle", keeping the selection so the
+// Abort a pending connect: status -> "idle", keeping the selection so the
 // panel still shows the chosen provider with Connect available. Clears any
 // stale url/message and tears down the in-flight login/child.
 export async function cancelTunnel(config: RuntimeConfig): Promise<TunnelState> {
+  // Capture the record + entry BEFORE the teardown awaits (mirrors disconnect).
+  const torndown = supervisors.get(config.instance);
+  const before = readState(config.instance).tunnel ?? null;
   teardown(config.instance);
+  // Cancel can land AFTER the background connect already flipped the record to
+  // "connected" (the UI's Cancel races the connect's completion). For a
+  // CHILDLESS manual provider (tailscale serve lives in tailscaled) teardown
+  // stops nothing, so run the provider-side teardown here or the old front
+  // would keep serving while the record reads idle. Best-effort + idempotent.
+  if (
+    before?.status === "connected" &&
+    before.selectedProvider &&
+    isManualProviderId(before.selectedProvider)
+  ) {
+    bumpProviderSideEpoch(config.instance);
+    try {
+      await deps.drivers[before.selectedProvider].disconnect?.();
+    } catch {
+      // never block cancel on a provider-teardown failure.
+    }
+  }
   return mutateState(config.instance, (state) => {
+    // A connect claimed the instance during the teardown awaits — leave its
+    // live record intact instead of clobbering it back to idle.
+    const current = supervisors.get(config.instance);
+    if (current && current !== torndown) return toState(state.tunnel ?? null);
     const selected = state.tunnel?.selectedProvider ?? null;
     applyTunnel(state, {
       ...(state.tunnel ?? {}),
@@ -1204,9 +1320,17 @@ export async function disconnectTunnel(config: RuntimeConfig): Promise<TunnelSta
   // if a new connect claims the instance during those awaits, the idle write
   // below must not clobber its live record.
   const torndown = supervisors.get(config.instance);
-  const selectedBefore = readState(config.instance).tunnel?.selectedProvider ?? null;
+  const before = readState(config.instance).tunnel ?? null;
+  const selectedBefore = before?.selectedProvider ?? null;
   teardown(config.instance);
-  if (selectedBefore === "gini-relay") {
+  // Provider-side side effects run ONLY when something runtime-managed was
+  // actually live (connected/connecting — and error, where a partial connect
+  // can leave provider-side state like a tailscale serve that came up before
+  // the DNS lookup failed). A bare select-then-disconnect while idle must not
+  // log the relay out or turn off an operator's PRE-EXISTING serve config
+  // that Gini never started.
+  const wasLive = before?.status === "connected" || before?.status === "connecting" || before?.status === "error";
+  if (wasLive && selectedBefore === "gini-relay") {
     // Local logout: disconnect severs the connector, so clear this instance's
     // stored relay session (local-only — no server-side revoke; keeps a stable
     // subdomain on reconnect). A later connect then requires a fresh login
@@ -1216,9 +1340,10 @@ export async function disconnectTunnel(config: RuntimeConfig): Promise<TunnelSta
     } catch {
       // never block disconnect on a logout failure.
     }
-  } else if (selectedBefore && isManualProviderId(selectedBefore)) {
+  } else if (wasLive && selectedBefore && isManualProviderId(selectedBefore)) {
     // Provider-side teardown for drivers whose tunnel outlives any child of
     // ours (tailscale serve). Child-backed drivers were stopped by teardown.
+    bumpProviderSideEpoch(config.instance);
     try {
       await deps.drivers[selectedBefore].disconnect?.();
     } catch {

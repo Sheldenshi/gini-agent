@@ -8,7 +8,7 @@ The catalog carries four drivable providers. `gini-relay` is always enabled; `ta
 
 ## Context
 
-An instance runs on the user's machine bound to loopback. To reach it from a phone or a remote device, the gateway needs a publicly reachable URL fronted by a tunnel. Users will eventually pick among several tunnel providers (a hosted Gini Relay, their own Tailscale network, ngrok, Cloudflare), but only the hosted relay is being built first. The UI needs the full provider catalog up front — including the disabled ones and why they're disabled — so it can render the selection panel in one pass, and it needs the live connection status to decide which view to show.
+An instance runs on the user's machine bound to loopback. To reach it from a phone or a remote device, the gateway needs a publicly reachable URL fronted by a tunnel. Users pick among several tunnel providers (the hosted Gini Relay, their own Tailscale network, ngrok, Cloudflare); the hosted relay shipped first, and the Tailscale/ngrok/Cloudflare drivers followed as detection-gated catalog rows. The UI needs the full provider catalog up front — including the disabled ones and why they're disabled — so it can render the selection panel in one pass, and it needs the live connection status to decide which view to show.
 
 The browser-connect capability (`src/capabilities/browser-connect.ts`, ADR-less but mirrored here) established the pattern this follows: an opt-in singleton on `RuntimeState` (`state.browser`), a behavior module exposing thin functions, HTTP routes that delegate to it, and a CLI shim that goes through the gateway. Tunnel connectivity reuses that shape (`state.tunnel`).
 
@@ -56,7 +56,7 @@ View derivation from state:
 | `gini-relay` | Gini Relay | always | — | gini-relay client (OAuth + frpc) |
 | `tailscale` | Tailscale | detected | `Tailscale network` | `tailscale serve` (childless; persists in tailscaled; same stable ts.net URL across restarts) |
 | `ngrok` | ngrok | detected | `ngrok account` | `ngrok http <port>` supervised child; URL scanned from agent output |
-| `cloudflare` | Cloudflare | detected | `cloudflared CLI` | quick tunnel (`--config /dev/null` built in) supervised child |
+| `cloudflare` | Cloudflare | detected | `cloudflared CLI` | named tunnel from `~/.cloudflared/config.yml` (run with the gateway as origin, publishing the config's stable ingress hostname — SSE-capable) when one exists; quick-tunnel fallback otherwise. `--config /dev/null` in both modes (loaded ingress rules would override `--url`); supervised child |
 
 Every manual entry also carries `setup: string[]` — the host-side install/auth steps — whether enabled or not, so the panel's info toggle can show a disabled row how to become available and an enabled row what Connect will run.
 

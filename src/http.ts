@@ -1837,9 +1837,10 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["POST", /^\/api\/relays\/([^/]+)\/health$/, async (_request, params) => json(await checkRelay(config, params[0]))],
     // Tunnel connectivity (ADR tunnel-connectivity.md). Every route returns
     // the full TunnelState so one fetch drives the selection/connect/connected
-    // UI. connect() flips to "connecting" and runs the gini-relay OAuth-loopback
-    // login + frpc handshake in the background; the UI polls GET /api/tunnel
-    // until status flips to "connected" (with url) or "error".
+    // UI. connect() flips to "connecting" and runs the selected provider's
+    // background flow (gini-relay: OAuth-loopback login + frpc; manual
+    // drivers: tailscale serve / a spawned agent, no login); the UI polls
+    // GET /api/tunnel until status flips to "connected" (with url) or "error".
     // `?detect=1` (the panel-open / CLI-status path) re-probes the manual
     // driver prerequisites first, so a freshly-installed CLI flips its catalog
     // row without a runtime restart; plain polling GETs never spawn detection.

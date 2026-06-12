@@ -12,7 +12,7 @@
 // frpc child.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { rmSync } from "node:fs";
+import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import {
   awaitTunnelSettled,
@@ -20,12 +20,14 @@ import {
   connectTunnel,
   defaultLogout,
   defaultOpenBrowser,
+  defaultReadCloudflareConfig,
   defaultRunCommand,
   defaultTunnelProcSpawn,
   disconnectTunnel,
   getTunnel,
   makeDefaultDeps,
   makeDefaultDrivers,
+  parseCloudflareConfig,
   reconcileTunnelOnStartup,
   refreshProviderDetection,
   selectProvider,
@@ -1426,6 +1428,38 @@ describe("manual tunnel drivers", () => {
     expect(getTunnel(config).message).toBeUndefined();
   });
 
+  test("a stale superseded run never tears down the front a NEWER connect just published", async () => {
+    // R1 connects (slow driver); cancel supersedes it; R2 connects and
+    // publishes. When R1's driver finally resolves, its abort path must SKIP
+    // the provider-side teardown — otherwise the serve config R2 just brought
+    // up would be yanked while the record reads connected.
+    const r1Gate = Promise.withResolvers<void>();
+    let connects = 0;
+    const tailscale = scriptedDriver({
+      connect: () => {
+        connects += 1;
+        return connects === 1
+          ? r1Gate.promise.then(() => ({ url: "https://machine.tail-test.ts.net" }))
+          : Promise.resolve({ url: "https://machine.tail-test.ts.net" });
+      }
+    });
+    setTunnelDeps(deps({ drivers: fakeDrivers({ tailscale }) }));
+
+    await connectTunnel(config, "tailscale"); // R1, parked on r1Gate
+    const r1Settled = awaitTunnelSettled(config.instance);
+    await cancelTunnel(config);               // supersede R1 (idle; no teardown — R1 wasn't connected)
+    await connectTunnel(config, "tailscale"); // R2
+    await awaitTunnelSettled(config.instance);
+    expect(getTunnel(config).status).toBe("connected");
+
+    r1Gate.resolve();                          // R1's driver finally resolves
+    await r1Settled;
+    // R1's abort path must NOT have run the provider-side teardown.
+    expect(tailscale.disconnects).toBe(0);
+    expect(getTunnel(config).status).toBe("connected");
+    expect(isRuntimeTunnelHost("machine.tail-test.ts.net")).toBe(true);
+  });
+
   test("a superseded child-backed manual connect stops the child it spawned (a stop failure is swallowed)", async () => {
     const gate = Promise.withResolvers<void>();
     const child = fakeChild();
@@ -1452,6 +1486,57 @@ describe("manual tunnel drivers", () => {
     await settled;
     expect(getTunnel(config).status).toBe("idle");
     expect(stops).toBeGreaterThanOrEqual(1);
+  });
+
+  test("cancel after a childless manual connect already landed tears down the provider state", async () => {
+    const tailscale = scriptedDriver();
+    setTunnelDeps(deps({ drivers: fakeDrivers({ tailscale }) }));
+    await connectTunnel(config, "tailscale");
+    await awaitTunnelSettled(config.instance);
+    expect(getTunnel(config).status).toBe("connected");
+    // The UI's Cancel can land after the background connect completed; the
+    // serve config must not keep serving while the record reads idle.
+    const state = await cancelTunnel(config);
+    expect(state.status).toBe("idle");
+    expect(tailscale.disconnects).toBe(1);
+    expect(isRuntimeTunnelHost("machine.tail-test.ts.net")).toBe(false);
+  });
+
+  test("disconnect while idle never runs provider-side teardown (protects a pre-existing serve config)", async () => {
+    const tailscale = scriptedDriver();
+    setTunnelDeps(deps({ drivers: fakeDrivers({ tailscale }) }));
+    await selectProvider(config, "tailscale");
+    const state = await disconnectTunnel(config);
+    expect(state.status).toBe("idle");
+    // Gini never started a tunnel — it must not turn off the operator's own
+    // tailscale serve config.
+    expect(tailscale.disconnects).toBe(0);
+  });
+
+  test("disconnect while idle with the relay selected does not log the relay out", async () => {
+    let loggedOut = 0;
+    setTunnelDeps(deps({
+      logout: () => {
+        loggedOut += 1;
+        return Promise.resolve();
+      }
+    }));
+    await selectProvider(config, "gini-relay");
+    const state = await disconnectTunnel(config);
+    expect(state.status).toBe("idle");
+    expect(loggedOut).toBe(0);
+  });
+
+  test("disconnect after a partial manual connect failure (error record) still cleans up provider state", async () => {
+    // tailscale serve came up but the DNS lookup failed -> record "error" with
+    // provider-side state live; disconnect must be able to clean that up.
+    const tailscale = scriptedDriver({ connect: () => Promise.reject(new Error("tailscale status failed: down")) });
+    setTunnelDeps(deps({ drivers: fakeDrivers({ tailscale }) }));
+    await connectTunnel(config, "tailscale");
+    await awaitTunnelSettled(config.instance);
+    expect(getTunnel(config).status).toBe("error");
+    await disconnectTunnel(config);
+    expect(tailscale.disconnects).toBe(1);
   });
 
   test("reconcile resumes a connected manual tunnel when its driver is still available", async () => {
@@ -1545,8 +1630,8 @@ describe("manual tunnel drivers", () => {
 
 // A scriptable SpawnedTunnelProc: push lines into stdout/stderr, resolve exit.
 function fakeProc(): SpawnedTunnelProc & {
-  emitOut: (line: string) => void;
-  emitErr: (line: string) => void;
+  emitOut: (line: string) => Promise<void>;
+  emitErr: (line: string) => Promise<void>;
   exit: (code: number) => void;
   killed: boolean;
 } {
@@ -1565,11 +1650,14 @@ function fakeProc(): SpawnedTunnelProc & {
       proc.killed = true;
       exited.resolve(143);
     },
+    // Return the write promise: awaiting it deterministically orders the
+    // scanner's read (the parked reader resolves in the same microtask job)
+    // ahead of the test's next step — no fixed sleeps needed.
     emitOut(line: string) {
-      void outWriter.write(encoder.encode(`${line}\n`));
+      return outWriter.write(encoder.encode(`${line}\n`));
     },
     emitErr(line: string) {
-      void errWriter.write(encoder.encode(`${line}\n`));
+      return errWriter.write(encoder.encode(`${line}\n`));
     },
     exit(code: number) {
       exited.resolve(code);
@@ -1610,8 +1698,9 @@ describe("spawnUrlChild", () => {
   test("an exit before the URL rejects with the output tail and the agent name", async () => {
     const proc = fakeProc();
     const pending = spawnUrlChild(() => proc, ["ngrok"], /url=(\S+)/, 5_000);
-    proc.emitErr("ERROR: authentication failed: your authtoken is invalid");
-    await Bun.sleep(5); // let the line land in the tail before the exit races it
+    // Awaiting the write delivers the line to the scanner (same microtask job
+    // resolves the parked read) before the exit races it — deterministic.
+    await proc.emitErr("ERROR: authentication failed: your authtoken is invalid");
     proc.exit(1);
     await expect(pending).rejects.toThrow(/ngrok exited \(code 1\).*authtoken is invalid/);
   });
@@ -1634,12 +1723,10 @@ describe("spawnUrlChild", () => {
       kill: () => exited.resolve(143)
     };
     const pending = spawnUrlChild(() => proc, ["agent"], /url=(\S+)/, 5_000);
-    void writer.write(new TextEncoder().encode("warming up\n"));
-    await Bun.sleep(5);
+    await writer.write(new TextEncoder().encode("warming up\n"));
     // The pipe tears down (e.g. the process was killed externally) — the read
     // loop's catch must swallow it rather than surface an unhandled rejection.
-    void writer.abort(new Error("pipe torn down"));
-    await Bun.sleep(5);
+    await writer.abort(new Error("pipe torn down"));
     exited.resolve(9);
     await expect(pending).rejects.toThrow(/agent exited \(code 9\)/);
   });
@@ -1761,7 +1848,8 @@ describe("makeDefaultDrivers", () => {
         procs.push(proc);
         return proc;
       };
-      const drivers = makeDefaultDrivers(runScript({}).run, spawn);
+      // No ~/.cloudflared/config.yml -> the quick-tunnel fallback.
+      const drivers = makeDefaultDrivers(runScript({}).run, spawn, async () => null);
 
       const ngrokPending = drivers.ngrok.connect(7342);
       procs[0]!.emitOut('msg="started tunnel" url=https://xy-1.ngrok-free.app');
@@ -1769,9 +1857,108 @@ describe("makeDefaultDrivers", () => {
       expect(spawned[0]).toEqual(["ngrok", "http", "7342", "--log", "stdout", "--log-format", "logfmt"]);
 
       const cfPending = drivers.cloudflare.connect(7342);
+      // The cloudflare connect awaits the config read before spawning — poll
+      // for the spawn instead of assuming it happened synchronously.
+      while (procs.length < 2) await Bun.sleep(1);
       procs[1]!.emitErr("INF |  https://ab-cd.trycloudflare.com  |");
       expect((await cfPending).url).toBe("https://ab-cd.trycloudflare.com");
       expect(spawned[1]).toEqual(["cloudflared", "--config", "/dev/null", "tunnel", "--url", "http://127.0.0.1:7342"]);
+    } finally {
+      delete process.env.GINI_TUNNEL_MANUAL_TIMEOUT_MS;
+    }
+  });
+
+  test("cloudflared: a named-tunnel config.yml runs the OPERATOR'S tunnel against the gateway and publishes its stable hostname", async () => {
+    process.env.GINI_TUNNEL_MANUAL_TIMEOUT_MS = "5000";
+    try {
+      const CONFIG = [
+        "tunnel: d8eafe76-0586-454c-8846-2e86db3cecb3",
+        "credentials-file: /Users/op/.cloudflared/d8eafe76-0586-454c-8846-2e86db3cecb3.json",
+        "",
+        "ingress:",
+        "  - hostname: app.demoivyly.com",
+        "    service: http://localhost:3000",
+        "  - service: http_status:404"
+      ].join("\n");
+      const spawned: string[][] = [];
+      const procs: ReturnType<typeof fakeProc>[] = [];
+      const spawn = (argv: string[]): SpawnedTunnelProc => {
+        spawned.push(argv);
+        const proc = fakeProc();
+        procs.push(proc);
+        return proc;
+      };
+      const drivers = makeDefaultDrivers(runScript({}).run, spawn, async () => CONFIG);
+      const pending = drivers.cloudflare.connect(7342);
+      while (procs.length < 1) await Bun.sleep(1);
+      procs[0]!.emitErr("2026-06-12T00:00:00Z INF Registered tunnel connection connIndex=0");
+      const result = await pending;
+      // The stable named-tunnel hostname (SSE-capable), NOT a trycloudflare URL.
+      expect(result.url).toBe("https://app.demoivyly.com");
+      expect(result.child).toBeDefined();
+      // --config /dev/null is required even here: with ingress rules loaded
+      // the --url origin override would be ignored.
+      expect(spawned[0]).toEqual([
+        "cloudflared", "--config", "/dev/null",
+        "tunnel", "--cred-file", "/Users/op/.cloudflared/d8eafe76-0586-454c-8846-2e86db3cecb3.json",
+        "run", "--url", "http://127.0.0.1:7342", "d8eafe76-0586-454c-8846-2e86db3cecb3"
+      ]);
+    } finally {
+      delete process.env.GINI_TUNNEL_MANUAL_TIMEOUT_MS;
+    }
+  });
+
+  test("defaultReadCloudflareConfig returns text when readable and null otherwise", async () => {
+    const prevHome = process.env.HOME;
+    try {
+      // A HOME with no ~/.cloudflared -> null.
+      process.env.HOME = "/tmp/gini-no-cloudflared-home";
+      expect(await defaultReadCloudflareConfig()).toBeNull();
+      // A HOME with a config.yml -> its text.
+      const home = "/tmp/gini-cloudflared-home";
+      rmSync(home, { recursive: true, force: true });
+      mkdirSync(`${home}/.cloudflared`, { recursive: true });
+      await Bun.write(`${home}/.cloudflared/config.yml`, "tunnel: abc\n");
+      process.env.HOME = home;
+      expect(await defaultReadCloudflareConfig()).toBe("tunnel: abc\n");
+    } finally {
+      process.env.HOME = prevHome;
+    }
+  });
+
+  test("parseCloudflareConfig folds: null, no tunnel id, no hostname, defaulted credentials file", () => {
+    expect(parseCloudflareConfig(null)).toBeNull();
+    expect(parseCloudflareConfig("ingress:\n  - hostname: a.example\n    service: x")).toBeNull();
+    expect(parseCloudflareConfig("tunnel: abc-123\ningress:\n  - service: http_status:404")).toBeNull();
+    expect(parseCloudflareConfig("tunnel: abc-123\ningress:\n  - hostname: a.example\n    service: x")).toEqual({
+      id: "abc-123",
+      credentialsFile: undefined,
+      hostname: "a.example"
+    });
+  });
+
+  test("cloudflared: a config without credentials-file defaults to ~/.cloudflared/<id>.json", async () => {
+    process.env.GINI_TUNNEL_MANUAL_TIMEOUT_MS = "5000";
+    try {
+      const spawned: string[][] = [];
+      const spawn = (argv: string[]): SpawnedTunnelProc => {
+        spawned.push(argv);
+        const proc = fakeProc();
+        void proc.emitErr("INF Registered tunnel connection connIndex=0");
+        return proc;
+      };
+      const drivers = makeDefaultDrivers(
+        runScript({}).run,
+        spawn,
+        async () => "tunnel: abc-123\ningress:\n  - hostname: gini.example.com\n    service: http://localhost:3000"
+      );
+      const result = await drivers.cloudflare.connect(7342);
+      expect(result.url).toBe("https://gini.example.com");
+      expect(spawned[0]).toEqual([
+        "cloudflared", "--config", "/dev/null",
+        "tunnel", "--cred-file", `${process.env.HOME}/.cloudflared/abc-123.json`,
+        "run", "--url", "http://127.0.0.1:7342", "abc-123"
+      ]);
     } finally {
       delete process.env.GINI_TUNNEL_MANUAL_TIMEOUT_MS;
     }
