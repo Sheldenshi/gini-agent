@@ -1,10 +1,10 @@
-// Unit tests for the pure helper of the check-call script.
+// Unit tests for the pure helpers of the check-call script.
 //
-// Only the side-effect-free export is covered here: mapping Bland's call
-// payload to the script result. No network.
+// Only the side-effect-free exports are covered here: mapping Bland's call
+// payload to the script result and normalizing waitSeconds. No network.
 
 import { describe, expect, test } from "bun:test";
-import { mapCallDetails } from "../check-call";
+import { mapCallDetails, normalizeWaitSeconds } from "../check-call";
 
 describe("mapCallDetails", () => {
   test("maps a completed call, keeping call_length as minutes", () => {
@@ -63,5 +63,23 @@ describe("mapCallDetails", () => {
     });
     expect(result.ok).toBe(true);
     expect(result.errorMessage).toBe("Call was not answered.");
+  });
+});
+
+describe("normalizeWaitSeconds", () => {
+  test("defaults to 0 when omitted or not a finite number", () => {
+    expect(normalizeWaitSeconds(undefined)).toBe(0);
+    expect(normalizeWaitSeconds(null)).toBe(0);
+    expect(normalizeWaitSeconds("60")).toBe(0);
+    expect(normalizeWaitSeconds(Number.NaN)).toBe(0);
+    expect(normalizeWaitSeconds(Number.POSITIVE_INFINITY)).toBe(0);
+  });
+
+  test("clamps to the [0, 240] budget", () => {
+    expect(normalizeWaitSeconds(-5)).toBe(0);
+    expect(normalizeWaitSeconds(0)).toBe(0);
+    expect(normalizeWaitSeconds(60)).toBe(60);
+    expect(normalizeWaitSeconds(240)).toBe(240);
+    expect(normalizeWaitSeconds(600)).toBe(240);
   });
 });

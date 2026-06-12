@@ -28,7 +28,7 @@ The runtime injects `BLAND_API_KEY` into the scripts — you never see or pass t
 1. **Gather the full task.** Before anything else, collect: who to call (name + number), the goal, hard constraints (dates, times, party size, budget), fallbacks if the first ask isn't available, and the name to give if the callee asks who's calling. A vague task produces a bad call.
 2. **Confirm with the user before dialing.** State the exact number and what the agent will say/ask, and get an explicit go-ahead. Calls are outward-facing and irreversible.
 3. **Place the call** with `place-call`. It returns `{ ok, callId }`.
-4. **Poll** `check-call` with that `callId` about every 10 seconds until `completed` is `true`.
+4. **Wait for the result** with `check-call`, passing `waitSeconds: 240` — the script polls Bland every 10 seconds internally and returns as soon as the call completes (or when the budget runs out). If the result comes back with `completed: false`, call `check-call` again with the same args and repeat until `completed` is `true`.
 5. **Report back** the `summary` and the key points of the `transcript` (quote relevant exchanges, don't dump the whole thing unless asked).
 
 If the user wants to abort a call in progress, run `stop-call` with the `callId`.
@@ -55,10 +55,10 @@ Returns `{ ok, callId }` or `{ ok: false, error }`.
 ### check-call
 
 ```
-skill_run({ skill: "phone-call", script: "check-call", args: { callId: "..." } })
+skill_run({ skill: "phone-call", script: "check-call", args: { callId: "...", waitSeconds: 240 } })
 ```
 
-Returns `{ ok, callId, status, completed, answeredBy, callLengthMinutes, to, from, transcript, summary, recordingUrl, errorMessage }`. Fields Bland hasn't populated yet are omitted; `transcript` and `summary` appear only after `completed` is `true`. `callLengthMinutes` is in minutes. `answeredBy` distinguishes `human` from `voicemail`.
+Returns `{ ok, callId, status, completed, answeredBy, callLengthMinutes, to, from, transcript, summary, recordingUrl, errorMessage }`. `waitSeconds` (optional, default 0, max 240) makes the script wait for the call to finish, polling Bland every 10 seconds; if the budget runs out first it returns the latest status with `completed: false` — call again with the same args. Fields Bland hasn't populated yet are omitted; `transcript` and `summary` appear only after `completed` is `true`. `callLengthMinutes` is in minutes. `answeredBy` distinguishes `human` from `voicemail`.
 
 ### stop-call
 
