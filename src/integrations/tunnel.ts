@@ -287,23 +287,29 @@ export async function spawnUrlChild(
   }
 }
 
-// Read the operator's ~/.cloudflared/config.yml (null when absent/unreadable).
-// Exported so tests can exercise the real default read seam.
-export async function defaultReadCloudflareConfig(): Promise<string | null> {
+// Read a text file, null when absent/unreadable. Exported so tests can
+// exercise the real default read seam.
+export async function defaultReadTextFile(path: string): Promise<string | null> {
   try {
-    return await Bun.file(`${process.env.HOME}/.cloudflared/config.yml`).text();
+    return await Bun.file(path).text();
   } catch {
     return null;
   }
 }
 
+// Read the operator's ~/.cloudflared/config.yml (null when absent/unreadable).
+export function defaultReadCloudflareConfig(): Promise<string | null> {
+  return defaultReadTextFile(`${process.env.HOME}/.cloudflared/config.yml`);
+}
+
 // Build the real CLI-backed drivers. Exported with injectable run/spawn/read
 // seams so tests cover every fold without the tailscale/ngrok/cloudflared
-// binaries or a real ~/.cloudflared.
+// binaries or a real ~/.cloudflared / ngrok.yml.
 export function makeDefaultDrivers(
   run: RunCommand = defaultRunCommand,
   spawn: TunnelProcSpawn = defaultTunnelProcSpawn,
-  readCloudflareConfig: () => Promise<string | null> = defaultReadCloudflareConfig
+  readCloudflareConfig: () => Promise<string | null> = defaultReadCloudflareConfig,
+  readTextFile: (path: string) => Promise<string | null> = defaultReadTextFile
 ): Record<ManualProviderId, ManualDriver> {
   const tailscaleDnsName = async (): Promise<string> => {
     const status = await run(["tailscale", "status", "--json"]);
@@ -364,9 +370,17 @@ export function makeDefaultDrivers(
       }
     },
     ngrok: {
+      // `ngrok config check` validates the FILE, which can be valid with no
+      // authtoken — and the catalog promises "requires ngrok account". So the
+      // probe also requires an authtoken: either in the config file the check
+      // reports ("Valid configuration file at <path>") or via NGROK_AUTHTOKEN.
       detect: async () => {
         const check = await run(["ngrok", "config", "check"], DETECT_TIMEOUT_MS).catch(() => null);
-        return check && check.exitCode === 0
+        if (!check || check.exitCode !== 0) return { enabled: false, requires: DEFAULT_REQUIRES.ngrok };
+        if ((process.env.NGROK_AUTHTOKEN ?? "").length > 0) return { enabled: true };
+        const path = /Valid configuration file at (.+)/.exec(check.stdout)?.[1]?.trim();
+        const body = path ? await readTextFile(path) : null;
+        return body && /^\s*authtoken:\s*\S+/m.test(body)
           ? { enabled: true }
           : { enabled: false, requires: DEFAULT_REQUIRES.ngrok };
       },
@@ -556,11 +570,53 @@ interface Supervisor {
 
 const supervisors = new Map<Instance, Supervisor>();
 
-// Monotonic per-instance connect-attempt stamp. connectTunnel awaits
-// (detection, old-provider teardown) BEFORE claiming the supervisor; an
-// attempt that resumes from those awaits after a newer attempt started must
-// bail instead of claiming — last user action wins.
+// Monotonic per-instance action stamp. connectTunnel awaits (detection,
+// old-provider teardown) BEFORE claiming the supervisor; an attempt that
+// resumes from those awaits after ANY newer user action (another connect, a
+// cancel/disconnect, a selection change) must bail instead of claiming —
+// the user's last action wins.
 const connectAttempts = new Map<Instance, number>();
+
+function bumpConnectAttempt(instance: Instance): number {
+  const next = (connectAttempts.get(instance) ?? 0) + 1;
+  connectAttempts.set(instance, next);
+  return next;
+}
+
+// Serialize provider-side driver calls per (instance, provider) for CHILDLESS
+// drivers (those declaring `disconnect` — tailscale, whose serve config is a
+// singleton in tailscaled). Two in-flight CLI calls can interleave at the OS
+// level: a stale `serve off` finishing after a newer `serve --bg` would
+// silently kill the new front while the record reads connected. Enqueue order
+// = action order, so the last action's provider-side effect lands last; the
+// epoch checks decide WHETHER a deferred teardown still runs, this queue
+// guarantees the ones that do run can't interleave. Child-backed providers
+// (ngrok/cloudflared) are never queued — their connects can park for the full
+// URL-discovery window and have no provider-side singleton to protect.
+const providerOps = new Map<string, Promise<unknown>>();
+
+function serializeProviderOp<T>(instance: Instance, provider: ManualProviderId, fn: () => Promise<T>): Promise<T> {
+  const key = `${instance}:${provider}`;
+  const prev = providerOps.get(key) ?? Promise.resolve();
+  const next = prev.then(fn, fn);
+  providerOps.set(key, next.then(() => undefined, () => undefined));
+  return next;
+}
+
+// Queue-aware driver call helpers: childless drivers go through the
+// per-(instance,provider) queue; child-backed drivers call straight through.
+function driverConnect(instance: Instance, provider: ManualProviderId, port: number): Promise<ManualDriverResult> {
+  const driver = deps.drivers[provider];
+  return driver.disconnect
+    ? serializeProviderOp(instance, provider, () => driver.connect(port))
+    : driver.connect(port);
+}
+
+function driverDisconnect(instance: Instance, provider: ManualProviderId): Promise<void> {
+  const driver = deps.drivers[provider];
+  if (!driver.disconnect) return Promise.resolve();
+  return serializeProviderOp(instance, provider, () => driver.disconnect!());
+}
 
 // Monotonic per-instance epoch for CHILDLESS provider-side state (tailscale
 // serve lives in tailscaled, not in a child we can stop). Every action that
@@ -612,24 +668,39 @@ function teardown(instance: Instance): void {
 // registry is cleared first, so each child's exit watcher sees its entry is gone
 // and writes no spurious "error" record during shutdown. Best-effort and awaited
 // so the drain can wait on a clean teardown.
-//
-// NOTE: a connected CHILDLESS tunnel (tailscale serve) is deliberately NOT
-// torn down here — serve persisting in tailscaled across a runtime restart is
-// what makes the boot resume seamless (the same ts.net URL keeps answering
-// while the gateway restarts), mirroring how frpc relay state outlives a
-// non-graceful exit. The reconcile resumes or settles the record on the next
-// boot; an operator who wants the front gone disconnects before stopping.
+// Childless provider-side state (tailscale serve) is torn down too: a serve
+// config left live after exit would route the public URL to whatever process
+// binds the gateway port next. The record stays `connected` on disk, so the
+// next boot's reconcile re-publishes the SAME URL — resume is unaffected. A
+// NON-graceful exit (crash/SIGKILL) runs none of this; reconcile re-publishes
+// from the persisted record either way.
 export async function stopAllTunnels(): Promise<void> {
-  const entries = [...supervisors.values()];
+  const entries = [...supervisors.entries()];
   supervisors.clear();
   await Promise.all(
-    entries.map((entry) => {
+    entries.map(([instance, entry]) => {
       try {
         entry.login?.cancel();
       } catch {
         // login already settled — nothing to cancel.
       }
-      return entry.child?.stop().then(() => undefined).catch(() => undefined) ?? Promise.resolve();
+      const stops: Promise<unknown>[] = [];
+      if (entry.child) stops.push(entry.child.stop().catch(() => undefined));
+      // A connected CHILDLESS tunnel (tailscale serve) would keep fronting the
+      // gateway PORT after this process exits — and whatever binds that port
+      // next. Turn the provider-side state off; the record stays `connected`
+      // on disk, so the next boot's reconcile re-publishes the SAME URL (the
+      // resume is unaffected — it re-runs `serve --bg` itself).
+      const record = readState(instance).tunnel;
+      if (
+        !entry.child &&
+        record?.status === "connected" &&
+        record.selectedProvider &&
+        isManualProviderId(record.selectedProvider)
+      ) {
+        stops.push(driverDisconnect(instance, record.selectedProvider).catch(() => undefined));
+      }
+      return Promise.all(stops);
     })
   );
 }
@@ -764,6 +835,9 @@ export function getTunnel(config: RuntimeConfig): TunnelState {
 // "idle" — the user still has to click Connect. Clears any prior url/message
 // because the selection changed.
 export async function selectProvider(config: RuntimeConfig, provider: string): Promise<TunnelState> {
+  // A selection change supersedes any connect still in its prep awaits (see
+  // cancel) - the user moved on; the older attempt must not resume and claim.
+  bumpConnectAttempt(config.instance);
   let entry = findProvider(provider);
   if (!entry) throw new Error(`Unknown tunnel provider: ${provider}`);
   if (!entry.enabled && isManualProviderId(entry.id)) {
@@ -810,7 +884,7 @@ export async function selectProvider(config: RuntimeConfig, provider: string): P
   ) {
     bumpProviderSideEpoch(config.instance);
     try {
-      await deps.drivers[current.selectedProvider].disconnect?.();
+      await driverDisconnect(config.instance, current.selectedProvider);
     } catch {
       // never block a provider switch on the old provider's teardown.
     }
@@ -858,8 +932,7 @@ export async function connectTunnel(config: RuntimeConfig, provider?: string): P
   // happens this older attempt must bail before the claim — otherwise it
   // would resume, tear down the newer winner's supervisor, and overwrite its
   // record (the user's LAST action must win).
-  const attempt = (connectAttempts.get(config.instance) ?? 0) + 1;
-  connectAttempts.set(config.instance, attempt);
+  const attempt = bumpConnectAttempt(config.instance);
   const superseded = (): boolean => connectAttempts.get(config.instance) !== attempt;
 
   const requested = provider ?? readState(config.instance).tunnel?.selectedProvider ?? null;
@@ -892,7 +965,7 @@ export async function connectTunnel(config: RuntimeConfig, provider?: string): P
   ) {
     bumpProviderSideEpoch(config.instance);
     try {
-      await deps.drivers[previous.selectedProvider].disconnect?.();
+      await driverDisconnect(config.instance, previous.selectedProvider);
     } catch {
       // never block the new connect on the old provider's teardown.
     }
@@ -1022,7 +1095,7 @@ async function runManualConnect(
       return;
     }
 
-    const result = await deps.drivers[provider].connect(port);
+    const result = await driverConnect(config.instance, provider, port);
     if (result.child) sup.child = result.child;
 
     // A cancel/disconnect or a newer connect may have superseded us while the
@@ -1036,7 +1109,7 @@ async function runManualConnect(
         void result.child.stop().catch(() => {});
         sup.child = undefined;
       } else if (epochCurrent()) {
-        void deps.drivers[provider].disconnect?.().catch(() => {});
+        void driverDisconnect(config.instance, provider).catch(() => {});
       }
       appendLog(config.instance, "tunnel.connect.aborted", { provider });
       return;
@@ -1349,6 +1422,9 @@ function watchChildExit(
 // panel still shows the chosen provider with Connect available. Clears any
 // stale url/message and tears down the in-flight login/child.
 export async function cancelTunnel(config: RuntimeConfig): Promise<TunnelState> {
+  // Cancel supersedes any connect still in its prep awaits — that older
+  // attempt must bail rather than resume past this cancel and reconnect.
+  bumpConnectAttempt(config.instance);
   // Capture the record + entry BEFORE the teardown awaits (mirrors disconnect).
   const torndown = supervisors.get(config.instance);
   const before = readState(config.instance).tunnel ?? null;
@@ -1365,7 +1441,7 @@ export async function cancelTunnel(config: RuntimeConfig): Promise<TunnelState> 
   ) {
     bumpProviderSideEpoch(config.instance);
     try {
-      await deps.drivers[before.selectedProvider].disconnect?.();
+      await driverDisconnect(config.instance, before.selectedProvider);
     } catch {
       // never block cancel on a provider-teardown failure.
     }
@@ -1403,6 +1479,8 @@ export async function cancelTunnel(config: RuntimeConfig): Promise<TunnelState> 
 // user can reconnect to the same provider without re-selecting. Stops the
 // frpc child and clears the url/message.
 export async function disconnectTunnel(config: RuntimeConfig): Promise<TunnelState> {
+  // Disconnect supersedes any connect still in its prep awaits (see cancel).
+  bumpConnectAttempt(config.instance);
   // Capture the entry we're tearing down BEFORE the provider-teardown awaits:
   // if a new connect claims the instance during those awaits, the idle write
   // below must not clobber its live record.
@@ -1432,7 +1510,7 @@ export async function disconnectTunnel(config: RuntimeConfig): Promise<TunnelSta
     // ours (tailscale serve). Child-backed drivers were stopped by teardown.
     bumpProviderSideEpoch(config.instance);
     try {
-      await deps.drivers[selectedBefore].disconnect?.();
+      await driverDisconnect(config.instance, selectedBefore);
     } catch {
       // never block disconnect on a provider-teardown failure.
     }

@@ -1445,15 +1445,14 @@ describe("manual tunnel drivers", () => {
     await connectTunnel(config, "tailscale"); // R1, parked on r1Gate
     const r1Settled = awaitTunnelSettled(config.instance);
     await cancelTunnel(config);               // supersede R1 (idle; no teardown — R1 wasn't connected)
-    await connectTunnel(config, "tailscale"); // R2
-    await awaitTunnelSettled(config.instance);
-    expect(getTunnel(config).status).toBe("connected");
-
-    r1Gate.resolve();                          // R1's driver finally resolves
+    await connectTunnel(config, "tailscale"); // R2 — its serve op queues behind R1's parked one
+    const r2Settled = awaitTunnelSettled(config.instance);
+    r1Gate.resolve();                          // release the provider-op queue: R1 aborts, then R2 publishes
     await r1Settled;
+    await r2Settled;
+    expect(getTunnel(config).status).toBe("connected");
     // R1's abort path must NOT have run the provider-side teardown.
     expect(tailscale.disconnects).toBe(0);
-    expect(getTunnel(config).status).toBe("connected");
     expect(isRuntimeTunnelHost("machine.tail-test.ts.net")).toBe(true);
   });
 
@@ -1537,13 +1536,16 @@ describe("manual tunnel drivers", () => {
     await connectTunnel(config, "tailscale");
     await awaitTunnelSettled(config.instance);
     // The switch to gini-relay parks on the old provider's disconnect; a new
-    // tailscale connect lands and publishes during that await. The selection's
-    // idle write must yield to the live record (the later user action wins).
+    // tailscale connect lands during that await (its serve op queues behind
+    // the parked disconnect, so off-then-on lands in action order). The
+    // selection's idle write must yield to the live record (the later user
+    // action wins).
     const switching = selectProvider(config, "gini-relay");
     await connectTunnel(config, "tailscale");
-    await awaitTunnelSettled(config.instance);
-    expect(getTunnel(config).status).toBe("connected");
+    const settled = awaitTunnelSettled(config.instance);
     disconnectGate.resolve();
+    await settled;
+    expect(getTunnel(config).status).toBe("connected");
     await switching;
     expect(getTunnel(config)).toMatchObject({ selectedProvider: "tailscale", status: "connected" });
   });
@@ -1586,23 +1588,60 @@ describe("manual tunnel drivers", () => {
     await connectTunnel(config, "tailscale");
     await awaitTunnelSettled(config.instance);
 
-    // A (ngrok) parks on tailscale's teardown; B (cloudflare) starts after,
-    // parks on its own teardown await; release both with B finishing FIRST.
+    // A (ngrok) parks on tailscale's teardown; B (cloudflare) ENTERS after —
+    // entering alone supersedes A. When A's prep await releases, A must bail
+    // instead of claiming/overwriting; B then proceeds and wins.
     const a = connectTunnel(config, "ngrok");
     await Bun.sleep(1); // A reaches its disconnect await (gate 0)
-    const b = connectTunnel(config, "cloudflare");
-    await Bun.sleep(1); // B reaches its disconnect await (gate 1)
-    disconnectGates[1]!.resolve();
+    const b = connectTunnel(config, "cloudflare"); // its teardown queues behind A's
+    await Bun.sleep(1);
+    disconnectGates[0]!.resolve(); // A's prep completes — superseded, bails
+    const aState = await a;
+    expect(ngrok.connects).toBe(0);
+    expect(aState.status).toBe("connected"); // A reports the still-live tailscale state, untouched
+    disconnectGates[1]!.resolve(); // B's prep completes — B claims and connects
     await b;
     await awaitTunnelSettled(config.instance);
     expect(getTunnel(config)).toMatchObject({ selectedProvider: "cloudflare", status: "connected" });
-
-    // A resumes from its await AFTER B won — it must bail, not claim/overwrite.
-    disconnectGates[0]!.resolve();
-    const aState = await a;
-    expect(aState.selectedProvider).toBe("cloudflare");
-    expect(getTunnel(config)).toMatchObject({ selectedProvider: "cloudflare", status: "connected" });
     expect(ngrok.connects).toBe(0);
+  });
+
+  test("a disconnect issued during a connect's prep supersedes it (the connect bails)", async () => {
+    const prepGate = Promise.withResolvers<void>();
+    let disconnects = 0;
+    const tailscale = scriptedDriver({
+      disconnect: () => {
+        disconnects += 1;
+        return disconnects === 1 ? prepGate.promise : Promise.resolve();
+      }
+    });
+    const ngrok = scriptedDriver({ connect: () => Promise.resolve({ url: "https://a.ngrok-free.app", child: fakeChild() }) });
+    setTunnelDeps(deps({ drivers: fakeDrivers({ tailscale, ngrok }) }));
+    await connectTunnel(config, "tailscale");
+    await awaitTunnelSettled(config.instance);
+
+    const a = connectTunnel(config, "ngrok"); // prep parks on tailscale's teardown
+    await Bun.sleep(1);
+    const d = disconnectTunnel(config); // the user's LAST action
+    prepGate.resolve(); // a's prep completes — superseded by the disconnect, bails
+    await a;
+    await d;
+    expect(getTunnel(config).status).toBe("idle");
+    expect(ngrok.connects).toBe(0);
+  });
+
+  test("stopAllTunnels turns childless provider-side state off; the record stays connected for the boot resume", async () => {
+    const tailscale = scriptedDriver();
+    setTunnelDeps(deps({ drivers: fakeDrivers({ tailscale }) }));
+    await connectTunnel(config, "tailscale");
+    await awaitTunnelSettled(config.instance);
+    await stopAllTunnels();
+    // serve must stop fronting the gateway port (whatever binds it next must
+    // not inherit the public URL)…
+    expect(tailscale.disconnects).toBe(1);
+    // …while the persisted record stays connected so the next boot's
+    // reconcile re-publishes the same URL.
+    expect(getTunnel(config).status).toBe("connected");
   });
 
   test("disconnect while idle never runs provider-side teardown (protects a pre-existing serve config)", async () => {
@@ -1709,6 +1748,8 @@ describe("manual tunnel drivers", () => {
   });
 
   test("manual resume settles to idle when the web never comes back", async () => {
+    const prevWait = process.env.GINI_TUNNEL_RESUME_WAIT_MS;
+    const prevPoll = process.env.GINI_TUNNEL_RESUME_POLL_MS;
     process.env.GINI_TUNNEL_RESUME_WAIT_MS = "0";
     process.env.GINI_TUNNEL_RESUME_POLL_MS = "1";
     try {
@@ -1722,8 +1763,10 @@ describe("manual tunnel drivers", () => {
       expect(getTunnel(config).status).toBe("idle");
       expect(getTunnel(config).selectedProvider).toBe("ngrok");
     } finally {
-      delete process.env.GINI_TUNNEL_RESUME_WAIT_MS;
-      delete process.env.GINI_TUNNEL_RESUME_POLL_MS;
+      if (prevWait === undefined) delete process.env.GINI_TUNNEL_RESUME_WAIT_MS;
+      else process.env.GINI_TUNNEL_RESUME_WAIT_MS = prevWait;
+      if (prevPoll === undefined) delete process.env.GINI_TUNNEL_RESUME_POLL_MS;
+      else process.env.GINI_TUNNEL_RESUME_POLL_MS = prevPoll;
     }
   });
 });
@@ -1940,19 +1983,42 @@ describe("makeDefaultDrivers", () => {
   });
 
   test("ngrok and cloudflared: detect maps the CLI checks; a missing binary disables", async () => {
-    const ok = runScript({
-      "ngrok config check": { exitCode: 0, stdout: "Valid configuration" },
-      "cloudflared --version": { exitCode: 0, stdout: "cloudflared version 2026.6.0" }
-    });
-    expect(await makeDefaultDrivers(ok.run).ngrok.detect()).toEqual({ enabled: true });
-    expect(await makeDefaultDrivers(ok.run).cloudflare.detect()).toEqual({ enabled: true });
+    const prevToken = process.env.NGROK_AUTHTOKEN;
+    delete process.env.NGROK_AUTHTOKEN; // ambient env must not flip fixtures
+    try {
+      const ok = runScript({
+        "ngrok config check": { exitCode: 0, stdout: "Valid configuration file at /home/u/ngrok.yml" },
+        "cloudflared --version": { exitCode: 0, stdout: "cloudflared version 2026.6.0" }
+      });
+      // A valid config WITH an authtoken -> enabled.
+      const withToken = makeDefaultDrivers(ok.run, undefined, undefined, async (path) =>
+        path === "/home/u/ngrok.yml" ? "version: 3\nagent:\n  authtoken: tok_x\n" : null
+      );
+      // The simple `authtoken:` line form is the common v2 layout.
+      const v2 = makeDefaultDrivers(ok.run, undefined, undefined, async () => "authtoken: tok_x\n");
+      expect(await v2.ngrok.detect()).toEqual({ enabled: true });
+      expect(await withToken.cloudflare.detect()).toEqual({ enabled: true });
+      // A valid config WITHOUT an authtoken -> still "requires ngrok account":
+      // `ngrok config check` validates the file, not the account.
+      const noToken = makeDefaultDrivers(ok.run, undefined, undefined, async () => "version: 3\n");
+      expect(await noToken.ngrok.detect()).toEqual({ enabled: false, requires: "ngrok account" });
+      // NGROK_AUTHTOKEN env satisfies the account requirement without a file.
+      process.env.NGROK_AUTHTOKEN = "tok_env";
+      const envToken = makeDefaultDrivers(ok.run, undefined, undefined, async () => null);
+      expect(await envToken.ngrok.detect()).toEqual({ enabled: true });
+      delete process.env.NGROK_AUTHTOKEN;
 
-    const none = runScript({});
-    expect((await makeDefaultDrivers(none.run).ngrok.detect()).enabled).toBe(false);
-    expect((await makeDefaultDrivers(none.run).cloudflare.detect()).enabled).toBe(false);
+      const none = runScript({});
+      expect((await makeDefaultDrivers(none.run).ngrok.detect()).enabled).toBe(false);
+      expect((await makeDefaultDrivers(none.run).cloudflare.detect()).enabled).toBe(false);
+    } finally {
+      if (prevToken === undefined) delete process.env.NGROK_AUTHTOKEN;
+      else process.env.NGROK_AUTHTOKEN = prevToken;
+    }
   });
 
   test("ngrok and cloudflared: connect spawns the agent and scans for its URL", async () => {
+    const prevTimeout = process.env.GINI_TUNNEL_MANUAL_TIMEOUT_MS;
     process.env.GINI_TUNNEL_MANUAL_TIMEOUT_MS = "5000";
     try {
       const spawned: string[][] = [];
@@ -1980,11 +2046,13 @@ describe("makeDefaultDrivers", () => {
       expect((await cfPending).url).toBe("https://ab-cd.trycloudflare.com");
       expect(spawned[1]).toEqual(["cloudflared", "--config", "/dev/null", "tunnel", "--url", "http://127.0.0.1:7342"]);
     } finally {
-      delete process.env.GINI_TUNNEL_MANUAL_TIMEOUT_MS;
+      if (prevTimeout === undefined) delete process.env.GINI_TUNNEL_MANUAL_TIMEOUT_MS;
+      else process.env.GINI_TUNNEL_MANUAL_TIMEOUT_MS = prevTimeout;
     }
   });
 
   test("cloudflared: a named-tunnel config.yml runs the OPERATOR'S tunnel against the gateway and publishes its stable hostname", async () => {
+    const prevTimeout = process.env.GINI_TUNNEL_MANUAL_TIMEOUT_MS;
     process.env.GINI_TUNNEL_MANUAL_TIMEOUT_MS = "5000";
     try {
       const CONFIG = [
@@ -2021,7 +2089,8 @@ describe("makeDefaultDrivers", () => {
         "run", "--url", "http://127.0.0.1:7342", "d8eafe76-0586-454c-8846-2e86db3cecb3"
       ]);
     } finally {
-      delete process.env.GINI_TUNNEL_MANUAL_TIMEOUT_MS;
+      if (prevTimeout === undefined) delete process.env.GINI_TUNNEL_MANUAL_TIMEOUT_MS;
+      else process.env.GINI_TUNNEL_MANUAL_TIMEOUT_MS = prevTimeout;
     }
   });
 
@@ -2057,6 +2126,7 @@ describe("makeDefaultDrivers", () => {
   });
 
   test("cloudflared: a config without credentials-file defaults to ~/.cloudflared/<id>.json", async () => {
+    const prevTimeout = process.env.GINI_TUNNEL_MANUAL_TIMEOUT_MS;
     process.env.GINI_TUNNEL_MANUAL_TIMEOUT_MS = "5000";
     try {
       const spawned: string[][] = [];
@@ -2079,11 +2149,13 @@ describe("makeDefaultDrivers", () => {
         "run", "--url", "http://127.0.0.1:7342", "abc-123"
       ]);
     } finally {
-      delete process.env.GINI_TUNNEL_MANUAL_TIMEOUT_MS;
+      if (prevTimeout === undefined) delete process.env.GINI_TUNNEL_MANUAL_TIMEOUT_MS;
+      else process.env.GINI_TUNNEL_MANUAL_TIMEOUT_MS = prevTimeout;
     }
   });
 
   test("the manual-connect timeout env knob falls back on garbage and applies when set", async () => {
+    const prevTimeout = process.env.GINI_TUNNEL_MANUAL_TIMEOUT_MS;
     process.env.GINI_TUNNEL_MANUAL_TIMEOUT_MS = "10";
     try {
       const spawn = (): SpawnedTunnelProc => fakeProc();
@@ -2091,7 +2163,8 @@ describe("makeDefaultDrivers", () => {
         /did not report a public URL/
       );
     } finally {
-      delete process.env.GINI_TUNNEL_MANUAL_TIMEOUT_MS;
+      if (prevTimeout === undefined) delete process.env.GINI_TUNNEL_MANUAL_TIMEOUT_MS;
+      else process.env.GINI_TUNNEL_MANUAL_TIMEOUT_MS = prevTimeout;
     }
   });
 

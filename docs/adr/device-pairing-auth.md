@@ -5,7 +5,8 @@
 A web request reaching the gateway on a **loopback** host
 (`127.0.0.1` / `localhost` / `[::1]`) is trusted with no pairing — it is the
 operator's own machine. A web request on any **non-loopback** front (the
-gini-relay tunnel subdomain, or a `GINI_TRUSTED_ORIGINS` host) must carry a
+gini-relay tunnel subdomain, a runtime-managed tunnel's connected host, or a
+`GINI_TRUSTED_ORIGINS` host) must carry a
 valid **session cookie** (`gini_session`) or it cannot reach the proxied web app
 or the `/api/runtime/*` BFF namespace. A device obtains that cookie through an
 operator-approved pairing handshake.

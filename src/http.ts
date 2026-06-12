@@ -2737,7 +2737,10 @@ function isNativePairingClient(request: Request, host: string): boolean {
   // and an XSS on /pair could exfiltrate the in-body secret/token. The native
   // client (Expo/RN fetch) sends no Origin, so this never affects it.
   if (request.headers.has("origin")) return false;
-  return isRelayHost(host) || isLoopbackHost(host);
+  // Trusted fronts: the relay, loopback, and a runtime-managed tunnel's
+  // connected host — the same provider-owned-DNS reasoning as the web lanes,
+  // so the mobile app can pair through a tailscale/ngrok/cloudflare front too.
+  return isRelayHost(host) || isLoopbackHost(host) || isRuntimeTunnelHost(host);
 }
 
 // The per-request binding secret, sourced by the single native gate: a verified

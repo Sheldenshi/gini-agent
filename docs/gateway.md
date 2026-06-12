@@ -97,7 +97,7 @@ A cross-site `Sec-Fetch-Site` value is rejected on every lane, and an unsafe met
 
 Closing the non-loopback fallback path blocks the DNS-rebinding shape where an attacker page sets `Origin` to a hostname they control but rebinds DNS to the gateway's loopback / tailnet IP — the rebound host equals itself, so a Host-comparison alone would pass. The allowlist (or the loopback restriction) takes that codepath off the table.
 
-After the host/origin check passes, a second gate applies **per-device pairing**: a web request on a non-loopback front (relay subdomain or a `GINI_TRUSTED_ORIGINS` host) must also carry a valid `gini_session` cookie, or its page navigations are redirected to `/pair` and its `/api/runtime/*` calls return 401. Loopback is trusted with no pairing. A device obtains the cookie through an operator-approved handshake on the loopback "Pair a device" panel; sessions are revocable `PairedDevice` rows. See [ADR: Device-pairing authentication](adr/device-pairing-auth.md).
+After the host/origin check passes, a second gate applies **per-device pairing**: a web request on a non-loopback front (relay subdomain, runtime-managed tunnel host, or a `GINI_TRUSTED_ORIGINS` host) must also carry a valid `gini_session` cookie, or its page navigations are redirected to `/pair` and its `/api/runtime/*` calls return 401. Loopback is trusted with no pairing. A device obtains the cookie through an operator-approved handshake on the loopback "Pair a device" panel; sessions are revocable `PairedDevice` rows. See [ADR: Device-pairing authentication](adr/device-pairing-auth.md).
 
 ## Lifecycle Commands
 

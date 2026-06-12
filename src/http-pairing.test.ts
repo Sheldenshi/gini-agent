@@ -734,6 +734,25 @@ describe("pairing routes — native client (mobile)", () => {
     expect(setCookieValue(res, "gini_pair")).toBeUndefined();
   });
 
+  test("native create works on a runtime-managed tunnel front (same trust as the relay)", async () => {
+    setRuntimeTunnelTrust("pair-native-tunnel", "https://machine.tail-test.ts.net");
+    try {
+      const { handler } = makeHandler("pair-native-tunnel");
+      const res = await pair(handler, "/api/pairing/request", {
+        method: "POST",
+        host: "machine.tail-test.ts.net",
+        pairClient: "native",
+        userAgent: "GiniMobile/1.0 (iOS)",
+        body: {}
+      });
+      expect(res.status).toBe(201);
+      const body = await res.json();
+      expect(body.bindSecret).toMatch(/^[0-9a-f]{64}$/);
+    } finally {
+      clearRuntimeTunnelTrust();
+    }
+  });
+
   test("a no-Origin POST WITHOUT the native opt-in is still refused (the exemption requires opt-in)", async () => {
     const { handler } = makeHandler("pair-native-nooptin");
     const relay = RELAY("pair-native-nooptin");

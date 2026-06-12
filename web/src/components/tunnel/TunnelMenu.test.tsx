@@ -210,7 +210,7 @@ describe("TunnelMenu", () => {
     expect(alert?.textContent).toContain("Tunnel connect failed");
   });
 
-  test("Connect on an unavailable provider opens THAT connector's setup guide sheet", async () => {
+  test("Connect on an unavailable provider opens THAT provider's setup guide sheet", async () => {
     const user = userEvent.setup();
     // The doc fetch must resolve a DocSection; everything else (pair-request
     // polling) keeps the empty default.
@@ -239,7 +239,7 @@ describe("TunnelMenu", () => {
     await screen.findByText(/isn't ready on this machine yet/);
     expect(screen.queryByText(/requires Tailscale network/)).not.toBeNull();
     await screen.findByText(/join your tailnet/);
-    // Connector-scoped: the guide fetched is tailscale's page.
+    // Provider-scoped: the guide fetched is tailscale's page.
     const fetched = (globalThis.fetch as unknown as ReturnType<typeof mock>).mock.calls.map((c) => String(c[0]));
     expect(fetched.some((u) => u.endsWith("/docs/remote-access/tailscale"))).toBe(true);
     // Dismissing the guide clears it; the popover (with the panel) remains.

@@ -14,7 +14,7 @@ Connect publishes:
 https://<machine>.<tailnet>.ts.net
 ```
 
-…private to your tailnet. The serve config lives in `tailscaled`, so the URL **survives gateway restarts** — on boot Gini resumes the same address. Disconnect turns the serve config off.
+…private to your tailnet. The URL **survives gateway restarts** — on boot Gini re-publishes the same address. Disconnect (and a clean gateway stop) turns the serve config off, so the name can never route to whatever binds the port next.
 
 ## What Connect runs
 

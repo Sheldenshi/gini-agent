@@ -29,7 +29,7 @@ import { useChatReadState, useThreadReadState } from "@/lib/use-chat-read-state"
 import { AgentAvatar } from "@/components/chat/AgentAvatar";
 import { CreateAgentDialog } from "@/components/CreateAgentDialog";
 import { TunnelMenu } from "@/components/tunnel/TunnelMenu";
-import { ConnectorGuides } from "@/components/tunnel/ConnectorGuides";
+import { ProviderGuides } from "@/components/tunnel/ProviderGuides";
 import { useUpdateGate } from "@/components/UpdateGate";
 import type { AgentRow, ChatSession } from "@/lib/view-types";
 import type { JobRecord, JobRoute } from "@runtime/types";
@@ -326,9 +326,9 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
 
       <div className="px-3 pb-2 pt-3">
         <TunnelMenu />
-        {/* Per-connector remote-access guides, each rendered inline in a
-            slide-over — connector-scoped only, no aggregate guide. */}
-        <ConnectorGuides />
+        {/* Per-provider remote-access guides, each rendered inline in a
+            slide-over — provider-scoped only, no aggregate guide. */}
+        <ProviderGuides />
       </div>
       <div className="h-px bg-sidebar-border" />
       <UpdateReminder />

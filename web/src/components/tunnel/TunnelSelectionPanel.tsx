@@ -3,10 +3,10 @@
 import { Globe, Loader2, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
-import { TailscaleLogo, NgrokLogo, CloudflareLogo } from "./connector-logos";
+import { TailscaleLogo, NgrokLogo, CloudflareLogo } from "./tunnel-logos";
 import type { TunnelProvider, TunnelProviderId, TunnelState } from "./types";
 
-// Official brand marks for the real connectors (see ./connector-logos.tsx);
+// Official brand marks for the real providers (see ./tunnel-logos.tsx);
 // the managed relay keeps the generic globe — it's Gini's own transport, not
 // an external brand.
 const PROVIDER_ICON: Record<TunnelProviderId, React.ComponentType<{ className?: string }>> = {
@@ -21,7 +21,7 @@ const PROVIDER_ICON: Record<TunnelProviderId, React.ComponentType<{ className?: 
  * call-to-action: Connect. Tapping it attempts the connect — the gateway
  * re-checks the provider's prerequisite server-side, so a freshly-installed
  * CLI just works — and when the provider genuinely isn't ready, the owner
- * (TunnelMenu) opens that connector's setup guide in a slide-over instead.
+ * (TunnelMenu) opens that provider's setup guide in a slide-over instead.
  * That's why a "Requires …" row still has a live Connect button.
  *
  * The selected provider's action reflects status: "Connecting..." + a
@@ -180,7 +180,7 @@ export function TunnelSelectionPanel({
                   // ONE call-to-action per row, always live (except while
                   // another row is mid-connect): the gateway decides whether
                   // this connects or needs setup first — in which case the
-                  // owner opens this connector's guide.
+                  // owner opens this provider's guide.
                   <Button
                     size="sm"
                     variant={isSelected ? "default" : "outline"}

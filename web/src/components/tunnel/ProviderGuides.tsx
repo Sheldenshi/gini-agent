@@ -2,8 +2,8 @@
 
 import { Globe } from "lucide-react";
 import { DocReference } from "@/components/DocReference";
-import { TailscaleLogo, NgrokLogo, CloudflareLogo } from "./connector-logos";
-import { CONNECTOR_DOC_URLS } from "./connector-docs";
+import { TailscaleLogo, NgrokLogo, CloudflareLogo } from "./tunnel-logos";
+import { PROVIDER_DOC_URLS } from "./provider-docs";
 import type { TunnelProviderId } from "./types";
 
 const GUIDES: Array<{
@@ -17,11 +17,11 @@ const GUIDES: Array<{
   { id: "cloudflare", name: "Cloudflare", Icon: CloudflareLogo }
 ];
 
-// Per-connector remote-access guides for the sidebar footer: each entry opens
-// ONLY that connector's guide (docs/remote-access/<id>.md) in a slide-over —
+// Per-provider remote-access guides for the sidebar footer: each entry opens
+// ONLY that provider's guide (docs/remote-access/<id>.md) in a slide-over —
 // there is no aggregate guide in the app. A compact two-column grid keeps the
 // footer to two extra rows.
-export function ConnectorGuides() {
+export function ProviderGuides() {
   return (
     <div className="mt-1.5">
       <p className="px-2 text-[10px] font-medium uppercase tracking-wide text-sidebar-foreground/40">
@@ -29,7 +29,7 @@ export function ConnectorGuides() {
       </p>
       <div className="mt-0.5 grid grid-cols-2 gap-x-1">
         {GUIDES.map(({ id, name, Icon }) => (
-          <DocReference key={id} url={CONNECTOR_DOC_URLS[id]}>
+          <DocReference key={id} url={PROVIDER_DOC_URLS[id]}>
             <button
               type="button"
               aria-label={`${name} remote access guide`}

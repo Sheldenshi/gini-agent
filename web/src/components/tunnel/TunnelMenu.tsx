@@ -7,7 +7,7 @@ import { DocSheet } from "@/components/DocSheet";
 import { TunnelTrigger } from "./TunnelTrigger";
 import { TunnelSelectionPanel } from "./TunnelSelectionPanel";
 import { TunnelConnectedPopover } from "./TunnelConnectedPopover";
-import { CONNECTOR_DOC_URLS } from "./connector-docs";
+import { PROVIDER_DOC_URLS } from "./provider-docs";
 import { useTunnel } from "./useTunnel";
 import type { TunnelProviderId } from "./types";
 
@@ -23,10 +23,10 @@ export function TunnelMenu() {
   const { state, error, select, connect, cancel, disconnect, refresh } = useTunnel();
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState(false);
-  // Which connector's setup guide is open. Connect is the single affordance:
+  // Which provider's setup guide is open. Connect is the single affordance:
   // the gateway re-checks the prerequisite on every attempt (so a freshly
   // installed CLI just works), and a `provider_unavailable` rejection opens
-  // that connector's guide (docs/remote-access/<id>.md) instead of leaving
+  // that provider's guide (docs/remote-access/<id>.md) instead of leaving
   // only the error banner.
   const [guideFor, setGuideFor] = useState<TunnelProviderId | null>(null);
   const handleConnect = (provider?: TunnelProviderId) => {
@@ -125,7 +125,7 @@ export function TunnelMenu() {
         {guideFor && (
           <DocSheet
             key={guideFor}
-            url={CONNECTOR_DOC_URLS[guideFor]}
+            url={PROVIDER_DOC_URLS[guideFor]}
             open
             onOpenChange={(next) => {
               if (!next) setGuideFor(null);

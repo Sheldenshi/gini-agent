@@ -1,4 +1,4 @@
-// Brand marks for the tunnel connectors. Paths are the official single-path
+// Brand marks for the tunnel providers. Paths are the official single-path
 // logos as published by Simple Icons (CC0): Tailscale's nine-dot grid, the
 // ngrok wordmark, and the Cloudflare cloud. All ship monochrome via
 // currentColor so the surrounding icon wrap controls the tint — the same

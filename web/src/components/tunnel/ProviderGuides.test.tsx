@@ -1,12 +1,12 @@
 /// <reference lib="dom" />
 
-// The sidebar's per-connector guide picker: one entry per connector, each
-// opening ONLY that connector's guide inline (no aggregate guide exists).
+// The sidebar's per-provider guide picker: one entry per tunnel provider,
+// each opening ONLY that provider's guide inline (no aggregate guide exists).
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { ConnectorGuides } from "./ConnectorGuides";
+import { ProviderGuides } from "./ProviderGuides";
 
 const realFetch = globalThis.fetch;
 let fetchCalls: string[] = [];
@@ -28,18 +28,18 @@ afterEach(() => {
   globalThis.fetch = realFetch;
 });
 
-describe("ConnectorGuides", () => {
-  test("renders one guide entry per connector", () => {
-    render(<ConnectorGuides />);
+describe("ProviderGuides", () => {
+  test("renders one guide entry per provider", () => {
+    render(<ProviderGuides />);
     for (const name of ["Gini Relay", "Tailscale", "ngrok", "Cloudflare"]) {
       expect(screen.queryByRole("button", { name: `${name} remote access guide` })).not.toBeNull();
     }
     expect(screen.queryByText("Remote access")).not.toBeNull();
   });
 
-  test("an entry opens that connector's guide (connector-scoped fetch)", async () => {
+  test("an entry opens that provider's guide (provider-scoped fetch)", async () => {
     const user = userEvent.setup();
-    render(<ConnectorGuides />);
+    render(<ProviderGuides />);
     await user.click(screen.getByRole("button", { name: "Tailscale remote access guide" }));
     await waitFor(() => expect(screen.queryByText("Tailnet-private access.")).not.toBeNull());
     expect(fetchCalls).toEqual(["/api/runtime/docs/remote-access/tailscale"]);
