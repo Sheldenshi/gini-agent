@@ -8,7 +8,8 @@ import {
   StyleSheet,
   Text,
   TextInput,
-  TouchableOpacity
+  TouchableOpacity,
+  View
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import * as Device from "expo-device";
@@ -457,13 +458,25 @@ export default function PairScreen() {
           {phase === "confirm" ? (
             <>
               <Text style={styles.subhead}>
-                This connects this device to{" "}
-                <Text style={styles.confirmHost}>{confirmHost}</Text>
-                {currentHost
-                  ? `, replacing your current connection to ${currentHost}`
-                  : ""}
-                . Continue only if you opened this link yourself.
+                Continue only if you opened this link yourself.
               </Text>
+
+              <View style={styles.hostBlock}>
+                <Text style={styles.hostLabel}>New connection</Text>
+                <View style={styles.hostChip}>
+                  <Text style={styles.hostChipText}>{confirmHost}</Text>
+                </View>
+              </View>
+
+              {currentHost ? (
+                <View style={styles.hostBlock}>
+                  <Text style={styles.hostLabel}>Replaces</Text>
+                  <View style={[styles.hostChip, styles.hostChipMuted]}>
+                    <Text style={styles.hostChipText}>{currentHost}</Text>
+                  </View>
+                </View>
+              ) : null}
+
               <TouchableOpacity
                 onPress={() => {
                   const origin = pendingOrigin;
@@ -471,7 +484,7 @@ export default function PairScreen() {
                 }}
                 style={styles.button}
               >
-                <Text style={styles.buttonText}>Connect to {confirmHost}</Text>
+                <Text style={styles.buttonText}>Connect</Text>
               </TouchableOpacity>
               <TouchableOpacity onPress={() => setPhase("cancelled")} style={styles.ghostButton}>
                 <Text style={styles.ghostButtonText}>Not now</Text>
@@ -603,10 +616,36 @@ const styles = StyleSheet.create({
     lineHeight: 20,
     marginBottom: 8
   },
-  confirmHost: {
+  hostBlock: {
+    gap: 6
+  },
+  hostLabel: {
+    color: theme.muted,
+    fontFamily: family("HankenGrotesk", 600),
+    fontSize: 12,
+    letterSpacing: 0.4,
+    textTransform: "uppercase"
+  },
+  // Contain the long relay subdomain in a padded, bordered chip so it wraps
+  // cleanly inside the box instead of breaking mid-token across the sentence.
+  hostChip: {
+    borderWidth: 1,
+    borderColor: theme.inputBorder,
+    borderRadius: 10,
+    backgroundColor: theme.codeChipBg,
+    paddingHorizontal: 14,
+    paddingVertical: 12
+  },
+  // The outgoing host is secondary context, so soften its chip with the plain
+  // surface fill while keeping the same border.
+  hostChipMuted: {
+    backgroundColor: theme.bg
+  },
+  hostChipText: {
+    color: theme.codeChipText,
     fontFamily: family("JetBrainsMono"),
     fontSize: 14,
-    color: theme.text
+    lineHeight: 20
   },
   label: {
     color: theme.text,
