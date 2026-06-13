@@ -13,6 +13,7 @@ import { dirname, join } from "node:path";
 import { spawn } from "bun";
 import type {
   Authorization,
+  ChatClientSurface,
   ImageAttachment,
   RuntimeConfig,
   RuntimeState,
@@ -148,6 +149,10 @@ export interface SubmitTaskOptions {
   // Threaded through to Task.images so the chat-task loop can dispatch
   // vision content without re-reading the chat message.
   images?: ImageAttachment[];
+  // Client surface of the user message that spawned this task. Threaded
+  // through to Task.clientSurface so the per-turn prompt can name the
+  // surface of the CURRENT message. See ADR client-surface-context.md.
+  clientSurface?: ChatClientSurface;
   // Set when the task replies inside a thread. Stamped on the task so
   // resolveEmitContext threads the whole response (every emit* block lands
   // tagged with the same thread_id/parent_block_id), not just the user turn.
@@ -181,6 +186,7 @@ export async function submitTask(
   );
   if (options.mode) created.mode = options.mode;
   if (options.images && options.images.length > 0) created.images = options.images;
+  if (options.clientSurface) created.clientSurface = options.clientSurface;
   if (options.threadId) created.threadId = options.threadId;
   if (options.parentBlockId) created.parentBlockId = options.parentBlockId;
   // When a parentTaskId is set, the upsert + the parent-status

@@ -855,6 +855,12 @@ export interface Task {
   // under ~/.gini/instances/<inst>/uploads/<id>.<ext>; this array only
   // carries the refs.
   images?: ImageAttachment[];
+  // Client surface of the user message that spawned this task. Stamped on
+  // submission (same rationale as `images`: the agent loop reads a single
+  // record instead of racing the chat-message write) so the per-turn prompt
+  // can tell the model which surface the CURRENT message came from. Absent
+  // when the surface is unknown. See ADR client-surface-context.md.
+  clientSurface?: ChatClientSurface;
   // Thread membership for the task's emitted chat blocks. Set when a task is
   // spawned to reply inside a thread (Phase 0c thread-reply endpoint), in
   // which case the whole response threads with no routing directive needed.
@@ -1014,6 +1020,16 @@ export type ChatSessionSource =
   // structured field instead of string-matching the title (which the
   // operator can rename via `gini chat rename`).
   | { kind: "openclaw"; openclawSessionId: string; openclawAgentId: string };
+
+// Client surface an inbound chat message was sent from. Per-MESSAGE, not
+// per-session — the same session can be used from phone and desktop
+// alternately, so the surface is resolved on every submit. UI clients tag
+// each POST with a `client` body field ("web" | "mobile" | "cli"); messaging
+// bridges don't send the field — their surface derives from the session's
+// `source.kind`. An absent/unrecognized value resolves to undefined
+// (unknown), never an error, so older clients keep working. See ADR
+// client-surface-context.md.
+export type ChatClientSurface = "web" | "mobile" | "cli" | "telegram" | "discord" | "openclaw";
 
 export interface ChatMessageRecord {
   id: string;

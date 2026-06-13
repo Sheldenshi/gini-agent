@@ -774,6 +774,30 @@ describe("runtime api", () => {
     expect(detail.taskIds).toContain(submitted.taskId);
   });
 
+  test("chat message POST accepts an optional client surface field", async () => {
+    const config = testConfig("chat-client-surface");
+    const handler = createHandler(config);
+
+    const session = await call(handler, config, "/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ title: "surface chat" })
+    });
+    // A valid `client` value lands on the spawned task; an unrecognized one
+    // resolves to unknown without rejecting the message (older clients must
+    // keep working). See ADR client-surface-context.md.
+    const tagged = await call(handler, config, `/api/chat/${session.id}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ content: "hello from my phone", client: "mobile" })
+    });
+    const untagged = await call(handler, config, `/api/chat/${session.id}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ content: "hello from somewhere", client: "fridge" })
+    });
+    const tasks = readState(config.instance).tasks;
+    expect(tasks.find((t) => t.id === tagged.taskId)?.clientSurface).toBe("mobile");
+    expect(tasks.find((t) => t.id === untagged.taskId)?.clientSurface).toBeUndefined();
+  });
+
   test("approval-gated file patch produces a diff approval", async () => {
     // Memory CRUD via `/api/memory` was removed alongside the
     // state.memories consolidation. See ADR
