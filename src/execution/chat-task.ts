@@ -57,6 +57,7 @@ import {
   USER_SOFT_CAP_CHARS,
   buildAgentSystemContext,
   buildBoundJobsBlock,
+  buildClientSurfaceBlock,
   buildCurrentDateBlock,
   resolveLocalTimeZone,
   decideIdentityEmission,
@@ -792,7 +793,12 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
   // the prior-transcript rebuild and the live user message deliver files the
   // same way (native doc vs extracted-text vs path-only).
   const modality = resolveProviderModality(effectiveForAgent.provider);
-  const ephemeralContext = subagent ? "" : renderEphemeralContext(identityBlock, recalledContext);
+  // The surface of the message that started THIS turn rides in the
+  // ephemeral tail (not the byte-stable system prefix) because the same
+  // session can alternate between phone and desktop across turns.
+  const ephemeralContext = subagent
+    ? ""
+    : renderEphemeralContext(identityBlock, recalledContext, buildClientSurfaceBlock(task.clientSurface));
   const currentUserMessage = await buildUserMessage(config, task, modality);
   const nonPriorMessages: ToolCallingMessage[] = [
     { role: "system", content: systemContext },

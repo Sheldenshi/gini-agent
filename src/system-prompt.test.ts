@@ -12,6 +12,7 @@ import {
   USER_SOFT_CAP_CHARS,
   __resetDefaultGiniInstructionsCacheForTest,
   buildAgentSystemContext,
+  buildClientSurfaceBlock,
   buildCurrentDateBlock,
   buildCurrentTimeResult,
   decideIdentityEmission,
@@ -275,6 +276,51 @@ describe("renderEphemeralContext", () => {
   test("returns an empty string when both pieces are empty", () => {
     expect(renderEphemeralContext(undefined, undefined)).toBe("");
     expect(renderEphemeralContext("", "   ")).toBe("");
+  });
+
+  test("places the client-surface note before identity and memory", () => {
+    const out = renderEphemeralContext(
+      "Your runtime identity:\n- instance: test",
+      "1. (semantic) snip",
+      buildClientSurfaceBlock("mobile")
+    );
+    expect(out.startsWith("The user is messaging from the mobile app")).toBe(true);
+    expect(out.indexOf("Your runtime identity:")).toBeLessThan(out.indexOf("Long-term memory"));
+  });
+
+  test("renders only the surface note when identity and memory are empty", () => {
+    const out = renderEphemeralContext(undefined, undefined, buildClientSurfaceBlock("web"));
+    expect(out).toBe(buildClientSurfaceBlock("web"));
+  });
+});
+
+describe("buildClientSurfaceBlock", () => {
+  test("desktop surfaces say a visible browser window would be visible", () => {
+    for (const surface of ["web", "cli"] as const) {
+      const out = buildClientSurfaceBlock(surface);
+      expect(out).toContain("would be visible to them");
+      expect(out).not.toContain("NOT at the gateway machine");
+    }
+    expect(buildClientSurfaceBlock("web")).toContain("web app");
+    expect(buildClientSurfaceBlock("cli")).toContain("CLI");
+  });
+
+  test("mobile and bridge surfaces say the user is not at the gateway machine", () => {
+    const expectations = [
+      ["mobile", "mobile app"],
+      ["telegram", "Telegram"],
+      ["discord", "Discord"],
+      ["openclaw", "OpenClaw"]
+    ] as const;
+    for (const [surface, name] of expectations) {
+      const out = buildClientSurfaceBlock(surface);
+      expect(out).toContain(name);
+      expect(out).toContain("NOT at the gateway machine");
+    }
+  });
+
+  test("returns an empty string for an unknown surface", () => {
+    expect(buildClientSurfaceBlock(undefined)).toBe("");
   });
 });
 

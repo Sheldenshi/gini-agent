@@ -1726,6 +1726,102 @@ describe("chat-task loop", () => {
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
 
+  // Client-surface injection: the surface of the message that started THIS
+  // turn rides in the ephemeral role:"user" tail (never the byte-stable
+  // system prefix), and is omitted entirely when unknown. See ADR
+  // client-surface-context.md.
+  test("injects the current message's client-surface line into the ephemeral tail, per turn", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-surface");
+    const provider = normalizeProvider(config.provider);
+    const { submitChatMessage, createChat } = await import("./chat");
+    const session = await createChat(config, { title: "Surface probe" });
+
+    // Turn 1 from the web, turn 2 from the phone — the same session can
+    // alternate surfaces, so each turn must carry only its OWN surface.
+    setEchoToolCallingResponse({ provider, text: "ok", toolCalls: [], finishReason: "stop" });
+    const first = await submitChatMessage(config, session.id, { content: "desktop turn", client: "web" });
+    expect((await waitForTerminal(config, first.taskId)).status).toBe("completed");
+
+    setEchoToolCallingResponse({ provider, text: "ok", toolCalls: [], finishReason: "stop" });
+    const second = await submitChatMessage(config, session.id, { content: "phone turn", client: "mobile" });
+    expect((await waitForTerminal(config, second.taskId)).status).toBe("completed");
+
+    const calls = getEchoToolCallingCalls();
+    const turn1 = calls[0]!;
+    const turn2 = calls[calls.length - 1]!;
+
+    // Turn 1: the web line rides in the tail immediately before the user
+    // message, and the system prefix stays surface-free.
+    const userIdx1 = turn1.findIndex((m) => m.role === "user" && m.content === "desktop turn");
+    expect(userIdx1).toBeGreaterThan(0);
+    const tail1 = String(turn1[userIdx1 - 1]!.content ?? "");
+    expect(tail1).toContain("The user is messaging from the web app");
+    expect(String(turn1.find((m) => m.role === "system")?.content ?? "")).not.toContain("The user is messaging");
+
+    // Turn 2: only the mobile line — the prior turn's web line must not
+    // replay into this turn's context.
+    const userIdx2 = turn2.findIndex((m) => m.role === "user" && m.content === "phone turn");
+    expect(userIdx2).toBeGreaterThan(0);
+    const tail2 = String(turn2[userIdx2 - 1]!.content ?? "");
+    expect(tail2).toContain("The user is messaging from the mobile app");
+    expect(tail2).toContain("NOT at the gateway machine");
+    for (const m of turn2) {
+      expect(String(m.content ?? "")).not.toContain("The user is messaging from the web app");
+    }
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("derives the surface line from a bridge session without a client field", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-surface-bridge");
+    const provider = normalizeProvider(config.provider);
+    const sessionId = await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "Telegram probe", {
+        kind: "telegram",
+        bridgeId: "bridge_1",
+        chatId: 42,
+        target: "42"
+      });
+      return session.id;
+    });
+
+    setEchoToolCallingResponse({ provider, text: "ok", toolCalls: [], finishReason: "stop" });
+    const { submitChatMessage } = await import("./chat");
+    const submitted = await submitChatMessage(config, sessionId, { content: "bridge turn" });
+    expect((await waitForTerminal(config, submitted.taskId)).status).toBe("completed");
+
+    const turn = getEchoToolCallingCalls()[0]!;
+    const userIdx = turn.findIndex((m) => m.role === "user" && m.content === "bridge turn");
+    expect(userIdx).toBeGreaterThan(0);
+    const tail = String(turn[userIdx - 1]!.content ?? "");
+    expect(tail).toContain("The user is messaging from Telegram");
+    expect(tail).toContain("NOT at the gateway machine");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("omits the surface line entirely when the surface is unknown", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-surface-unknown");
+    const provider = normalizeProvider(config.provider);
+    const { submitChatMessage, createChat } = await import("./chat");
+    const session = await createChat(config, { title: "Unknown surface probe" });
+
+    setEchoToolCallingResponse({ provider, text: "ok", toolCalls: [], finishReason: "stop" });
+    const submitted = await submitChatMessage(config, session.id, { content: "untagged turn" });
+    expect((await waitForTerminal(config, submitted.taskId)).status).toBe("completed");
+
+    // No claim anywhere in the turn — not a hedged "unknown surface" line.
+    const turn = getEchoToolCallingCalls()[0]!;
+    for (const m of turn) {
+      expect(String(m.content ?? "")).not.toContain("The user is messaging");
+    }
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
   test("omits the identity block on a follow-up turn when nothing changed", async () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
     const config = buildConfig(workspaceRoot, "chat-task-identity-followup");
