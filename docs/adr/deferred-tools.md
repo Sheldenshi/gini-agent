@@ -83,7 +83,7 @@ self-descriptively.
 
 ## Currently Deferred
 
-- The browser cluster — 15 of 18 tools. `browser_navigate`,
+- The browser cluster — 21 of 24 tools. `browser_navigate`,
   `browser_fill_secrets`, and `browser_connect` stay core. `browser_fill_secrets`
   and `browser_connect` are escalation / onboarding meta-tools that must be
   reachable before the cluster is loaded (a sign-in wall mid-task).
