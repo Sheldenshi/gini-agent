@@ -2820,20 +2820,25 @@ async function runLoop(
       // contract. Persisted to task.loadedTools so an approval pause/resume
       // keeps the cluster live (same pattern as the load_tools handler above).
       if (call.function.name === "browser_navigate") {
-        let seeded = false;
+        const seededNames: string[] = [];
         for (const tool of fullCatalog) {
           if (tool.deferred && tool.toolset === "browser" && !loadedToolNames.has(tool.function.name)) {
             loadedToolNames.add(tool.function.name);
-            seeded = true;
+            seededNames.push(tool.function.name);
           }
         }
-        if (seeded) {
+        if (seededNames.length > 0) {
           recompute();
           await mutateState(config.instance, (state) => {
             const item = findTask(state, taskId);
             if (isTerminalTaskStatus(item.status)) return;
             item.loadedTools = [...loadedToolNames];
             item.updatedAt = now();
+          });
+          appendTrace(config.instance, taskId, {
+            type: "tool",
+            message: "Deferred browser tools seeded by browser_navigate",
+            data: { toolCallId: call.id, toolNames: seededNames }
           });
         }
       }

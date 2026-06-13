@@ -3532,6 +3532,13 @@ describe("chat-task loop", () => {
     expect(toolNames[1]).toContain("browser_click");
     expect(toolNames[2]).toContain("browser_snapshot");
 
+    // The seed leaves a trace entry so "why is this tool live?" is answerable.
+    const { readTrace } = await import("../state");
+    const seedTrace = readTrace(config.instance, task.id).find(
+      (t) => t.message === "Deferred browser tools seeded by browser_navigate"
+    );
+    expect(seedTrace).toBeDefined();
+
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
 
@@ -3810,7 +3817,7 @@ describe("chat-task loop", () => {
     });
 
     // Twelve tool-call turns reading DISTINCT files (so no loop-breaker
-    // trips), each result ~3.6k chars — elidable (>200 chars) but the total
+    // trips), each result ~3.4k chars — elidable (>200 chars) but the total
     // stays under every estimate-driven threshold. Only the LAST response
     // reports usage; the resulting calibration gap forces the pre-call trim
     // ahead of the 13th call.
