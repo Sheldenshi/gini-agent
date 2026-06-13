@@ -91,25 +91,6 @@ describe("useTunnel", () => {
     expect(result.current.error).toBe("nope");
   });
 
-  test("select() POSTs /select with the provider body and applies the returned state", async () => {
-    const { result } = renderHook(() => useTunnel());
-    await waitFor(() => expect(result.current.loading).toBe(false));
-
-    const selected = makeState({ selectedProvider: "ngrok" });
-    fetchMock.mockResolvedValueOnce(res({ body: selected }));
-
-    await act(async () => {
-      result.current.select("ngrok");
-    });
-
-    expect(fetchMock).toHaveBeenCalledWith(`${BASE}/select`, {
-      method: "POST",
-      headers: { "content-type": "application/json", accept: "application/json" },
-      body: JSON.stringify({ provider: "ngrok" })
-    });
-    expect(result.current.state).toEqual(selected);
-  });
-
   test("connect(provider) POSTs /connect with a provider body", async () => {
     const { result } = renderHook(() => useTunnel());
     await waitFor(() => expect(result.current.loading).toBe(false));

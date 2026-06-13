@@ -34,7 +34,6 @@ function makeState(over: Partial<TunnelState> = {}): TunnelState {
 }
 
 const actions = {
-  select: mock(() => {}),
   connect: mock(async (): Promise<{ ok: true } | { ok: false; message: string; code?: string }> => ({ ok: true })),
   cancel: mock(() => {}),
   disconnect: mock(() => {}),
@@ -133,29 +132,20 @@ describe("TunnelMenu", () => {
     expect(actions.disconnect).toHaveBeenCalledTimes(1);
   });
 
-  test("connected: Cancel from the edit panel returns to the connected view (does not close)", async () => {
+  test("connected: Close from the edit panel returns to the connected view (does not close the popover)", async () => {
     const user = userEvent.setup();
     controller.state = makeState({ status: "connected", url: "https://g31.example" });
     render(<TunnelMenu />);
     await open(user, "Tunnel connected");
     await user.click(screen.getByRole("button", { name: "Edit selection" }));
     expect(screen.queryByText("Choose how Gini is exposed")).not.toBeNull();
-    await user.click(screen.getByRole("button", { name: "Cancel" }));
-    // Back on the connected (QR) view — the popover stays open, not closed.
+    // The panel's header Close (X) is the only dismiss control now (no Save/Cancel
+    // footer). When reached via Edit, it returns to the connected (QR) view rather
+    // than closing the whole popover.
+    await user.click(screen.getByRole("button", { name: "Close" }));
     expect(screen.queryByText("Choose how Gini is exposed")).toBeNull();
     expect(screen.queryByRole("button", { name: "Reveal QR" })).not.toBeNull();
     expect(screen.queryByRole("button", { name: "Edit selection" })).not.toBeNull();
-  });
-
-  test("connected: Save from the edit panel returns to the connected view (does not close)", async () => {
-    const user = userEvent.setup();
-    controller.state = makeState({ status: "connected", url: "https://g31.example" });
-    render(<TunnelMenu />);
-    await open(user, "Tunnel connected");
-    await user.click(screen.getByRole("button", { name: "Edit selection" }));
-    await user.click(screen.getByRole("button", { name: "Save" }));
-    expect(screen.queryByText("Choose how Gini is exposed")).toBeNull();
-    expect(screen.queryByRole("button", { name: "Reveal QR" })).not.toBeNull();
   });
 
   test("closing the edit panel via Escape resets editing; reopening shows the connected view", async () => {
@@ -181,14 +171,12 @@ describe("TunnelMenu", () => {
     expect(actions.disconnect).toHaveBeenCalledTimes(1);
   });
 
-  test("idle: choosing a provider and Connect route to the controller", async () => {
+  test("idle: clicking a provider's Connect routes to the controller (connect IS the selection)", async () => {
     const user = userEvent.setup();
     render(<TunnelMenu />);
     await open(user, "Open tunnel");
-    await user.click(screen.getByText("Gini Relay"));
     await user.click(screen.getByRole("button", { name: "Connect Gini Relay" }));
-    expect(actions.select).toHaveBeenCalledWith("gini-relay");
-    expect(actions.connect).toHaveBeenCalled();
+    expect(actions.connect).toHaveBeenCalledWith("gini-relay");
   });
 
   test("the selection panel's Close button dismisses the popover", async () => {

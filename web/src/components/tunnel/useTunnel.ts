@@ -33,12 +33,14 @@ async function readState(res: Response): Promise<TunnelState> {
 // "provider_unavailable" instead of leaving just the error banner.
 export type TunnelActionResult = { ok: true } | { ok: false; message: string; code?: string };
 
+// No `select`: the web UI is single-tunnel "tap to switch" (connecting a
+// provider IS the selection), so it never calls /api/tunnel/select. That route
+// stays on the gateway for the CLI (`gini tunnel select <provider>`).
 export type TunnelController = {
   state: TunnelState;
   loading: boolean;
   error: string | null;
   refresh: () => void;
-  select: (provider: TunnelProviderId) => void;
   connect: (provider?: TunnelProviderId) => Promise<TunnelActionResult>;
   cancel: () => void;
   disconnect: () => void;
@@ -116,7 +118,6 @@ export function useTunnel(): TunnelController {
     return () => clearInterval(id);
   }, [polling]);
 
-  const select = useCallback((provider: TunnelProviderId) => void post("/select", { provider }), [post]);
   const connect = useCallback(
     (provider?: TunnelProviderId) => post("/connect", provider ? { provider } : undefined),
     [post]
@@ -124,5 +125,5 @@ export function useTunnel(): TunnelController {
   const cancel = useCallback(() => void post("/cancel"), [post]);
   const disconnect = useCallback(() => void post("/disconnect"), [post]);
 
-  return { state, loading, error, refresh: () => void get(true), select, connect, cancel, disconnect };
+  return { state, loading, error, refresh: () => void get(true), connect, cancel, disconnect };
 }

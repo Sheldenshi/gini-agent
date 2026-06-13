@@ -1,6 +1,7 @@
 "use client";
 
-import { Globe, Loader2, X } from "lucide-react";
+import { useState } from "react";
+import { Globe, Loader2, X, AlertTriangle } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { TailscaleLogo, NgrokLogo, CloudflareLogo } from "./tunnel-logos";
@@ -16,29 +17,44 @@ const PROVIDER_ICON: Record<TunnelProviderId, React.ComponentType<{ className?: 
   cloudflare: CloudflareLogo
 };
 
+// A reconnect keeps the SAME public host — so paired devices survive it —
+// only where the provider re-publishes a stable address: gini-relay keys its
+// subdomain to a stable deviceId, and tailscale to the machine name. ngrok and
+// cloudflare (quick tunnels) mint a fresh host every connect. So switching the
+// LIVE provider to a different one always changes the host (a paired device's
+// session cookie is host-bound and is invalidated), EXCEPT relay→relay /
+// tailscale→tailscale, which can't happen here (you can't switch to the
+// provider that's already live). Net: any switch away from a live provider
+// changes the host. We surface that before tearing the working tunnel down.
+function switchChangesHost(from: TunnelProviderId, to: TunnelProviderId): boolean {
+  return from !== to;
+}
+
 /**
- * Provider picker (selection design Variant02). Every row carries ONE
- * call-to-action: Connect. Tapping it attempts the connect — the gateway
- * re-checks the provider's prerequisite server-side, so a freshly-installed
- * CLI just works — and when the provider genuinely isn't ready, the owner
- * (TunnelMenu) opens that provider's setup guide in a slide-over instead.
- * That's why a "Requires …" row still has a live Connect button.
+ * Provider picker — Option 1, "one active, tap to switch". A single tunnel is
+ * live at a time (the gateway is single-tunnel: connecting a provider tears
+ * down whatever was live and makes the new one the selection). So there is no
+ * separate "select" step and no Save/Cancel: the live tunnel IS the selection.
  *
- * The selected provider's action reflects status: "Connecting..." + a
- * destructive Cancel while pending, a destructive Disconnect when connected.
- * A LIVE connection is proof the provider is available, so the connected row
- * is always treated as available regardless of the (best-effort, lag-prone)
- * detection flag — no "Requires …", a selectable radio, and Disconnect — and
- * can never fall through to a stale "unavailable" Connect.
- * Radio semantics live on the icon+label area of each row so the action
- * cluster stays interactive even when the radio is aria-disabled (an
- * unavailable provider can't be SELECTED — the gateway rejects it — but its
- * Connect must stay tappable to reach the guide). While connecting the panel
- * locks down — other rows and Save are gated and the panel is aria-busy.
+ * Each row carries ONE action:
+ *   - the LIVE provider           → destructive Disconnect
+ *   - the provider mid-connect     → "Connecting…" + destructive Cancel
+ *   - any other available provider → Connect (relabeled "Switch" when a tunnel
+ *                                    is already live, since it replaces it)
+ *
+ * Connect/Switch stays live even on a "Requires …" row: the gateway re-checks
+ * the prerequisite server-side (a freshly-installed CLI just works), and a
+ * genuine miss rejects with `provider_unavailable`, on which the owner
+ * (TunnelMenu) opens that provider's setup guide. A LIVE provider is proof it's
+ * available, so the connected row ignores the (lag-prone) detection flag — no
+ * "Requires …", always Disconnect.
+ *
+ * Switching away from a live provider changes the public host, which drops
+ * every device paired on the old one (their host-bound session is invalidated)
+ * — so a switch first asks for confirmation via an in-panel screen.
  */
 export function TunnelSelectionPanel({
   state,
-  onSelect,
   onConnect,
   onCancel,
   onDisconnect,
@@ -46,7 +62,6 @@ export function TunnelSelectionPanel({
   className
 }: {
   state: TunnelState;
-  onSelect: (provider: TunnelProviderId) => void;
   onConnect: (provider?: TunnelProviderId) => void;
   onCancel: () => void;
   onDisconnect: () => void;
@@ -55,11 +70,65 @@ export function TunnelSelectionPanel({
 }) {
   const connecting = state.status === "connecting";
   const connected = state.status === "connected";
+  const liveProvider = connected ? state.selectedProvider : null;
+  // A switch that needs confirmation, staged until the user confirms/cancels.
+  const [pendingSwitch, setPendingSwitch] = useState<TunnelProvider | null>(null);
+
+  // Connect/Switch entry point. A switch away from a live provider drops the
+  // old host's paired devices, so stage a confirm first; a fresh connect (no
+  // live tunnel) goes straight through.
+  const requestConnect = (p: TunnelProvider): void => {
+    if (liveProvider && liveProvider !== p.id && switchChangesHost(liveProvider, p.id)) {
+      setPendingSwitch(p);
+      return;
+    }
+    onConnect(p.id);
+  };
+
+  if (pendingSwitch) {
+    const fromName = state.providers.find((p) => p.id === liveProvider)?.name ?? liveProvider;
+    return (
+      <div className={cn("flex w-full flex-col text-card-foreground", className)}>
+        <div className="flex items-start justify-between gap-3 border-b border-border px-4 py-3">
+          <span className="text-sm font-semibold leading-none">Switch tunnel?</span>
+          <Button variant="ghost" size="icon-sm" aria-label="Close" onClick={() => setPendingSwitch(null)}>
+            <X className="size-4" />
+          </Button>
+        </div>
+        <div className="flex flex-col gap-3 p-4">
+          <div className="flex gap-3">
+            <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-500" />
+            <p className="text-sm leading-relaxed text-muted-foreground">
+              Switching to <span className="font-medium text-foreground">{pendingSwitch.name}</span> gives
+              your agent a new public address. Devices paired over{" "}
+              <span className="font-medium text-foreground">{fromName}</span> will need to scan the new QR
+              code to reconnect.
+            </p>
+          </div>
+          <div className="flex items-center justify-end gap-2">
+            <Button variant="ghost" size="sm" onClick={() => setPendingSwitch(null)}>
+              Keep {fromName}
+            </Button>
+            <Button
+              size="sm"
+              aria-label={`Switch to ${pendingSwitch.name}`}
+              onClick={() => {
+                const target = pendingSwitch;
+                setPendingSwitch(null);
+                onConnect(target.id);
+              }}
+            >
+              Switch to {pendingSwitch.name}
+            </Button>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div
       className={cn("flex w-full flex-col text-card-foreground", className)}
-      role="radiogroup"
       aria-label="Tunnel provider"
       aria-busy={connecting}
     >
@@ -81,63 +150,27 @@ export function TunnelSelectionPanel({
       <div className="flex flex-col gap-2.5 p-4">
         {state.providers.map((p: TunnelProvider) => {
           const Icon = PROVIDER_ICON[p.id];
-          const isSelected = p.id === state.selectedProvider;
-          const rowConnecting = connecting && isSelected;
-          // A live tunnel is proof the provider is AVAILABLE on this machine —
-          // the detection probe is a best-effort hint that can lag or flake
-          // (a transient CLI miss), so it must never override a real
-          // connection. The connected provider is therefore always treated as
-          // available: no "Requires …" caption, a selectable (not disabled)
-          // radio, and a Disconnect action — never a stale "unavailable" Connect.
-          const isLive = connected && isSelected;
+          const isLive = connected && p.id === liveProvider;
+          const rowConnecting = connecting && p.id === state.selectedProvider;
+          // A live tunnel is proof the provider is AVAILABLE — the detection
+          // probe is a best-effort hint that can lag/flake, so it must never
+          // override a real connection. Otherwise availability gates the action.
           const available = p.enabled || isLive;
-          // An unavailable provider can't be SELECTED (the gateway rejects
-          // it), and while connecting every other row is locked.
-          const radioDisabled = !available || (connecting && !isSelected);
           return (
             <div
               key={p.id}
               className={cn(
                 "flex min-h-15 w-full items-center gap-2 rounded-lg border px-3 py-2.5 transition-colors",
-                // Green is reserved for a LIVE connection. A selected-but-not-yet-
-                // connected provider gets a neutral highlight, so it reads as
-                // "chosen, still needs Connect" rather than "connected/good".
-                isSelected
-                  ? connected
-                    ? "border-emerald-500/60 bg-emerald-500/5"
-                    : "border-foreground/30 bg-foreground/5"
-                  : "border-border",
-                !radioDisabled && "hover:border-foreground/30"
+                // Green is reserved for the LIVE connection; every other row is
+                // neutral. There's no "selected but not connected" state anymore.
+                isLive ? "border-emerald-500/60 bg-emerald-500/5" : "border-border"
               )}
             >
-              <div
-                role="radio"
-                aria-checked={isSelected}
-                aria-disabled={radioDisabled || undefined}
-                tabIndex={radioDisabled ? -1 : 0}
-                onClick={() => {
-                  if (!radioDisabled) onSelect(p.id);
-                }}
-                onKeyDown={(e) => {
-                  if (radioDisabled) return;
-                  if (e.key === "Enter" || e.key === " ") {
-                    e.preventDefault();
-                    onSelect(p.id);
-                  }
-                }}
-                className={cn(
-                  "flex min-w-0 flex-1 items-center gap-3 rounded-md outline-none transition-opacity focus-visible:ring-3 focus-visible:ring-ring/50",
-                  radioDisabled ? "cursor-not-allowed opacity-50" : "cursor-pointer"
-                )}
-              >
+              <div className="flex min-w-0 flex-1 items-center gap-3">
                 <span
                   className={cn(
                     "flex size-8 shrink-0 items-center justify-center rounded-md border",
-                    isSelected
-                      ? connected
-                        ? "border-emerald-500/50 text-emerald-500"
-                        : "border-foreground/40 text-foreground"
-                      : "border-border text-muted-foreground"
+                    isLive ? "border-emerald-500/50 text-emerald-500" : "border-border text-muted-foreground"
                   )}
                 >
                   <Icon className="size-4" />
@@ -145,15 +178,8 @@ export function TunnelSelectionPanel({
                 <div className="flex min-w-0 flex-1 flex-col gap-0.5">
                   <div className="flex items-center gap-2">
                     <span className="truncate text-sm font-medium">{p.name}</span>
-                    {isSelected && (
-                      <span
-                        className={cn(
-                          "shrink-0 text-xs font-medium",
-                          connected ? "text-emerald-500" : "text-muted-foreground"
-                        )}
-                      >
-                        {connected ? "Connected" : "Selected"}
-                      </span>
+                    {isLive && (
+                      <span className="shrink-0 text-xs font-medium text-emerald-500">Connected</span>
                     )}
                   </div>
                   {!available && p.requires && (
@@ -180,9 +206,6 @@ export function TunnelSelectionPanel({
                     </Button>
                   </div>
                 ) : isLive ? (
-                  // The live provider always offers Disconnect — connected is
-                  // proof it's available, so it can never fall through to a
-                  // stale "unavailable" Connect.
                   <Button
                     variant="destructive"
                     size="sm"
@@ -192,18 +215,18 @@ export function TunnelSelectionPanel({
                     Disconnect
                   </Button>
                 ) : (
-                  // ONE call-to-action per row, always live (except while
-                  // another row is mid-connect): the gateway decides whether
-                  // this connects or needs setup first — in which case the
-                  // owner opens this provider's guide.
+                  // ONE call-to-action per row. "Connect" when nothing is live,
+                  // "Switch" when it replaces a live tunnel (the gateway tears
+                  // the old one down). Always tappable — even a "Requires …" row
+                  // routes through, so the gateway can re-check or open the guide.
                   <Button
                     size="sm"
-                    variant={isSelected ? "default" : "outline"}
-                    aria-label={`Connect ${p.name}`}
+                    variant="outline"
+                    aria-label={`${liveProvider ? "Switch to" : "Connect"} ${p.name}`}
                     disabled={connecting}
-                    onClick={() => onConnect(p.id)}
+                    onClick={() => requestConnect(p)}
                   >
-                    Connect
+                    {liveProvider ? "Switch" : "Connect"}
                   </Button>
                 )}
               </div>
@@ -213,19 +236,10 @@ export function TunnelSelectionPanel({
       </div>
 
       {state.status === "error" && state.message && (
-        <div className="px-4 pb-2">
+        <div className="px-4 pb-3">
           <p className="text-xs text-destructive">{state.message}</p>
         </div>
       )}
-
-      <div className="flex items-center justify-end gap-2 border-t border-border px-4 py-3">
-        <Button variant="ghost" size="sm" onClick={onClose}>
-          Cancel
-        </Button>
-        <Button size="sm" onClick={onClose} disabled={connecting}>
-          Save
-        </Button>
-      </div>
     </div>
   );
 }

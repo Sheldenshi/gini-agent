@@ -20,7 +20,7 @@ import type { TunnelProviderId } from "./types";
  * tunnel down. State + actions come from useTunnel (the live gateway-backed hook).
  */
 export function TunnelMenu() {
-  const { state, error, select, connect, cancel, disconnect, refresh } = useTunnel();
+  const { state, error, connect, cancel, disconnect, refresh } = useTunnel();
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState(false);
   // Which provider's setup guide is open. Connect is the single affordance:
@@ -115,7 +115,6 @@ export function TunnelMenu() {
             ) : (
               <TunnelSelectionPanel
                 state={state}
-                onSelect={select}
                 onConnect={handleConnect}
                 onCancel={cancel}
                 onDisconnect={disconnect}
