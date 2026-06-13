@@ -659,6 +659,10 @@ const echoToolCallingStubs: Array<{ tag?: string; result?: ToolCallingResult; no
 // conversation transcript. The buffer is cleared by
 // clearEchoToolCallingResponses so the per-test setup also resets it.
 const echoToolCallingCalls: ToolCallingMessage[][] = [];
+// Capture the tool names advertised on each echo call. Tests inspect this
+// to assert which (deferred) tool schemas were live in the provider tools
+// array on a given turn. Cleared alongside echoToolCallingCalls.
+const echoToolCallingToolNames: string[][] = [];
 
 // `nonStreaming` suppresses the synthesized onDelta below, mirroring a
 // provider that returns the whole string at once — callers' no-delta
@@ -687,6 +691,7 @@ export function setEchoToolCallingFailure(message: string, opts?: { streamTextBe
 export function clearEchoToolCallingResponses(): void {
   echoToolCallingStubs.length = 0;
   echoToolCallingCalls.length = 0;
+  echoToolCallingToolNames.length = 0;
 }
 
 // Test-only accessor: returns the messages array passed to every
@@ -694,6 +699,12 @@ export function clearEchoToolCallingResponses(): void {
 // Each entry is the full transcript at the moment of the call.
 export function getEchoToolCallingCalls(): ToolCallingMessage[][] {
   return echoToolCallingCalls.map((messages) => messages.slice());
+}
+
+// Test-only accessor: returns the tool names in the `tools` array passed to
+// every echo-backed `generateToolCallingResponse` call since the last clear.
+export function getEchoToolCallingToolNames(): string[][] {
+  return echoToolCallingToolNames.map((names) => names.slice());
 }
 
 function nextEchoToolCallingResult(
@@ -754,6 +765,7 @@ export async function generateToolCallingResponse(
 
   if (provider.name === "echo") {
     echoToolCallingCalls.push(messages.map((m) => ({ ...m })));
+    echoToolCallingToolNames.push(tools.map((t) => t.function.name));
     const { result, nonStreaming } = nextEchoToolCallingResult(provider, lastUserText, onDelta);
     if (result.text && onDelta && !nonStreaming) {
       // Synthesize a single streamed delta so callers exercise their

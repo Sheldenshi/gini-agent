@@ -15,6 +15,7 @@ import {
   clearEchoToolCallingResponses,
   getEchoAuxTextRequests,
   getEchoToolCallingCalls,
+  getEchoToolCallingToolNames,
   setEchoAuxTextFailure,
   setEchoAuxTextResponse,
   setEchoToolCallingFailure,
@@ -3465,6 +3466,82 @@ describe("chat-task loop", () => {
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
 
+  // browser_navigate seeds the deferred browser cluster: a navigation
+  // establishes a browsing session whose snapshot is full of actionable @eN
+  // refs, so the interaction tools (snapshot, click, type, …) must be live on
+  // the NEXT provider call without a load_tools round-trip per tool — and the
+  // seeded set must persist on task.loadedTools so a pause/resume keeps it.
+  // The navigate here targets a loopback URL (SSRF-blocked pre-flight, no
+  // Chromium) — seeding is unconditional on the navigate outcome.
+  test("browser_navigate seeds the deferred browser cluster live on the next turn and persists it on loadedTools", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    // strict so the turn-2 file_write gates, snapshotting loadedTools mid-task.
+    const config = buildConfig(workspaceRoot, "chat-task-navigate-seeds");
+    const provider = normalizeProvider(config.provider);
+
+    // Turn 1: navigate WITHOUT any load_tools call.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_nav", type: "function", function: { name: "browser_navigate", arguments: JSON.stringify({ url: "http://127.0.0.1:9/" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    // Turn 2: file_write (core, strict → pauses) so the paused task row
+    // exposes the persisted loadedTools.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_w", type: "function", function: { name: "file_write", arguments: JSON.stringify({ path: "notes.txt", content: "seeded" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    // Turn 3 (resumed): final answer.
+    setEchoToolCallingResponse({
+      provider,
+      text: "Browsing session ready.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "open the page", { mode: "chat" });
+    const paused = await waitForTerminal(config, task.id, 10000);
+    expect(paused.status).toBe("waiting_approval");
+    // The whole browser cluster persisted onto the task after the navigate.
+    expect(paused.loadedTools).toContain("browser_snapshot");
+    expect(paused.loadedTools).toContain("browser_click");
+    expect(paused.loadedTools).toContain("browser_type");
+
+    await decideApproval(config, paused.approvalIds[0]!, "approve");
+    const finished = await waitForTerminal(config, task.id, 10000);
+    expect(finished.status).toBe("completed");
+    expect(finished.summary).toBe("Browsing session ready.");
+    // Cleared on terminal completion.
+    expect(finished.loadedTools).toBeUndefined();
+
+    // Provider tools array per call: deferred browser tools absent on the
+    // navigate turn, live on the next turn, and still live on the resumed turn
+    // (re-seeded from task.loadedTools).
+    const toolNames = getEchoToolCallingToolNames();
+    expect(toolNames.length).toBe(3);
+    expect(toolNames[0]).toContain("browser_navigate");
+    expect(toolNames[0]).not.toContain("browser_snapshot");
+    expect(toolNames[1]).toContain("browser_snapshot");
+    expect(toolNames[1]).toContain("browser_click");
+    expect(toolNames[2]).toContain("browser_snapshot");
+
+    // The seed leaves a trace entry so "why is this tool live?" is answerable.
+    const { readTrace } = await import("../state");
+    const seedTrace = readTrace(config.instance, task.id).find(
+      (t) => t.message === "Deferred browser tools seeded by browser_navigate"
+    );
+    expect(seedTrace).toBeDefined();
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
   // create_agent approve/resume regression: the direct self tool routes
   // through the unchanged self.config approval branch. Approving the gate
   // must run the create_agent handler (agent row lands) and resume the loop.
@@ -3740,12 +3817,12 @@ describe("chat-task loop", () => {
     });
 
     // Twelve tool-call turns reading DISTINCT files (so no loop-breaker
-    // trips), each result ~3.6k chars — elidable (>200 chars) but the total
+    // trips), each result ~3.4k chars — elidable (>200 chars) but the total
     // stays under every estimate-driven threshold. Only the LAST response
     // reports usage; the resulting calibration gap forces the pre-call trim
     // ahead of the 13th call.
     for (let i = 0; i < 12; i++) {
-      writeFileSync(join(workspaceRoot, `chunk${i}.md`), `chunk-${i} `.repeat(450));
+      writeFileSync(join(workspaceRoot, `chunk${i}.md`), `chunk-${i} `.repeat(420));
       setEchoToolCallingResponse({
         provider,
         text: "",
@@ -4564,7 +4641,7 @@ describe("chat-task loop", () => {
     });
 
     for (let i = 0; i < 12; i++) {
-      writeFileSync(join(workspaceRoot, `chunk${i}.md`), `chunk-${i} `.repeat(450));
+      writeFileSync(join(workspaceRoot, `chunk${i}.md`), `chunk-${i} `.repeat(420));
       setEchoToolCallingResponse({
         provider,
         text: "",
