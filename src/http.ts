@@ -114,7 +114,7 @@ import { persistConnectOutcome, safeResume } from "./execution/safe-resume";
 import { approvalToolCallId } from "./execution/tool-dispatch";
 import { v1Readiness } from "./runtime/readiness";
 import { getRun, listRuns } from "./execution/runs";
-import { assertCurrentRuntimeUpdateSupported, currentVersionInfo, refreshVersionInfo, scheduleRuntimeRestart, updateRuntime } from "./runtime/update";
+import { assertCurrentRuntimeUpdateSupported, currentVersionInfo, isUpdateInFlight, refreshVersionInfo, scheduleRuntimeRestart, updateRuntime } from "./runtime/update";
 import { projectRoot } from "./paths";
 import { readDocSection } from "./docs";
 import { isLogStream, readLogTail } from "./state/logs";
@@ -197,7 +197,11 @@ async function emitConnectorRequestAudit(
 export function createHandler(config: RuntimeConfig): (request: Request) => Response | Promise<Response> {
   const routes: Array<[string, RegExp, Handler]> = [
     ["GET", /^\/api\/status$/, () => json(status(config))],
-    ["GET", /^\/api\/version$/, () => json(currentVersionInfo())],
+    // `updateInProgress` reports the gateway's single-flight update guard.
+    // The browser's UpdateGate polls it while blurred and extends its stall
+    // deadline only while the gateway says work is still happening, so a
+    // long build doesn't strand the user behind a released-too-early gate.
+    ["GET", /^\/api\/version$/, () => json({ ...currentVersionInfo(), updateInProgress: isUpdateInFlight() })],
     ["POST", /^\/api\/update\/check$/, async () => json(await refreshVersionInfo())],
     ["POST", /^\/api\/update$/, async () => {
       assertCurrentRuntimeUpdateSupported();

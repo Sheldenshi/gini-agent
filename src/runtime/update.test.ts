@@ -7,6 +7,7 @@ import {
   buildWebProdBundle,
   currentVersionInfo,
   formatInstallFailure,
+  isUpdateInFlight,
   resolveWebProdDistDir,
   scheduleRuntimeRestart,
   updateRuntime,
@@ -273,17 +274,23 @@ describe("updateRuntime", () => {
   test("single-flight: a second update while one is in flight rejects, and the guard clears after settle", async () => {
     const runtimeDir = makeUpdateRepo();
     const gate = Promise.withResolvers<void>();
+    expect(isUpdateInFlight()).toBe(false);
     const first = updateRuntime(runtimeDir, {
       runStepImpl: async () => {
         await gate.promise;
         return okStep;
       }
     });
+    // The guard state is what GET /api/version surfaces as updateInProgress
+    // (the UpdateGate's deadline-extension signal): true exactly while the
+    // single-flight promise is held.
+    expect(isUpdateInFlight()).toBe(true);
 
     await expect(updateRuntime(runtimeDir, { runStepImpl: async () => okStep })).rejects.toThrow(/already in progress/);
 
     gate.resolve();
     await first;
+    expect(isUpdateInFlight()).toBe(false);
     // The in-flight guard cleared: a fresh update runs to completion.
     const again = await updateRuntime(runtimeDir, { runStepImpl: async () => okStep });
     expect(again.upToDate).toBe(true);

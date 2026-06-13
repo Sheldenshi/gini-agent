@@ -73,6 +73,10 @@ let statusFailing: boolean;
 let webPid: number | null;
 let webPpid: number | null;
 let healthzFailing: boolean;
+// The gateway's GET /api/version progress flag: true while its single-flight
+// update guard is held. Drives the stall-deadline extension.
+let updateInProgressFlag: boolean;
+let versionFailing: boolean;
 let updateResponse: () => Promise<Response>;
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -90,6 +94,8 @@ beforeEach(() => {
   webPid = 333;
   webPpid = 444;
   healthzFailing = false;
+  updateInProgressFlag = false;
+  versionFailing = false;
   updateResponse = async () => jsonResponse(updateResult());
 
   globalThis.fetch = mock(async (input: RequestInfo | URL) => {
@@ -97,6 +103,10 @@ beforeEach(() => {
     if (url.includes("/__healthz")) {
       if (healthzFailing) throw new TypeError("connection refused");
       return jsonResponse({ ok: true, service: "gini-web", pid: webPid ?? undefined, ppid: webPpid ?? undefined });
+    }
+    if (url.includes("/version")) {
+      if (versionFailing) throw new TypeError("connection refused");
+      return jsonResponse({ ...versionInfo(statusSha), updateInProgress: updateInProgressFlag });
     }
     if (url.includes("/update/check")) return jsonResponse(versionInfo(statusSha));
     if (url.includes("/update")) return updateResponse();
@@ -133,7 +143,14 @@ function Probe() {
   );
 }
 
-function renderGate(props: { stallTimeoutMs?: number } = {}) {
+function renderGate(
+  props: {
+    stallTimeoutMs?: number;
+    progressPollIntervalMs?: number;
+    progressExtendMs?: number;
+    gateHardCapMs?: number;
+  } = {}
+) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const view = rtlRender(
     <QueryClientProvider client={client}>
@@ -167,6 +184,12 @@ async function pollStatus(client: QueryClient) {
 async function pollHealthz(client: QueryClient) {
   await act(async () => {
     await client.refetchQueries({ queryKey: ["web", "healthz"] }).catch(() => {});
+  });
+}
+
+async function pollProgress(client: QueryClient) {
+  await act(async () => {
+    await client.refetchQueries({ queryKey: ["version", "progress"] }).catch(() => {});
   });
 }
 
@@ -573,6 +596,126 @@ describe("UpdateGate", () => {
 
     await act(async () => {
       jest.advanceTimersByTime(1_000);
+    });
+    await flush();
+    expect(phase()).toBe("idle");
+    expect(reloadSpy).not.toHaveBeenCalled();
+  });
+
+  test("an updateInProgress:true progress answer extends the stall deadline; silence after it releases at the extension", async () => {
+    jest.useFakeTimers();
+    const t0 = new Date("2026-01-01T00:00:00.000Z");
+    setSystemTime(t0);
+    // A POST that never settles, status forever on the old sha — only the
+    // progress poll vouches for the update. The poll interval is injected
+    // far out so polls happen only when the test drives them: extension must
+    // come from an actual gateway answer, not the passage of time.
+    updateResponse = () => new Promise<Response>(() => {});
+    updateInProgressFlag = true;
+    const { client } = renderGate({ stallTimeoutMs: 2_000, progressExtendMs: 5_000, progressPollIntervalMs: 600_000 });
+    await flush();
+
+    fireEvent.click(screen.getByRole("button", { name: "start-update" }));
+    expect(phase()).toBe("updating");
+    await flush();
+    // The gateway answers "still working" → deadline pushed to t0 + 5s.
+    await pollProgress(client);
+
+    // Past the 2s base deadline: the extension holds the blur.
+    await act(async () => {
+      jest.advanceTimersByTime(2_500);
+      setSystemTime(new Date(t0.getTime() + 2_500));
+    });
+    await flush();
+    expect(phase()).toBe("updating");
+
+    // No further progress answers: the extended deadline is final and the
+    // gate releases there.
+    await act(async () => {
+      jest.advanceTimersByTime(3_000);
+      setSystemTime(new Date(t0.getTime() + 5_500));
+    });
+    await flush();
+    expect(phase()).toBe("idle");
+    expect(reloadSpy).not.toHaveBeenCalled();
+  });
+
+  test("updateInProgress:false extends nothing — the base deadline releases the gate", async () => {
+    jest.useFakeTimers();
+    const t0 = new Date("2026-01-01T00:00:00.000Z");
+    setSystemTime(t0);
+    updateResponse = () => new Promise<Response>(() => {});
+    updateInProgressFlag = false;
+    const { client } = renderGate({ stallTimeoutMs: 1_000, progressExtendMs: 5_000, progressPollIntervalMs: 600_000 });
+    await flush();
+
+    fireEvent.click(screen.getByRole("button", { name: "start-update" }));
+    await flush();
+    await pollProgress(client);
+
+    await act(async () => {
+      jest.advanceTimersByTime(1_000);
+      setSystemTime(new Date(t0.getTime() + 1_000));
+    });
+    await flush();
+    expect(phase()).toBe("idle");
+  });
+
+  test("a failing progress poll extends nothing — the base deadline releases the gate", async () => {
+    jest.useFakeTimers();
+    const t0 = new Date("2026-01-01T00:00:00.000Z");
+    setSystemTime(t0);
+    updateResponse = () => new Promise<Response>(() => {});
+    versionFailing = true;
+    const { client } = renderGate({ stallTimeoutMs: 1_000, progressExtendMs: 5_000, progressPollIntervalMs: 600_000 });
+    await flush();
+
+    fireEvent.click(screen.getByRole("button", { name: "start-update" }));
+    await flush();
+    await pollProgress(client);
+
+    await act(async () => {
+      jest.advanceTimersByTime(1_000);
+      setSystemTime(new Date(t0.getTime() + 1_000));
+    });
+    await flush();
+    expect(phase()).toBe("idle");
+  });
+
+  test("progress extensions never push the deadline past the hard cap", async () => {
+    jest.useFakeTimers();
+    const t0 = new Date("2026-01-01T00:00:00.000Z");
+    setSystemTime(t0);
+    updateResponse = () => new Promise<Response>(() => {});
+    updateInProgressFlag = true;
+    // Each answer asks for now + 10s, but the cap (3s from gate start) wins:
+    // a wedged-but-alive gateway saying "still working" forever must not
+    // blur the app forever.
+    const { client } = renderGate({
+      stallTimeoutMs: 1_000,
+      progressExtendMs: 10_000,
+      gateHardCapMs: 3_000,
+      progressPollIntervalMs: 600_000
+    });
+    await flush();
+
+    fireEvent.click(screen.getByRole("button", { name: "start-update" }));
+    await flush();
+    await pollProgress(client);
+
+    // Past the 1s base deadline: the (capped) extension holds.
+    await act(async () => {
+      jest.advanceTimersByTime(1_500);
+      setSystemTime(new Date(t0.getTime() + 1_500));
+    });
+    await flush();
+    expect(phase()).toBe("updating");
+    // A fresh "still working" answer cannot move the deadline past the cap.
+    await pollProgress(client);
+
+    await act(async () => {
+      jest.advanceTimersByTime(2_000);
+      setSystemTime(new Date(t0.getTime() + 3_500));
     });
     await flush();
     expect(phase()).toBe("idle");
