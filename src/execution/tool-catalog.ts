@@ -158,7 +158,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   },
   {
     toolset: "messaging",
-    displayLabel: "Fetch URL",
+    displayLabel: "Read",
     crossToolsetHint: {
       toolset: "browser",
       text: "For interacting with pages — clicking, typing, authenticated sessions — use the browser tools (browser_navigate) instead."
