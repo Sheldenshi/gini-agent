@@ -4202,13 +4202,18 @@ describe("chat-task loop", () => {
 
   // In-turn compaction happy path. Token geometry under the echo provider
   // (32k window, high-water 27,200): the always-on tool schemas + system
-  // prompt occupy ~13.8k tokens, so six ~2.4k-token read_skill results cross
-  // the high-water mark before the 7th call — and pruning can't help (all
-  // six results sit inside the elision layer's protected-recent window). The
-  // loop must summarize the middle exchanges via ONE aux call, splice in the
-  // marked summary message, protect the head and the recent tail, and keep
-  // going to completion. Toolsets are disabled to pin the schema to the
-  // always-on floor — read_skill is always-on, so the calls still dispatch.
+  // prompt occupy ~15.3k tokens (slightly less on Linux, where the
+  // macOS-only apple skills stay out of the system prompt), so six
+  // ~2.1k-token read_skill results cross the high-water mark before the 7th
+  // call — and pruning can't help (all six results sit inside the elision
+  // layer's protected-recent window). The loop must summarize the middle
+  // exchanges via ONE aux call, splice in the marked summary message,
+  // protect the head and the recent tail, and keep going to completion.
+  // Toolsets are disabled to pin the schema to the always-on floor —
+  // read_skill is always-on, so the calls still dispatch. The body size
+  // balances two erosion modes: growing the always-on floor pushes the
+  // trigger a call earlier (5 results must stay under the mark), shrinking
+  // it pushes the trigger a call later (6 results must stay over).
   test("in-turn compaction summarizes the middle, protects head and tail, and continues", async () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
     const config = buildConfig(workspaceRoot, "chat-task-compaction");
@@ -4218,7 +4223,7 @@ describe("chat-task loop", () => {
     });
 
     for (let i = 0; i < 7; i++) {
-      await seedBulkSkill(config, `bulk-skill-${i}`, `BODY-${i} ${"x".repeat(9_600)}`);
+      await seedBulkSkill(config, `bulk-skill-${i}`, `BODY-${i} ${"x".repeat(8_400)}`);
       setEchoToolCallingResponse({
         provider,
         text: "",
@@ -4345,17 +4350,19 @@ describe("chat-task loop", () => {
     });
 
     // Geometry: the projection crosses the high-water mark (27,200 tokens
-    // under the echo provider's 32k window) by a hair, with a small middle
-    // span — so the compaction reclaims under 10% of the projection (the
-    // savings-bail threshold) but enough to dip back under the mark.
-    // Exchange 0 is the protected head, exchanges 1–2 the summarizable
-    // middle, exchanges 3–4 the protected tail.
+    // under the echo provider's 32k window) with a small middle span — so
+    // the compaction reclaims under 10% of the projection (the savings-bail
+    // threshold) but enough to dip back under the mark. Exchange 0 is the
+    // protected head, exchanges 1–2 the summarizable middle, exchanges 3–4
+    // the protected tail. The tail sizes leave a few hundred tokens of
+    // post-compaction headroom under the mark; the always-on tool schemas
+    // count toward the projection, so growing them erodes this headroom.
     const bodies = [
       `BODY-0 ${"x".repeat(9_600)}`,
       `BODY-1 ${"x".repeat(4_000)}`,
       `BODY-2 ${"x".repeat(4_000)}`,
       `BODY-3 ${"x".repeat(19_000)}`,
-      `BODY-4 ${"x".repeat(19_000)}`
+      `BODY-4 ${"x".repeat(16_000)}`
     ];
     for (let i = 0; i < bodies.length; i++) {
       await seedBulkSkill(config, `bulk-skill-${i}`, bodies[i]!);
@@ -4402,7 +4409,7 @@ describe("chat-task loop", () => {
     // Same geometry as the happy path (compaction fires before call 7) plus
     // a 7th huge read that immediately refills the reclaimed space.
     for (let i = 0; i < 7; i++) {
-      const chars = i === 6 ? 36_000 : 9_600;
+      const chars = i === 6 ? 36_000 : 8_400;
       await seedBulkSkill(config, `bulk-skill-${i}`, `BODY-${i} ${"x".repeat(chars)}`);
       setEchoToolCallingResponse({
         provider,
@@ -4450,12 +4457,12 @@ describe("chat-task loop", () => {
         finishReason: "tool_calls"
       });
     };
-    // Twelve ~2.4k-token reads. The high-water mark trips after every sixth
+    // Twelve ~2.1k-token reads. The high-water mark trips after every sixth
     // accumulated full result, so compactions land at iterations 7 and 10 —
     // three iterations apart, wide enough that the refill guard stays quiet
     // — and the third trigger at iteration 13 hits the cap.
     for (let i = 0; i < 12; i++) {
-      await seedBulkSkill(config, `bulk-skill-${i}`, `BODY-${i} ${"x".repeat(9_600)}`);
+      await seedBulkSkill(config, `bulk-skill-${i}`, `BODY-${i} ${"x".repeat(8_400)}`);
       queueRead(i);
     }
     setEchoAuxTextResponse({ text: "SUMMARY-ONE" });
@@ -4499,7 +4506,7 @@ describe("chat-task loop", () => {
     });
 
     for (let i = 0; i < 7; i++) {
-      await seedBulkSkill(config, `bulk-skill-${i}`, `BODY-${i} ${"x".repeat(9_600)}`);
+      await seedBulkSkill(config, `bulk-skill-${i}`, `BODY-${i} ${"x".repeat(8_400)}`);
       setEchoToolCallingResponse({
         provider,
         text: "",

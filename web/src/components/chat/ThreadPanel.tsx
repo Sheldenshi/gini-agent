@@ -1,12 +1,13 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useMemo, useState } from "react";
 import { X } from "lucide-react";
 import { toast } from "sonner";
 import type { ChatBlock } from "@runtime/types";
 import type { UploadRef } from "@/lib/api";
 import { useChatBlocks, useReplyToThread, useThread } from "@/lib/queries";
 import { groupExchanges, type ChatRenderItem } from "@/lib/group-exchanges";
+import { useStickToBottom } from "@/lib/use-stick-to-bottom";
 import type { ThreadSummary } from "@/lib/view-types";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { AgentAvatar } from "./AgentAvatar";
@@ -46,11 +47,16 @@ export function ThreadPanel({
   const parentBlock = sessionBlocks.find((b) => b.id === thread.parentBlockId);
   const reply = useReplyToThread(sessionId, thread.threadId);
   const [text, setText] = useState("");
-  const endRef = useRef<HTMLDivElement | null>(null);
-
-  useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [blocks.length, thread.threadId]);
+  // Snap to the latest reply instantly when the panel opens (the inbox reuses
+  // one panel across threads, so key on threadId to re-arm per thread); follow
+  // smoothly as new reply blocks arrive. Gate on having reply blocks: the
+  // panel mounts empty while the thread loads, and snapping then would burn the
+  // instant-snap latch before the replies are laid out, leaving the real
+  // content to animate in.
+  const endRef = useStickToBottom(blocks.length, {
+    key: thread.threadId,
+    enabled: blocks.length > 0
+  });
 
   const visibleBlocks = useMemo(
     () =>

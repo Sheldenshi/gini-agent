@@ -403,6 +403,20 @@ describe("buildToolCatalog", () => {
     });
   });
 
+  test("web_search description steers factual/lookup questions away from memory", () => {
+    // The search-vs-memory policy is the behavioral fix for models that
+    // answer source-dependent questions from parametric or recalled memory
+    // instead of searching. Pin the clause so a description rewrite can't
+    // silently drop it. The same policy lives in the default INSTRUCTIONS.md
+    // (see system-prompt.test.ts); both surfaces must carry it.
+    const state = stateWithToolsets([ts("web_search")]);
+    const catalog = buildToolCatalog(state);
+    const desc = catalog.find((t) => t.function.name === "web_search")?.function.description ?? "";
+    expect(desc).toContain("BEFORE answering");
+    expect(desc).toContain("recalled memory");
+    expect(desc).toContain("stable general knowledge");
+  });
+
   describe("cross-toolset routing hints", () => {
     // browser_navigate's description steers content discovery to
     // web_search, and the search/fetch descriptions steer page

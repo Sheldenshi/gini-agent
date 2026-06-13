@@ -1208,10 +1208,12 @@ export async function connectTunnel(config: RuntimeConfig, provider?: string): P
   return connecting;
 }
 
-// Boot-resume web-readiness knobs. Right after a restart the gateway is
-// listening but the web child it reverse-proxies may still be (re)compiling, so
-// the resume polls the local port until it answers instead of failing on a
-// single probe. Read at call time (not module load) so tests can tighten them.
+// Override-port resume readiness knobs. The default resume fronts the gateway
+// port and is gated on the bind (gatewayReady) with no poll; these apply ONLY to
+// the GINI_TUNNEL_PORT override fallback, where the tunnel exposes a port this
+// process doesn't bind and must poll it for readiness with retry (the override
+// target may still be coming up after a restart). Read at call time so tests can
+// tighten them.
 function resumeWaitMs(): number {
   const v = Number(process.env.GINI_TUNNEL_RESUME_WAIT_MS);
   return Number.isFinite(v) && v >= 0 ? v : 60_000;
@@ -1221,9 +1223,10 @@ function resumePollMs(): number {
   return Number.isFinite(v) && v > 0 ? v : 1_000;
 }
 
-// Poll the local web port until the probe succeeds or the deadline elapses. Used
-// only by the boot resume (awaitWebReady). Bails false the moment the run is
-// superseded (a user connect/cancel during the wait) so it never fights a winner.
+// Poll the resolved local port until the identity probe succeeds or the deadline
+// elapses. Used only by the resume's GINI_TUNNEL_PORT-override fallback. Bails
+// false the moment the run is superseded (a user connect/cancel during the wait)
+// so it never fights a winner.
 async function waitForLocalPort(
   config: RuntimeConfig,
   port: number,
@@ -1239,8 +1242,9 @@ async function waitForLocalPort(
 }
 
 // Settle the tunnel to "idle" keeping the selection. Used by the boot resume when
-// it can't reconnect non-interactively (web never came up, or no stored session):
-// a routine restart shouldn't surface an "error" badge, and idle lets the user
+// it can't reconnect non-interactively — there's no stored session, or (on a
+// GINI_TUNNEL_PORT override) the resolved port never verified as serving gini: a
+// routine restart shouldn't surface an "error" badge, and idle lets the user
 // reconnect manually. No audit row — the appendLog at the call site is the trace.
 async function settleResumeIdle(config: RuntimeConfig, provider: TunnelProviderId): Promise<void> {
   await mutateState(config.instance, (state) => {
@@ -1256,14 +1260,26 @@ async function settleResumeIdle(config: RuntimeConfig, provider: TunnelProviderI
 }
 
 // The background connect flow for a MANUAL driver (tailscale / ngrok /
-// cloudflared). Mirrors runConnect's supervision contract — same web-readiness
-// probe, same isCurrent ownership rules, same error-into-state fold — without
+// cloudflared). Mirrors runConnect's supervision contract — same readiness
+// guard, same isCurrent ownership rules, same error-into-state fold — without
 // the OAuth/session machinery (these drivers have no login).
+//
+// opts (boot resume only):
+//   resume       — boot-resume semantics: a readiness failure settles to idle
+//                  (a routine restart must not surface an "error" badge)
+//                  instead of throwing, and the port wait is gated on the bind
+//                  or polled instead of single-probed.
+//   gatewayReady — resolves once THIS process has bound the gateway port; the
+//                  resume awaits it before running the driver, so the public
+//                  URL is never fronted onto a stale/foreign listener still
+//                  holding the port. It vouches only for config.port — an
+//                  overridden tunnel port falls back to the bounded identity
+//                  poll (see runConnect for the full rationale).
 async function runManualConnect(
   config: RuntimeConfig,
   provider: ManualProviderId,
   sup: Supervisor,
-  opts: { awaitWebReady?: boolean } = {}
+  opts: { resume?: boolean; gatewayReady?: Promise<void> } = {}
 ): Promise<void> {
   const isCurrent = (): boolean => supervisors.get(config.instance) === sup;
   // Claim a provider-side epoch for this run. The deferred abort teardown
@@ -1274,12 +1290,26 @@ async function runManualConnect(
   const epochCurrent = (): boolean => providerSideEpochs.get(config.instance) === epoch;
   try {
     const port = deps.resolveLocalPort(config);
-    const ready = opts.awaitWebReady
-      ? await waitForLocalPort(config, port, isCurrent)
-      : await deps.probeLocalPort(config, port);
+    let ready: boolean;
+    if (!opts.resume) {
+      // Fresh, user-initiated connect: refuse to front a port that doesn't
+      // serve gini (a not-yet-ready app or a stale/foreign listener).
+      ready = await deps.probeLocalPort(config, port);
+    } else if (opts.gatewayReady && port === config.port) {
+      // Boot resume fronting our own gateway port: the bind proves ownership —
+      // no web-child probe, so the front returns the moment the port is ours
+      // instead of after the web recompile (see runConnect).
+      await opts.gatewayReady;
+      ready = true;
+    } else {
+      // Boot resume of a GINI_TUNNEL_PORT override (or no bind signal, as in
+      // tests): gatewayReady proves only config.port, so verify the port's
+      // identity with the bounded, cancellable poll before fronting it.
+      ready = await waitForLocalPort(config, port, isCurrent);
+    }
     if (!ready) {
-      if (opts.awaitWebReady) {
-        // Boot resume: a restart where the web never came back up shouldn't
+      if (opts.resume) {
+        // Boot resume: a restart where the port never verified shouldn't
         // error — settle idle so the user can reconnect (mirrors the relay
         // resume; waitForLocalPort already returns false when superseded).
         if (isCurrent()) await settleResumeIdle(config, provider);
@@ -1390,7 +1420,7 @@ async function runManualConnect(
 
 // The background login + tunnel handshake. Runs the full gini-relay flow:
 // mint the consent URL → open it in the host browser → await the session →
-// build + start frpc on the local web port → record the public url. On any
+// build + start frpc on the local gateway port → record the public url. On any
 // failure (or if the connect was cancelled mid-flight) it writes an "error"
 // (or leaves the cancel-written "idle") record. Never throws — errors are
 // captured into state so the polling UI surfaces them.
@@ -1399,13 +1429,24 @@ async function runManualConnect(
 //   reuseOnly    — never open a browser / mint a fresh login. If the stored
 //                  session is missing or rejected, settle to idle instead. Keeps
 //                  a headless restart from popping an OAuth tab on the server.
-//   awaitWebReady — poll the local port until it answers (the web child may still
-//                  be compiling after a restart) instead of a single probe.
+//                  Also skips the pre-connect web-readiness probe: a resume
+//                  restores the remote client's only channel as soon as the
+//                  gateway port is ours, not after the web child's recompile.
+//   gatewayReady — resolves once THIS process has bound the gateway port. The
+//                  resume awaits it before building frpc, so the stable public
+//                  URL is never forwarded to a stale/foreign listener still
+//                  holding the port (a paired browser would otherwise hand it
+//                  the session cookie). Resolves the instant Bun.serve binds and
+//                  never if the bind fails. Omitting it is NOT a bypass: the
+//                  resume then degrades to the local-port probe below (the same
+//                  guard a fresh connect uses), so it still verifies the port —
+//                  it just loses the no-web-wait fast path. Tests omit it (or
+//                  point the port off config.port) to drive that probe path.
 async function runConnect(
   config: RuntimeConfig,
   provider: TunnelProviderId,
   sup: Supervisor,
-  opts: { reuseOnly?: boolean; awaitWebReady?: boolean } = {}
+  opts: { reuseOnly?: boolean; gatewayReady?: Promise<void> } = {}
 ): Promise<void> {
   // This run "owns" the instance only while its supervisor entry is the current
   // one. A cancel/disconnect (teardown deletes the entry) or a newer concurrent
@@ -1416,26 +1457,49 @@ async function runConnect(
     const store = deps.createStore(config);
     const relay = deps.resolveDefaults();
     const port = deps.resolveLocalPort(config);
-    const ready = opts.awaitWebReady
-      ? await waitForLocalPort(config, port, isCurrent)
-      : await deps.probeLocalPort(config, port);
-    if (!ready) {
-      // Boot resume: a restart where the web never came back up shouldn't error —
-      // settle idle so the user can reconnect. (waitForLocalPort already returns
-      // false when superseded; the isCurrent guard avoids clobbering a winner.)
-      if (opts.reuseOnly) {
-        if (isCurrent()) await settleResumeIdle(config, provider);
-        appendLog(config.instance, "tunnel.resume.web_unavailable", { provider, port });
-        return;
+    // Don't expose `port` through the relay until we know it's legitimately
+    // ours. Three cases:
+    //   - Fresh, user-initiated connect: probe the local web port and refuse to
+    //     advertise a brand-new public URL unless it serves gini — so a
+    //     not-yet-ready app or a stale/foreign port is never published.
+    //   - Resume of the gateway port (the default): the tunnel fronts THIS
+    //     process's own gateway port (config.port), but reconcileTunnelOnStartup
+    //     runs before Bun.serve binds it — so wait only for the bind. gatewayReady
+    //     resolves the instant Bun.serve binds config.port (and never if the bind
+    //     fails), proving we own the port; no web-child probe, so reachability
+    //     returns the moment the port is ours instead of after the web recompile.
+    //     The relay URL is a remote client's only channel to watch the restart
+    //     finish, so the client's own polls — and the watchdog — handle web-child
+    //     readiness, not the tunnel.
+    //   - Resume of a NON-gateway port: a GINI_TUNNEL_PORT override points the
+    //     tunnel at a port this process never binds, so gatewayReady (which proves
+    //     only config.port) can't vouch for it. Fall back to a bounded, cancellable
+    //     poll of that port's identity before exposing it, mirroring the
+    //     fresh-connect guard (the override target may still be coming up after a
+    //     restart), so a stale override can't publish a foreign listener.
+    let overrideProbeFailed = false;
+    if (!opts.reuseOnly) {
+      if (!(await deps.probeLocalPort(config, port))) {
+        throw new Error(
+          `Gini's web UI isn't responding on port ${port} — start it, then reconnect.`
+        );
       }
-      throw new Error(
-        `Gini's web UI isn't responding on port ${port} — start it, then reconnect.`
-      );
+    } else if (opts.gatewayReady && port === config.port) {
+      await opts.gatewayReady;
+    } else {
+      overrideProbeFailed = !(await waitForLocalPort(config, port, isCurrent));
     }
-    // A cancel/disconnect/supersede may have landed during the probe await —
-    // bail before spawning frpc (reuse path) or minting a login (login path).
+    // A cancel/disconnect/supersede may have landed during the await above — bail
+    // before settling idle, minting a login, or building frpc.
     if (!isCurrent()) {
       appendLog(config.instance, "tunnel.connect.aborted", { provider });
+      return;
+    }
+    if (overrideProbeFailed) {
+      // Resume couldn't verify the override port — don't expose it. Settle idle so
+      // the operator can reconnect rather than surfacing a spurious error.
+      await settleResumeIdle(config, provider);
+      appendLog(config.instance, "tunnel.resume.web_unavailable", { provider, port });
       return;
     }
 
@@ -1804,13 +1868,26 @@ export async function disconnectTunnel(config: RuntimeConfig): Promise<TunnelSta
 // tunnel that was "connected" at shutdown is brought back AUTOMATICALLY:
 // persist-and-resume. We flip the record to "connecting" (never leave a stale
 // "connected" the first GET could read) and kick off a background reconnect that
-// REUSES the stored relay session — no browser login — and waits for the web
-// child to come back up. It is best-effort: on no session / web-never-ready it
-// settles to idle. A prior "connecting" was an incomplete attempt with no
-// guaranteed session, so it just resets to idle; idle/error records are left
-// untouched. The caller (src/server.ts boot) wraps this in a best-effort
+// REUSES the stored relay session — no browser login — and restores the tunnel
+// as soon as this process owns the gateway port (`gatewayReady`), without
+// waiting on the web child's recompile: the relay URL is a remote client's only
+// channel to watch the restart finish, so reachability can't be gated on the web
+// app being ready (the client's own polls handle that). It is best-effort: on no
+// session it settles to idle. A prior "connecting" was an incomplete attempt
+// with no guaranteed session, so it just resets to idle; idle/error records are
+// left untouched. The caller (src/server.ts boot) wraps this in a best-effort
 // .catch() so a state-write failure can never crash boot.
-export async function reconcileTunnelOnStartup(config: RuntimeConfig): Promise<TunnelState> {
+//
+// `gatewayReady` resolves once Bun.serve has bound config.port. The status flip
+// runs synchronously (so the call can stay before the bind, keeping the first
+// GET off a stale "connected"), but the background frpc rebuild awaits this
+// before exposing the port — see runConnect. Omitting it (as tests do) is not a
+// bypass: the rebuild then degrades to the local-port probe, which still verifies
+// the port before exposing it.
+export async function reconcileTunnelOnStartup(
+  config: RuntimeConfig,
+  opts: { gatewayReady?: Promise<void> } = {}
+): Promise<TunnelState> {
   const record = readState(config.instance).tunnel ?? null;
   if (!record || (record.status !== "connected" && record.status !== "connecting")) {
     return toState(record);
@@ -1866,17 +1943,18 @@ export async function reconcileTunnelOnStartup(config: RuntimeConfig): Promise<T
   });
 
   if (willResume && provider) {
-    // Background reconnect, waiting for the web child to become reachable (the
-    // gateway binds, and the web child finishes compiling, just after this
-    // returns — so the resume probes with retry). gini-relay reuses the stored
-    // session (no browser); manual drivers just reconnect — tailscale republishes
-    // the same stable ts.net URL, while ngrok/cloudflared mint a fresh one.
-    // Retained on the supervisor so tests can await the terminal transition.
+    // Background reconnect: rebuild the front as soon as this process owns the
+    // gateway port (gatewayReady), so a remote client regains its channel right
+    // after the bind instead of waiting out the web child's recompile. gini-relay
+    // reuses the stored session (no browser); manual drivers just reconnect —
+    // tailscale republishes the same stable ts.net URL, while ngrok/cloudflared
+    // mint a fresh one. Retained on the supervisor so tests can await the
+    // terminal transition.
     teardown(config.instance);
     const sup = supervisor(config.instance);
     sup.settled = isManualProviderId(provider.id)
-      ? runManualConnect(config, provider.id, sup, { awaitWebReady: true })
-      : runConnect(config, provider.id, sup, { reuseOnly: true, awaitWebReady: true });
+      ? runManualConnect(config, provider.id, sup, { resume: true, gatewayReady: opts.gatewayReady })
+      : runConnect(config, provider.id, sup, { reuseOnly: true, gatewayReady: opts.gatewayReady });
   }
   return next;
 }

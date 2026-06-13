@@ -2042,12 +2042,20 @@ export function isWebProxyPath(pathname: string): boolean {
 // server isn't reachable (web down, or a --no-web instance). The banner's
 // natural home is exactly the case where the UI isn't there to serve.
 function runtimeBanner(request: Request, config: RuntimeConfig): Response {
+  // The web-down self-describe. Some bootstrap paths (/pair, /_next/*, static
+  // assets) are exempt from the relay session gate, so a remote relay visitor can
+  // reach this banner during the web child's post-restart startup window. Only
+  // loopback (the local operator) gets the full self-describe; a non-loopback
+  // caller gets the bare name/message and never the instance, port, or web-URL
+  // hint, so the banner can't leak deployment details over the relay.
+  const host = request.headers.get("host") ?? new URL(request.url).host;
+  const detail = isLoopbackHost(host)
+    ? { instance: config.instance, port: config.port, ui_url_hint: process.env.GINI_WEB_URL ?? null }
+    : {};
   return withCors(request, json({
     name: "gini-runtime",
-    instance: config.instance,
-    port: config.port,
     message: "Gini runtime API. The Next.js control plane runs on a separate port; see `gini status`.",
-    ui_url_hint: process.env.GINI_WEB_URL ?? null
+    ...detail
   }));
 }
 

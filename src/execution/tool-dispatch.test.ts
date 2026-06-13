@@ -1562,10 +1562,14 @@ describe("web_search dispatch", () => {
     }
     expect(thrown).toBeInstanceOf(ToolDisplayError);
     const err = thrown as ToolDisplayError;
-    // The model still receives the full steering so it calls
-    // request_connector and doesn't guess URLs with web_fetch.
+    // The model is steered to keep searching via the live-web tools it
+    // already has (browser / web_fetch a search engine) instead of
+    // answering from memory, with request_connector offered as a quality
+    // upgrade rather than a hard gate.
+    expect(err.message).toContain("browser_navigate");
+    expect(err.message).toContain("web_fetch");
+    expect(err.message).toContain("do NOT answer from memory");
     expect(err.message).toContain("request_connector");
-    expect(err.message).toContain("Do NOT fall back to web_fetch");
     // The user only sees a short, neutral line.
     expect(err.displayMessage).toBe("No search provider connected.");
     expect(err.displaySeverity).toBe("info");

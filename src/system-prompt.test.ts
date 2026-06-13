@@ -166,6 +166,17 @@ describe("buildAgentSystemContext", () => {
     expect(out).toBe(expectedDefaultInstructions);
   });
 
+  test("bundled default instructions carry the search-vs-memory policy", () => {
+    // Models that answer source-dependent questions from training-time or
+    // recalled memory instead of searching are the failure this rule fixes.
+    // Pin the key clauses so a future edit to the preamble can't silently
+    // drop them; the web_search tool description carries the same policy
+    // (see tool-catalog.test.ts).
+    const out = getDefaultGiniInstructions();
+    expect(out).toContain("search the web FIRST");
+    expect(out).toContain("not a citable source of external fact");
+  });
+
   test("instructionsOverride wins over the bundled defaults", () => {
     const out = buildAgentSystemContext({
       instructionsOverride: "Custom rules only."

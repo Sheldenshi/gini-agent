@@ -76,30 +76,42 @@ export async function runFillSecretConnect(
       }
     };
   }
-  // Floor on minimum value length. Values shorter than
-  // FILLED_SECRET_MIN_REDACTION_LENGTH are not registered for
-  // redaction (single-character secrets would shred snapshot @eN
-  // refs via literal substring replacement). The constant lives
-  // in src/tools/browser.ts alongside the redactor; importing it
-  // here keeps the gate and the registry in sync — if the floor
-  // is ever bumped, /connect refusal and recordFilledSecret
-  // change together. Refusing short values here closes the
-  // asymmetry where /connect would otherwise accept a value
-  // below the floor and fill it into the DOM with no subsequent
-  // redaction. Realistic credentials are always above this floor
-  // (PINs 4+, OTPs 6+, passwords 8+) so the only inputs blocked
-  // are typos / test data; CVV-style 3-digit codes don't fit
-  // fill_secret's threat model (they belong on connector
-  // pathways).
+  // Minimum-length floor, scoped to password-kind slots only.
+  //
+  // FILLED_SECRET_MIN_REDACTION_LENGTH is the redactor's floor:
+  // recordFilledSecret (src/tools/browser.ts) refuses to register
+  // values shorter than it, because the redactor does literal
+  // substring replacement and a short value would shred structural
+  // snapshot tokens like [@e1] / @e43. The constant is imported
+  // here so the gate and the registry move together if it is ever
+  // bumped.
+  //
+  // The gate is NOT a general input-validation floor. fill_secret
+  // also collects identity/PII fields (the tool advertises "account
+  // ids"; a real call here asks for date of birth + last name), and
+  // those are legitimately short — "Shi", "Ng", "Li", "Wu", "Lee"
+  // are valid last names. Blocking them is wrong. A short non-
+  // password value fills but is not redaction-registered; that is
+  // inherent and acceptable because substring-redacting a sub-floor
+  // value is meaningless/harmful regardless, and the field is not a
+  // credential.
+  //
+  // password-kind is the one case where a sub-floor value is both a
+  // near-certain typo AND an un-redactable leak risk (the exfil
+  // scans in src/tools/browser.ts that catch a registered secret
+  // smuggled into a URL / form / dialog all skip values below the
+  // floor too). So keep refusing there. An agent that wants a short
+  // numeric secret (a PIN) protected should declare kind "password",
+  // which also masks it — the correct choice.
   const tooShort = slots
-    .filter((slot) => secrets[slot.name].length < FILLED_SECRET_MIN_REDACTION_LENGTH)
+    .filter((slot) => slot.kind === "password" && secrets[slot.name].length < FILLED_SECRET_MIN_REDACTION_LENGTH)
     .map((slot) => slot.name);
   if (tooShort.length > 0) {
     return {
       status: 400,
       body: {
         ok: false,
-        message: `Slot value too short (< ${FILLED_SECRET_MIN_REDACTION_LENGTH} chars): ${tooShort.join(", ")}. Re-enter a longer value.`
+        message: `Secret value too short (< ${FILLED_SECRET_MIN_REDACTION_LENGTH} chars): ${tooShort.join(", ")}. Re-enter a longer value.`
       }
     };
   }

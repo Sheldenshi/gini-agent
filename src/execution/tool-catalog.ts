@@ -140,7 +140,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "web_search",
-      description: "Search the public web. Returns up to `count` ranked results, each as `[N] title — url\\n    snippet`. Use this instead of guessing URLs or asking the user — it's the agent's primary way to discover fresh information. Backends: Brave returns keyword web results (broad, fresh, free tier). Exa returns semantically-matched results with extracted content highlights (better for research / discovering substantive content on a concept). Default picks the first healthy connector (Brave preferred). If results don't fit the task, you may suggest the user set up the other backend via request_connector — never hardcode a choice; let the user decide. If this tool errors because no connector is configured, call request_connector for 'brave-search' (default) or 'exa' to have the user add an API key, then retry — do NOT fall back to web_fetch on guessed URLs, since that defeats the user's intent to search the live web.",
+      description: "Search the public web. Returns up to `count` ranked results, each as `[N] title — url\\n    snippet`. Use this instead of guessing URLs or asking the user — it's the agent's primary way to discover fresh information. Reach for it BEFORE answering any question whose answer depends on a current, specific, or authoritative source (regulations, requirements, prices, hours, schedules, news, statistics, specific people/places/products/events, or any \"look it up\" request) rather than answering from training-time or recalled memory; only stable general knowledge (explanations, definitions, reasoning) should be answered without a search. Backends: Brave returns keyword web results (broad, fresh, free tier). Exa returns semantically-matched results with extracted content highlights (better for research / discovering substantive content on a concept). Default picks the first healthy connector (Brave preferred). If results don't fit the task, you may suggest the user set up the other backend via request_connector — never hardcode a choice; let the user decide. If this tool errors because no connector is configured, you still have live-web access — rather than answering from memory, query a search engine another way: use browser_navigate to open a search engine and read the results, or web_fetch a search-results URL (querying a real engine is searching; guessing random content URLs is not). You can also call request_connector for 'brave-search' (default) or 'exa' to add an API key for faster, cleaner results.",
       parameters: {
         type: "object",
         properties: {
@@ -158,7 +158,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   },
   {
     toolset: "messaging",
-    displayLabel: "Fetch URL",
+    displayLabel: "Read",
     crossToolsetHint: {
       toolset: "browser",
       text: "For interacting with pages — clicking, typing, authenticated sessions — use the browser tools (browser_navigate) instead."
@@ -797,7 +797,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "ask_user",
-      description: "Ask the user to pick between options when multiple viable paths exist and their preference matters. The user sees a single-select card in chat; the task pauses until they choose, then resumes with their selection. ESPECIALLY use this before requesting connector setup — offer the setup-vs-alternative choices first (e.g. \"Set up Brave + Exa\", \"Set up Brave only\", \"Neither — use web_fetch\") so the user decides whether setup is worth it. Also use it for general mid-task preference or clarification questions (which approach, which account, which format). Single-select only. The card automatically adds an \"Other (type your answer)\" freeform input and a Skip affordance — do NOT include an \"Other\" / \"something else\" / \"skip\" entry in `options`. Do NOT use this for permission confirmations — risk-gated actions already go through the authorization flow.",
+      description: "Ask the user to pick between options when multiple viable paths exist and their preference matters. The user sees a single-select card in chat; the task pauses until they choose, then resumes with their selection. Every option must be a concrete action you can actually take with your available tools, or a setup you can request — never a way of opting out of the task. ESPECIALLY use this before requesting connector setup — offer the setup-vs-alternative choices first (e.g. for missing web search: \"Connect a search provider\", \"Fetch likely sites directly with web_fetch\", \"Browse the web with the browser\") so the user decides whether setup is worth it. Do NOT offer \"answer from general knowledge/memory\" as an option for research or current-information tasks — if the user wants that, they can type it under Other; fall back to general knowledge only when they explicitly choose it or every live path is exhausted. Also use it for general mid-task preference or clarification questions (which approach, which account, which format). Single-select only. The card automatically adds an \"Other (type your answer)\" freeform input and a Skip affordance — do NOT include an \"Other\" / \"something else\" / \"skip\" entry in `options`. Do NOT use this for permission confirmations — risk-gated actions already go through the authorization flow.",
       parameters: {
         type: "object",
         properties: {
@@ -1171,6 +1171,16 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
           timeoutSeconds: {
             type: "number",
             description: "Wall-clock seconds before the spawned task is killed. Default 600 (10 min) — enough for typical git/gh + multi-file scan jobs. Drop lower (e.g. 60-120) for trivial reminders; raise (e.g. 1800-3600) when the prompt invokes external CLIs like codex or claude-code that can run several minutes. The model will be terminated mid-thought if this is too low."
+          },
+          preRunHook: {
+            type: "object",
+            description: "Optional pre-fire hook: a registered trusted handler runs in-process before each fire and either shortCircuits the run (no model turn; also auto-pauses oneShot jobs, so watch jobs need oneShot=false) or injects context items into the prompt turn. The built-in \"skill-script\" handler runs config.skill/config.script headless, passing the remaining config keys to the script as args.",
+            properties: {
+              handlerId: { type: "string", description: "Registered handler id (built-in: \"skill-script\")." },
+              config: { type: "object", description: "For \"skill-script\": { skill, script, ...args }." },
+              timeoutMs: { type: "number", description: "Timeout in ms (default 30000)." }
+            },
+            required: ["handlerId", "config"]
           }
         },
         required: ["name", "prompt"]

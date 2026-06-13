@@ -558,13 +558,15 @@ export default function ChatDetailScreen() {
                   if (item.kind === "file_artifact") {
                     return <GeneratedFilesCard key={item.id} files={item.files} />;
                   }
-                  // An assistant_text block can host a thread; render the
+                  // A thread can branch off either an assistant reply (the
+                  // user's own "Reply in thread") or the user's message (an
+                  // agent-routed turn), so look up a chip for both. Render the
                   // block then the inline "N replies" chip beneath it. A
                   // finished assistant reply with no thread yet shows the
                   // "Reply in thread" pill so the user can start one.
                   const block = item.block;
                   const thread =
-                    block.kind === "assistant_text"
+                    block.kind === "assistant_text" || block.kind === "user_text"
                       ? threadByParentBlock.get(block.id)
                       : undefined;
                   const canStartThread =
@@ -584,6 +586,9 @@ export default function ChatDetailScreen() {
                           <ThreadRepliesChip
                             replyCount={thread.replyCount}
                             lastReplyAt={thread.lastReplyAt}
+                            // User messages are right-aligned, so align the
+                            // chip to the message it branched from.
+                            align={block.kind === "user_text" ? "end" : "start"}
                             onPress={() =>
                               router.push(
                                 `/chat/${sessionId}/thread/${thread.threadId}`

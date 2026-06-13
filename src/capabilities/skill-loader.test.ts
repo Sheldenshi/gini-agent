@@ -110,6 +110,44 @@ describe("skill-loader frontmatter parsing", () => {
     expect(parsed.requiredConnectors).toBeUndefined();
   });
 
+  test("parseSkillFile reads metadata.gini.requires.approval as script names", () => {
+    const text = [
+      "---",
+      "name: phone-call",
+      'description: "Place calls."',
+      "metadata:",
+      "  gini:",
+      "    requires:",
+      "      credentials: [BLAND_API_KEY]",
+      "      approval: [place-call]",
+      "---",
+      "",
+      "# Phone call"
+    ].join("\n");
+    const parsed = parseSkillFile(text);
+    expect(parsed.requiresApprovalScripts).toEqual(["place-call"]);
+    expect(parsed.requiredCredentials).toEqual(["BLAND_API_KEY"]);
+    // No warnings: `approval` is a recognized requires subkey.
+    expect(parsed.warnings).toBeUndefined();
+  });
+
+  test("parseSkillFile drops blank/non-string requires.approval entries and omits an empty list", () => {
+    const text = [
+      "---",
+      "name: phone-call",
+      'description: "Place calls."',
+      "metadata:",
+      "  gini:",
+      "    requires:",
+      "      approval: [\"\"]",
+      "---",
+      "",
+      "# Phone call"
+    ].join("\n");
+    const parsed = parseSkillFile(text);
+    expect(parsed.requiresApprovalScripts).toBeUndefined();
+  });
+
   test("parseSkillFile derives requiredCredentials from legacy requires.connectors (template providers)", () => {
     const text = [
       "---",
@@ -300,6 +338,31 @@ describe("loadSkillsFromDisk", () => {
     const skill = readState(config.instance).skills.find((s) => s.name === "weather");
     expect(skill?.category).toBeUndefined();
     expect(skill?.body).toContain("Fetch a forecast.");
+  });
+
+  test("persists requires.approval onto the SkillRecord through upsert", async () => {
+    writeSkill(
+      bundled,
+      "integrations",
+      "phone-call",
+      [
+        "---",
+        "name: phone-call",
+        'description: "Place calls."',
+        "metadata:",
+        "  gini:",
+        "    requires:",
+        "      approval: [place-call]",
+        "---",
+        "",
+        "# Phone call"
+      ].join("\n")
+    );
+
+    const config = buildConfig("loader-approval");
+    await loadSkillsFromDisk(config);
+    const skill = readState(config.instance).skills.find((s) => s.name === "phone-call");
+    expect(skill?.requiresApprovalScripts).toEqual(["place-call"]);
   });
 
   test("skips skills whose platforms don't include the host", async () => {

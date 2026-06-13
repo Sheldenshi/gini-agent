@@ -1514,6 +1514,10 @@ export type AuthorizationAction =
   | "browser.upload_file"
   | "browser.download"
   | "messaging.send"
+  // skill_run on a script the skill declares under
+  // `metadata.gini.requires.approval` — ALWAYS gated, regardless of
+  // approval mode. See ADR skill-script-approval-gating.md.
+  | "skill.run"
   | "self.config";
 
 export interface Authorization {
@@ -1661,6 +1665,13 @@ export interface SkillRecord {
   // ConnectorRecord with that `name`, and resolveSkillEnv resolves the skill's
   // prerequisites.env from those named credentials. Defaults to [].
   requiredCredentials?: string[];
+  // Frontmatter `metadata.gini.requires.approval` — script names (the
+  // skill_run `script` arg) that always pause for an explicit user
+  // Approve/Deny before running, regardless of approval mode. Only the
+  // skill_run dispatch path enforces this; internal invokeSkillScript
+  // callers (pre-run hooks, the approved-action executor) are unaffected.
+  // See ADR skill-script-approval-gating.md.
+  requiresApprovalScripts?: string[];
   // Per-(skill, connector) consent: the credential NAMES the user has granted
   // this skill access to (the field name is kept for back-compat; the contents
   // are now names, not provider strings). `resolveSkillEnv` injects a named

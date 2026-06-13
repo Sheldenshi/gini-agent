@@ -322,7 +322,7 @@ export function Composer({
               "disabled:cursor-not-allowed disabled:opacity-40 hover:opacity-90"
             )}
           >
-            <Send className="size-4" />
+            <Send className="size-4 -translate-x-px translate-y-px" />
           </button>
         )}
       </div>

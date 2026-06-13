@@ -1,7 +1,7 @@
 "use client";
 
 import { useSearchParams } from "next/navigation";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -21,6 +21,7 @@ import { JobsTab } from "@/components/chat/JobsTab";
 import { SettingsTab } from "@/components/chat/SettingsTab";
 import { api, type UploadRef } from "@/lib/api";
 import { useChatReadState, useThreadReadState } from "@/lib/use-chat-read-state";
+import { useStickToBottom } from "@/lib/use-stick-to-bottom";
 import { groupExchanges, type ChatRenderItem } from "@/lib/group-exchanges";
 import {
   latestInFlightTaskId,
@@ -141,7 +142,6 @@ function ChatSurface({
   const [query, setQuery] = useState("");
   const [activeMatch, setActiveMatch] = useState(0);
   const invalidate = useInvalidate();
-  const messagesEndRef = useRef<HTMLDivElement | null>(null);
 
   // On a channel, resolve the originating job by its linked chat session so the
   // header can offer a "Back to job" link. The session carries no jobId, so we
@@ -223,11 +223,6 @@ function ChatSurface({
 
   const cancel = useCancelTask();
 
-  useEffect(() => {
-    if (tab !== "messages") return;
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [mainBlocks.length, tab]);
-
   const submit = (images: UploadRef[]) => {
     const trimmed = text.trim();
     if (send.isPending) return;
@@ -262,6 +257,15 @@ function ChatSurface({
 
   const renderItems = useMemo<ChatRenderItem[]>(() => groupExchanges(visibleBlocks), [visibleBlocks]);
   const hasBlocks = visibleBlocks.length > 0;
+
+  // Pin the transcript to the newest message. Snap instantly when the chat
+  // opens or the user returns to the Messages tab (the viewport mounts at the
+  // top, so an animated scroll there would be visible); follow smoothly as new
+  // blocks arrive mid-turn. Keyed by sessionId so switching agents re-arms the snap.
+  const messagesEndRef = useStickToBottom(mainBlocks.length, {
+    key: sessionId,
+    enabled: tab === "messages" && hasBlocks
+  });
 
   // Block ids whose message text contains the query, in display order. Only
   // the searchable message kinds count (not tool calls / phases / files).
