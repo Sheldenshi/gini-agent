@@ -3706,6 +3706,143 @@ describe("chat-task loop", () => {
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
 
+  // The iteration-cap/loop-stall summary exit completes the task with a real
+  // user-facing summary, so it must land the same durable assistant answer
+  // row as the no-tool-calls path — otherwise a turn that ends on the cap
+  // leaves the session with no answer for the next turn to replay.
+  test("iteration-cap summary exit persists the durable answer row", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-cap-answer-row");
+    config.agent = { maxIterations: 3 };
+    const provider = normalizeProvider(config.provider);
+
+    const sessionId = await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "Cap chat");
+      return session.id;
+    });
+
+    // Three distinct tool-call turns consume the cap without tripping the
+    // identical-repeat loop-breaker, then the tool-less summary turn fires.
+    for (let i = 0; i < 3; i++) {
+      writeFileSync(join(workspaceRoot, `cap${i}.md`), `cap content (${i})`);
+      setEchoToolCallingResponse({
+        provider,
+        text: "",
+        toolCalls: [
+          {
+            id: `call_cap_${i}`,
+            type: "function",
+            function: { name: "file_read", arguments: JSON.stringify({ path: `cap${i}.md` }) }
+          }
+        ],
+        finishReason: "tool_calls"
+      });
+    }
+    setEchoToolCallingResponse({
+      provider,
+      text: "Cap summary: I read three files but could not finish.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "loop forever", { mode: "chat", chatSessionId: sessionId });
+    const finished = await waitForTerminal(config, task.id, 10000);
+    expect(finished.status).toBe("completed");
+    expect(finished.currentStep).toBe("Completed (iteration cap reached: 3)");
+
+    const answerRows = readState(config.instance).chatMessages.filter(
+      (m) => m.sessionId === sessionId && m.role === "assistant" && m.kind !== "tool_transcript" && m.kind !== "approval_reason"
+    );
+    expect(answerRows.length).toBe(1);
+    expect(answerRows[0]!.content).toBe("Cap summary: I read three files but could not finish.");
+    expect(answerRows[0]!.taskId).toBe(task.id);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // The context-exhaustion partial-result exit also completes with a real
+  // user-facing summary and must persist the same durable answer row.
+  test("context-exhaustion partial-result exit persists the durable answer row", async () => {
+    const OVERFLOW_MESSAGE = "prompt is too long: 250000 tokens > 200000 maximum";
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-overflow-answer-row");
+    const session = await mutateState(config.instance, (state) =>
+      createChatSession(state, "Overflow chat")
+    );
+    const { submitChatMessage } = await import("./chat");
+
+    // Every attempt of the turn's model call overflows (3 total attempts).
+    setEchoToolCallingFailure(OVERFLOW_MESSAGE);
+    setEchoToolCallingFailure(OVERFLOW_MESSAGE);
+    setEchoToolCallingFailure(OVERFLOW_MESSAGE);
+
+    const submitted = await submitChatMessage(config, session.id, { content: "go" });
+    const finished = await waitForTerminal(config, submitted.taskId, 10000);
+    expect(finished.status).toBe("completed");
+    expect(finished.currentStep).toBe("Completed (stopped: context window exhausted)");
+
+    const answerRows = readState(config.instance).chatMessages.filter(
+      (m) => m.sessionId === session.id && m.role === "assistant" && m.kind !== "tool_transcript" && m.kind !== "approval_reason"
+    );
+    expect(answerRows.length).toBe(1);
+    expect(answerRows[0]!.content).toContain("This is a partial result.");
+    expect(answerRows[0]!.taskId).toBe(submitted.taskId);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // A thread-reply turn stamps threadId/parentBlockId on the task; the
+  // persisted answer row must carry both (sync's short-circuit means it can
+  // never be backfilled later) and the run must link to the answer
+  // (assistantMessageId), symmetric with the userMessageId set at submit.
+  test("thread-reply turn's persisted answer row carries parentBlockId and links the run", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-thread-answer-row");
+    const provider = normalizeProvider(config.provider);
+
+    const { sessionId, runId } = await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "Threaded chat");
+      const run = createRun(state, {
+        kind: "conversation_turn",
+        title: "Thread turn",
+        input: "follow up",
+        conversationId: session.id
+      });
+      return { sessionId: session.id, runId: run.id };
+    });
+
+    setEchoToolCallingResponse({
+      provider,
+      text: "Threaded answer.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "follow up", {
+      mode: "chat",
+      runId,
+      chatSessionId: sessionId,
+      threadId: "thread_t1",
+      parentBlockId: "blk_parent"
+    });
+    const finished = await waitForTerminal(config, task.id);
+    expect(finished.status).toBe("completed");
+
+    const answerRows = readState(config.instance).chatMessages.filter(
+      (m) => m.sessionId === sessionId && m.role === "assistant" && m.kind !== "tool_transcript" && m.kind !== "approval_reason"
+    );
+    expect(answerRows.length).toBe(1);
+    expect(answerRows[0]!.content).toBe("Threaded answer.");
+    expect(answerRows[0]!.threadId).toBe("thread_t1");
+    expect(answerRows[0]!.parentBlockId).toBe("blk_parent");
+
+    const run = readState(config.instance).runs.find((r) => r.id === runId);
+    expect(run?.assistantMessageId).toBe(answerRows[0]!.id);
+    expect(run?.updatedAt).toBe(answerRows[0]!.createdAt);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
   // A parent-delegated subagent with NO chatSessionId resolves no session, so
   // neither the transcript nor the final text is persisted — its result flows
   // back to the parent as a tool result, not into any channel's history.

@@ -991,6 +991,64 @@ function persistTranscriptRow(
   });
 }
 
+// Persist the FINAL turn-ending text as a durable assistant chatMessage for
+// every completed chat task — the no-tool-calls answer, the context-exhaustion
+// partial result, and the iteration-cap/loop-stall summary all land here.
+// Without this row, priorChatMessages replays the session to the model with
+// the user's questions and tool transcripts but no answers, so the next turn
+// re-answers the previous question. syncChatTaskResult stays for
+// clients/pollers that need the message record returned (mobile /sync,
+// messaging pollers) and is idempotent against this write via its existing
+// short-circuit, which we mirror here (an existing non-transcript assistant
+// row) so neither path double-writes. jobId-bearing tasks are excluded:
+// finalizeJobRunFromTask owns their row plus delivery semantics. The [SILENT]
+// sentinel is suppressed exactly like the block/legacy paths. The row carries
+// the task's thread membership (threadId/parentBlockId) and links back to the
+// run (assistantMessageId), mirroring syncChatTaskResult's create path.
+async function persistFinalAnswerRow(
+  config: RuntimeConfig,
+  finished: Task,
+  finalText: string,
+  transcriptSessionId: string | undefined
+): Promise<void> {
+  if (
+    finished.status !== "completed" ||
+    finished.jobId ||
+    !transcriptSessionId ||
+    finalText.trim().length === 0 ||
+    finalText.trim() === "[SILENT]"
+  ) {
+    return;
+  }
+  await mutateState(config.instance, (state) => {
+    if (!state.chatSessions.some((s) => s.id === transcriptSessionId)) return;
+    const already = state.chatMessages.some(
+      (m) =>
+        m.taskId === finished.id &&
+        m.role === "assistant" &&
+        m.kind !== "approval_reason" &&
+        m.kind !== "tool_transcript"
+    );
+    if (already) return;
+    const message = createChatMessage(state, {
+      sessionId: transcriptSessionId,
+      role: "assistant",
+      content: finalText,
+      taskId: finished.id,
+      runId: finished.runId,
+      ...(finished.threadId ? { threadId: finished.threadId } : {}),
+      ...(finished.parentBlockId ? { parentBlockId: finished.parentBlockId } : {})
+    });
+    if (finished.runId) {
+      const run = state.runs.find((item) => item.id === finished.runId);
+      if (run) {
+        run.assistantMessageId = message.id;
+        run.updatedAt = message.createdAt;
+      }
+    }
+  });
+}
+
 // Pull prior chat messages for multi-turn context. We replay the full
 // ordered transcript of every prior turn in the same chat session —
 // user/assistant text plus the assistant tool_calls and role:"tool" results
@@ -1960,6 +2018,8 @@ async function runLoop(
     });
     await updateRunFromTask(config, exhausted);
     await syncSubagentFromTask(config, exhausted);
+    // Durable answer row for the partial result (see persistFinalAnswerRow).
+    await persistFinalAnswerRow(config, exhausted, finalText, transcriptSessionId);
     if (exhausted.jobId) await finalizeJobRunFromTask(config, exhausted);
     if (exhausted.status === "completed") {
       void scheduleAutoRetain(config, exhausted);
@@ -2493,44 +2553,8 @@ async function runLoop(
       });
       await updateRunFromTask(config, finished);
       await syncSubagentFromTask(config, finished);
-      // Persist the FINAL turn-ending text as a durable assistant chatMessage
-      // for every completed chat task. Without this row, priorChatMessages
-      // replays the session to the model with the user's questions and tool
-      // transcripts but no answers, so the next turn re-answers the previous
-      // question. syncChatTaskResult stays for clients/pollers that need the
-      // message record returned (mobile /sync, messaging pollers) and is
-      // idempotent against this write via its existing short-circuit, which we
-      // mirror here (an existing non-transcript assistant row) so neither path
-      // double-writes. jobId-bearing tasks are excluded: finalizeJobRunFromTask
-      // below owns their row plus delivery semantics. The [SILENT] sentinel is
-      // suppressed exactly like the block/legacy paths above.
-      if (
-        finished.status === "completed" &&
-        !finished.jobId &&
-        transcriptSessionId &&
-        finalText.trim().length > 0 &&
-        finalText.trim() !== "[SILENT]"
-      ) {
-        await mutateState(config.instance, (state) => {
-          if (!state.chatSessions.some((s) => s.id === transcriptSessionId)) return;
-          const already = state.chatMessages.some(
-            (m) =>
-              m.taskId === taskId &&
-              m.role === "assistant" &&
-              m.kind !== "approval_reason" &&
-              m.kind !== "tool_transcript"
-          );
-          if (already) return;
-          createChatMessage(state, {
-            sessionId: transcriptSessionId,
-            role: "assistant",
-            content: finalText,
-            taskId,
-            runId: finished.runId,
-            ...(finished.threadId ? { threadId: finished.threadId } : {})
-          });
-        });
-      }
+      // Durable answer row for the turn (see persistFinalAnswerRow).
+      await persistFinalAnswerRow(config, finished, finalText, transcriptSessionId);
       // Chat-mode tasks spawned by a scheduled job (create_job tool path)
       // need the same finalize hook the imperative path uses, otherwise
       // the JobRunRecord stays stuck in `running` and the chat-session
@@ -3161,6 +3185,8 @@ async function runLoop(
     });
     await updateRunFromTask(config, exhausted);
     await syncSubagentFromTask(config, exhausted);
+    // Durable answer row for the exhaustion summary (see persistFinalAnswerRow).
+    await persistFinalAnswerRow(config, exhausted, finalText, transcriptSessionId);
     if (exhausted.jobId) await finalizeJobRunFromTask(config, exhausted);
     if (exhausted.status === "completed") {
       void scheduleAutoRetain(config, exhausted);
