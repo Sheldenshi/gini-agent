@@ -26,8 +26,10 @@ reads a healthy-but-updating gateway as dead. Updates are **single-flight**
 ("gini update already in progress") instead of interleaving git/install
 steps. For the duration of `updateRuntime`, an **update-in-progress marker**
 (`~/.gini/update-in-progress`, machine-global because the installed runtime
-is shared) tells the watchdog to suppress revive actions; the marker is
-removed when the update settles and goes stale after 15 minutes (see
+is shared) tells the watchdog to suppress revive actions. Its body records
+the updater's pid (`{"pid": <pid>}`) so a marker left behind by a dead
+updater reads as stale immediately; the marker is removed when the update
+settles and goes stale after 15 minutes regardless (see
 [Always-Up Supervision](always-up-supervision.md)).
 
 The CLI `gini update` keeps the same installer-managed target

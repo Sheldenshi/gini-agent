@@ -39,8 +39,9 @@
 // update-in-progress marker on disk, written by src/runtime/update.ts),
 // every revive action is suppressed: probe misses are expected during the
 // install/build window. The tick still probes and logs
-// "suppressed:update:<kind>"; a marker older than UPDATE_MARKER_STALE_MS is
-// ignored so a crashed update can't disarm the watchdog forever.
+// "suppressed:update:<kind>"; a marker whose recorded updater pid is dead is
+// deleted on sight, and one older than UPDATE_MARKER_STALE_MS is ignored, so
+// a crashed update can't disarm the watchdog.
 //
 // A tick never throws and the loop never exits on its own; exitCode stays 0 so
 // a `--once` run (or a killed loop) reads as a clean probe to launchd. Every
@@ -48,7 +49,7 @@
 // inter-tick sleep) is injectable so tests never bind real ports, call real
 // launchctl, or sleep real time.
 
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, statSync } from "node:fs";
 import { arch, platform } from "node:os";
 import { join } from "node:path";
 import type { CliContext } from "../context";
@@ -92,7 +93,9 @@ const REVIVE_FAILURE_THRESHOLD = 2;
 // and the build pegs the CPU — so a `kickstart -k` would force-kill a
 // healthy-but-busy service mid-update. The tick still probes and logs
 // (action "suppressed:update:<kind>"). Past this age the marker is stale
-// (a crashed update never removed it) and revives proceed as normal.
+// and revives proceed as normal. This is the BACKSTOP: a dead updater is
+// normally caught immediately by the marker's pid (see updateMarkerFresh),
+// so the full window only mutes revives for a live-but-wedged update.
 export const UPDATE_MARKER_STALE_MS = 15 * 60_000;
 // How many trailing lines of each web log to carry into the crash report.
 // Bounded so a long log doesn't bloat the report.
@@ -178,10 +181,44 @@ function readWebLogTail(instance: string, filename: string): RuntimeLogLine[] {
 // update-in-progress marker on disk; see UPDATE_MARKER_STALE_MS). A missing
 // or unreadable marker reads as "no update" so a stat failure can never
 // disarm the watchdog.
+//
+// The marker body is JSON {"pid": <updater pid>} (written by updateRuntime).
+// When that pid no longer exists, the updater died without reaching its
+// finally — the update is over, however badly — so the marker is stale NOW:
+// delete it and stop suppressing, instead of muting revives for the rest of
+// the 15-minute mtime window while the services it left broken stay down.
+// EPERM from the signal-0 probe means the pid exists (just not ours to
+// signal), so it counts as alive. A legacy/unparseable marker keeps the
+// mtime-only behavior, and the mtime cap stays as the final backstop either
+// way (a live-but-wedged updater must not suppress forever).
 function updateMarkerFresh(clock: () => Date): boolean {
+  const marker = updateInProgressMarkerPath();
   try {
-    const stat = statSync(updateInProgressMarkerPath());
-    return clock().getTime() - stat.mtimeMs < UPDATE_MARKER_STALE_MS;
+    const stat = statSync(marker);
+    if (clock().getTime() - stat.mtimeMs >= UPDATE_MARKER_STALE_MS) return false;
+    let pid: number | null = null;
+    try {
+      const parsed = JSON.parse(readFileSync(marker, "utf8")) as { pid?: unknown };
+      if (typeof parsed.pid === "number" && Number.isInteger(parsed.pid) && parsed.pid > 0) pid = parsed.pid;
+    } catch {
+      // Legacy/unparseable body: fall back to mtime-only freshness.
+    }
+    if (pid !== null) {
+      try {
+        process.kill(pid, 0);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ESRCH") {
+          try {
+            rmSync(marker, { force: true });
+          } catch {
+            // Best-effort delete; the marker reads stale regardless.
+          }
+          return false;
+        }
+        // EPERM (or anything else): the process exists — treat as alive.
+      }
+    }
+    return true;
   } catch {
     return false;
   }

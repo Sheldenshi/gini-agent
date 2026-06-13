@@ -21,7 +21,8 @@
 // report queued) on the one and only tick.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { watchdog, UPDATE_MARKER_STALE_MS, WATCHDOG_TICK_INTERVAL_MS } from "./watchdog";
 import type { CliContext } from "../context";
@@ -680,7 +681,9 @@ describe("watchdog", () => {
     writePorts();
     // updateRuntime writes this for the duration of the install/build window;
     // probe misses there are expected and a kickstart -k would force-kill the
-    // mid-update service.
+    // mid-update service. The body here is a LEGACY (pre-pid) timestamp —
+    // unparseable as JSON — pinning the fallback: an unknown body keeps the
+    // mtime-only freshness behavior instead of dropping suppression.
     writeFileSync(updateInProgressMarkerPath(), "2026-06-12T00:00:00.000Z\n");
     const kicks: PlistKind[] = [];
     await watchdog(ctxFor([]), {
@@ -727,6 +730,59 @@ describe("watchdog", () => {
       sleep: async () => {}
     });
     expect(kicks).toEqual(["gateway"]);
+    expect(process.exitCode).toBe(0);
+  });
+
+  test("a marker whose recorded updater pid is DEAD does not suppress and is deleted", async () => {
+    writePorts();
+    // A real, guaranteed-dead pid: the child has exited and been reaped by
+    // the time spawnSync returns. A marker carrying it means the updater
+    // crashed before its finally removed the marker — the update is over, so
+    // the watchdog must revive immediately instead of staying muted for the
+    // rest of the 15-minute mtime window.
+    const deadPid = spawnSync("true").pid;
+    writeFileSync(updateInProgressMarkerPath(), `${JSON.stringify({ pid: deadPid })}\n`);
+    const kicks: PlistKind[] = [];
+    await watchdog(ctxFor([]), {
+      probeRuntime: async () => false,
+      probeWeb: async () => true,
+      kickstartImpl: (_instance, kind) => {
+        kicks.push(kind);
+        return okLaunchctl;
+      },
+      isLoadedImpl: () => true,
+      supervisorImpl: () => "launchd",
+      maxTicks: 2,
+      sleep: async () => {}
+    });
+    expect(kicks).toEqual(["gateway"]);
+    // The dead-pid marker was cleaned up on sight, not left for the mtime cap.
+    expect(existsSync(updateInProgressMarkerPath())).toBe(false);
+    expect(process.exitCode).toBe(0);
+  });
+
+  test("a marker whose recorded updater pid is ALIVE suppresses like a fresh marker", async () => {
+    writePorts();
+    // Our own pid is the canonical live-updater stand-in (updateRuntime
+    // records process.pid — in production that's the gateway running the
+    // update).
+    writeFileSync(updateInProgressMarkerPath(), `${JSON.stringify({ pid: process.pid })}\n`);
+    const kicks: PlistKind[] = [];
+    await watchdog(ctxFor([]), {
+      probeRuntime: async () => false,
+      probeWeb: async () => false,
+      kickstartImpl: (_instance, kind) => {
+        kicks.push(kind);
+        return okLaunchctl;
+      },
+      isLoadedImpl: () => true,
+      supervisorImpl: () => "launchd",
+      maxTicks: 3,
+      sleep: async () => {}
+    });
+    expect(kicks.length).toBe(0);
+    expect(listPendingReports().length).toBe(0);
+    expect(existsSync(updateInProgressMarkerPath())).toBe(true);
     expect(process.exitCode).toBe(0);
   });
 

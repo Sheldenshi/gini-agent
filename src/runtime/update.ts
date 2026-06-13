@@ -166,14 +166,16 @@ async function performUpdate(runtimeDir: string, options: UpdateRuntimeOptions):
   // fresh it suppresses revive actions, because probe misses are EXPECTED
   // here — the bun installs swap node_modules under the live web server and
   // the build pegs the CPU, so a 2s health probe can time out against a
-  // healthy-but-busy service. Removed in the finally below; the watchdog
-  // treats a marker older than 15 minutes as stale (a crashed update must
-  // not disarm the safety net forever). Advisory only — a marker I/O
+  // healthy-but-busy service. Removed in the finally below. The body carries
+  // OUR pid so the watchdog can tell a live update from a dead one: if the
+  // updating process is gone (it crashed, or was killed, before the finally
+  // ran), the marker is stale immediately rather than muting the safety net
+  // for the full 15-minute mtime backstop. Advisory only — a marker I/O
   // failure never fails the update.
   const marker = updateInProgressMarkerPath();
   try {
     mkdirSync(dirname(marker), { recursive: true });
-    writeFileSync(marker, `${new Date().toISOString()}\n`);
+    writeFileSync(marker, `${JSON.stringify({ pid: process.pid })}\n`);
   } catch {
     // Advisory marker; proceed without watchdog suppression.
   }

@@ -72,9 +72,12 @@ The model rests on four pieces:
   [Runtime Update Surface](runtime-update-surface.md)), revive actions are
   suppressed entirely: probe misses are expected while `node_modules` are
   swapped under the live web server and the build pegs the CPU. The tick
-  still probes and logs `suppressed:update:<kind>`; a marker older than 15
-  minutes is stale (a crashed update never removed it) and stops
-  suppressing. The revive itself: a service launchd
+  still probes and logs `suppressed:update:<kind>`. The marker body is JSON
+  `{"pid": <updater pid>}`: a marker whose pid is dead means the updater
+  crashed before removing it — the watchdog deletes it on sight and stops
+  suppressing within one tick. A legacy/unparseable body falls back to
+  mtime-only freshness, and a marker older than 15 minutes is stale either
+  way (the backstop for a live-but-wedged updater). The revive itself: a service launchd
   still has registered is `launchctl kickstart -k`ed, while a *core*
   service launchd has **deregistered** is re-bootstrapped via `autostart
   enable` (kickstart is a no-op on a label launchd no longer knows, and
@@ -248,7 +251,8 @@ launchd instances so foreground/conductor/tmux runs are unaffected.
   is re-kicked every two ticks, never on consecutive ticks). With a fresh
   update-in-progress marker on
   disk it takes no revive action regardless of streaks (logging
-  `suppressed:update:<kind>` instead); a stale marker (>15 min) does not
+  `suppressed:update:<kind>` instead); a stale marker (recorded updater pid
+  dead, or >15 min old) does not
   suppress. The loop paces itself at
   `WATCHDOG_TICK_INTERVAL_MS` between ticks and never exits on its own;
   `gini watchdog --once` runs exactly one tick and revives on it.

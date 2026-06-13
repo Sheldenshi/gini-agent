@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ChildProcess } from "node:child_process";
 import { spawnSync } from "node:child_process";
@@ -237,9 +237,13 @@ describe("updateRuntime", () => {
     const runtimeDir = makeUpdateRepo();
     const calls: string[] = [];
     let markerSeenDuringSteps = true;
+    let markerBody: string | null = null;
     const runStepImpl: RunStepImpl = async (cmd, args) => {
       calls.push([cmd, ...args].join(" "));
       markerSeenDuringSteps &&= existsSync(updateInProgressMarkerPath());
+      if (markerBody === null && existsSync(updateInProgressMarkerPath())) {
+        markerBody = readFileSync(updateInProgressMarkerPath(), "utf8");
+      }
       return okStep;
     };
 
@@ -251,6 +255,9 @@ describe("updateRuntime", () => {
     expect(calls).toEqual([`git -C ${runtimeDir} fetch origin`, "bun install"]);
     // The marker covered every long step and is gone once the update settles.
     expect(markerSeenDuringSteps).toBe(true);
+    // The body records the updater's pid so the watchdog can detect a dead
+    // updater (stale marker) instead of waiting out the mtime backstop.
+    expect(JSON.parse(markerBody ?? "{}")).toEqual({ pid: process.pid });
     expect(existsSync(updateInProgressMarkerPath())).toBe(false);
   });
 
