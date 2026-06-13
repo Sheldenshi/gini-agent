@@ -119,6 +119,11 @@ instead.
   not-yet-loaded routes) until they are restarted themselves, at which
   point they pick up the new bundle. Single-instance installs — the
   installer default — never hit this.
+- CI gates merges on the same serving mode: the workflow builds the web app
+  into a `GINI_DIST_DIR` production bundle, boots `next start -H 127.0.0.1`
+  from it, and fails unless `/api/runtime/__healthz` answers
+  `{"service":"gini-web"}` — so a commit that can't build or serve in prod
+  mode (what installed runtimes pull on update) never lands on main.
 - The launchd web plist's `GINI_DIST_DIR` env stays the dev-fallback value;
   the shim exports the prod dir over it only on the prod branch. The shim
   change re-stamps existing installs automatically — the plist stamp hashes
