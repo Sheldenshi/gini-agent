@@ -239,11 +239,14 @@ remote previews, screen readers) would need the same translation code.
    for v1 — the mobile client doesn't have SSE wired up yet.
 
 4. **Phase 4 (cleanup, future):** retire the legacy
-   `/api/chat/:id` shape that mixes messages + tasks. Drop
-   `syncChatTaskResult` and the synthesized streaming placeholder in
-   `getChatSession`. Stop dual-writing ChatMessageRecord rows for
-   chat-task assistant output (user messages keep landing for
-   prior-turn rehydration via `priorChatMessages`).
+   `/api/chat/:id` shape that mixes messages + tasks. Drop the
+   `/sync` endpoint and the synthesized streaming placeholder in
+   `getChatSession`. The durable ChatMessageRecord rows are NOT part
+   of this cleanup: user rows and the final assistant answer row
+   (written server-side by `persistFinalAnswerRow` on chat-task
+   completion) keep landing, because they are model-facing replay
+   state — `priorChatMessages` rehydrates them so the model sees its
+   own prior answers — not a UI legacy.
 
 ## Read And Write Semantics
 
