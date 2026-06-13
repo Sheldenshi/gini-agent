@@ -21,7 +21,7 @@
 // report queued) on the one and only tick.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { watchdog, UPDATE_MARKER_STALE_MS, WATCHDOG_TICK_INTERVAL_MS } from "./watchdog";
@@ -758,6 +758,46 @@ describe("watchdog", () => {
     expect(kicks).toEqual(["gateway"]);
     // The dead-pid marker was cleaned up on sight, not left for the mtime cap.
     expect(existsSync(updateInProgressMarkerPath())).toBe(false);
+    expect(process.exitCode).toBe(0);
+  });
+
+  test("a dead-pid marker rewritten between the read and the delete survives and keeps suppressing", async () => {
+    writePorts();
+    // The dead-pid cleanup is stat → read → kill(pid, 0) → unlink, which is
+    // not atomic: a NEW update can rewrite the marker inside that window, and
+    // deleting blindly would strip the fresh marker and revive mid-update.
+    // The injected clock runs between the entry stat and the delete, so its
+    // mtime-bump side effect stands in for that concurrent rewrite: the
+    // pre-delete re-stat must see the moved mtime, keep the marker, and read
+    // it as fresh for this tick.
+    const deadPid = spawnSync("true").pid;
+    writeFileSync(updateInProgressMarkerPath(), `${JSON.stringify({ pid: deadPid })}\n`);
+    let bumped = false;
+    const clock = () => {
+      if (!bumped) {
+        bumped = true;
+        const later = new Date(Date.now() + 60_000);
+        utimesSync(updateInProgressMarkerPath(), later, later);
+      }
+      return new Date();
+    };
+    const kicks: PlistKind[] = [];
+    await watchdog(ctxFor(), {
+      probeRuntime: async () => false,
+      probeWeb: async () => true,
+      kickstartImpl: (_instance, kind) => {
+        kicks.push(kind);
+        return okLaunchctl;
+      },
+      isLoadedImpl: () => true,
+      supervisorImpl: () => "launchd",
+      clock
+    });
+    // Suppressed, not revived — and the rewritten marker is still on disk.
+    expect(kicks.length).toBe(0);
+    expect(existsSync(updateInProgressMarkerPath())).toBe(true);
+    const tickLog = readFileSync(join(logDir(INSTANCE), "runtime.jsonl"), "utf8");
+    expect(tickLog).toContain("suppressed:update:gateway");
     expect(process.exitCode).toBe(0);
   });
 

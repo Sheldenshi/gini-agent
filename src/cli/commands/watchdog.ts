@@ -208,10 +208,18 @@ function updateMarkerFresh(clock: () => Date): boolean {
         process.kill(pid, 0);
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "ESRCH") {
+          // The recorded updater is dead — but stat → read → kill → unlink is
+          // not atomic, and a NEW update can rewrite the marker in that
+          // window. Deleting blindly would strip the fresh marker and drop
+          // suppression mid-update, so only remove the marker actually read
+          // above (same mtime); a moved mtime is a rewrite from a live
+          // updater — keep it and stay suppressed this tick.
           try {
+            if (statSync(marker).mtimeMs !== stat.mtimeMs) return true;
             rmSync(marker, { force: true });
           } catch {
-            // Best-effort delete; the marker reads stale regardless.
+            // Best-effort delete (or the marker vanished under the re-stat);
+            // it reads stale regardless.
           }
           return false;
         }
