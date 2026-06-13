@@ -33,6 +33,7 @@ import {
   unlinkSync,
   writeFileSync
 } from "node:fs";
+import { createHash } from "node:crypto";
 import { basename, dirname, join } from "node:path";
 import { instanceRoot } from "../paths";
 import { appendLog } from "../state/trace";
@@ -263,6 +264,94 @@ export function migrateInstructionsIdentityLine(instance: Instance): boolean {
   } catch (error) {
     try {
       appendLog(instance, "identity.migrate.error", {
+        file: "INSTRUCTIONS.md",
+        path,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    } catch {
+      // Best-effort — see scaffoldInstanceIdentityFiles.
+    }
+    return false;
+  }
+}
+
+// sha256 hex digests of every bundled default INSTRUCTIONS.md previously
+// shipped on main, plus — for each default whose first line is one of the
+// legacy identity sentences above — the variant
+// `migrateInstructionsIdentityLine` produces from it (first line replaced
+// with CURRENT_INSTRUCTIONS_IDENTITY_LINE). The current bundled content's
+// own hash is deliberately absent: a file matching the current default
+// needs no rewrite.
+//
+// Regenerate when the bundled default changes: for each distinct content of
+// src/runtime/defaults/INSTRUCTIONS.md across main history
+// (`git log origin/main --format=%H -- src/runtime/defaults/INSTRUCTIONS.md`,
+// then `git show <sha>:src/runtime/defaults/INSTRUCTIONS.md`), emit
+// sha256-hex of the utf8 bytes; when the first line is in
+// LEGACY_INSTRUCTIONS_IDENTITY_LINES, also emit sha256-hex of the content
+// with that first line swapped for CURRENT_INSTRUCTIONS_IDENTITY_LINE.
+// Drop the hash of the current bundled content, dedupe, sort.
+const HISTORICAL_DEFAULT_INSTRUCTIONS_HASHES = new Set<string>([
+  "1430ef558e32d1cd399c34e538e82fb24da512684a93a8b4a350761bfe221647",
+  "22cf12abce1f65b6e5bd38fc981f529d79e58141a8244663d76ce821790d6dda",
+  "284e00bc2cada20ba749c154a8fa3965c59aae71b8635a0642095b8fa8a90043",
+  "3edee3cd2db7aa8bb0692b51a1b198b5842ab4fddb73a9a461833006e70f1428",
+  "5034605999a947426e87bf882fa16989aa075ecb5dd7d9346694786c02c913be",
+  "580b678bc3685f09bc8b6dce3a3ce250508f6bdc70ac18cf4ccdc42b25fa9274",
+  "71f177d9bba7d5cd29c12c0eb0f5a56721a7021418b4b84fe22dcc950cf84979",
+  "738d1779b069ad0b82d188faedcf57121d3f79b55de72218f387b396aa0976bf",
+  "81cbd07859ddd42a31dc5ba580e4fd32bf1e1e81cfa8239f3d02e780a5c46c1d",
+  "83ce3943888247f370514aeb861f582c7c2a7c9c41b7376ae598cd42dda4c4b2",
+  "8956033161bfcea520b44bc3d9b48f15505a85c6fc7de6438aa640d3eb497f80",
+  "8b5ac3ead1ed75c6d587878eaff6758a6633bfc305d12cd92b8e9883a905cc26",
+  "9e39c4ba3eac94d69481fe642eef9291b3bd8a55ccc34401a99c6d0547c1b7c4",
+  "b8671923cc45e8aaed6eff41299db173f6363bfe4f226f34a18b19be9e47c836",
+  "d74e287c6174b6f5a03febb7ea692e998704abdb6f882bc692705728f501a746",
+  "f174c8636952bbaff8b26f6ffeab08f1f76abb46cebcf668dec95fc88e24f5ae",
+  "f3bf7709632500f127862a6b4bdc4ffa2f512ff767fd97b5e07fe6ab86f8e3da",
+  "fe1d4847d92a520406e4ea05524ac62b7c267efba8d93c4411eda72b75daa4c1",
+  "fe7f9f4967dc44f1bebeafcd92ee0fd2735404086d9683d61386bfa1d533535f"
+]);
+
+// Per-boot reseed of an unedited default INSTRUCTIONS.md. install() seeds
+// each instance's INSTRUCTIONS.md with the bundled default bytes and the
+// on-disk copy shadows the bundled file from then on (see ADR
+// runtime-identity-files.md, "Drift cost") — so without intervention an
+// instance created before a defaults change never receives it. This closes
+// the gap for the common case (the user never touched the file) while
+// guaranteeing a user-edited file is NEVER clobbered: the on-disk bytes are
+// hashed and overwritten ONLY when the digest matches a known
+// previously-shipped default. Any user edit changes the digest, so it can
+// never match. A file already byte-identical to the current default is left
+// alone (idempotent — no spurious rewrite or mtime churn). Best-effort:
+// filesystem errors log via `appendLog` and never crash boot. Returns true
+// when it rewrote the file.
+export function reseedDefaultInstructions(instance: Instance): boolean {
+  const path = instructionsPath(instance);
+  if (!existsSync(path)) return false;
+  let currentDefault: Buffer;
+  try {
+    currentDefault = readFileSync(DEFAULT_INSTRUCTIONS_PATH);
+  } catch {
+    // Missing bundle file. scaffoldInstanceIdentityFiles already surfaces
+    // a packaging error loudly at install; the reseed stays quiet.
+    return false;
+  }
+  let onDisk: Buffer;
+  try {
+    onDisk = readFileSync(path);
+  } catch {
+    return false;
+  }
+  if (onDisk.equals(currentDefault)) return false;
+  const digest = createHash("sha256").update(onDisk).digest("hex");
+  if (!HISTORICAL_DEFAULT_INSTRUCTIONS_HASHES.has(digest)) return false;
+  try {
+    writeFileSafe(path, currentDefault.toString("utf8"));
+    return true;
+  } catch (error) {
+    try {
+      appendLog(instance, "identity.reseed.error", {
         file: "INSTRUCTIONS.md",
         path,
         error: error instanceof Error ? error.message : String(error)
