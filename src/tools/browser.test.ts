@@ -45,7 +45,7 @@ import {
   setEchoAuxTextResponse,
   setEchoVisionResponse
 } from "../provider";
-import { createAgentRecord, createTask, mutateState, readState, upsertTask } from "../state";
+import { createAgentRecord, createTask, mutateState, readState, readTrace, upsertTask } from "../state";
 import type { RuntimeConfig } from "../types";
 
 // Direct unit coverage for the URL safety guard. We exercise the function
@@ -6392,6 +6392,18 @@ describe("dispatchToolCall(browser_connect)", () => {
     if (bogus.kind !== "pending") throw new Error("unreachable");
     const bogusSetup = readState(config.instance).setupRequests.find((s) => s.id === bogus.approvalId);
     expect(bogusSetup?.payload.mode).toBeUndefined();
+
+    // The request trace mirrors the payload's conditional mode key, so an
+    // audit of the task can tell a handoff request apart from a sign-in.
+    const connectTraces = readTrace(config.instance, taskId).filter(
+      (t) => t.type === "approval" && t.message === "Approval requested for browser connect (chat-task)"
+    );
+    expect(connectTraces).toHaveLength(3);
+    const traceByCall = (callId: string) =>
+      connectTraces.find((t) => (t.data as Record<string, unknown>)?.toolCallId === callId);
+    expect(traceByCall("call_mode_default")?.data).not.toHaveProperty("mode");
+    expect((traceByCall("call_mode_handoff")?.data as Record<string, unknown>)?.mode).toBe("handoff");
+    expect(traceByCall("call_mode_bogus")?.data).not.toHaveProperty("mode");
 
     rmSync(ROOT, { recursive: true, force: true });
   });

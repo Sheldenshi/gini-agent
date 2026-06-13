@@ -3352,7 +3352,7 @@ async function requestBrowserConnect(
     appendTrace(config.instance, item.id, {
       type: "approval",
       message: "Approval requested for browser connect (chat-task)",
-      data: { approvalId: approval.id, reason, toolCallId, headless, url }
+      data: { approvalId: approval.id, reason, toolCallId, headless, url, ...(handoff ? { mode: "handoff" } : {}) }
     });
     return approval.id;
   });
