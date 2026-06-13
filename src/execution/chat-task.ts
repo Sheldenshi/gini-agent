@@ -2808,6 +2808,35 @@ async function runLoop(
         });
         continue;
       }
+      // browser_navigate establishes a browsing session, so seed every
+      // deferred browser-toolset tool into the loaded set: the snapshot it
+      // returns is full of actionable @eN refs whose action vocabulary
+      // (snapshot, click, type, scroll, …) would otherwise cost a load_tools
+      // round-trip per tool. Mirrors the seedSubagentDeferred precedent for
+      // browser-scoped subagents. Seeding is unconditional on the navigate
+      // outcome (deterministic, harmless) and takes effect on the NEXT
+      // provider call — the loadedAtTurnStart gate above still nudges
+      // same-batch interaction calls, consistent with the deferred-tools
+      // contract. Persisted to task.loadedTools so an approval pause/resume
+      // keeps the cluster live (same pattern as the load_tools handler above).
+      if (call.function.name === "browser_navigate") {
+        let seeded = false;
+        for (const tool of fullCatalog) {
+          if (tool.deferred && tool.toolset === "browser" && !loadedToolNames.has(tool.function.name)) {
+            loadedToolNames.add(tool.function.name);
+            seeded = true;
+          }
+        }
+        if (seeded) {
+          recompute();
+          await mutateState(config.instance, (state) => {
+            const item = findTask(state, taskId);
+            if (isTerminalTaskStatus(item.status)) return;
+            item.loadedTools = [...loadedToolNames];
+            item.updatedAt = now();
+          });
+        }
+      }
       try {
         const dispatch = await dispatchToolCall(
           config,
