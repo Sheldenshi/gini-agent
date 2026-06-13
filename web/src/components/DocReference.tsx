@@ -7,8 +7,9 @@ import { parseDocsUrl } from "@/lib/docs";
 
 // Reusable trigger that renders an app-referenced doc inline in a slide-over
 // (DocSheet) instead of linking out. `url` is the full hosted docs URL the
-// runtime already emits. `children` is the trigger element (a button, a
-// link-styled span, …). Non-/docs/ URLs degrade to a plain external link.
+// runtime already emits. `children` must be an INTERACTIVE element (a button
+// or link): Slot only merges a click handler onto it, so a plain span would
+// be keyboard-inaccessible. Non-/docs/ URLs degrade to a plain external link.
 export function DocReference({ url, children }: { url: string; children: React.ReactNode }) {
   const [open, setOpen] = useState(false);
 

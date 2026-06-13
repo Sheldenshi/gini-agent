@@ -2361,9 +2361,39 @@ describe("makeDefaultDrivers", () => {
         stdout: JSON.stringify({ Web: { "mac.tail-test.ts.net:443": { Handlers: { "/": { Proxy: "http://127.0.0.1:9999" } } } } })
       }
     });
-    await expect(makeDefaultDrivers(foreign.run).tailscale.connect(7342)).rejects.toThrow("already fronts 127.0.0.1:9999");
+    await expect(makeDefaultDrivers(foreign.run).tailscale.connect(7342)).rejects.toThrow("already fronts http://127.0.0.1:9999");
     // The refusal happens BEFORE any serve --bg is issued.
     expect(foreign.calls).toEqual(["tailscale serve status --json"]);
+  });
+
+  test("tailscale: the foreign-claim check catches localhost-typed targets and ignores non-443 listeners", async () => {
+    // `tailscale serve --bg localhost:3001` stores its target un-normalized —
+    // the check must catch any loopback spelling at :443…
+    const localhostClaim = runScript({
+      "tailscale serve status --json": {
+        exitCode: 0,
+        stdout: JSON.stringify({ Web: { "mac.tail-test.ts.net:443": { Handlers: { "/": { Proxy: "http://localhost:3001" } } } } })
+      }
+    });
+    await expect(makeDefaultDrivers(localhostClaim.run).tailscale.connect(7342)).rejects.toThrow("already fronts http://localhost:3001");
+    // …while a listener on another port (serve --https=8443) never collides
+    // with the 443 front and must NOT block the connect.
+    const otherPort = runScript({
+      "tailscale serve status --json": {
+        exitCode: 0,
+        stdout: JSON.stringify({ Web: { "mac.tail-test.ts.net:8443": { Handlers: { "/": { Proxy: "http://127.0.0.1:3000" } } } } })
+      },
+      "tailscale serve --bg http://127.0.0.1:7342": { exitCode: 0 },
+      "tailscale status --json": { exitCode: 0, stdout: TS_STATUS_RUNNING }
+    });
+    expect(await makeDefaultDrivers(otherPort.run).tailscale.connect(7342)).toEqual({ url: "https://mac.tail-test.ts.net" });
+    // Unparseable status output proceeds best-effort (same as a failed probe).
+    const garbled = runScript({
+      "tailscale serve status --json": { exitCode: 0, stdout: "not json" },
+      "tailscale serve --bg http://127.0.0.1:7342": { exitCode: 0 },
+      "tailscale status --json": { exitCode: 0, stdout: TS_STATUS_RUNNING }
+    });
+    expect(await makeDefaultDrivers(garbled.run).tailscale.connect(7342)).toEqual({ url: "https://mac.tail-test.ts.net" });
   });
 
   test("tailscale: connect proceeds when the existing serve proxy is OUR port (boot resume)", async () => {

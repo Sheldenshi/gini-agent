@@ -416,17 +416,37 @@ export function makeDefaultDrivers(
       connect: async (port) => {
         // The serve config is a MACHINE-global singleton: a sibling Gini
         // instance (or the operator's own serve) may already front 443 to a
-        // different local port. Refuse instead of silently stealing that
-        // front — our later disconnect would also tear THEIRS down. A proxy
-        // already pointing at OUR port is the boot-resume case and proceeds.
-        // Best-effort: if the status probe itself fails, connect proceeds.
+        // different target. Refuse instead of silently stealing that front —
+        // our later disconnect would also tear THEIRS down. A handler already
+        // proxying to OUR port is the boot-resume case and proceeds. Only the
+        // :443 web front matters (it is what serve --bg writes and what our
+        // off clears); listeners on other ports never collide. The status
+        // stores targets as typed (`localhost:3000` stays `localhost`), so
+        // parse the JSON and accept any loopback host rather than pattern-
+        // matching one spelling. Best-effort: an unreadable probe proceeds.
         const claimed = await run(["tailscale", "serve", "status", "--json"], DETECT_TIMEOUT_MS).catch(() => null);
         if (claimed && claimed.exitCode === 0) {
-          const proxies = [...claimed.stdout.matchAll(/"Proxy":\s*"http:\/\/127\.0\.0\.1:(\d+)"/g)].map((m) => Number(m[1]));
-          const foreign = proxies.find((p) => p !== port);
-          if (foreign !== undefined) {
+          let foreign: string | null = null;
+          try {
+            const parsed = JSON.parse(claimed.stdout) as {
+              Web?: Record<string, { Handlers?: Record<string, { Proxy?: string }> }>;
+            };
+            for (const [hostPort, entry] of Object.entries(parsed.Web ?? {})) {
+              if (!hostPort.endsWith(":443")) continue;
+              for (const handler of Object.values(entry.Handlers ?? {})) {
+                const target = handler.Proxy ?? "";
+                const match = /^https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):(\d+)$/.exec(target);
+                if (!match || Number(match[1]) !== port) {
+                  foreign = target || hostPort;
+                }
+              }
+            }
+          } catch {
+            // Unparseable status output — proceed, as with a failed probe.
+          }
+          if (foreign !== null) {
             throw new Error(
-              `tailscale serve already fronts 127.0.0.1:${foreign} (another instance or a manually-run serve) — ` +
+              `tailscale serve already fronts ${foreign} (another instance or a manually-run serve) — ` +
               `disconnect that first, or use a different provider here.`
             );
           }
