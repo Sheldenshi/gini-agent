@@ -148,6 +148,14 @@ export interface UpdateRuntimeOptions {
 // races against the same ~/.gini/runtime.
 let updateInFlight: Promise<GiniUpdateResult> | null = null;
 
+// Whether THIS process currently has an update in flight (the single-flight
+// guard above is held). Surfaced as `updateInProgress` on GET /api/version
+// so the browser's UpdateGate can tell a still-working update from a hung
+// one and extend its blur deadline only while work is actually happening.
+export function isUpdateInFlight(): boolean {
+  return updateInFlight !== null;
+}
+
 export function updateRuntime(runtimeDir = installedRuntimeDir(), options: UpdateRuntimeOptions = {}): Promise<GiniUpdateResult> {
   if (updateInFlight) {
     return Promise.reject(new Error("gini update already in progress."));

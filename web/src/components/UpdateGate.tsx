@@ -117,24 +117,50 @@ const COMPLETE_RELOAD_DELAY_MS = 1_500;
 // Whole-gate deadline: a generous ceiling on the entire update (git + bun
 // install in both roots, the sha-keyed production `next build` of the web
 // app — itself up to ~90s — the restart, and the pre-reload probe). The
-// deadline is fixed the moment the gate leaves idle; phase transitions and
-// probe drop-backs reschedule against it with the remaining time, never
-// extending it. If the update hasn't reloaded by then, the gate releases
-// rather than trapping the user behind a permanent blur. The completion
-// detectors normally tear the gate down long before this fires.
+// deadline is set the moment the gate leaves idle; phase transitions and
+// probe drop-backs reschedule against it with the remaining time. The ONLY
+// thing that moves it is the progress poll below — a gateway that answers
+// `updateInProgress: true` proves work is still happening, so the deadline
+// is pushed out (capped by GATE_HARD_CAP_MS); a hung or dead gateway extends
+// nothing and this base deadline releases the blur as before. If the update
+// hasn't reloaded by the deadline, the gate releases rather than trapping
+// the user behind a permanent blur. The completion detectors normally tear
+// the gate down long before this fires.
 const STALL_TIMEOUT_MS = 240_000;
+// While the gate is waiting, GET /api/version (via the BFF proxy) is polled
+// at this cadence for the gateway's `updateInProgress` flag — the
+// single-flight update guard, true exactly while updateRuntime is running.
+const PROGRESS_POLL_INTERVAL_MS = 5_000;
+// Each `updateInProgress: true` answer pushes the stall deadline out to at
+// least now + this much. 90s comfortably outlasts the poll cadence and the
+// longest single step (the production `next build`) between answers, while
+// keeping the post-progress release window short once the gateway goes
+// quiet. `false`, errors, and silence extend nothing.
+const PROGRESS_EXTEND_MS = 90_000;
+// Absolute ceiling on the whole gate, measured from the moment it leaves
+// idle. Progress extensions never push the deadline past this — a gateway
+// stuck in a wedged-but-alive update (the single-flight promise never
+// settles) must not blur the app forever.
+const GATE_HARD_CAP_MS = 30 * 60_000;
 
 export function UpdateGateProvider({
   children,
   // The whole-gate deadline is injectable so tests can drive the stall release
   // without advancing fake time across the 240s default — a single advance that
   // long fires the 1.5s status/healthz poll intervals 160 times each (240000 /
-  // 1500) and wedges the worker under `bun test --isolate`. Production always
-  // uses the constant default.
-  stallTimeoutMs = STALL_TIMEOUT_MS
+  // 1500) and wedges the worker under `bun test --isolate`. The progress-poll
+  // timings below are injectable for the same reason. Production always uses
+  // the constant defaults.
+  stallTimeoutMs = STALL_TIMEOUT_MS,
+  progressPollIntervalMs = PROGRESS_POLL_INTERVAL_MS,
+  progressExtendMs = PROGRESS_EXTEND_MS,
+  gateHardCapMs = GATE_HARD_CAP_MS
 }: {
   children: ReactNode;
   stallTimeoutMs?: number;
+  progressPollIntervalMs?: number;
+  progressExtendMs?: number;
+  gateHardCapMs?: number;
 }) {
   const qc = useQueryClient();
   const [phase, setPhase] = useState<UpdatePhase>("idle");
@@ -145,9 +171,18 @@ export function UpdateGateProvider({
   const [restartExpected, setRestartExpected] = useState(true);
   // When the gate entered "restarting" — see the pid-less fallbacks below.
   const [restartingSince, setRestartingSince] = useState<number | null>(null);
-  // Wall-clock deadline for the whole gate, set once when it leaves "idle"
-  // and cleared when it returns — see the stall safety net below.
+  // Wall-clock deadline for the whole gate, set when it leaves "idle" and
+  // cleared when it returns — see the stall safety net below. Pushed out by
+  // the progress poll while the gateway reports updateInProgress, capped by
+  // hardCapRef.
   const stallDeadlineRef = useRef<number | null>(null);
+  // Absolute ceiling for progress extensions, fixed when the gate leaves
+  // "idle": no amount of gateway progress holds the blur past this.
+  const hardCapRef = useRef<number | null>(null);
+  // Bumped whenever the progress poll moves the deadline so the stall effect
+  // below re-runs and re-arms its timer against the new deadline (a ref
+  // change alone re-schedules nothing).
+  const [deadlineExtensions, setDeadlineExtensions] = useState(0);
 
   // Poll status fast while updating/restarting so the new revision — and then
   // the restarted gateway — are picked up promptly.
@@ -174,6 +209,38 @@ export function UpdateGateProvider({
     retry: false
   });
   const healthzPpid = typeof healthz.data?.ppid === "number" ? healthz.data.ppid : null;
+
+  // Progress poll: while waiting, ask the gateway whether its single-flight
+  // update is still running. Only an affirmative answer feeds the deadline
+  // extension below; retry: false keeps failed polls on the interval cadence
+  // (and a failed poll extends nothing by construction — dataUpdatedAt only
+  // advances on success).
+  const progress = useQuery({
+    queryKey: ["version", "progress"],
+    queryFn: () => api<{ updateInProgress?: boolean }>("/version"),
+    enabled: waiting,
+    refetchInterval: progressPollIntervalMs,
+    retry: false
+  });
+
+  // Each fresh `updateInProgress: true` answer pushes the stall deadline out
+  // to at least now + progressExtendMs, never past the hard cap. Keyed on
+  // dataUpdatedAt so only a NEW successful poll extends: `false`, errors,
+  // and a silent gateway leave the deadline where it was, so a hung update
+  // still releases on the fixed-deadline fallback exactly as before. The
+  // retained `true` from a previous poll can re-run this on a phase flip,
+  // which is harmless: at gate start the remaining time exceeds the
+  // extension, so max() keeps the base deadline.
+  const progressUpdatedAt = progress.dataUpdatedAt;
+  const progressInFlight = progress.data?.updateInProgress === true;
+  useEffect(() => {
+    if (!waiting || !progressInFlight) return;
+    if (stallDeadlineRef.current == null || hardCapRef.current == null) return;
+    const extended = Math.min(hardCapRef.current, Math.max(stallDeadlineRef.current, Date.now() + progressExtendMs));
+    if (extended === stallDeadlineRef.current) return;
+    stallDeadlineRef.current = extended;
+    setDeadlineExtensions((n) => n + 1);
+  }, [waiting, progressInFlight, progressUpdatedAt, progressExtendMs]);
 
   const versionCheck = useQuery({
     queryKey: ["version", "check"],
@@ -403,17 +470,22 @@ export function UpdateGateProvider({
   // revision, or a stack that proved its restart and then died — the latter
   // cycles complete ↔ restarting on pre-reload probe failures because the
   // latched identity legs re-complete the gate instantly). The deadline is
-  // fixed when the gate leaves idle: phase changes re-run this effect, but
-  // each run schedules the remaining time against that one deadline, so no
-  // amount of transitions or drop-backs can extend the blur. Releasing from
+  // set when the gate leaves idle: phase changes re-run this effect, but
+  // each run schedules the remaining time against the one shared deadline,
+  // so transitions and drop-backs cannot extend the blur. Only the progress
+  // poll above moves the deadline — each move bumps deadlineExtensions so
+  // this effect re-arms against it — and its hard cap (fixed here alongside
+  // the deadline) bounds the whole gate absolutely. Releasing from
   // "complete" also tears down the pending probe/reload via that effect's
   // cancelled-flag cleanup.
   useEffect(() => {
     if (phase === "idle") {
       stallDeadlineRef.current = null;
+      hardCapRef.current = null;
       return;
     }
     stallDeadlineRef.current ??= Date.now() + stallTimeoutMs;
+    hardCapRef.current ??= Date.now() + gateHardCapMs;
     const timer = setTimeout(() => {
       reset();
       toast.error("Update is taking longer than expected. Reload to check on it.");
@@ -421,7 +493,7 @@ export function UpdateGateProvider({
       qc.invalidateQueries({ queryKey: ["version", "check"] });
     }, stallDeadlineRef.current - Date.now());
     return () => clearTimeout(timer);
-  }, [phase, reset, qc, stallTimeoutMs]);
+  }, [phase, reset, qc, stallTimeoutMs, gateHardCapMs, deadlineExtensions]);
 
   const value = useMemo<UpdateGateValue>(
     () => ({ version, updateSupported, updateAvailable, phase, start }),

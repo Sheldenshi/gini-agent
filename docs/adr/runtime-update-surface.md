@@ -86,9 +86,16 @@ installer-origin guardrails rather than adding a browser-only shortcut.
   captured falls back to a restart-freshness heuristic. Before reloading,
   the client re-probes `__healthz` once and drops back to waiting if the
   web server is not actually serving, so the reload can never land on a
-  dead server. The whole gate is bounded by one fixed stall deadline that
+  dead server. The whole gate is bounded by one shared stall deadline that
   phase transitions cannot extend; past it the blur is released with a
-  notice instead of trapping the user. Because the restart only fires
+  notice instead of trapping the user. The deadline is **progress-aware**:
+  `GET /api/version` carries `updateInProgress` (the gateway's single-flight
+  update guard), the blurred client polls it every ~5s, and each `true`
+  answer pushes the deadline out to at least now + 90s — so a genuinely
+  long update keeps the blur up for as long as the gateway proves it is
+  still working, capped by an absolute 30-minute ceiling from gate start.
+  `false`, errors, and silence extend nothing, so a hung or dead gateway
+  still releases on the base deadline. Because the restart only fires
   after the response flushes (above), a dropped `POST /api/update`
   connection is read as "restarting, not failed" — the blur is held and
   released only on a structured error the gateway itself produced. An HTTP
@@ -98,7 +105,7 @@ installer-origin guardrails rather than adding a browser-only shortcut.
   tagged shape like a transport failure and holds the blur. The
   in-flight state is persisted to `sessionStorage` so the restart-triggered
   reload resumes the blur instead of briefly exposing a half-updated app.
-  The gate's fixed stall deadline is 240s — the POST now contains a full
+  The gate's base stall deadline is 240s — the POST now contains a full
   `next build` of the web app on top of git + the installs — and the
   restart's downtime window itself is short (~1-2s gateway drain +
   respawn): the restarted web service answers from the prebuilt bundle
@@ -132,9 +139,10 @@ installer-origin guardrails rather than adding a browser-only shortcut.
   reload rather than briefly exposing the app.
 - `gini update` no longer prints a manual restart instruction.
 - The gateway answers `/api/status` while a `POST /api/update` is running;
-  a concurrent `POST /api/update` returns 409; the update-in-progress
-  marker exists exactly for the duration of `updateRuntime` (removed on
-  success and on failure).
+  a concurrent `POST /api/update` returns 409; `GET /api/version` reports
+  `updateInProgress: true` exactly while an update is in flight; the
+  update-in-progress marker exists exactly for the duration of
+  `updateRuntime` (removed on success and on failure).
 - After a non-upToDate update, `web/` contains exactly one `.next-prod-*`
   dir keyed to the new HEAD's short sha; a failed web build surfaces a
   structured error and schedules no restart.
