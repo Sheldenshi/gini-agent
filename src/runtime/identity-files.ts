@@ -1210,3 +1210,5 @@ export function previewRemoveSoulSection(
   const scan = scanForInjection(result, "SOUL.md");
   return { ok: true, scanFindings: scan.findings, nextBody: result };
 }
+
+export const __testing = { HISTORICAL_DEFAULT_INSTRUCTIONS_HASHES };

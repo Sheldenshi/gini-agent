@@ -3,11 +3,13 @@
 // real on-disk paths without polluting a developer's actual instance.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { buildAgentSystemContext } from "../system-prompt";
 import {
   HISTORY_MAX_SNAPSHOTS,
+  __testing,
   approveSoul,
   approveUserProfile,
   dedupeAppendLines,
@@ -687,6 +689,24 @@ describe("identity-files", () => {
     test("no-op when INSTRUCTIONS.md is absent", () => {
       expect(reseedDefaultInstructions(INSTANCE)).toBe(false);
       expect(existsSync(instructionsPath(INSTANCE))).toBe(false);
+    });
+
+    test("the bundled default's hash is pinned so edits also update the historical hash list", () => {
+      // Reseed only recognizes a file as an unedited prior default if its
+      // hash is in HISTORICAL_DEFAULT_INSTRUCTIONS_HASHES. If the bundled
+      // default changes without the OLD default's hash joining that list,
+      // every instance still carrying the old default silently stops
+      // receiving updates.
+      const pinned = "e74c1a398a061cc9db5fe92c0cadb0862a499742a9260db6ce51aabd667bef39";
+      const current = createHash("sha256").update(readFileSync(DEFAULT_INSTRUCTIONS_FILE)).digest("hex");
+      expect(
+        current,
+        "src/runtime/defaults/INSTRUCTIONS.md changed. Add the OLD default's sha256 (the pinned hash below) to HISTORICAL_DEFAULT_INSTRUCTIONS_HASHES in src/runtime/identity-files.ts, then update this test's pinned hash to the new file's sha256 (`shasum -a 256 src/runtime/defaults/INSTRUCTIONS.md`)."
+      ).toBe(pinned);
+      expect(
+        __testing.HISTORICAL_DEFAULT_INSTRUCTIONS_HASHES.has(pinned),
+        "The current bundled default's hash must NOT be in HISTORICAL_DEFAULT_INSTRUCTIONS_HASHES — the list holds only previously shipped defaults (a file matching the current default needs no rewrite)."
+      ).toBe(false);
     });
   });
 
