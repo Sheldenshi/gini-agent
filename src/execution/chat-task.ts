@@ -817,15 +817,13 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
   // the prior-transcript rebuild and the live user message deliver files the
   // same way (native doc vs extracted-text vs path-only).
   const modality = resolveProviderModality(effectiveForAgent.provider);
-  // A text-only model (no vision) can't ingest image content parts: an image_url
-  // part 400s the whole turn on e.g. DeepSeek ("unknown variant image_url, expected
-  // text"), taking the user's text question down with it. Reject up front with an
-  // actionable message instead of surfacing a raw provider deserialization error.
-  // Non-image attachments (PDF, CSV) are fine on text-only models — they flow through
-  // the document/extracted-text path — so gate specifically on image mime.
-  if (!modality.vision && (task.images ?? []).some((a) => a.mimeType.startsWith("image/"))) {
-    throw new Error("Gini's current model doesn't support images. Switch to a model that supports images and try again.");
-  }
+  // A text-only model (no vision) can't ingest image content parts, but
+  // buildAttachmentContent degrades an image to a text note (never an image_url
+  // part), so there's no 400 risk and no need to abort the turn here. We let the
+  // turn proceed so the agent refuses IN-BAND as a normal, replayable assistant
+  // turn: a hard reject would have surfaced only as a UI-only system_note, which
+  // is never replayed into the model's context and so breaks "try again"
+  // resolution on the next turn (see ADR chat-file-attachments.md).
   // The surface of the message that started THIS turn rides in the
   // ephemeral tail (not the byte-stable system prefix) because the same
   // session can alternate between phone and desktop across turns.
@@ -1289,9 +1287,9 @@ function wrapInlinedFile(
 // /api/uploads/:id, so we inline base64 bytes); a missing/unreadable image is
 // dropped with a trace. The image path IS gated on `modality.vision`: a
 // non-vision model degrades an image attachment to a text note instead of an
-// image_url part, and current-turn image attachments are rejected upstream by
-// runChatTask's vision guard, so a text-only provider never receives an
-// image_url part it would 400 on.
+// image_url part, so a text-only provider never receives an image_url part it
+// would 400 on. On the arrival turn, a non-vision image also adds a steering
+// directive so the agent refuses in-band rather than hallucinating contents.
 //
 // Non-image files are delivered deterministically by capability, in core, with
 // no skill dependency: every file is materialized to the workspace, then —
@@ -1315,9 +1313,9 @@ export async function buildAttachmentContent(
   const loaded: Array<{ id: string; mimeType: string; size: number }> = [];
   for (const image of images) {
     if (!modality.vision) {
-      // Non-vision model: the current turn is rejected upstream by runChatTask's vision
-      // guard, so we only reach here on a prior-turn replay. Degrade the image to a note
-      // rather than emitting an image_url part a text-only provider would 400 on.
+      // Non-vision model: degrade the image to a terse note rather than emitting an
+      // image_url part a text-only provider would 400 on. A current-turn steering
+      // directive is appended after this loop (see below).
       parts.push({
         type: "text",
         text: `[Attached image: ${image.id} (${image.mimeType}, ${formatBytes(image.size)}) — not shown: the active model can't view images.]`
@@ -1331,6 +1329,16 @@ export async function buildAttachmentContent(
     }
     parts.push({ type: "image_url", image_url: { url: dataUrl } });
     loaded.push({ id: image.id, mimeType: image.mimeType, size: image.size });
+  }
+  // On the arrival turn, when the active model has no vision, steer the agent to
+  // refuse in-band instead of hallucinating image contents. Prior-turn replay
+  // (isCurrentTurn=false) keeps only the terse per-image note above to bound
+  // replay context.
+  if (isCurrentTurn && !modality.vision && images.length > 0) {
+    parts.push({
+      type: "text",
+      text: "You cannot see the image(s) above — the active model has no vision. Do not guess or infer their contents. Tell the user you can't view images and ask them to switch to a vision-capable model or describe what the image shows."
+    });
   }
   // Surface upload metadata to the model so non-vision tools (e.g.
   // signed_upload, MCP attachment uploads) can plug the right values into

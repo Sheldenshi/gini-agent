@@ -28,6 +28,7 @@ import {
   setEchoToolCallingFailure,
   setEchoToolCallingResponse,
   normalizeProvider,
+  type MessageContentPart,
   type ToolCallingMessage
 } from "../provider";
 import { submitTask, decideApproval, resolveSetupRequest } from "../agent";
@@ -548,12 +549,13 @@ describe("chat-task loop", () => {
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
 
-  test("image attachment on a non-vision model fails the task with an actionable message", async () => {
+  test("image attachment on a non-vision model proceeds and steers an in-band refusal", async () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
     const config = buildConfig(workspaceRoot, "chat-task-image-no-vision");
 
-    // The echo provider resolves to vision:false; a PNG header is enough since
-    // the guard never reads the bytes — it gates on mime alone.
+    // The echo provider resolves to vision:false. A PNG header is enough since
+    // buildAttachmentContent degrades the image to a text note without reading
+    // the bytes — it gates on mime alone, never emitting an image_url part.
     const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01]);
     const upload = storeUpload(config.instance, png, "image/png", "pic.png");
 
@@ -563,8 +565,21 @@ describe("chat-task loop", () => {
     });
     const finished = await waitForTerminal(config, task.id);
 
-    expect(finished.status).toBe("failed");
-    expect(finished.error).toContain("doesn't support images");
+    // The turn is no longer hard-rejected: it runs to completion so the refusal
+    // is a normal, replayable assistant turn.
+    expect(finished.status).toBe("completed");
+
+    // The model saw the image degraded to a text note plus the steering
+    // directive, and never received an image_url part it would 400 on.
+    const turn = getEchoToolCallingCalls()[0]!;
+    const userMessage = turn.find((m) => m.role === "user" && Array.isArray(m.content))!;
+    const userParts = userMessage.content as MessageContentPart[];
+    expect(userParts.every((p) => p.type !== "image_url")).toBe(true);
+    const userText = userParts
+      .filter((p): p is { type: "text"; text: string } => p.type === "text")
+      .map((p) => p.text)
+      .join("\n");
+    expect(userText).toContain("You cannot see the image(s) above");
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });

@@ -6,9 +6,9 @@
 // Used at task-build time to decide attachment delivery and prior-history
 // token budgets: `nativeDocs` gates the native `document` content part;
 // `vision` gates the image content part in `buildAttachmentContent` (a
-// non-vision model degrades an image attachment to a text note) plus a
-// pre-flight guard in `runChatTask` that rejects current-turn image
-// attachments on a non-vision model with an actionable message.
+// non-vision model degrades an image attachment to a text note, current
+// turn and replay alike, plus an arrival-turn steering directive so the
+// agent refuses in-band rather than hallucinating image contents).
 //
 // Defaults are conservative: an unknown provider/model resolves to
 // { vision: false, nativeDocs: false } and a 32K-token context window so we
