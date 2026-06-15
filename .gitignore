@@ -8,6 +8,3 @@ web/.next/
 web/.turbo/
 web/next-env.d.ts
 web/tsconfig.tsbuildinfo
-
-# Generated feature-demo slide deck (built by scripts/capture-provider-docs-deck.ts)
-deck/
