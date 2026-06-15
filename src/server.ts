@@ -10,7 +10,8 @@ import { syncProviderMcpServers } from "./integrations/mcp-sync";
 import { install } from "./runtime";
 import { migrateIfNeeded } from "./memory";
 import { loadConfig, parseInstance, runtimePortPath } from "./paths";
-import { appendLog, backfillEmailWatcherJobs, mutateState, readState } from "./state";
+import { appendLog, backfillEmailWatcherJobs, mutateState, now, readState } from "./state";
+import { reconcileInFlightTasks } from "./agent";
 import { loadSkillsFromDisk } from "./capabilities/skill-loader";
 import { consumeAutostartRefresh } from "./runtime/autostart-refresh";
 import { reconcileAutostartPlistOnStartup } from "./runtime/autostart-reconcile";
@@ -51,6 +52,11 @@ const config = loadConfig(instance);
 // redacted report; nothing is filed here — the on-restart consent flow
 // (maybeAskAboutCrashes) asks the user before any report is published.
 installCrashHandlers({ instance, source: "runtime" });
+// Process boot time, captured before any state work. reconcileInFlightTasks
+// uses it as the cutoff that distinguishes orphans left by the previous
+// process (updatedAt < this) from tasks this process creates after binding
+// the HTTP port. See ADR task-resume-on-restart.md.
+const bootStartedAt = now();
 const installStartedMs = performance.now();
 await install(config);
 const installFinishedMs = performance.now();
@@ -310,6 +316,14 @@ console.log(`Gini runtime listening on http://127.0.0.1:${server.port} instance=
 // to file them — best-effort, never blocks or crashes boot.
 maybeAskAboutCrashes(config).catch((err) =>
   appendLog(config.instance, "crash.recovery.error", { error: String(err) })
+);
+
+// Resume in-flight chat turns interrupted by the previous process and fail
+// any other orphaned task so nothing hangs at "Thinking…" forever. The
+// bootStartedAt cutoff guards against racing a post-bind submission.
+// Best-effort, never blocks or crashes boot. See ADR task-resume-on-restart.md.
+reconcileInFlightTasks(config, { cutoffIso: bootStartedAt }).catch((err) =>
+  appendLog(config.instance, "tasks.reconcile.error", { error: String(err) })
 );
 
 // Resolves the moment shutdown begins so the background loops below interrupt
