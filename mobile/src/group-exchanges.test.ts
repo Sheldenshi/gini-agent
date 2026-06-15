@@ -8,7 +8,7 @@
 // pure-JS tests over minimal ChatBlock fixtures.
 
 import { describe, expect, test } from "bun:test";
-import type { ChatBlock, ToolCallBlock } from "@runtime/types";
+import type { ChatBlock, ToolCallBlock } from "@/src/types";
 import { groupExchanges } from "./group-exchanges";
 
 let ordinal = 0;
@@ -62,8 +62,6 @@ describe("groupExchanges file artifacts", () => {
     expect(artifacts.length).toBe(1);
     expect(artifacts[0]!.files.length).toBe(1);
     expect(artifacts[0]!.files[0]).toMatchObject({ path: "note.md", toolName: "file_write" });
-    // The card renders below the agent's reply: file_artifact comes after the
-    // assistant_text block.
     const assistantIdx = items.findIndex((i) => i.kind === "block" && i.block.kind === "assistant_text");
     const artifactIdx = items.findIndex((i) => i.kind === "file_artifact");
     expect(assistantIdx).toBeGreaterThanOrEqual(0);
@@ -93,7 +91,6 @@ describe("groupExchanges file artifacts", () => {
     const artifacts = items.filter((i) => i.kind === "file_artifact");
     expect(artifacts.length).toBe(1);
     expect(artifacts[0]!.files.length).toBe(1);
-    // Last occurrence's toolName wins.
     expect(artifacts[0]!.files[0]).toMatchObject({ path: "note.md", toolName: "file_patch" });
   });
 
@@ -125,7 +122,6 @@ describe("groupExchanges by taskId", () => {
     ]);
     const groups = items.filter((i) => i.kind === "tool_group");
     expect(groups.length).toBe(3);
-    // Each group holds exactly the one cycle's tool call, not a merged pile.
     expect(groups.every((g) => g.calls.length === 1)).toBe(true);
     expect(groups.map((g) => g.calls[0]!.argsPreview)).toEqual([
       "breaking news today",
@@ -153,7 +149,6 @@ describe("groupExchanges by taskId", () => {
       ...cycle("task_live", "second", /* streaming */ true)
     ]);
     const groups = items.filter((i) => i.kind === "tool_group");
-    // Completed cycle groups; the streaming one keeps its tool call inline.
     expect(groups.length).toBe(1);
     expect(groups[0]!.calls[0]!.argsPreview).toBe("first");
     const inlineToolCalls = items.filter((i) => i.kind === "block" && i.block.kind === "tool_call");
@@ -161,9 +156,6 @@ describe("groupExchanges by taskId", () => {
   });
 
   test("interleaved task blocks still group by task (manual run overlapping a scheduled run)", () => {
-    // task_a emits its tool call, then task_b runs to completion, then task_a
-    // emits its final reply — out of order in the session's ordinal stream.
-    // Grouping by taskId (not contiguous run) must still form both groups.
     const items = groupExchanges([
       assistant("checking", "task_a"),
       toolCall({ toolName: "web_search", argsPreview: "alpha", status: "ok", taskId: "task_a" }),
@@ -174,10 +166,7 @@ describe("groupExchanges by taskId", () => {
     ]);
     const groups = items.filter((i) => i.kind === "tool_group");
     expect(groups.length).toBe(2);
-    // Exchange order follows each task's first appearance: task_a, then task_b.
     expect(groups.map((g) => g.calls[0]!.argsPreview)).toEqual(["alpha", "beta"]);
-    // Both groups are complete (each task's final reply closes its exchange),
-    // so neither tool call leaks out as an inline block.
     expect(items.some((i) => i.kind === "block" && i.block.kind === "tool_call")).toBe(false);
   });
 
@@ -193,7 +182,6 @@ describe("groupExchanges by taskId", () => {
       user("search", "task_run"),
       toolCall({ toolName: "web_search", argsPreview: "q", status: "running", taskId: "task_run" })
     ]);
-    // Incomplete: no non-streaming assistant_text closes it, so no group forms.
     expect(items.some((i) => i.kind === "tool_group")).toBe(false);
     expect(items.filter((i) => i.kind === "block" && i.block.kind === "tool_call").length).toBe(1);
   });
@@ -202,8 +190,6 @@ describe("groupExchanges by taskId", () => {
     const items = groupExchanges([
       { kind: "phase", id: "p0", sessionId: "s", instance: "test", ordinal: ordinal++, createdAt: "2026-01-01T00:00:00.000Z", label: "thinking" } as ChatBlock
     ]);
-    // No assistant_text anywhere ⇒ isExchangeComplete falls through to false,
-    // so the phase block passes through as a raw block, never a group.
     expect(items.some((i) => i.kind === "tool_group")).toBe(false);
     expect(items).toEqual([{ kind: "block", block: expect.objectContaining({ kind: "phase" }) }]);
   });
