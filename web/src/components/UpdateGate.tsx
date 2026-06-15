@@ -144,6 +144,11 @@ function defaultGateChannel(): GateChannel | null {
 // Hold the "complete" confirmation on screen this long before the final
 // pre-reload probe and the reload onto the freshly built assets.
 const COMPLETE_RELOAD_DELAY_MS = 1_500;
+// Per-request timeout for the deadline's final verify (the /version +
+// __healthz fetches below). Short and retry-free: the deadline already fired,
+// so this is a last definitive read, not a poll — a slow/dead stack must fall
+// through to the error rather than stretch the blur further.
+const DEADLINE_VERIFY_TIMEOUT_MS = 4_000;
 // Whole-gate deadline: a generous ceiling on the entire update (git + bun
 // install in both roots, the sha-keyed production `next build` of the web
 // app — itself up to ~90s — the restart, and the pre-reload probe). The
@@ -607,11 +612,42 @@ export function UpdateGateProvider({
     };
   }, [phase, beforePid, beforeWebPpid]);
 
-  // Safety net spanning every non-idle phase: release if the update never
-  // reloads (a hung POST, a failed restart, a reload that lost the target
-  // revision, or a stack that proved its restart and then died — the latter
-  // cycles complete ↔ restarting on pre-reload probe failures because the
-  // latched identity legs re-complete the gate instantly). The deadline is
+  // The deadline's final verify: read the live stack directly and report
+  // whether the update actually completed on the target revision. Both fetches
+  // are awaited with a short timeout and no retries — the deadline already
+  // fired, so this is a definitive last read, not a poll. Success requires the
+  // FULL stack on the target: the gateway reachable, no update still in flight
+  // (updateInProgress not true), and HEAD landed on the target — matched
+  // explicitly when a targetSha was recorded, else inferred from the gateway
+  // reporting nothing newer to pull (updateAvailable false); plus the web
+  // server reachable and, under production serving, serving the target build
+  // (targetSha startsWith buildSha). When buildSha is absent (dev/legacy)
+  // reachability alone stands for the web leg, mirroring the completion
+  // detector's fallback. Any rejection (a down server, a timeout) resolves
+  // false so the caller surfaces the stall notice.
+  const deadlineVerify = useCallback(async (): Promise<boolean> => {
+    try {
+      const signal = AbortSignal.timeout(DEADLINE_VERIFY_TIMEOUT_MS);
+      const [ver, health] = await Promise.all([
+        api<GiniVersionInfo & { updateInProgress?: boolean }>("/version", { signal }),
+        api<{ buildSha?: string }>("/__healthz", { signal })
+      ]);
+      if (ver.updateInProgress === true) return false;
+      const headOnTarget = targetSha != null ? ver.git.sha === targetSha : ver.git.updateAvailable === false;
+      if (!headOnTarget) return false;
+      const webOnTarget =
+        typeof health.buildSha === "string" && targetSha != null ? targetSha.startsWith(health.buildSha) : true;
+      return webOnTarget;
+    } catch {
+      return false;
+    }
+  }, [targetSha]);
+
+  // Safety net spanning every non-idle phase: the deadline catches an update
+  // that never reloaded (a hung POST, a failed restart, a reload that lost the
+  // target revision, or a stack that proved its restart and then died — the
+  // latter cycles complete ↔ restarting on pre-reload probe failures because
+  // the latched identity legs re-complete the gate instantly). The deadline is
   // set when the gate leaves idle: phase changes re-run this effect, but
   // each run schedules the remaining time against the one shared deadline,
   // so transitions and drop-backs cannot extend the blur. Only the progress
@@ -620,6 +656,19 @@ export function UpdateGateProvider({
   // the deadline) bounds the whole gate absolutely. Releasing from
   // "complete" also tears down the pending probe/reload via that effect's
   // cancelled-flag cleanup.
+  //
+  // The deadline firing does NOT mean the update failed — only that the
+  // completion detectors never latched (a missed identity transition, a
+  // poll that never landed on the brief restart window). So before crying
+  // wolf, do ONE final definitive read of the stack: /version (the gateway)
+  // and __healthz (the web server), awaited, short timeout, no retries. If
+  // the gateway is up and idle on the target revision AND the web server is
+  // serving the target build, the update DID complete — reload onto it with
+  // no error toast, exactly as a normal completion would. Only when the stack
+  // is genuinely not up on the target does the original release fire: reset
+  // the blur and surface the "taking longer than expected" notice. This
+  // guarantees the false error can't show on any detection-miss path, not
+  // just the ppid race Change 1 targets.
   useEffect(() => {
     if (phase === "idle") {
       stallDeadlineRef.current = null;
@@ -631,14 +680,30 @@ export function UpdateGateProvider({
     // the hard cap from "now".
     stallDeadlineRef.current ??= (startedAtRef.current ?? Date.now()) + stallTimeoutMs;
     hardCapRef.current ??= (startedAtRef.current ?? Date.now()) + gateHardCapMs;
+    let cancelled = false;
     const timer = setTimeout(() => {
-      reset();
-      toast.error("Update is taking longer than expected. Reload to check on it.");
-      qc.invalidateQueries({ queryKey: ["status"] });
-      qc.invalidateQueries({ queryKey: ["version", "check"] });
+      void deadlineVerify().then((up) => {
+        if (cancelled) return;
+        if (up) {
+          // The update completed; a detector just never observed it. Land on
+          // the new app instead of erroring. Clear the persisted gate first
+          // so the reloaded page comes up clean (mirrors the complete path).
+          if (ownerRef.current) channelRef.current?.postMessage({ type: "done" });
+          writePersistedGate(null);
+          window.location.reload();
+          return;
+        }
+        reset();
+        toast.error("Update is taking longer than expected. Reload to check on it.");
+        qc.invalidateQueries({ queryKey: ["status"] });
+        qc.invalidateQueries({ queryKey: ["version", "check"] });
+      });
     }, stallDeadlineRef.current - Date.now());
-    return () => clearTimeout(timer);
-  }, [phase, reset, qc, stallTimeoutMs, gateHardCapMs, deadlineExtensions]);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [phase, deadlineVerify, reset, qc, stallTimeoutMs, gateHardCapMs, deadlineExtensions]);
 
   const value = useMemo<UpdateGateValue>(
     () => ({ version, updateSupported, updateAvailable, phase, start }),

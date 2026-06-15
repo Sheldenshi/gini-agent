@@ -16,7 +16,8 @@
 // point-in-time, so the gate re-probes __healthz once right before reloading
 // and drops back to "restarting" if the web server stopped answering.
 //
-// LEAK SAFETY: no module mocks — global fetch, window.location.reload and
+// LEAK SAFETY: no module mocks — global fetch, window.location.reload,
+// toast.error (replaced on the imported sonner object, not the module) and
 // sessionStorage are stubbed/cleared per test and restored in afterEach.
 
 import { afterAll, afterEach, beforeEach, describe, expect, jest, mock, setSystemTime, test } from "bun:test";
@@ -25,6 +26,7 @@ import { defaultScheduler, notifyManager, QueryClient, QueryClientProvider } fro
 import { UpdateGateProvider, useUpdateGate } from "./UpdateGate";
 import { GATEWAY_RESTARTING_MESSAGE, GATEWAY_UNREACHABLE_CODE } from "@/lib/gateway-codes";
 import type { GiniUpdateResult, GiniVersionInfo } from "@runtime/types";
+import { toast } from "sonner";
 
 // react-query delivers observer notifications through a deferred scheduler by
 // default, which makes microtask-based flushing racy and deadlocks under fake
@@ -79,6 +81,10 @@ let healthzFailing: boolean;
 // The gateway's GET /api/version progress flag: true while its single-flight
 // update guard is held. Drives the stall-deadline extension.
 let updateInProgressFlag: boolean;
+// The updateAvailable bit GET /api/version reports. The deadline's final
+// verify reads it to infer "HEAD is on the target" when no explicit targetSha
+// was recorded.
+let updateAvailableFlag: boolean;
 let versionFailing: boolean;
 let updateResponse: () => Promise<Response>;
 
@@ -89,6 +95,11 @@ function jsonResponse(body: unknown, status = 200): Response {
 const realFetch = globalThis.fetch;
 let reloadSpy: ReturnType<typeof mock>;
 let originalReload: typeof window.location.reload;
+// Spy on the imported toast.error (a writable own property on the sonner
+// object) so the deadline tests can assert the stall notice fired — or didn't,
+// on the verify-then-reload path — without rendering real toasts.
+let toastErrorSpy: ReturnType<typeof mock>;
+const originalToastError = toast.error;
 
 beforeEach(() => {
   statusSha = "sha-old";
@@ -99,6 +110,7 @@ beforeEach(() => {
   webBuildSha = null;
   healthzFailing = false;
   updateInProgressFlag = false;
+  updateAvailableFlag = true;
   versionFailing = false;
   updateResponse = async () => jsonResponse(updateResult());
 
@@ -116,7 +128,12 @@ beforeEach(() => {
     }
     if (url.includes("/version")) {
       if (versionFailing) throw new TypeError("connection refused");
-      return jsonResponse({ ...versionInfo(statusSha), updateInProgress: updateInProgressFlag });
+      const info = versionInfo(statusSha);
+      return jsonResponse({
+        ...info,
+        git: { ...info.git, updateAvailable: updateAvailableFlag },
+        updateInProgress: updateInProgressFlag
+      });
     }
     if (url.includes("/update/check")) return jsonResponse(versionInfo(statusSha));
     if (url.includes("/update")) return updateResponse();
@@ -131,6 +148,8 @@ beforeEach(() => {
   originalReload = window.location.reload;
   reloadSpy = mock(() => {});
   Object.defineProperty(window.location, "reload", { configurable: true, value: reloadSpy });
+  toastErrorSpy = mock(() => "");
+  toast.error = toastErrorSpy as unknown as typeof toast.error;
 });
 
 afterEach(() => {
@@ -139,6 +158,7 @@ afterEach(() => {
   globalThis.fetch = realFetch;
   window.sessionStorage.clear();
   Object.defineProperty(window.location, "reload", { configurable: true, value: originalReload });
+  toast.error = originalToastError;
 });
 
 // Minimal consumer so tests can read the phase and trigger start() the same
@@ -758,6 +778,122 @@ describe("UpdateGate", () => {
     await flush();
     expect(phase()).toBe("idle");
     expect(reloadSpy).not.toHaveBeenCalled();
+  });
+
+  test("the deadline reloads without erroring when the final verify finds the stack up on target (dev fallback)", async () => {
+    jest.useFakeTimers();
+    // The detectors miss the restart entirely (dev serving: no buildSha, and
+    // the ppid never observed flipping), so the gate sits in "restarting" past
+    // the deadline. But the stack DID land: /version reports the target sha
+    // and __healthz answers. The deadline must verify-then-reload, not toast.
+    const { client } = renderGate({ stallTimeoutMs: 5_000 });
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: "start-update" }));
+    await flush();
+    statusSha = "sha-new";
+    await pollStatus(client);
+    expect(phase()).toBe("restarting");
+
+    await act(async () => {
+      jest.advanceTimersByTime(5_000);
+    });
+    await flush();
+    expect(reloadSpy).toHaveBeenCalledTimes(1);
+    expect(toastErrorSpy).not.toHaveBeenCalled();
+    // Cleared first so the reloaded page comes up clean (like a normal complete).
+    expect(window.sessionStorage.getItem(STORAGE_KEY)).toBeNull();
+  });
+
+  test("the deadline verify accepts the web leg via a matching buildSha", async () => {
+    jest.useFakeTimers();
+    const targetSha = "0123456789abcdef0123456789abcdef01234567";
+    updateResponse = async () => jsonResponse(updateResult({ afterSha: targetSha, version: versionInfo(targetSha) }));
+    const { client } = renderGate({ stallTimeoutMs: 5_000 });
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: "start-update" }));
+    await flush();
+    statusSha = targetSha;
+    // Under production serving the verify additionally requires the served
+    // build to match the target; here it does.
+    webBuildSha = targetSha.slice(0, 12);
+    await pollStatus(client);
+    expect(phase()).toBe("restarting");
+
+    await act(async () => {
+      jest.advanceTimersByTime(5_000);
+    });
+    await flush();
+    expect(reloadSpy).toHaveBeenCalledTimes(1);
+    expect(toastErrorSpy).not.toHaveBeenCalled();
+  });
+
+  test("the deadline verify infers completion from updateAvailable:false when no target was recorded", async () => {
+    jest.useFakeTimers();
+    const t0 = new Date("2026-01-01T00:00:00.000Z");
+    setSystemTime(t0);
+    // A resumed gate whose POST was interrupted: no targetSha. The verify
+    // can't match an explicit sha, so it infers "HEAD is on target" from the
+    // gateway reporting nothing left to pull.
+    statusSha = "sha-new";
+    updateAvailableFlag = false;
+    window.sessionStorage.setItem(STORAGE_KEY, JSON.stringify({ phase: "restarting", startedAt: t0.getTime() }));
+    renderGate({ stallTimeoutMs: 5_000 });
+    await flush();
+    expect(phase()).toBe("restarting");
+
+    await act(async () => {
+      jest.advanceTimersByTime(5_000);
+      setSystemTime(new Date(t0.getTime() + 5_000));
+    });
+    await flush();
+    expect(reloadSpy).toHaveBeenCalledTimes(1);
+    expect(toastErrorSpy).not.toHaveBeenCalled();
+  });
+
+  test("the deadline still errors when the verify finds the stack not up on target", async () => {
+    jest.useFakeTimers();
+    // HEAD reached the target, but the web server is down (the failed-restart
+    // shape): the verify's __healthz read rejects, so the stack is NOT up and
+    // the original stall notice fires.
+    const { client } = renderGate({ stallTimeoutMs: 5_000 });
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: "start-update" }));
+    await flush();
+    statusSha = "sha-new";
+    await pollStatus(client);
+    expect(phase()).toBe("restarting");
+
+    healthzFailing = true;
+    await act(async () => {
+      jest.advanceTimersByTime(5_000);
+    });
+    await flush();
+    expect(reloadSpy).not.toHaveBeenCalled();
+    expect(toastErrorSpy).toHaveBeenCalledTimes(1);
+    expect(phase()).toBe("idle");
+  });
+
+  test("the deadline still errors when the gateway reports an update still in flight", async () => {
+    jest.useFakeTimers();
+    // HEAD and the web build are on target, but the gateway's single-flight
+    // guard is still held: the update is not actually finished, so the verify
+    // rejects the reload and the notice fires.
+    const { client } = renderGate({ stallTimeoutMs: 5_000 });
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: "start-update" }));
+    await flush();
+    statusSha = "sha-new";
+    await pollStatus(client);
+    expect(phase()).toBe("restarting");
+
+    updateInProgressFlag = true;
+    await act(async () => {
+      jest.advanceTimersByTime(5_000);
+    });
+    await flush();
+    expect(reloadSpy).not.toHaveBeenCalled();
+    expect(toastErrorSpy).toHaveBeenCalledTimes(1);
+    expect(phase()).toBe("idle");
   });
 
   test("an updateInProgress:true progress answer extends the stall deadline; silence after it releases at the extension", async () => {
