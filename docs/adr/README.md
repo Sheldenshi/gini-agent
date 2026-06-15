@@ -28,6 +28,7 @@ Each file in this directory captures one architecture decision: the context, the
 - [Always-Up Supervision For launchd-Managed Instances](always-up-supervision.md)
 - [Sha-Keyed Production Serving For The Web Control Plane](web-production-serving.md)
 - [Crash Reporting And Issue Filing](crash-reporting-and-issue-filing.md)
+- [Resume In-Flight Tasks After A Gateway Restart](task-resume-on-restart.md)
 - [Connector + Provider Vocabulary, Spec Compliance, And Meta-Skills](connector-provider-spec-compliance.md)
 - [Provider extraBody Escape Hatch And Reserved-Key Denylist](provider-extra-body.md)
 - [Native Anthropic Messages Provider (First-Party Claude)](anthropic-messages-provider.md)
