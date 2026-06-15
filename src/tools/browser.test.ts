@@ -45,7 +45,7 @@ import {
   setEchoAuxTextResponse,
   setEchoVisionResponse
 } from "../provider";
-import { createAgentRecord, createTask, mutateState, readState, upsertTask } from "../state";
+import { createAgentRecord, createTask, mutateState, readState, readTrace, upsertTask } from "../state";
 import type { RuntimeConfig } from "../types";
 
 // Direct unit coverage for the URL safety guard. We exercise the function
@@ -6019,8 +6019,28 @@ describe("dispatchToolCall(browser_connect)", () => {
     if (third.kind !== "sync") throw new Error("unreachable");
     const parsed = JSON.parse(third.result) as { ok: boolean; error: string };
     expect(parsed.ok).toBe(false);
-    expect(parsed.error).toMatch(/twice in this task|blocked on signing in/i);
+    expect(parsed.error).toMatch(/twice in this task/i);
+    // The card serves two uses (sign-in unblock and user handoff); the
+    // refusal must not claim the model is blocked on signing in when the
+    // pending step may be a handoff.
+    expect(parsed.error).toMatch(/sign-in or a user handoff/i);
     // Still exactly two cards — the loop did not spam a third approval.
+    expect(connectCards()).toBe(2);
+
+    // A handoff-mode call shares the same per-host bucket and gets the same
+    // mode-neutral refusal.
+    const fourth = await dispatchToolCall(
+      config,
+      taskId,
+      "browser_connect",
+      "call_loop_4",
+      JSON.stringify({ reason: "Enter payment details", mode: "handoff" })
+    );
+    expect(fourth.kind).toBe("sync");
+    if (fourth.kind !== "sync") throw new Error("unreachable");
+    const parsedFourth = JSON.parse(fourth.result) as { ok: boolean; error: string };
+    expect(parsedFourth.ok).toBe(false);
+    expect(parsedFourth.error).toMatch(/sign-in or a user handoff/i);
     expect(connectCards()).toBe(2);
 
     rmSync(ROOT, { recursive: true, force: true });
@@ -6297,6 +6317,164 @@ describe("dispatchToolCall(browser_connect)", () => {
       const persisted = readState(config.instance).browser;
       expect(persisted?.mode).toBe("managed");
       expect(persisted?.headless).toBe(true);
+    } finally {
+      mock.restore();
+      browserMod.__test.uninstallFakeBrowserForTest();
+      browserMod.__test.clearFakeSessionsForTest();
+      browserMod.__test.resetChromiumImportForTest();
+      rmSync(ROOT, { recursive: true, force: true });
+    }
+  });
+
+  // The browser.connect payload drives the web card's completion-button
+  // wording: no mode key renders the historical sign-in labels, an explicit
+  // mode:"handoff" renders the generalized "I'm done" completion (ADR
+  // browser-connect-handoff.md). Pin both shapes — the default payload must
+  // stay byte-identical to the pre-handoff contract so every existing
+  // sign-in flow is unchanged, and only the literal "handoff" opts in.
+  test("default call mints the exact sign-in payload (no mode key); mode:'handoff' rides the payload", async () => {
+    rmSync(ROOT, { recursive: true, force: true });
+    mkdirSync(WORKSPACE, { recursive: true });
+    const config = dispatchConfig("browser-connect-dispatch-mode");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "connect mode", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+    browserTest.installFakeSessionWithPageForTest(taskId, {
+      url: () => "https://store.example.com/checkout",
+      close: () => Promise.resolve()
+    });
+
+    // Default (no mode): payload keys are exactly the pre-handoff set.
+    const signIn = await dispatchToolCall(
+      config,
+      taskId,
+      "browser_connect",
+      "call_mode_default",
+      JSON.stringify({ reason: "Sign in to the store" })
+    );
+    expect(signIn.kind).toBe("pending");
+    if (signIn.kind !== "pending") throw new Error("unreachable");
+    const signInSetup = readState(config.instance).setupRequests.find((s) => s.id === signIn.approvalId);
+    expect(signInSetup?.payload).toEqual({
+      reason: "Sign in to the store",
+      toolCallId: "call_mode_default",
+      headless: false,
+      url: "https://store.example.com/checkout"
+    });
+
+    // mode:"handoff": same payload plus the mode marker the card reads.
+    const handoff = await dispatchToolCall(
+      config,
+      taskId,
+      "browser_connect",
+      "call_mode_handoff",
+      JSON.stringify({ reason: "Enter your payment details to finish the order", mode: "handoff" })
+    );
+    expect(handoff.kind).toBe("pending");
+    if (handoff.kind !== "pending") throw new Error("unreachable");
+    const handoffSetup = readState(config.instance).setupRequests.find((s) => s.id === handoff.approvalId);
+    expect(handoffSetup?.payload.mode).toBe("handoff");
+    expect(handoffSetup?.payload.reason).toBe("Enter your payment details to finish the order");
+    expect(handoffSetup?.payload.url).toBe("https://store.example.com/checkout");
+
+    // An unrecognized mode value degrades to the default sign-in payload —
+    // no mode key, so the card falls back to the sign-in wording.
+    const bogus = await dispatchToolCall(
+      config,
+      taskId,
+      "browser_connect",
+      "call_mode_bogus",
+      JSON.stringify({ reason: "Sign in again", mode: "co-browse", url: "https://other.example.com/login" })
+    );
+    expect(bogus.kind).toBe("pending");
+    if (bogus.kind !== "pending") throw new Error("unreachable");
+    const bogusSetup = readState(config.instance).setupRequests.find((s) => s.id === bogus.approvalId);
+    expect(bogusSetup?.payload.mode).toBeUndefined();
+
+    // The request trace mirrors the payload's conditional mode key, so an
+    // audit of the task can tell a handoff request apart from a sign-in.
+    const connectTraces = readTrace(config.instance, taskId).filter(
+      (t) => t.type === "approval" && t.message === "Approval requested for browser connect (chat-task)"
+    );
+    expect(connectTraces).toHaveLength(3);
+    const traceByCall = (callId: string) =>
+      connectTraces.find((t) => (t.data as Record<string, unknown>)?.toolCallId === callId);
+    expect(traceByCall("call_mode_default")?.data).not.toHaveProperty("mode");
+    expect((traceByCall("call_mode_handoff")?.data as Record<string, unknown>)?.mode).toBe("handoff");
+    expect(traceByCall("call_mode_bogus")?.data).not.toHaveProperty("mode");
+
+    rmSync(ROOT, { recursive: true, force: true });
+  });
+
+  // Completion behavior is mode-independent: after the user finishes acting
+  // in the visible window (sign-in OR a handoff step like payment entry),
+  // /complete must return the browser to headless. signInStarted is the
+  // stage-1 marker for both modes, so a handoff payload completes through
+  // the exact same headless relaunch as sign-in.
+  test("handoff completion returns the browser to headless, same as sign-in", async () => {
+    rmSync(ROOT, { recursive: true, force: true });
+    mkdirSync(WORKSPACE, { recursive: true });
+    const config = dispatchConfig("browser-connect-dispatch-handoff-complete");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "handoff complete", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+    browserTest.installFakeSessionWithPageForTest(taskId, {
+      url: () => "https://store.example.com/checkout",
+      close: () => Promise.resolve()
+    });
+
+    const browserMod = await import("./browser");
+    const launchCalls: Array<{ options: Record<string, unknown> }> = [];
+    mock.module("playwright-core", () => ({
+      chromium: {
+        executablePath: () => "/fake/path/to/chromium",
+        launchPersistentContext: async (_dataDir: string, options: Record<string, unknown>) => {
+          launchCalls.push({ options });
+          return {
+            browser: () => ({ process: () => ({ pid: 4242 }) }),
+            close: async () => undefined
+          };
+        }
+      }
+    }));
+    browserMod.__test.resetChromiumImportForTest();
+    try {
+      const result = await dispatchToolCall(
+        config,
+        taskId,
+        "browser_connect",
+        "call_handoff_complete_1",
+        JSON.stringify({ reason: "Complete the purchase yourself", mode: "handoff" })
+      );
+      expect(result.kind).toBe("pending");
+      if (result.kind !== "pending") throw new Error("unreachable");
+      // Stage 1 (the user clicked Connect): /open-browser marks
+      // signInStarted on the pending row — same marker for both modes.
+      await mutateState(config.instance, (state) => {
+        const item = state.setupRequests.find((s) => s.id === result.approvalId);
+        if (item) item.payload = { ...item.payload, signInStarted: true };
+      });
+      const pendingSetup = readState(config.instance).setupRequests.find((s) => s.id === result.approvalId);
+      if (!pendingSetup) throw new Error("setup request not minted");
+      expect(pendingSetup.payload.mode).toBe("handoff");
+      // Stage 2 (the user clicked "I'm done"): complete relaunches headless.
+      const { result: toolResult } = await completeBrowserConnectSetup(config, pendingSetup);
+      const parsed = JSON.parse(toolResult) as {
+        success: boolean;
+        connected: boolean;
+        mode?: string;
+        headless?: boolean;
+      };
+      expect(parsed.success).toBe(true);
+      expect(parsed.connected).toBe(true);
+      expect(parsed.mode).toBe("managed");
+      expect(parsed.headless).toBe(true);
+      expect(launchCalls.length).toBe(1);
+      expect(launchCalls[0]!.options.headless).toBe(true);
     } finally {
       mock.restore();
       browserMod.__test.uninstallFakeBrowserForTest();

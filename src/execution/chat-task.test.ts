@@ -22,6 +22,7 @@ import {
   clearEchoToolCallingResponses,
   getEchoAuxTextRequests,
   getEchoToolCallingCalls,
+  getEchoToolCallingToolNames,
   setEchoAuxTextFailure,
   setEchoAuxTextResponse,
   setEchoToolCallingFailure,
@@ -48,6 +49,7 @@ import {
   recordProviderAuthFailure
 } from "../state";
 import { echoEmbed } from "../embeddings";
+import { storeUpload } from "../state/uploads";
 import { resolveDefaultPriorContextTokenBudget } from "../provider-capabilities";
 import type { AgentIdentity, GoogleAccount, JobRecord, RuntimeConfig, RuntimeState, SkillRecord, Task, ToolsetRecord } from "../types";
 import { createSkillFromInput, setSkillStatus } from "../capabilities/skills";
@@ -542,6 +544,27 @@ describe("chat-task loop", () => {
     expect(after.status).toBe("failed");
     expect(after.toolCallState).toBeUndefined();
     expect(existsSync(join(workspaceRoot, "x.txt"))).toBe(false);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("image attachment on a non-vision model fails the task with an actionable message", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-image-no-vision");
+
+    // The echo provider resolves to vision:false; a PNG header is enough since
+    // the guard never reads the bytes — it gates on mime alone.
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01]);
+    const upload = storeUpload(config.instance, png, "image/png", "pic.png");
+
+    const task = await submitTask(config, "see this", {
+      mode: "chat",
+      images: [{ id: upload.id, mimeType: "image/png", size: upload.size }]
+    });
+    const finished = await waitForTerminal(config, task.id);
+
+    expect(finished.status).toBe("failed");
+    expect(finished.error).toContain("doesn't support images");
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
@@ -1803,6 +1826,102 @@ describe("chat-task loop", () => {
       const text = String(m.content ?? "");
       expect(text).not.toContain("Your runtime identity:");
       expect(text).not.toContain("Runtime identity changes since last turn:");
+    }
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // Client-surface injection: the surface of the message that started THIS
+  // turn rides in the ephemeral role:"user" tail (never the byte-stable
+  // system prefix), and is omitted entirely when unknown. See ADR
+  // client-surface-context.md.
+  test("injects the current message's client-surface line into the ephemeral tail, per turn", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-surface");
+    const provider = normalizeProvider(config.provider);
+    const { submitChatMessage, createChat } = await import("./chat");
+    const session = await createChat(config, { title: "Surface probe" });
+
+    // Turn 1 from the web, turn 2 from the phone — the same session can
+    // alternate surfaces, so each turn must carry only its OWN surface.
+    setEchoToolCallingResponse({ provider, text: "ok", toolCalls: [], finishReason: "stop" });
+    const first = await submitChatMessage(config, session.id, { content: "desktop turn", client: "web" });
+    expect((await waitForTerminal(config, first.taskId)).status).toBe("completed");
+
+    setEchoToolCallingResponse({ provider, text: "ok", toolCalls: [], finishReason: "stop" });
+    const second = await submitChatMessage(config, session.id, { content: "phone turn", client: "mobile" });
+    expect((await waitForTerminal(config, second.taskId)).status).toBe("completed");
+
+    const calls = getEchoToolCallingCalls();
+    const turn1 = calls[0]!;
+    const turn2 = calls[calls.length - 1]!;
+
+    // Turn 1: the web line rides in the tail immediately before the user
+    // message, and the system prefix stays surface-free.
+    const userIdx1 = turn1.findIndex((m) => m.role === "user" && m.content === "desktop turn");
+    expect(userIdx1).toBeGreaterThan(0);
+    const tail1 = String(turn1[userIdx1 - 1]!.content ?? "");
+    expect(tail1).toContain("The user is messaging from the web app");
+    expect(String(turn1.find((m) => m.role === "system")?.content ?? "")).not.toContain("The user is messaging");
+
+    // Turn 2: only the mobile line — the prior turn's web line must not
+    // replay into this turn's context.
+    const userIdx2 = turn2.findIndex((m) => m.role === "user" && m.content === "phone turn");
+    expect(userIdx2).toBeGreaterThan(0);
+    const tail2 = String(turn2[userIdx2 - 1]!.content ?? "");
+    expect(tail2).toContain("The user is messaging from the mobile app");
+    expect(tail2).toContain("NOT at the gateway machine");
+    for (const m of turn2) {
+      expect(String(m.content ?? "")).not.toContain("The user is messaging from the web app");
+    }
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("derives the surface line from a bridge session without a client field", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-surface-bridge");
+    const provider = normalizeProvider(config.provider);
+    const sessionId = await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "Telegram probe", {
+        kind: "telegram",
+        bridgeId: "bridge_1",
+        chatId: 42,
+        target: "42"
+      });
+      return session.id;
+    });
+
+    setEchoToolCallingResponse({ provider, text: "ok", toolCalls: [], finishReason: "stop" });
+    const { submitChatMessage } = await import("./chat");
+    const submitted = await submitChatMessage(config, sessionId, { content: "bridge turn" });
+    expect((await waitForTerminal(config, submitted.taskId)).status).toBe("completed");
+
+    const turn = getEchoToolCallingCalls()[0]!;
+    const userIdx = turn.findIndex((m) => m.role === "user" && m.content === "bridge turn");
+    expect(userIdx).toBeGreaterThan(0);
+    const tail = String(turn[userIdx - 1]!.content ?? "");
+    expect(tail).toContain("The user is messaging from Telegram");
+    expect(tail).toContain("NOT at the gateway machine");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("omits the surface line entirely when the surface is unknown", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-surface-unknown");
+    const provider = normalizeProvider(config.provider);
+    const { submitChatMessage, createChat } = await import("./chat");
+    const session = await createChat(config, { title: "Unknown surface probe" });
+
+    setEchoToolCallingResponse({ provider, text: "ok", toolCalls: [], finishReason: "stop" });
+    const submitted = await submitChatMessage(config, session.id, { content: "untagged turn" });
+    expect((await waitForTerminal(config, submitted.taskId)).status).toBe("completed");
+
+    // No claim anywhere in the turn — not a hedged "unknown surface" line.
+    const turn = getEchoToolCallingCalls()[0]!;
+    for (const m of turn) {
+      expect(String(m.content ?? "")).not.toContain("The user is messaging");
     }
 
     rmSync(workspaceRoot, { recursive: true, force: true });
@@ -3547,6 +3666,82 @@ describe("chat-task loop", () => {
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
 
+  // browser_navigate seeds the deferred browser cluster: a navigation
+  // establishes a browsing session whose snapshot is full of actionable @eN
+  // refs, so the interaction tools (snapshot, click, type, …) must be live on
+  // the NEXT provider call without a load_tools round-trip per tool — and the
+  // seeded set must persist on task.loadedTools so a pause/resume keeps it.
+  // The navigate here targets a loopback URL (SSRF-blocked pre-flight, no
+  // Chromium) — seeding is unconditional on the navigate outcome.
+  test("browser_navigate seeds the deferred browser cluster live on the next turn and persists it on loadedTools", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    // strict so the turn-2 file_write gates, snapshotting loadedTools mid-task.
+    const config = buildConfig(workspaceRoot, "chat-task-navigate-seeds");
+    const provider = normalizeProvider(config.provider);
+
+    // Turn 1: navigate WITHOUT any load_tools call.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_nav", type: "function", function: { name: "browser_navigate", arguments: JSON.stringify({ url: "http://127.0.0.1:9/" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    // Turn 2: file_write (core, strict → pauses) so the paused task row
+    // exposes the persisted loadedTools.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_w", type: "function", function: { name: "file_write", arguments: JSON.stringify({ path: "notes.txt", content: "seeded" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    // Turn 3 (resumed): final answer.
+    setEchoToolCallingResponse({
+      provider,
+      text: "Browsing session ready.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "open the page", { mode: "chat" });
+    const paused = await waitForTerminal(config, task.id, 10000);
+    expect(paused.status).toBe("waiting_approval");
+    // The whole browser cluster persisted onto the task after the navigate.
+    expect(paused.loadedTools).toContain("browser_snapshot");
+    expect(paused.loadedTools).toContain("browser_click");
+    expect(paused.loadedTools).toContain("browser_type");
+
+    await decideApproval(config, paused.approvalIds[0]!, "approve");
+    const finished = await waitForTerminal(config, task.id, 10000);
+    expect(finished.status).toBe("completed");
+    expect(finished.summary).toBe("Browsing session ready.");
+    // Cleared on terminal completion.
+    expect(finished.loadedTools).toBeUndefined();
+
+    // Provider tools array per call: deferred browser tools absent on the
+    // navigate turn, live on the next turn, and still live on the resumed turn
+    // (re-seeded from task.loadedTools).
+    const toolNames = getEchoToolCallingToolNames();
+    expect(toolNames.length).toBe(3);
+    expect(toolNames[0]).toContain("browser_navigate");
+    expect(toolNames[0]).not.toContain("browser_snapshot");
+    expect(toolNames[1]).toContain("browser_snapshot");
+    expect(toolNames[1]).toContain("browser_click");
+    expect(toolNames[2]).toContain("browser_snapshot");
+
+    // The seed leaves a trace entry so "why is this tool live?" is answerable.
+    const { readTrace } = await import("../state");
+    const seedTrace = readTrace(config.instance, task.id).find(
+      (t) => t.message === "Deferred browser tools seeded by browser_navigate"
+    );
+    expect(seedTrace).toBeDefined();
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
   // create_agent approve/resume regression: the direct self tool routes
   // through the unchanged self.config approval branch. Approving the gate
   // must run the create_agent handler (agent row lands) and resume the loop.
@@ -3678,12 +3873,13 @@ describe("chat-task loop", () => {
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
 
-  // No double-write for a normal turn. A normal web/chat turn gets its summary
-  // chatMessage from syncChatTaskResult — the finalize persistence must not add
-  // a second assistant row. Here we model the normal path: a run-bound chat task
-  // (run.conversationId === session) with NO subagentId. Finalize must NOT
-  // create a summary row (it's gated to the subagent path), so calling
-  // syncChatTaskResult once yields exactly one assistant summary message.
+  // No double-write for a normal turn. Finalize persists the durable assistant
+  // summary row for every completed chat task; syncChatTaskResult (mobile /sync,
+  // messaging pollers) must short-circuit to that existing row instead of
+  // adding a second one. Here we model the normal path: a run-bound chat task
+  // (run.conversationId === session) with NO subagentId. Finalize writes the
+  // row, then syncChatTaskResult returns it, yielding exactly one assistant
+  // summary message.
   test("normal chat turn persists exactly one assistant summary (no double-write)", async () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
     const config = buildConfig(workspaceRoot, "chat-task-no-double-write");
@@ -3711,11 +3907,12 @@ describe("chat-task loop", () => {
     const finished = await waitForTerminal(config, task.id);
     expect(finished.status).toBe("completed");
 
-    // Finalize did NOT write a summary row for a non-subagent turn.
+    // Finalize wrote the summary row for the normal turn.
     const beforeSync = readState(config.instance).chatMessages.filter(
       (m) => m.sessionId === sessionId.sessionId && m.role === "assistant" && m.kind !== "tool_transcript" && m.kind !== "approval_reason"
     );
-    expect(beforeSync.length).toBe(0);
+    expect(beforeSync.length).toBe(1);
+    expect(beforeSync[0]!.content).toBe("Here is your answer.");
 
     const { syncChatTaskResult } = await import("./chat");
     const synced = await syncChatTaskResult(config, sessionId.sessionId, task.id);
@@ -3725,6 +3922,200 @@ describe("chat-task loop", () => {
       (m) => m.sessionId === sessionId.sessionId && m.role === "assistant" && m.kind !== "tool_transcript" && m.kind !== "approval_reason"
     );
     expect(afterSync.length).toBe(1);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // Normal chat-turn answer durability. A plain chat turn (no subagentId, no
+  // jobId) must land its final answer in durable chatMessages at completion —
+  // no client /sync callback required — so the next turn in the same session
+  // replays the answer via priorChatMessages instead of seeing the prior
+  // question unanswered.
+  test("normal chat turn persists its final answer and the next turn replays it", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-normal-answer-history");
+    const provider = normalizeProvider(config.provider);
+
+    const sessionId = await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "General chat");
+      return session.id;
+    });
+
+    setEchoToolCallingResponse({
+      provider,
+      text: "Section 413 has better sightlines than Cat2.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "is 413 better than Cat2?", { mode: "chat", chatSessionId: sessionId });
+    const finished = await waitForTerminal(config, task.id);
+    expect(finished.status).toBe("completed");
+
+    // Exactly one durable assistant answer row (not a transcript/approval row).
+    const answerRows = readState(config.instance).chatMessages.filter(
+      (m) => m.sessionId === sessionId && m.role === "assistant" && m.kind !== "tool_transcript" && m.kind !== "approval_reason"
+    );
+    expect(answerRows.length).toBe(1);
+    expect(answerRows[0]!.content).toBe("Section 413 has better sightlines than Cat2.");
+    expect(answerRows[0]!.taskId).toBe(task.id);
+    expect(answerRows[0]!.kind).toBeUndefined();
+
+    clearEchoToolCallingResponses();
+    setEchoToolCallingResponse({
+      provider,
+      text: "Noted.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    // Turn 2 in the same session: the provider messages must replay the
+    // prior turn's answer via priorChatMessages.
+    const followUp = await submitTask(config, "ok thanks", { mode: "chat", chatSessionId: sessionId });
+    const finishedFollowUp = await waitForTerminal(config, followUp.id);
+    expect(finishedFollowUp.status).toBe("completed");
+
+    const calls = getEchoToolCallingCalls();
+    const lastTurn = calls[calls.length - 1]!;
+    const replayed = lastTurn.map((m) => (typeof m.content === "string" ? m.content : "")).join("\n");
+    expect(replayed).toContain("Section 413 has better sightlines than Cat2.");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // The iteration-cap/loop-stall summary exit completes the task with a real
+  // user-facing summary, so it must land the same durable assistant answer
+  // row as the no-tool-calls path — otherwise a turn that ends on the cap
+  // leaves the session with no answer for the next turn to replay.
+  test("iteration-cap summary exit persists the durable answer row", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-cap-answer-row");
+    config.agent = { maxIterations: 3 };
+    const provider = normalizeProvider(config.provider);
+
+    const sessionId = await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "Cap chat");
+      return session.id;
+    });
+
+    // Three distinct tool-call turns consume the cap without tripping the
+    // identical-repeat loop-breaker, then the tool-less summary turn fires.
+    for (let i = 0; i < 3; i++) {
+      writeFileSync(join(workspaceRoot, `cap${i}.md`), `cap content (${i})`);
+      setEchoToolCallingResponse({
+        provider,
+        text: "",
+        toolCalls: [
+          {
+            id: `call_cap_${i}`,
+            type: "function",
+            function: { name: "file_read", arguments: JSON.stringify({ path: `cap${i}.md` }) }
+          }
+        ],
+        finishReason: "tool_calls"
+      });
+    }
+    setEchoToolCallingResponse({
+      provider,
+      text: "Cap summary: I read three files but could not finish.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "loop forever", { mode: "chat", chatSessionId: sessionId });
+    const finished = await waitForTerminal(config, task.id, 10000);
+    expect(finished.status).toBe("completed");
+    expect(finished.currentStep).toBe("Completed (iteration cap reached: 3)");
+
+    const answerRows = readState(config.instance).chatMessages.filter(
+      (m) => m.sessionId === sessionId && m.role === "assistant" && m.kind !== "tool_transcript" && m.kind !== "approval_reason"
+    );
+    expect(answerRows.length).toBe(1);
+    expect(answerRows[0]!.content).toBe("Cap summary: I read three files but could not finish.");
+    expect(answerRows[0]!.taskId).toBe(task.id);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // The context-exhaustion partial-result exit also completes with a real
+  // user-facing summary and must persist the same durable answer row.
+  test("context-exhaustion partial-result exit persists the durable answer row", async () => {
+    const OVERFLOW_MESSAGE = "prompt is too long: 250000 tokens > 200000 maximum";
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-overflow-answer-row");
+    const session = await mutateState(config.instance, (state) =>
+      createChatSession(state, "Overflow chat")
+    );
+    const { submitChatMessage } = await import("./chat");
+
+    // Every attempt of the turn's model call overflows (3 total attempts).
+    setEchoToolCallingFailure(OVERFLOW_MESSAGE);
+    setEchoToolCallingFailure(OVERFLOW_MESSAGE);
+    setEchoToolCallingFailure(OVERFLOW_MESSAGE);
+
+    const submitted = await submitChatMessage(config, session.id, { content: "go" });
+    const finished = await waitForTerminal(config, submitted.taskId, 10000);
+    expect(finished.status).toBe("completed");
+    expect(finished.currentStep).toBe("Completed (stopped: context window exhausted)");
+
+    const answerRows = readState(config.instance).chatMessages.filter(
+      (m) => m.sessionId === session.id && m.role === "assistant" && m.kind !== "tool_transcript" && m.kind !== "approval_reason"
+    );
+    expect(answerRows.length).toBe(1);
+    expect(answerRows[0]!.content).toContain("This is a partial result.");
+    expect(answerRows[0]!.taskId).toBe(submitted.taskId);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // A thread-reply turn stamps threadId/parentBlockId on the task; the
+  // persisted answer row must carry both (sync's short-circuit means it can
+  // never be backfilled later) and the run must link to the answer
+  // (assistantMessageId), symmetric with the userMessageId set at submit.
+  test("thread-reply turn's persisted answer row carries parentBlockId and links the run", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-thread-answer-row");
+    const provider = normalizeProvider(config.provider);
+
+    const { sessionId, runId } = await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "Threaded chat");
+      const run = createRun(state, {
+        kind: "conversation_turn",
+        title: "Thread turn",
+        input: "follow up",
+        conversationId: session.id
+      });
+      return { sessionId: session.id, runId: run.id };
+    });
+
+    setEchoToolCallingResponse({
+      provider,
+      text: "Threaded answer.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "follow up", {
+      mode: "chat",
+      runId,
+      chatSessionId: sessionId,
+      threadId: "thread_t1",
+      parentBlockId: "blk_parent"
+    });
+    const finished = await waitForTerminal(config, task.id);
+    expect(finished.status).toBe("completed");
+
+    const answerRows = readState(config.instance).chatMessages.filter(
+      (m) => m.sessionId === sessionId && m.role === "assistant" && m.kind !== "tool_transcript" && m.kind !== "approval_reason"
+    );
+    expect(answerRows.length).toBe(1);
+    expect(answerRows[0]!.content).toBe("Threaded answer.");
+    expect(answerRows[0]!.threadId).toBe("thread_t1");
+    expect(answerRows[0]!.parentBlockId).toBe("blk_parent");
+
+    const run = readState(config.instance).runs.find((r) => r.id === runId);
+    expect(run?.assistantMessageId).toBe(answerRows[0]!.id);
+    expect(run?.updatedAt).toBe(answerRows[0]!.createdAt);
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
@@ -3822,12 +4213,12 @@ describe("chat-task loop", () => {
     });
 
     // Twelve tool-call turns reading DISTINCT files (so no loop-breaker
-    // trips), each result ~3.6k chars — elidable (>200 chars) but the total
+    // trips), each result ~3.4k chars — elidable (>200 chars) but the total
     // stays under every estimate-driven threshold. Only the LAST response
     // reports usage; the resulting calibration gap forces the pre-call trim
     // ahead of the 13th call.
     for (let i = 0; i < 12; i++) {
-      writeFileSync(join(workspaceRoot, `chunk${i}.md`), `chunk-${i} `.repeat(450));
+      writeFileSync(join(workspaceRoot, `chunk${i}.md`), `chunk-${i} `.repeat(420));
       setEchoToolCallingResponse({
         provider,
         text: "",
@@ -4289,8 +4680,10 @@ describe("chat-task loop", () => {
   // six results sit inside the elision layer's protected-recent window). The
   // loop must summarize the middle exchanges via ONE aux call, splice in the
   // marked summary message, protect the head and the recent tail, and keep
-  // going to completion. Toolsets are disabled to pin the schema to the
-  // always-on floor — read_skill is always-on, so the calls still dispatch.
+  // going to completion. The schema floor is pinned to FIXED_COMPACTION_CATALOG
+  // (installed below) so the crossing geometry is decoupled from live
+  // always-on catalog growth; toolsets are also disabled, and read_skill is in
+  // the fixed catalog so the calls still dispatch.
   test("in-turn compaction summarizes the middle, protects head and tail, and continues", async () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
     const config = buildConfig(workspaceRoot, "chat-task-compaction");
@@ -4436,17 +4829,19 @@ describe("chat-task loop", () => {
     __setBaseToolCatalogForTests(FIXED_COMPACTION_CATALOG);
 
     // Geometry: the projection crosses the high-water mark (27,200 tokens
-    // under the echo provider's 32k window) by a hair, with a small middle
-    // span — so the compaction reclaims under 10% of the projection (the
-    // savings-bail threshold) but enough to dip back under the mark.
-    // Exchange 0 is the protected head, exchanges 1–2 the summarizable
-    // middle, exchanges 3–4 the protected tail.
+    // under the echo provider's 32k window) with a small middle span — so
+    // the compaction reclaims under 10% of the projection (the savings-bail
+    // threshold) but enough to dip back under the mark. Exchange 0 is the
+    // protected head, exchanges 1–2 the summarizable middle, exchanges 3–4
+    // the protected tail. The tail sizes leave a few hundred tokens of
+    // post-compaction headroom under the mark; the always-on tool schemas
+    // count toward the projection, so growing them erodes this headroom.
     const bodies = [
       `BODY-0 ${"x".repeat(8_000)}`,
       `BODY-1 ${"x".repeat(4_000)}`,
       `BODY-2 ${"x".repeat(4_000)}`,
       `BODY-3 ${"x".repeat(19_000)}`,
-      `BODY-4 ${"x".repeat(19_000)}`
+      `BODY-4 ${"x".repeat(14_000)}`
     ];
     for (let i = 0; i < bodies.length; i++) {
       await seedBulkSkill(config, `bulk-skill-${i}`, bodies[i]!);
@@ -4657,7 +5052,7 @@ describe("chat-task loop", () => {
     });
 
     for (let i = 0; i < 12; i++) {
-      writeFileSync(join(workspaceRoot, `chunk${i}.md`), `chunk-${i} `.repeat(450));
+      writeFileSync(join(workspaceRoot, `chunk${i}.md`), `chunk-${i} `.repeat(420));
       setEchoToolCallingResponse({
         provider,
         text: "",

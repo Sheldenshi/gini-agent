@@ -10,19 +10,24 @@
 //   - missing port files -> treated as down (kickstart fired), no report, exit 0
 //   - a deregistered core service -> re-bootstrap (enable) instead of kickstart,
 //     only under launchd; a failed/throwing re-enable is swallowed, exit 0
-//   - loop mode: ticks are paced by the injectable sleep, recover mid-loop,
-//     and `--once` forces a single tick
+//   - loop mode: ticks are paced by the injectable sleep, revive requires TWO
+//     consecutive failed ticks (a one-tick probe miss never hard-kills a
+//     healthy-but-busy service), streaks reset on a healthy probe, and
+//     `--once` forces a single tick with the threshold back at 1
 //
 // Single-tick tests run via `--once` so the loop (the launchd default) never
-// spins; loop tests bound it with deps.maxTicks.
+// spins; loop tests bound it with deps.maxTicks. The `--once` single-tick
+// tests double as the threshold-1 pin: a down service is revived (and a web
+// report queued) on the one and only tick.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { join } from "node:path";
-import { watchdog, WATCHDOG_TICK_INTERVAL_MS } from "./watchdog";
+import { watchdog, UPDATE_MARKER_STALE_MS, WATCHDOG_TICK_INTERVAL_MS } from "./watchdog";
 import type { CliContext } from "../context";
 import type { LaunchctlResult, PlistKind } from "../../integrations/launchd";
-import { runtimePortPath, webPortPath } from "../../paths";
+import { logDir, runtimePortPath, updateInProgressMarkerPath, webPortPath } from "../../paths";
 import { listPendingReports } from "../../runtime/crash-report";
 
 function tag(): string {
@@ -354,9 +359,9 @@ describe("watchdog", () => {
     expect(process.exitCode).toBe(0);
   });
 
-  test("loop: a gateway that dies mid-loop is kickstarted on the tick that sees it, and the loop keeps going", async () => {
+  test("loop: a gateway dead for two consecutive ticks is kickstarted on the second, and the loop keeps going", async () => {
     writePorts();
-    const results = [true, false, true];
+    const results = [true, false, false, true];
     let probes = 0;
     const kicks: PlistKind[] = [];
     await watchdog(ctxFor([]), {
@@ -372,14 +377,132 @@ describe("watchdog", () => {
       },
       isLoadedImpl: () => true,
       supervisorImpl: () => "launchd",
-      maxTicks: 3,
+      maxTicks: 4,
       intervalMs: 7,
       sleep: async () => {}
     });
-    expect(probes).toBe(3);
-    // Exactly one revive: the dead tick kicked the gateway, the healthy
-    // ticks before and after did nothing.
+    expect(probes).toBe(4);
+    // Exactly one revive: the first dead tick only opened the streak, the
+    // second confirmed it and kicked the gateway, and the healthy ticks
+    // before and after did nothing.
     expect(kicks).toEqual(["gateway"]);
+    expect(process.exitCode).toBe(0);
+  });
+
+  test("loop: a single failed tick never revives (two-strike), and a recovery resets the streak", async () => {
+    writePorts();
+    // Failures never run back-to-back: each one is followed by a healthy
+    // probe that resets the streak, so the threshold of 2 is never reached.
+    const results = [false, true, false, true];
+    let probes = 0;
+    const kicks: PlistKind[] = [];
+    await watchdog(ctxFor([]), {
+      probeRuntime: async () => {
+        const result = results[probes] ?? true;
+        probes += 1;
+        return result;
+      },
+      probeWeb: async () => true,
+      kickstartImpl: (_instance, kind) => {
+        kicks.push(kind);
+        return okLaunchctl;
+      },
+      isLoadedImpl: () => true,
+      supervisorImpl: () => "launchd",
+      maxTicks: 4,
+      sleep: async () => {}
+    });
+    expect(probes).toBe(4);
+    expect(kicks).toEqual([]);
+    expect(process.exitCode).toBe(0);
+  });
+
+  test("loop: a sustained gateway outage re-kicks every threshold ticks, not every tick", async () => {
+    writePorts();
+    // The streak resets after each revive, so the kicked gateway gets a full
+    // threshold window to boot: kicks land on ticks 3 and 5, not 3-4-5
+    // (without the post-revive reset, streak 3/4/5 would re-kick every tick
+    // and keep restarting the very boot the watchdog is waiting for).
+    const results = [true, false, false, false, false];
+    let probes = 0;
+    const kicks: PlistKind[] = [];
+    await watchdog(ctxFor([]), {
+      probeRuntime: async () => {
+        const result = results[probes] ?? false;
+        probes += 1;
+        return result;
+      },
+      probeWeb: async () => true,
+      kickstartImpl: (_instance, kind) => {
+        kicks.push(kind);
+        return okLaunchctl;
+      },
+      isLoadedImpl: () => true,
+      supervisorImpl: () => "launchd",
+      maxTicks: 5,
+      sleep: async () => {}
+    });
+    expect(probes).toBe(5);
+    expect(kicks).toEqual(["gateway", "gateway"]);
+    expect(process.exitCode).toBe(0);
+  });
+
+  test("loop: the web streak resets after a revive too", async () => {
+    writePorts();
+    // Three consecutive web failures: tick 2 reaches the threshold (report +
+    // kick), the reset makes tick 3 streak 1 again — no second kick.
+    const webResults = [false, false, false];
+    let probes = 0;
+    const kicks: PlistKind[] = [];
+    await watchdog(ctxFor([]), {
+      probeRuntime: async () => true,
+      probeWeb: async () => {
+        const result = webResults[probes] ?? true;
+        probes += 1;
+        return result;
+      },
+      kickstartImpl: (_instance, kind) => {
+        kicks.push(kind);
+        return okLaunchctl;
+      },
+      isLoadedImpl: () => true,
+      supervisorImpl: () => "launchd",
+      maxTicks: 3,
+      sleep: async () => {}
+    });
+    expect(probes).toBe(3);
+    expect(kicks).toEqual(["web"]);
+    expect(process.exitCode).toBe(0);
+  });
+
+  test("loop: web crash report waits for the second consecutive failed tick too", async () => {
+    writePorts();
+    const webResults = [false, false];
+    let probes = 0;
+    const kicks: PlistKind[] = [];
+    let reportsAtFirstKick = -1;
+    await watchdog(ctxFor([]), {
+      probeRuntime: async () => true,
+      probeWeb: async () => {
+        const result = webResults[probes] ?? true;
+        probes += 1;
+        return result;
+      },
+      kickstartImpl: (_instance, kind) => {
+        if (kicks.length === 0) reportsAtFirstKick = listPendingReports().length;
+        kicks.push(kind);
+        return okLaunchctl;
+      },
+      isLoadedImpl: () => true,
+      supervisorImpl: () => "launchd",
+      maxTicks: 2,
+      sleep: async () => {}
+    });
+    // No report (and no kick) after tick 1; both fire together on tick 2 —
+    // the report is written just before the kick.
+    expect(kicks).toEqual(["web"]);
+    expect(reportsAtFirstKick).toBe(1);
+    expect(listPendingReports().length).toBe(1);
     expect(process.exitCode).toBe(0);
   });
 
@@ -530,8 +653,8 @@ describe("watchdog", () => {
 
   test("loop: a sustained web outage queues ONE report per episode, not one per tick", async () => {
     writePorts();
-    // Four ticks: down, down (same episode), recovered, down (new episode).
-    const webResults = [false, false, true, false];
+    // Seven ticks: down x3 (one episode), recovered, down x3 (new episode).
+    const webResults = [false, false, false, true, false, false, false];
     let probes = 0;
     await watchdog(ctxFor([]), {
       probeRuntime: async () => true,
@@ -543,13 +666,163 @@ describe("watchdog", () => {
       kickstartImpl: () => okLaunchctl,
       isLoadedImpl: () => true,
       supervisorImpl: () => "launchd",
-      maxTicks: 4,
+      maxTicks: 7,
       sleep: async () => {}
     });
-    expect(probes).toBe(4);
-    // Tick 1 reports, tick 2 is the same episode (suppressed), tick 3 clears
-    // the episode, tick 4 is a fresh outage and reports again.
+    expect(probes).toBe(7);
+    // Tick 2 (second consecutive failure) reports, tick 3 is the same episode
+    // (suppressed), tick 4 clears the episode, tick 6 confirms a fresh outage
+    // and reports again, tick 7 is suppressed.
     expect(listPendingReports().length).toBe(2);
+    expect(process.exitCode).toBe(0);
+  });
+
+  test("a fresh update-in-progress marker suppresses revives AND the web report despite sustained failures", async () => {
+    writePorts();
+    // updateRuntime writes this for the duration of the install/build window;
+    // probe misses there are expected and a kickstart -k would force-kill the
+    // mid-update service. The body here is a LEGACY (pre-pid) timestamp —
+    // unparseable as JSON — pinning the fallback: an unknown body keeps the
+    // mtime-only freshness behavior instead of dropping suppression.
+    writeFileSync(updateInProgressMarkerPath(), "2026-06-12T00:00:00.000Z\n");
+    const kicks: PlistKind[] = [];
+    await watchdog(ctxFor([]), {
+      probeRuntime: async () => false,
+      probeWeb: async () => false,
+      kickstartImpl: (_instance, kind) => {
+        kicks.push(kind);
+        return okLaunchctl;
+      },
+      isLoadedImpl: () => true,
+      supervisorImpl: () => "launchd",
+      maxTicks: 3,
+      sleep: async () => {}
+    });
+    // Three failed ticks for both services, zero revive actions and zero
+    // queued reports — only suppression entries in the tick log.
+    expect(kicks.length).toBe(0);
+    expect(listPendingReports().length).toBe(0);
+    const tickLog = readFileSync(join(logDir(INSTANCE), "runtime.jsonl"), "utf8");
+    expect(tickLog).toContain("suppressed:update:gateway");
+    expect(tickLog).toContain("suppressed:update:web");
+    expect(process.exitCode).toBe(0);
+  });
+
+  test("a STALE marker does not suppress: revives proceed as normal", async () => {
+    writePorts();
+    writeFileSync(updateInProgressMarkerPath(), "2026-06-12T00:00:00.000Z\n");
+    // The injected clock sits past the staleness cutoff relative to the
+    // marker's just-written mtime — a crashed update that never removed its
+    // marker must not disarm the watchdog forever.
+    const clock = () => new Date(Date.now() + UPDATE_MARKER_STALE_MS + 60_000);
+    const kicks: PlistKind[] = [];
+    await watchdog(ctxFor([]), {
+      probeRuntime: async () => false,
+      probeWeb: async () => true,
+      kickstartImpl: (_instance, kind) => {
+        kicks.push(kind);
+        return okLaunchctl;
+      },
+      isLoadedImpl: () => true,
+      supervisorImpl: () => "launchd",
+      clock,
+      maxTicks: 2,
+      sleep: async () => {}
+    });
+    expect(kicks).toEqual(["gateway"]);
+    expect(process.exitCode).toBe(0);
+  });
+
+  test("a marker whose recorded updater pid is DEAD does not suppress and is deleted", async () => {
+    writePorts();
+    // A real, guaranteed-dead pid: the child has exited and been reaped by
+    // the time spawnSync returns. A marker carrying it means the updater
+    // crashed before its finally removed the marker — the update is over, so
+    // the watchdog must revive immediately instead of staying muted for the
+    // rest of the 15-minute mtime window.
+    const deadPid = spawnSync("true").pid;
+    writeFileSync(updateInProgressMarkerPath(), `${JSON.stringify({ pid: deadPid })}\n`);
+    const kicks: PlistKind[] = [];
+    await watchdog(ctxFor([]), {
+      probeRuntime: async () => false,
+      probeWeb: async () => true,
+      kickstartImpl: (_instance, kind) => {
+        kicks.push(kind);
+        return okLaunchctl;
+      },
+      isLoadedImpl: () => true,
+      supervisorImpl: () => "launchd",
+      maxTicks: 2,
+      sleep: async () => {}
+    });
+    expect(kicks).toEqual(["gateway"]);
+    // The dead-pid marker was cleaned up on sight, not left for the mtime cap.
+    expect(existsSync(updateInProgressMarkerPath())).toBe(false);
+    expect(process.exitCode).toBe(0);
+  });
+
+  test("a dead-pid marker rewritten between the read and the delete survives and keeps suppressing", async () => {
+    writePorts();
+    // The dead-pid cleanup is stat → read → kill(pid, 0) → unlink, which is
+    // not atomic: a NEW update can rewrite the marker inside that window, and
+    // deleting blindly would strip the fresh marker and revive mid-update.
+    // The injected clock runs between the entry stat and the delete, so its
+    // mtime-bump side effect stands in for that concurrent rewrite: the
+    // pre-delete re-stat must see the moved mtime, keep the marker, and read
+    // it as fresh for this tick.
+    const deadPid = spawnSync("true").pid;
+    writeFileSync(updateInProgressMarkerPath(), `${JSON.stringify({ pid: deadPid })}\n`);
+    let bumped = false;
+    const clock = () => {
+      if (!bumped) {
+        bumped = true;
+        const later = new Date(Date.now() + 60_000);
+        utimesSync(updateInProgressMarkerPath(), later, later);
+      }
+      return new Date();
+    };
+    const kicks: PlistKind[] = [];
+    await watchdog(ctxFor(), {
+      probeRuntime: async () => false,
+      probeWeb: async () => true,
+      kickstartImpl: (_instance, kind) => {
+        kicks.push(kind);
+        return okLaunchctl;
+      },
+      isLoadedImpl: () => true,
+      supervisorImpl: () => "launchd",
+      clock
+    });
+    // Suppressed, not revived — and the rewritten marker is still on disk.
+    expect(kicks.length).toBe(0);
+    expect(existsSync(updateInProgressMarkerPath())).toBe(true);
+    const tickLog = readFileSync(join(logDir(INSTANCE), "runtime.jsonl"), "utf8");
+    expect(tickLog).toContain("suppressed:update:gateway");
+    expect(process.exitCode).toBe(0);
+  });
+
+  test("a marker whose recorded updater pid is ALIVE suppresses like a fresh marker", async () => {
+    writePorts();
+    // Our own pid is the canonical live-updater stand-in (updateRuntime
+    // records process.pid — in production that's the gateway running the
+    // update).
+    writeFileSync(updateInProgressMarkerPath(), `${JSON.stringify({ pid: process.pid })}\n`);
+    const kicks: PlistKind[] = [];
+    await watchdog(ctxFor([]), {
+      probeRuntime: async () => false,
+      probeWeb: async () => false,
+      kickstartImpl: (_instance, kind) => {
+        kicks.push(kind);
+        return okLaunchctl;
+      },
+      isLoadedImpl: () => true,
+      supervisorImpl: () => "launchd",
+      maxTicks: 3,
+      sleep: async () => {}
+    });
+    expect(kicks.length).toBe(0);
+    expect(listPendingReports().length).toBe(0);
+    expect(existsSync(updateInProgressMarkerPath())).toBe(true);
     expect(process.exitCode).toBe(0);
   });
 

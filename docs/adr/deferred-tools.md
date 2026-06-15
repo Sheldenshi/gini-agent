@@ -67,19 +67,31 @@ self-descriptively.
   those tool names seeded into its loaded set at `runLoop` entry, so an
   explicitly-scoped subagent has them live without spending a turn on
   `load_tools`.
+- **`browser_navigate` seeds the browser cluster.** Dispatching a
+  `browser_navigate` call unions every deferred `browser`-toolset tool into the
+  loaded set (recompute + `Task.loadedTools` persistence, same as an inline
+  `load_tools`). A navigation establishes a browsing session whose snapshot is
+  full of actionable `@eN` refs; the interaction tools (snapshot, click, type,
+  scroll, …) are that session's action vocabulary, and making each first use
+  cost a failed call plus a `load_tools` round-trip biased the loop toward
+  reading one page and summarizing instead of acting. Seeding is unconditional
+  on the navigate outcome and the next-turn rule still applies: interaction
+  calls in the SAME batch as the navigate get the "load it first" nudge.
 - **`toolsHash`.** Recorded on the pause snapshot for trace/telemetry only; it
   is not enforced on resume (resume rebuilds the catalog via `runLoop`). A
   loaded set that grows the catalog is therefore safe.
 
 ## Currently Deferred
 
-- The browser cluster — 15 of 18 tools. `browser_navigate`,
+- The browser cluster — 21 of 24 tools. `browser_navigate`,
   `browser_fill_secrets`, and `browser_connect` stay core. `browser_fill_secrets`
   and `browser_connect` are escalation / onboarding meta-tools that must be
   reachable before the cluster is loaded (a sign-in wall mid-task).
   `browser_navigate` is core because `browser_connect`'s navigate-first guard
   refuses a cold connect and steers the agent to navigate first — so navigate
   must be directly callable for that steer to be satisfiable in one step.
+  In practice the deferred browser tools rarely need an explicit `load_tools`:
+  the first `browser_navigate` seeds the whole cluster (see Required Now).
 - The self-config tools (ADR self-config-registry.md).
 
 Messaging-lifecycle, jobs, skill-lifecycle, identity-edit, and `mcp_call` tools
@@ -114,6 +126,9 @@ same mechanism.
 - A tool loaded before an approval pause is still in the provider `tools` array
   after resume (`Task.loadedTools` persisted and re-seeded), and the resumed
   turn can dispatch it.
+- A turn containing a `browser_navigate` call puts every deferred browser tool
+  in the provider `tools` array on the next provider call and on
+  `Task.loadedTools`, with no `load_tools` call.
 - A real chat turn confirms model selection: a core-only ask loads nothing; an
   ask needing a deferred tool drives `load_tools(<name>)` then a direct call.
 - `bun run typecheck` and `bun test` are green.

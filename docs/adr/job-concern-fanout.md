@@ -127,11 +127,12 @@ subagents — rather than adding a new one.
   that normally write a turn's transcript + a durable assistant chatMessage do not
   fire for it. The chat task resolves its transcript session from `task.chatSessionId`
   (the same key the block-emit path uses, so blocks and transcript land in the same
-  channel) and persists the final turn-ending text as a durable assistant chatMessage
-  for the session-bound-subagent case (a completed worker with a `subagentId`, no
-  `jobId`, and non-empty non-sentinel text), guarded against double-writing an
-  existing assistant row. Without this, the channel would replay empty history and a
-  follow-up user message would not see the worker's prior draft.
+  channel), and the general completion rule covers it: every completed chat task
+  persists its final turn-ending text as a durable assistant chatMessage
+  (`persistFinalAnswerRow`, gated on no `jobId` and non-empty non-sentinel text,
+  guarded against double-writing an existing assistant row), so the worker needs no
+  subagent-specific carve-out. Without that row, the channel would replay empty
+  history and a follow-up user message would not see the worker's prior draft.
 - **`[SILENT]` is suppressed at the chat-BLOCK layer.** A worker (like any
   scheduled-job turn) with nothing to report answers with exactly `[SILENT]` to
   suppress delivery. The legacy message layer already drops that `ChatMessageRecord`;

@@ -57,6 +57,7 @@ import {
   USER_SOFT_CAP_CHARS,
   buildAgentSystemContext,
   buildBoundJobsBlock,
+  buildClientSurfaceBlock,
   buildCurrentDateBlock,
   resolveLocalTimeZone,
   decideIdentityEmission,
@@ -115,6 +116,7 @@ import { getSubagentForTask, syncSubagentFromTask } from "../capabilities/subage
 import { listEnabledSkillScripts } from "../capabilities/skill-scripts";
 import { autoRenameChatAfterTurn } from "./chat";
 import { finalizeJobRunFromTask } from "../jobs/finalize";
+import { peekRefLabel } from "../tools/browser";
 import { isSkillActive } from "../integrations/connectors";
 import { getProvider, providerForCredentialName } from "../integrations/connectors/registry";
 import { resolveEffectiveContext } from "./effective-context";
@@ -815,7 +817,21 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
   // the prior-transcript rebuild and the live user message deliver files the
   // same way (native doc vs extracted-text vs path-only).
   const modality = resolveProviderModality(effectiveForAgent.provider);
-  const ephemeralContext = subagent ? "" : renderEphemeralContext(identityBlock, recalledContext);
+  // A text-only model (no vision) can't ingest image content parts: an image_url
+  // part 400s the whole turn on e.g. DeepSeek ("unknown variant image_url, expected
+  // text"), taking the user's text question down with it. Reject up front with an
+  // actionable message instead of surfacing a raw provider deserialization error.
+  // Non-image attachments (PDF, CSV) are fine on text-only models — they flow through
+  // the document/extracted-text path — so gate specifically on image mime.
+  if (!modality.vision && (task.images ?? []).some((a) => a.mimeType.startsWith("image/"))) {
+    throw new Error("Gini's current model doesn't support images. Switch to a model that supports images and try again.");
+  }
+  // The surface of the message that started THIS turn rides in the
+  // ephemeral tail (not the byte-stable system prefix) because the same
+  // session can alternate between phone and desktop across turns.
+  const ephemeralContext = subagent
+    ? ""
+    : renderEphemeralContext(identityBlock, recalledContext, buildClientSurfaceBlock(task.clientSurface));
   const currentUserMessage = await buildUserMessage(config, task, modality);
   const nonPriorMessages: ToolCallingMessage[] = [
     { role: "system", content: systemContext },
@@ -1011,6 +1027,64 @@ function persistTranscriptRow(
       ...(row.toolCalls ? { toolCalls: row.toolCalls } : {}),
       ...(row.toolCallId ? { toolCallId: row.toolCallId } : {})
     });
+  });
+}
+
+// Persist the FINAL turn-ending text as a durable assistant chatMessage for
+// every completed chat task — the no-tool-calls answer, the context-exhaustion
+// partial result, and the iteration-cap/loop-stall summary all land here.
+// Without this row, priorChatMessages replays the session to the model with
+// the user's questions and tool transcripts but no answers, so the next turn
+// re-answers the previous question. syncChatTaskResult stays for
+// clients/pollers that need the message record returned (mobile /sync,
+// messaging pollers) and is idempotent against this write via its existing
+// short-circuit, which we mirror here (an existing non-transcript assistant
+// row) so neither path double-writes. jobId-bearing tasks are excluded:
+// finalizeJobRunFromTask owns their row plus delivery semantics. The [SILENT]
+// sentinel is suppressed exactly like the block/legacy paths. The row carries
+// the task's thread membership (threadId/parentBlockId) and links back to the
+// run (assistantMessageId), mirroring syncChatTaskResult's create path.
+async function persistFinalAnswerRow(
+  config: RuntimeConfig,
+  finished: Task,
+  finalText: string,
+  transcriptSessionId: string | undefined
+): Promise<void> {
+  if (
+    finished.status !== "completed" ||
+    finished.jobId ||
+    !transcriptSessionId ||
+    finalText.trim().length === 0 ||
+    finalText.trim() === "[SILENT]"
+  ) {
+    return;
+  }
+  await mutateState(config.instance, (state) => {
+    if (!state.chatSessions.some((s) => s.id === transcriptSessionId)) return;
+    const already = state.chatMessages.some(
+      (m) =>
+        m.taskId === finished.id &&
+        m.role === "assistant" &&
+        m.kind !== "approval_reason" &&
+        m.kind !== "tool_transcript"
+    );
+    if (already) return;
+    const message = createChatMessage(state, {
+      sessionId: transcriptSessionId,
+      role: "assistant",
+      content: finalText,
+      taskId: finished.id,
+      runId: finished.runId,
+      ...(finished.threadId ? { threadId: finished.threadId } : {}),
+      ...(finished.parentBlockId ? { parentBlockId: finished.parentBlockId } : {})
+    });
+    if (finished.runId) {
+      const run = state.runs.find((item) => item.id === finished.runId);
+      if (run) {
+        run.assistantMessageId = message.id;
+        run.updatedAt = message.createdAt;
+      }
+    }
   });
 }
 
@@ -1213,7 +1287,11 @@ function wrapInlinedFile(
 //
 // Images are inlined as data URLs (the provider can't authenticate against
 // /api/uploads/:id, so we inline base64 bytes); a missing/unreadable image is
-// dropped with a trace. The image path is NOT gated on `modality.vision`.
+// dropped with a trace. The image path IS gated on `modality.vision`: a
+// non-vision model degrades an image attachment to a text note instead of an
+// image_url part, and current-turn image attachments are rejected upstream by
+// runChatTask's vision guard, so a text-only provider never receives an
+// image_url part it would 400 on.
 //
 // Non-image files are delivered deterministically by capability, in core, with
 // no skill dependency: every file is materialized to the workspace, then —
@@ -1236,6 +1314,16 @@ export async function buildAttachmentContent(
   const files = attachments.filter((a) => !a.mimeType.startsWith("image/"));
   const loaded: Array<{ id: string; mimeType: string; size: number }> = [];
   for (const image of images) {
+    if (!modality.vision) {
+      // Non-vision model: the current turn is rejected upstream by runChatTask's vision
+      // guard, so we only reach here on a prior-turn replay. Degrade the image to a note
+      // rather than emitting an image_url part a text-only provider would 400 on.
+      parts.push({
+        type: "text",
+        text: `[Attached image: ${image.id} (${image.mimeType}, ${formatBytes(image.size)}) — not shown: the active model can't view images.]`
+      });
+      continue;
+    }
     const dataUrl = uploadDataUrl(config.instance, image.id);
     if (!dataUrl) {
       appendLog(config.instance, "chat.image.missing", { uploadId: image.id });
@@ -1983,6 +2071,8 @@ async function runLoop(
     });
     await updateRunFromTask(config, exhausted);
     await syncSubagentFromTask(config, exhausted);
+    // Durable answer row for the partial result (see persistFinalAnswerRow).
+    await persistFinalAnswerRow(config, exhausted, finalText, transcriptSessionId);
     if (exhausted.jobId) await finalizeJobRunFromTask(config, exhausted);
     if (exhausted.status === "completed") {
       void scheduleAutoRetain(config, exhausted);
@@ -2516,44 +2606,8 @@ async function runLoop(
       });
       await updateRunFromTask(config, finished);
       await syncSubagentFromTask(config, finished);
-      // Persist the FINAL turn-ending text as a durable assistant chatMessage
-      // for the session-bound-subagent path (a fan-out watch worker spawned
-      // into a concern channel). A normal chat turn gets this row from
-      // syncChatTaskResult (web /sync, messaging pollers, finalizeJobRunFromTask
-      // for jobId-bearing tasks); the fan-out worker is spawned via
-      // spawnSubagent and none of those fire, so its draft never becomes a
-      // chatMessage and the next turn in the channel replays empty history. We
-      // mirror syncChatTaskResult's own short-circuit (an existing non-transcript
-      // assistant row) so this never double-writes, and suppress the [SILENT]
-      // sentinel exactly like the block/legacy paths above.
-      if (
-        finished.status === "completed" &&
-        finished.subagentId &&
-        !finished.jobId &&
-        transcriptSessionId &&
-        finalText.trim().length > 0 &&
-        finalText.trim() !== "[SILENT]"
-      ) {
-        await mutateState(config.instance, (state) => {
-          if (!state.chatSessions.some((s) => s.id === transcriptSessionId)) return;
-          const already = state.chatMessages.some(
-            (m) =>
-              m.taskId === taskId &&
-              m.role === "assistant" &&
-              m.kind !== "approval_reason" &&
-              m.kind !== "tool_transcript"
-          );
-          if (already) return;
-          createChatMessage(state, {
-            sessionId: transcriptSessionId,
-            role: "assistant",
-            content: finalText,
-            taskId,
-            runId: finished.runId,
-            ...(finished.threadId ? { threadId: finished.threadId } : {})
-          });
-        });
-      }
+      // Durable answer row for the turn (see persistFinalAnswerRow).
+      await persistFinalAnswerRow(config, finished, finalText, transcriptSessionId);
       // Chat-mode tasks spawned by a scheduled job (create_job tool path)
       // need the same finalize hook the imperative path uses, otherwise
       // the JobRunRecord stays stuck in `running` and the chat-session
@@ -2777,7 +2831,8 @@ async function runLoop(
       emitToolCallRunning(emitCtx, {
         toolName: call.function.name,
         callId: call.id,
-        args: parsedArgs
+        args: parsedArgs,
+        resolveRefLabel: (ref) => peekRefLabel(taskId, ref)
       });
       // load_tools is handled INLINE (not via dispatchToolCall): it mutates
       // the loaded set, recomputes providerTools so the NEXT iteration ships
@@ -2830,6 +2885,40 @@ async function runLoop(
           data: { toolCallId: call.id, toolName: call.function.name }
         });
         continue;
+      }
+      // browser_navigate establishes a browsing session, so seed every
+      // deferred browser-toolset tool into the loaded set: the snapshot it
+      // returns is full of actionable @eN refs whose action vocabulary
+      // (snapshot, click, type, scroll, …) would otherwise cost a load_tools
+      // round-trip per tool. Mirrors the seedSubagentDeferred precedent for
+      // browser-scoped subagents. Seeding is unconditional on the navigate
+      // outcome (deterministic, harmless) and takes effect on the NEXT
+      // provider call — the loadedAtTurnStart gate above still nudges
+      // same-batch interaction calls, consistent with the deferred-tools
+      // contract. Persisted to task.loadedTools so an approval pause/resume
+      // keeps the cluster live (same pattern as the load_tools handler above).
+      if (call.function.name === "browser_navigate") {
+        const seededNames: string[] = [];
+        for (const tool of fullCatalog) {
+          if (tool.deferred && tool.toolset === "browser" && !loadedToolNames.has(tool.function.name)) {
+            loadedToolNames.add(tool.function.name);
+            seededNames.push(tool.function.name);
+          }
+        }
+        if (seededNames.length > 0) {
+          recompute();
+          await mutateState(config.instance, (state) => {
+            const item = findTask(state, taskId);
+            if (isTerminalTaskStatus(item.status)) return;
+            item.loadedTools = [...loadedToolNames];
+            item.updatedAt = now();
+          });
+          appendTrace(config.instance, taskId, {
+            type: "tool",
+            message: "Deferred browser tools seeded by browser_navigate",
+            data: { toolCallId: call.id, toolNames: seededNames }
+          });
+        }
       }
       try {
         const dispatch = await dispatchToolCall(
@@ -3184,6 +3273,8 @@ async function runLoop(
     });
     await updateRunFromTask(config, exhausted);
     await syncSubagentFromTask(config, exhausted);
+    // Durable answer row for the exhaustion summary (see persistFinalAnswerRow).
+    await persistFinalAnswerRow(config, exhausted, finalText, transcriptSessionId);
     if (exhausted.jobId) await finalizeJobRunFromTask(config, exhausted);
     if (exhausted.status === "completed") {
       void scheduleAutoRetain(config, exhausted);

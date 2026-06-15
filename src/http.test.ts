@@ -474,6 +474,12 @@ describe("runtime api", () => {
       url: "https://relay.test/consent", redirectUri: "http://127.0.0.1:8765/cb",
       waitForSession: () => Promise.resolve(session), cancel: () => {}
     };
+    // Inert manual drivers so nothing in this flow can shell out to a
+    // host-installed tailscale/ngrok/cloudflared (or flip their catalog rows).
+    const inertDriver = (requires: string) => ({
+      detect: () => Promise.resolve({ enabled: false, requires }),
+      connect: () => Promise.reject(new Error("manual driver must not run"))
+    });
     setTunnelDeps({
       loginUrl: () => Promise.resolve(handle),
       buildTunnel: (_opts: TunnelOptions) => child,
@@ -481,7 +487,12 @@ describe("runtime api", () => {
       resolveDefaults: () => relay,
       openBrowser: () => {},
       resolveLocalPort: () => 4321,
-      probeLocalPort: () => Promise.resolve(true)
+      probeLocalPort: () => Promise.resolve(true),
+      drivers: {
+        tailscale: inertDriver("Tailscale network"),
+        ngrok: inertDriver("ngrok account"),
+        cloudflare: inertDriver("cloudflared CLI")
+      }
     });
 
     try {
@@ -542,16 +553,62 @@ describe("runtime api", () => {
     }
   });
 
+  test("GET /api/tunnel?detect=1 re-probes driver availability and flips catalog rows", async () => {
+    const config = testConfig("tunnel-detect");
+    const handler = createHandler(config);
+    const inert = (requires: string) => ({
+      detect: () => Promise.resolve({ enabled: false, requires }),
+      connect: () => Promise.reject(new Error("unused"))
+    });
+    setTunnelDeps({
+      drivers: {
+        tailscale: { detect: () => Promise.resolve({ enabled: true }), connect: () => Promise.reject(new Error("unused")) },
+        ngrok: inert("ngrok account"),
+        cloudflare: inert("cloudflared CLI")
+      }
+    });
+    try {
+      // A plain GET never spawns detection: the catalog stays default-disabled.
+      const plain = await call(handler, config, "/api/tunnel");
+      const plainRow = plain.providers.find((p: { id: string }) => p.id === "tailscale");
+      expect(plainRow.enabled).toBe(false);
+      // detect=1 probes the drivers and the row flips.
+      const detected = await call(handler, config, "/api/tunnel?detect=1");
+      const row = detected.providers.find((p: { id: string }) => p.id === "tailscale");
+      expect(row.enabled).toBe(true);
+      expect(row.requires).toBeUndefined();
+    } finally {
+      setTunnelDeps();
+    }
+  });
+
   test("POST /api/tunnel/select rejects a disabled provider with a 400", async () => {
     const config = testConfig("tunnel-reject");
     const handler = createHandler(config);
-    const response = await rawCall(handler, config, "/api/tunnel/select", {
-      method: "POST",
-      body: JSON.stringify({ provider: "ngrok" })
-    }, config.token);
-    expect(response.status).toBe(400);
-    const value = await response.json();
-    expect(value.error).toContain("not available");
+    // The select path re-probes a disabled provider's prerequisite before
+    // rejecting — pin detection to disabled so the rejection (and this test)
+    // never depends on which CLIs the host machine happens to have.
+    setTunnelDeps({
+      drivers: {
+        tailscale: { detect: () => Promise.resolve({ enabled: false, requires: "Tailscale network" }), connect: () => Promise.reject(new Error("unused")) },
+        ngrok: { detect: () => Promise.resolve({ enabled: false, requires: "ngrok account" }), connect: () => Promise.reject(new Error("unused")) },
+        cloudflare: { detect: () => Promise.resolve({ enabled: false, requires: "cloudflared CLI" }), connect: () => Promise.reject(new Error("unused")) }
+      }
+    });
+    try {
+      const response = await rawCall(handler, config, "/api/tunnel/select", {
+        method: "POST",
+        body: JSON.stringify({ provider: "ngrok" })
+      }, config.token);
+      expect(response.status).toBe(400);
+      const value = await response.json();
+      expect(value.error).toContain("not available");
+      // The machine-readable code rides along so clients can branch on the
+      // failure kind (the web UI opens the provider's guide on this code).
+      expect(value.code).toBe("provider_unavailable");
+    } finally {
+      setTunnelDeps();
+    }
   });
 
   test("supports V1 skill governance and job run history workflows", async () => {
@@ -772,6 +829,30 @@ describe("runtime api", () => {
     expect(retry.input).toContain("remember chat history works");
     expect(detail.messages).toHaveLength(2);
     expect(detail.taskIds).toContain(submitted.taskId);
+  });
+
+  test("chat message POST accepts an optional client surface field", async () => {
+    const config = testConfig("chat-client-surface");
+    const handler = createHandler(config);
+
+    const session = await call(handler, config, "/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ title: "surface chat" })
+    });
+    // A valid `client` value lands on the spawned task; an unrecognized one
+    // resolves to unknown without rejecting the message (older clients must
+    // keep working). See ADR client-surface-context.md.
+    const tagged = await call(handler, config, `/api/chat/${session.id}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ content: "hello from my phone", client: "mobile" })
+    });
+    const untagged = await call(handler, config, `/api/chat/${session.id}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ content: "hello from somewhere", client: "fridge" })
+    });
+    const tasks = readState(config.instance).tasks;
+    expect(tasks.find((t) => t.id === tagged.taskId)?.clientSurface).toBe("mobile");
+    expect(tasks.find((t) => t.id === untagged.taskId)?.clientSurface).toBeUndefined();
   });
 
   test("approval-gated file patch produces a diff approval", async () => {
@@ -2788,14 +2869,17 @@ describe("runtime api", () => {
     expect(after?.status).toBe("pending");
   });
 
-  test("POST /api/setup-requests/<id>/complete refuses fill_secret slot values shorter than 4 chars", async () => {
+  test("POST /api/setup-requests/<id>/complete refuses sub-floor password-kind slot values", async () => {
     // The snapshot post-redactor uses literal substring replacement;
     // single-character (and other very short) values would shred
     // structural tokens like [@e1] in snapshot text. The 4-char
     // floor in src/tools/browser.ts:recordFilledSecret keeps the
-    // redactor safe, and /connect refuses values below that floor
-    // so the registry-skip-for-short-values doesn't leak the
-    // value via subsequent unredacted tool results.
+    // redactor safe. For a password-kind slot a sub-floor value is
+    // both a near-certain typo AND an un-redactable leak risk, so
+    // /connect refuses it (the registry-skip-for-short-values would
+    // otherwise let the value escape via a later unredacted tool
+    // result). Non-password slots take the opposite path — see the
+    // short-PII test below.
     const config = testConfig("complete-fill-secret-too-short");
     const handler = createHandler(config);
     const { createTask, upsertTask, createSetupRequest } = await import("./state");
@@ -2812,7 +2896,7 @@ describe("runtime api", () => {
         reason: "Sign in",
         payload: {
           slots: [
-            { name: "pin", locator: "@e1", label: "PIN", kind: "number" }
+            { name: "pin", locator: "@e1", label: "PIN", kind: "password" }
           ],
           reason: "Sign in",
           toolCallId: "call_fill",
@@ -2842,6 +2926,73 @@ describe("runtime api", () => {
     expect(body.message).toContain("pin");
     const after = readState(config.instance).setupRequests.find((a) => a.id === approval.id);
     expect(after?.status).toBe("pending");
+  });
+
+  test("POST /api/setup-requests/<id>/complete accepts a sub-floor non-password (PII) slot value", async () => {
+    // fill_secret also collects identity/PII fields — a real call
+    // asks for date of birth + last name. Short last names ("Shi",
+    // "Ng", "Li") are valid and must fill. The redaction floor is a
+    // redactor-safety constraint, not an input-validation gate, so a
+    // text-kind slot below the floor is accepted and filled (it is
+    // simply not redaction-registered, which is fine for a non-
+    // credential). Pin the boundary so the floor never silently
+    // re-broadens to block PII again.
+    const config = testConfig("complete-fill-secret-short-pii");
+    const handler = createHandler(config);
+    const { createTask, upsertTask, createSetupRequest } = await import("./state");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "short PII test");
+      upsertTask(state, task);
+      return task.id;
+    });
+    const approval = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        taskId,
+        action: "browser.fill_secret",
+        target: "https://example.com",
+        reason: "Look up account",
+        payload: {
+          slots: [
+            { name: "lastname", locator: "@e43", label: "Last Name", kind: "text" }
+          ],
+          reason: "Look up account",
+          toolCallId: "call_fill",
+          approvedUrl: "https://example.com"
+        }
+      })
+    );
+    const filled: Array<{ locator: string; value: string }> = [];
+    const { __test: browserTest } = await import("./tools/browser");
+    browserTest.installFakeSessionWithPageForTest(taskId, {
+      url: () => "https://example.com",
+      close: () => Promise.resolve(),
+      // browserFillByLocator resolves an @-ref to a literal
+      // [data-gini-ref] selector, then calls page.locator(sel).fill().
+      locator: (selector: string) => ({
+        fill: (value: string) => {
+          filled.push({ locator: selector, value });
+          return Promise.resolve();
+        },
+        evaluate: () => Promise.resolve()
+      })
+    } as unknown as Partial<import("playwright-core").Page>);
+    const response = await rawCall(
+      handler,
+      config,
+      `/api/setup-requests/${approval.id}/complete`,
+      {
+        method: "POST",
+        body: JSON.stringify({ secrets: { lastname: "Shi" } })
+      },
+      config.token
+    );
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.ok).toBe(true);
+    expect(body.filledSlots).toEqual(["lastname"]);
+    expect(filled).toEqual([{ locator: '[data-gini-ref="e43"]', value: "Shi" }]);
+    const after = readState(config.instance).setupRequests.find((a) => a.id === approval.id);
+    expect(after?.status).toBe("completed");
   });
 
   test("POST /api/setup-requests/<id>/complete: distinct 409 when live session exists but page navigated to a different origin", async () => {

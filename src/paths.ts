@@ -67,6 +67,19 @@ export function baseLogRoot(): string | undefined {
   return process.env.GINI_LOG_ROOT ? resolve(process.env.GINI_LOG_ROOT) : undefined;
 }
 
+// Machine-global marker present while `updateRuntime` (src/runtime/update.ts)
+// is rewriting the installed runtime at ~/.gini/runtime: git reset, the bun
+// installs, and the web production build. Global (not per-instance) because
+// the installed runtime is shared by every instance served from it. The
+// watchdog reads it each tick and suppresses revive actions while the file
+// is fresh (<15 min) — probe misses are expected during the install/build
+// window, and a `kickstart -k` then would force-kill a healthy-but-busy
+// service. The writer removes it in a finally; the freshness cutoff keeps a
+// crashed update from disarming the watchdog forever.
+export function updateInProgressMarkerPath(): string {
+  return join(baseStateRoot(), "update-in-progress");
+}
+
 // All instance state lives under <baseStateRoot>/instances/<instance>/ so wiping every
 // instance is a single rm -rf without touching the shared model cache or logs.
 export function instancesRoot(): string {

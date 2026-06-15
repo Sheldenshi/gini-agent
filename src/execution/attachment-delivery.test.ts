@@ -246,7 +246,7 @@ describe("attachment delivery", () => {
     expect(documentParts(parts).length).toBe(0);
   });
 
-  test("image attachments stay image_url and are not gated on vision", async () => {
+  test("image attachment on a non-vision provider degrades to a text note", async () => {
     // A real-ish PNG header is enough; uploadDataUrl just base64s the bytes.
     const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01]);
     const upload = storeUpload(config.instance, png, "image/png", "pic.png");
@@ -255,7 +255,23 @@ describe("attachment delivery", () => {
       config,
       "see this",
       [{ id: upload.id, mimeType: "image/png", size: upload.size }],
-      TEXT_ONLY, // vision:false must NOT drop the image
+      TEXT_ONLY, // vision:false must NOT emit an image_url part a text-only provider would 400 on
+      true
+    );
+
+    expect(parts.every((p) => p.type !== "image_url")).toBe(true);
+    expect(textParts(parts).some((t) => t.includes("can't view images"))).toBe(true);
+  });
+
+  test("image attachment on a vision provider stays an image_url part", async () => {
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01]);
+    const upload = storeUpload(config.instance, png, "image/png", "pic.png");
+
+    const parts = await buildAttachmentContent(
+      config,
+      "see this",
+      [{ id: upload.id, mimeType: "image/png", size: upload.size }],
+      NATIVE, // vision:true keeps the inlined image bytes
       true
     );
 

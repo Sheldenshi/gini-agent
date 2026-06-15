@@ -7,7 +7,7 @@
 
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import type { AgentIdentity, IdentitySnapshotRecord, JobRecord } from "./types";
+import type { AgentIdentity, ChatClientSurface, IdentitySnapshotRecord, JobRecord } from "./types";
 
 // Number of user turns in the same chat session between full identity
 // re-emissions. Below this threshold the model receives only field-level
@@ -208,16 +208,21 @@ export function buildAgentSystemContext(options?: AgentSystemContextOptions): st
 
 // Render the ephemeral per-turn context body that rides in a role:"user"
 // message placed after the full prior transcript and immediately before
-// the real user message. It carries the two per-turn-varying blocks that
-// used to break the cacheable system prefix:
-//   1. emitted identity — the tell-once/delta/refresh block, when emitted.
-//   2. recalled memory  — Hindsight long-term memory for this turn's query.
-// Blocks are joined by a blank line in the same order they used to sit in
-// the system prompt (identity before memory); each is elided when empty.
-// Returns "" when both are empty so the caller can skip injecting a tail
-// message entirely. See ADR stable-system-prefix.md.
-export function renderEphemeralContext(emittedIdentity?: string, recalledContext?: string): string {
+// the real user message. It carries the per-turn-varying blocks that
+// would break the cacheable system prefix:
+//   1. client surface  — which surface the CURRENT message came from, when
+//      known (see buildClientSurfaceBlock).
+//   2. emitted identity — the tell-once/delta/refresh block, when emitted.
+//   3. recalled memory  — Hindsight long-term memory for this turn's query.
+// Blocks are joined by a blank line (identity before memory, as they used
+// to sit in the system prompt); each is elided when empty. Returns ""
+// when all are empty so the caller can skip injecting a tail message
+// entirely. See ADR stable-system-prefix.md.
+export function renderEphemeralContext(emittedIdentity?: string, recalledContext?: string, clientSurfaceNote?: string): string {
   const parts: string[] = [];
+  if (clientSurfaceNote && clientSurfaceNote.length > 0) {
+    parts.push(clientSurfaceNote);
+  }
   if (emittedIdentity && emittedIdentity.length > 0) {
     parts.push(emittedIdentity);
   }
@@ -245,6 +250,33 @@ export function buildCurrentDateBlock(now: Date, timeZone: string): string {
     timeZone
   });
   return `Current date: ${date} (${timeZone}). For the exact current wall-clock time, call get_current_time.`;
+}
+
+// Per-turn client-surface line for the ephemeral role:"user" tail. Names
+// the surface the CURRENT inbound message was sent from and what that
+// implies for a visible-browser handoff: a window opened by the browser
+// tools appears on the gateway machine, so it only helps a user sitting at
+// that computer. Per-message (NOT in the byte-stable system prefix, and
+// never cached per-session) because the same session can alternate between
+// phone and desktop. Returns "" for an unknown surface so the prompt makes
+// no claim rather than guessing. See ADR client-surface-context.md.
+export function buildClientSurfaceBlock(surface: ChatClientSurface | undefined): string {
+  switch (surface) {
+    case "web":
+      return "The user is messaging from the web app on a computer — likely at the gateway machine, where a visible browser window opened by the browser tools would be visible to them.";
+    case "cli":
+      return "The user is messaging from the CLI on the gateway machine — a visible browser window opened by the browser tools would be visible to them.";
+    case "mobile":
+      return "The user is messaging from the mobile app on their phone — they are NOT at the gateway machine, so a visible browser window opened there is useless to them.";
+    case "telegram":
+      return "The user is messaging from Telegram — they are likely NOT at the gateway machine, so a visible browser window opened there is useless to them.";
+    case "discord":
+      return "The user is messaging from Discord — they are likely NOT at the gateway machine, so a visible browser window opened there is useless to them.";
+    case "openclaw":
+      return "The user is messaging through an OpenClaw bridge — they are likely NOT at the gateway machine, so a visible browser window opened there is useless to them.";
+    default:
+      return "";
+  }
 }
 
 // Structured, unambiguous current-time string returned by the

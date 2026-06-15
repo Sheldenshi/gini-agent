@@ -61,6 +61,25 @@ export function peekCurrentBrowserUrl(taskId: string): string | undefined {
   }
 }
 
+// Synchronously read the accessibility role + name a snapshot recorded for
+// a ref, if the task's session still holds it. Used by the chat tool_call
+// preview so a click row reads `button "Buy a License"` instead of the
+// opaque `@e38`. Refs are stored `@`-prefixed (see resolveRefForAction);
+// we normalize so a caller passing either form resolves. Returns undefined
+// when there's no live session or the ref was swept — the preview falls
+// back to the bare ref.
+export function peekRefLabel(
+  taskId: string,
+  ref: string
+): { role: string; name: string } | undefined {
+  const session = sessions.get(taskId);
+  if (!session) return undefined;
+  const normalized = ref.startsWith("@") ? ref : `@${ref}`;
+  const target = session.refs.get(normalized);
+  if (!target) return undefined;
+  return { role: target.role, name: target.name };
+}
+
 const SNAPSHOT_CHAR_BUDGET = 32_000;
 const IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 const SWEEP_INTERVAL_MS = 30_000;

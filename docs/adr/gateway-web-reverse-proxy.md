@@ -69,8 +69,9 @@ bearer-injecting BFF calls to a foreign instance.
   the whole web surface is down, so a browser cannot be mid-session against a
   dead BFF — the banner is the correct self-describe.
 - The gateway is the single trust front: it validates every web-bound request's
-  `Host`/`Origin` (loopback / gini-relay subdomain / `GINI_TRUSTED_ORIGINS`,
-  fail-closed on a malformed allowlist, plus a `Sec-Fetch-Site` check) and then
+  `Host`/`Origin` (loopback / gini-relay subdomain / runtime-managed tunnel
+  host / `GINI_TRUSTED_ORIGINS`, fail-closed on a malformed allowlist, plus a
+  `Sec-Fetch-Site` check) and then
   rewrites `Host`/`Origin` to loopback before proxying, so the inner web child is
   purely internal and needs no relay awareness. External (non-relay,
   non-loopback) exposure still requires `GINI_TRUSTED_ORIGINS` to include the

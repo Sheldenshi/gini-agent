@@ -13,6 +13,7 @@ import { dirname, join } from "node:path";
 import { spawn } from "bun";
 import type {
   Authorization,
+  ChatClientSurface,
   ImageAttachment,
   RuntimeConfig,
   RuntimeState,
@@ -98,6 +99,7 @@ import { resolveApprovalPolicy, type PolicyAction } from "./execution/policy";
 import { resolveEffectiveContext } from "./execution/effective-context";
 import { browserDownloadApproved, browserUploadFileApproved } from "./tools/browser";
 import { connectBrowser } from "./capabilities/browser-connect";
+import { findSkillScript, invokeSkillScript } from "./capabilities/skill-scripts";
 import {
   abortApprovalsForTask,
   claimApproval,
@@ -147,6 +149,10 @@ export interface SubmitTaskOptions {
   // Threaded through to Task.images so the chat-task loop can dispatch
   // vision content without re-reading the chat message.
   images?: ImageAttachment[];
+  // Client surface of the user message that spawned this task. Threaded
+  // through to Task.clientSurface so the per-turn prompt can name the
+  // surface of the CURRENT message. See ADR client-surface-context.md.
+  clientSurface?: ChatClientSurface;
   // Set when the task replies inside a thread. Stamped on the task so
   // resolveEmitContext threads the whole response (every emit* block lands
   // tagged with the same thread_id/parent_block_id), not just the user turn.
@@ -180,6 +186,7 @@ export async function submitTask(
   );
   if (options.mode) created.mode = options.mode;
   if (options.images && options.images.length > 0) created.images = options.images;
+  if (options.clientSurface) created.clientSurface = options.clientSurface;
   if (options.threadId) created.threadId = options.threadId;
   if (options.parentBlockId) created.parentBlockId = options.parentBlockId;
   // When a parentTaskId is set, the upsert + the parent-status
@@ -2336,6 +2343,84 @@ async function runApprovedAction(
       await resumeChatTask(config, approval.taskId, chatToolCallId, result);
     }
     return result;
+  }
+
+  if (approval.action === "skill.run") {
+    // Approved skill_run on a script gated via requires.approval (see
+    // ADR skill-script-approval-gating.md). Calls invokeSkillScript
+    // directly — the skill_run dispatch gate already fired when this
+    // approval was created, so re-routing through dispatch would gate
+    // it twice. The hook handler's invokeSkillScript path is likewise
+    // untouched by the gate.
+    const skillName = String(approval.payload.skillName ?? "");
+    const scriptName = String(approval.payload.scriptName ?? "");
+    const scriptArgs = (approval.payload.scriptArgs && typeof approval.payload.scriptArgs === "object" && !Array.isArray(approval.payload.scriptArgs))
+      ? approval.payload.scriptArgs as Record<string, unknown>
+      : {};
+    if (signal.aborted) {
+      const aborted = JSON.stringify({ ok: false, aborted: true, error: "skill.run aborted: task was cancelled." });
+      if (approval.taskId) {
+        appendTrace(config.instance, approval.taskId, {
+          type: "tool",
+          message: "skill.run aborted by task cancellation",
+          data: { skill: skillName, script: scriptName, aborted: true }
+        });
+      }
+      return aborted;
+    }
+    // Re-resolve the script handle at execution time: the skill may have
+    // been disabled (or the script removed) between the approval request
+    // and the user's decision. Fail the tool result cleanly rather than
+    // running against a stale handle.
+    let resultStr: string;
+    let resultOk: boolean;
+    const handle = findSkillScript(readState(config.instance), skillName, scriptName);
+    if (!handle) {
+      resultOk = false;
+      resultStr = JSON.stringify({
+        ok: false,
+        error: `Skill script not found: ${skillName}/${scriptName}. The skill may have been disabled since the approval was requested.`
+      });
+    } else {
+      // Same result mapping as skillRunTool so the model sees an
+      // identical tool-result shape on both the gated and ungated paths.
+      const result = await invokeSkillScript(config, handle, scriptArgs, { taskId: approval.taskId });
+      resultOk = result.ok;
+      if (result.parsed !== null && result.parsed !== undefined) {
+        resultStr = typeof result.parsed === "string" ? result.parsed : JSON.stringify(result.parsed);
+      } else {
+        resultStr = JSON.stringify({ ok: result.ok, error: result.error ?? "Skill script returned no output." });
+      }
+    }
+    const task = await mutateState(config.instance, (state) => {
+      addAudit(
+        state,
+        {
+          actor: "agent",
+          action: "skill.run",
+          target: `${skillName}/${scriptName}`,
+          risk: "high",
+          taskId: approval.taskId,
+          runId: approval.taskId ? state.tasks.find((t) => t.id === approval.taskId)?.runId : undefined,
+          approvalId: approval.id,
+          evidence: { ...extraEvidence, skill: skillName, script: scriptName, ok: resultOk }
+        },
+        approvalAgentContext(approval)
+      );
+      return approval.taskId ? state.tasks.find((item) => item.id === approval.taskId) : undefined;
+    });
+    if (approval.taskId) {
+      appendTrace(config.instance, approval.taskId, {
+        type: "tool",
+        message: "skill.run completed",
+        data: { skill: skillName, script: scriptName, ok: resultOk }
+      });
+    }
+    if (task) await updateRunFromTask(config, task);
+    if (shouldResumeChat && chatToolCallId && approval.taskId) {
+      await resumeChatTask(config, approval.taskId, chatToolCallId, resultStr);
+    }
+    return resultStr;
   }
 
   if (approval.action === "messaging.send") {

@@ -203,7 +203,7 @@ export async function update(ctx: CliContext): Promise<void> {
 
   let result;
   try {
-    result = updateRuntime(installedRuntimeDir());
+    result = await updateRuntime(installedRuntimeDir());
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));
     process.exit(1);

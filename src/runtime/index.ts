@@ -8,7 +8,7 @@ import { resolveEffectiveContext } from "../execution/effective-context";
 import { closeMemoryDb, getMemoryDb, memoryDbPath } from "../state/memory-db";
 import { migratePinnedMemoriesToUserProfile } from "../memory/migrate-pinned-to-user-md";
 import { providerHealth } from "../provider";
-import { migrateInstructionsIdentityLine, seedAgentSoulFile, scaffoldInstanceIdentityFiles } from "./identity-files";
+import { migrateInstructionsIdentityLine, reseedDefaultInstructions, seedAgentSoulFile, scaffoldInstanceIdentityFiles } from "./identity-files";
 import { currentVersionInfo } from "./update";
 
 export function status(config: RuntimeConfig) {
@@ -104,6 +104,13 @@ export async function install(config: RuntimeConfig): Promise<void> {
   // framework wording) to the current generic line. The agent's name now
   // lives in its SOUL.md. Idempotent + best-effort.
   migrateInstructionsIdentityLine(config.instance);
+  // The seeded INSTRUCTIONS.md shadows the bundled default forever, so an
+  // instance created before a defaults change never picks it up on its own.
+  // When the on-disk file byte-matches a previously shipped default (incl.
+  // the post-identity-line-migration variant of one), replace it with the
+  // current bundled default. A user-edited file never hash-matches and is
+  // never touched. Idempotent + best-effort.
+  reseedDefaultInstructions(config.instance);
   // Approval-mode migration: legacy configs that carry
   // `dangerouslyAutoApprove: true` without an explicit `approvalMode`
   // get aliased to `approvalMode: "yolo"`. Patch the in-memory config

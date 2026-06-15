@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RuntimeConfig } from "./types";
 import { createHandler, isPairingBootstrapPath, resetPairingLimiters } from "./http";
+import { clearRuntimeTunnelTrust, setRuntimeTunnelTrust } from "./lib/origin-trust";
 import { createPairingRequest, mutateState } from "./state";
 
 // The pairing rate limiters are module-level singletons shared across this
@@ -171,6 +172,28 @@ describe("pairing routes — device create + poll", () => {
     expect(cookie).toContain("HttpOnly");
     expect(cookie).toContain("Secure");
     expect(cookie).toContain("Path=/api/pairing");
+  });
+
+  test("create on a runtime-managed tunnel front sets Secure (the runtime only publishes https fronts)", async () => {
+    // A runtime-driven tunnel terminates TLS upstream, so the gateway hop is
+    // plain http with no X-Forwarded-Proto guarantee — the host being a
+    // connected runtime tunnel is itself the proof of an https front.
+    setRuntimeTunnelTrust("pair-tunnel-secure", "https://machine.tail-test.ts.net");
+    try {
+      const { handler } = makeHandler("pair-tunnel-secure");
+      const res = await pair(handler, "/api/pairing/request", {
+        method: "POST",
+        host: "machine.tail-test.ts.net",
+        origin: "https://machine.tail-test.ts.net",
+        secFetchSite: "same-origin",
+        body: {}
+      });
+      expect(res.status).toBe(201);
+      const cookie = res.headers.getSetCookie().find((c) => c.startsWith("gini_pair="));
+      expect(cookie).toContain("Secure");
+    } finally {
+      clearRuntimeTunnelTrust();
+    }
   });
 
   test("create over a plain-http trusted front omits Secure on the binding cookie", async () => {
@@ -709,6 +732,25 @@ describe("pairing routes — native client (mobile)", () => {
     // Native is cookieless — the secret rides the body, NOT a Set-Cookie, so the
     // iOS cookie jar never persists a gini_pair the gateway won't read.
     expect(setCookieValue(res, "gini_pair")).toBeUndefined();
+  });
+
+  test("native create works on a runtime-managed tunnel front (same trust as the relay)", async () => {
+    setRuntimeTunnelTrust("pair-native-tunnel", "https://machine.tail-test.ts.net");
+    try {
+      const { handler } = makeHandler("pair-native-tunnel");
+      const res = await pair(handler, "/api/pairing/request", {
+        method: "POST",
+        host: "machine.tail-test.ts.net",
+        pairClient: "native",
+        userAgent: "GiniMobile/1.0 (iOS)",
+        body: {}
+      });
+      expect(res.status).toBe(201);
+      const body = await res.json();
+      expect(body.bindSecret).toMatch(/^[0-9a-f]{64}$/);
+    } finally {
+      clearRuntimeTunnelTrust();
+    }
   });
 
   test("a no-Origin POST WITHOUT the native opt-in is still refused (the exemption requires opt-in)", async () => {

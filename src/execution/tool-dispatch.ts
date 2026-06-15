@@ -260,7 +260,7 @@ async function dispatchToolCallInner(
     case "mcp_call":
       return { kind: "sync", result: await mcpCallTool(config, taskId, args) };
     case "skill_run":
-      return { kind: "sync", result: await skillRunTool(config, taskId, args) };
+      return await skillRunDispatch(config, taskId, toolCallId, args);
     case "vision_query":
       return { kind: "sync", result: await visionQueryTool(config, taskId, args) };
     case "request_connector":
@@ -384,17 +384,20 @@ async function dispatchToolCallInner(
       return await dispatchSelfOp(config, taskId, toolCallId, toolName, args);
     case "browser_connect": {
       // browser.connect is a SetupRequest (user-actor): the user opens the
-      // visible browser, signs in, then clicks Connect. There is no
+      // visible browser, performs their step (sign-in, or a handoff step
+      // like payment entry), then signals done. There is no
       // "auto-approve" path — the user has to perform the action — so
       // bypass pendingOrAuto and always return the pending approval id.
       //
       // Navigate-first precondition (same contract as browser_fill_secrets):
-      // browser_connect's only job is to clear a sign-in / auth wall the agent
-      // ALREADY hit by navigating. Calling it cold — before any browser_navigate
+      // both sanctioned uses act on a page the agent ALREADY reached by
+      // navigating — a sign-in / auth wall to clear, or a sensitive step the
+      // user must perform themselves (ADR browser-connect-handoff.md).
+      // Calling it cold — before any browser_navigate
       // — is a misuse that would pop a spurious "Connect" card at the user for
       // what is really an ordinary browse-the-web request. Refuse the cold call
       // and steer the agent to browse headless first; it then only escalates to
-      // a Connect prompt when a navigation genuinely lands on a sign-in wall.
+      // a Connect prompt when a navigation genuinely reaches such a step.
       // Validate the reason first so a missing reason fails identically
       // regardless of browser state.
       requireString(args, "reason");
@@ -414,7 +417,7 @@ async function dispatchToolCallInner(
           result: JSON.stringify({
             ok: false,
             error:
-              "browser_connect only clears a sign-in or auth wall you have already hit. No browser page is open yet — call browser_navigate (headless) to open the page first, and call browser_connect only if that navigation lands on a login, OAuth, or 401/403 wall."
+              "browser_connect only acts on a page you have already reached — a sign-in wall to clear, or a step the user must perform themselves. No browser page is open yet — call browser_navigate (headless) to open the page first, and call browser_connect only when that page genuinely needs the user (a login, OAuth, or 401/403 wall, or a handoff step like payment entry)."
           })
         };
       }
@@ -442,7 +445,7 @@ async function dispatchToolCallInner(
           result: JSON.stringify({
             ok: false,
             error:
-              "You've already surfaced a Connect card for this site twice in this task and the sign-in wall hasn't cleared. Do NOT call browser_connect again for this site. If you can finish without signing in, continue; otherwise stop and tell the user you're blocked on signing in to this site."
+              "You've already surfaced a Connect card for this site twice in this task and the step it was for (sign-in or a user handoff) hasn't been completed. Do NOT call browser_connect again for this site. If you can finish without the user acting in the browser, continue; otherwise stop and tell the user you're blocked waiting on them to complete that step on this site."
           })
         };
       }
@@ -963,7 +966,7 @@ async function webSearchTool(config: RuntimeConfig, taskId: string, args: Record
     // keeps the generic line (nothing is connected at all).
     const requestedLabel = requested ? (getProvider(requested)?.label ?? requested) : undefined;
     throw new ToolDisplayError(
-      `Web search is unavailable: no healthy ${wanted} connector. Your next move is to call request_connector with provider '${requested ?? "brave-search"}' so the user can paste an API key — then retry this search. Do NOT fall back to web_fetch on guessed URLs; the user asked for real web search, and guessing URLs bypasses that intent.`,
+      `Web search via a connector is unavailable: no healthy ${wanted} connector. You still have live-web tools, so do NOT answer from memory — search another way and answer from what you find: use browser_navigate to query a search engine (e.g. https://duckduckgo.com/?q=<query> or https://www.google.com/search?q=<query>) and read the results, or web_fetch a search-results URL. Querying a real search engine like this IS searching; only guessing random content URLs is not. You can also call request_connector with provider '${requested ?? "brave-search"}' to add a search API key for faster, cleaner results going forward, then retry this tool.`,
       {
         displayMessage: requestedLabel ? `${requestedLabel} is not connected.` : "No search provider connected.",
         severity: "info"
@@ -1087,6 +1090,89 @@ function truncate(text: string, max: number): string {
   return `${text.slice(0, max)}\n... (truncated)`;
 }
 
+// skill_run dispatch wrapper: scripts a skill declares under
+// `metadata.gini.requires.approval` ALWAYS pause for an explicit user
+// Approve/Deny — mode-independent, like browser_connect bypassing
+// pendingOrAuto. auto/yolo must NOT bypass this gate: a gated script
+// (e.g. phone-call/place-call) performs an outward-facing, irreversible
+// side effect, and the approval card IS the user's confirmation.
+// Ungated scripts stay on the plain sync path below.
+//
+// The gate lives HERE, in skill_run dispatch, and deliberately NOT in
+// invokeSkillScript: internal callers — the skill-script pre-run hook
+// handler (skill-script-hook.ts) and the approved-action executor in
+// agent.ts — call invokeSkillScript directly and must stay ungated.
+// See ADR skill-script-approval-gating.md.
+async function skillRunDispatch(
+  config: RuntimeConfig,
+  taskId: string,
+  toolCallId: string,
+  args: Record<string, unknown>
+): Promise<DispatchResult> {
+  const skillName = requireString(args, "skill");
+  const scriptName = requireString(args, "script");
+  const handle = findSkillScript(readState(config.instance), skillName, scriptName);
+  if (handle && (handle.skill.requiresApprovalScripts ?? []).includes(scriptName)) {
+    let approvalId: string;
+    try {
+      approvalId = await requestSkillScriptApproval(config, taskId, toolCallId, skillName, scriptName, skillScriptArgs(args));
+    } catch (err) {
+      // Same conversion pendingOrAuto performs: a terminal task means
+      // the approval row was never created — surface a clean skip.
+      if (err instanceof TaskAlreadyTerminalError) {
+        return { kind: "sync", result: `Action skipped: task was already ${err.status} when the request reached the runtime.` };
+      }
+      throw err;
+    }
+    return { kind: "pending", approvalId };
+  }
+  return { kind: "sync", result: await skillRunTool(config, taskId, args) };
+}
+
+// Mint the skill.run approval row. Mirrors requestTerminalExec: the
+// reason is what the user reads on the approval card, so it carries a
+// compact preview of the script args alongside the skill/script pair.
+async function requestSkillScriptApproval(
+  config: RuntimeConfig,
+  taskId: string,
+  toolCallId: string,
+  skillName: string,
+  scriptName: string,
+  scriptArgs: Record<string, unknown>
+): Promise<string> {
+  const preview = JSON.stringify(scriptArgs);
+  const argsPreview = preview.length > 400 ? `${preview.slice(0, 400)}…` : preview;
+  return mutateState(config.instance, (state: RuntimeState) => {
+    const item = findTask(state, taskId);
+    if (isTerminalTaskStatus(item.status)) {
+      throw new TaskAlreadyTerminalError(taskId, item.status);
+    }
+    const approval = createAuthorization(state, {
+      taskId: item.id,
+      action: "skill.run",
+      target: `${skillName}/${scriptName}`,
+      risk: "high",
+      reason: `Run skill script ${skillName}/${scriptName}: ${argsPreview}`,
+      payload: { skillName, scriptName, scriptArgs, toolCallId }
+    });
+    item.approvalIds.push(approval.id);
+    item.updatedAt = now();
+    appendTrace(config.instance, item.id, {
+      type: "approval",
+      message: "Approval requested for skill script (chat-task)",
+      data: { approvalId: approval.id, skill: skillName, script: scriptName, toolCallId }
+    });
+    return approval.id;
+  });
+}
+
+// The optional `args` object a skill_run call forwards to the script.
+function skillScriptArgs(args: Record<string, unknown>): Record<string, unknown> {
+  return args.args && typeof args.args === "object" && !Array.isArray(args.args)
+    ? args.args as Record<string, unknown>
+    : {};
+}
+
 // skill_run dispatch: looks up the requested skill+script and spawns the
 // script with stdin = JSON args. Returns the script's JSON stdout
 // verbatim, or a clear { ok: false, error } envelope on script failure
@@ -1099,9 +1185,7 @@ async function skillRunTool(
 ): Promise<string> {
   const skillName = requireString(args, "skill");
   const scriptName = requireString(args, "script");
-  const scriptArgs = args.args && typeof args.args === "object" && !Array.isArray(args.args)
-    ? args.args as Record<string, unknown>
-    : {};
+  const scriptArgs = skillScriptArgs(args);
   const handle = findSkillScript(readState(config.instance), skillName, scriptName);
   if (!handle) {
     return JSON.stringify({
@@ -1386,6 +1470,13 @@ async function createJobTool(
     }
     timeoutSeconds = args.timeoutSeconds;
   }
+  // `preRunHook` passes through UNVALIDATED on purpose: the authoritative
+  // shape + known-handler (isKnownHook) validation lives in
+  // `createScheduledJob` — the same seam the HTTP /api/jobs route uses — and
+  // its typed `Invalid input: …` relays back as the tool-result error.
+  // Duplicating the registry check here would just drift from that one
+  // source of truth.
+  const preRunHook = args.preRunHook;
 
   // Walk task -> run -> conversation to determine whether the agent is
   // invoking us from inside a chat task. If so, we want each scheduled
@@ -1451,7 +1542,8 @@ async function createJobTool(
       approvalMode,
       autoApproveCommands,
       dangerousTerminalPatterns,
-      timeoutSeconds
+      timeoutSeconds,
+      preRunHook
     }, {
       // Inherit the originating task's owning agent so a scheduler tick
       // doesn't reattribute the job to whichever agent happens to be
@@ -1493,7 +1585,10 @@ async function createJobTool(
           approvalMode,
           autoApproveCommands,
           dangerousTerminalPatterns,
-          timeoutSeconds
+          timeoutSeconds,
+          // Handler id only — the hook's declarative config can carry bulky
+          // per-script data the audit row doesn't need.
+          preRunHookHandlerId: job.preRunHook?.handlerId
         }
       },
       { taskId: item.id }
@@ -1512,6 +1607,7 @@ async function createJobTool(
       oneShot,
       skillNames: job.skillNames,
       chatSessionId,
+      preRunHookHandlerId: job.preRunHook?.handlerId,
       dangerouslyAutoApprove,
       approvalMode,
       autoApproveCommands,
@@ -3241,6 +3337,11 @@ async function requestBrowserConnect(
   // Validated minimally; safetyCheck runs server-side in the open-browser
   // endpoint before navigation.
   const url = resolveConnectUrl(args, taskId);
+  // Handoff mode is opt-in: only an explicit mode:"handoff" rides the payload
+  // (it flips the web card's completion button from "I've signed in" to
+  // "I'm done" — ADR browser-connect-handoff.md). Anything else, including
+  // the unset default, keeps the payload byte-identical to the sign-in flow.
+  const handoff = args.mode === "handoff";
   return mutateState(config.instance, (state: RuntimeState) => {
     const item = findTask(state, taskId);
     if (isTerminalTaskStatus(item.status)) {
@@ -3254,14 +3355,14 @@ async function requestBrowserConnect(
       // the body when rendering a browser.connect card.
       target: reason,
       reason: reasonOverride ?? "Opening a managed browser window requires explicit approval.",
-      payload: { reason, toolCallId, headless, url }
+      payload: { reason, toolCallId, headless, url, ...(handoff ? { mode: "handoff" } : {}) }
     });
     item.approvalIds.push(approval.id);
     item.updatedAt = now();
     appendTrace(config.instance, item.id, {
       type: "approval",
       message: "Approval requested for browser connect (chat-task)",
-      data: { approvalId: approval.id, reason, toolCallId, headless, url }
+      data: { approvalId: approval.id, reason, toolCallId, headless, url, ...(handoff ? { mode: "handoff" } : {}) }
     });
     return approval.id;
   });

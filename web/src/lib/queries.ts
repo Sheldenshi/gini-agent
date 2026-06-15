@@ -797,7 +797,7 @@ export function useReplyToThread(sessionId: string | null, threadId: string | nu
     mutationFn: (input) =>
       api(`/chat/${sessionId}/threads/${threadId}/messages`, {
         method: "POST",
-        body: JSON.stringify(input)
+        body: JSON.stringify({ ...input, client: "web" })
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["chat"] });

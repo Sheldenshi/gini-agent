@@ -13,6 +13,7 @@ Gini is not just a chat box, CLI, messaging bot, or pile of tools. Chat is an in
 - [Memory](docs/memory.md): retain, recall, embeddings, reranking, review, and storage
 - [Runtime Capabilities](docs/runtime-capabilities.md): current CLI/API capability map and verification commands
 - [Operations](docs/operations.md): install, start, stop, smoke, diagnostics, and cleanup
+- [Remote Access](docs/remote-access.md): tunnel modes and confirmation, plus a self-contained guide per tunnel provider — [Gini Relay](docs/remote-access/gini-relay.md), [Tailscale](docs/remote-access/tailscale.md), [ngrok](docs/remote-access/ngrok.md), [Cloudflare](docs/remote-access/cloudflare.md) — the same pages the app opens inline
 - [Releases](docs/releases.md): versioning, CHANGELOG conventions, and the release process
 - [Migrating from openclaw](docs/migration-from-openclaw.md): import an existing openclaw install into gini
 - [Implementation Notes](docs/implementation-notes.md): source layout and module boundary rules

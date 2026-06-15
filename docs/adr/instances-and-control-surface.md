@@ -33,7 +33,9 @@ Pinning `default` to fixed memorable ports lets `gini start` produce a stable UR
   user-domain LaunchAgents under `~/Library/LaunchAgents/`:
   `ai.lilaclabs.gini.<instance>.gateway` (Bun runtime, runs
   `src/server.ts` directly), `ai.lilaclabs.gini.<instance>.web`
-  (Next.js dev server, gated on the gateway becoming healthy via a
+  (Next.js server — prod or dev per
+  [Web Production Serving](web-production-serving.md) — gated on the
+  gateway becoming healthy via a
   shell shim), and `ai.lilaclabs.gini.<instance>.watchdog` (a
   long-lived health-probe loop). All three are supervised with
   `KeepAlive` set to `true` (launchd always respawns on *any* exit,

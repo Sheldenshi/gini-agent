@@ -18,13 +18,30 @@
 //   2. Probe the web (Next.js) child at /api/runtime/__healthz via
 //      isSupervisedWebChild (verifies service:"gini-web" + matching instance,
 //      so we don't mistake some other local process on the port for ours).
-//   3. If the runtime is dead/hung -> `launchctl kickstart -k` the gateway.
-//      KeepAlive should respawn it, but on macOS 26 launchd frequently defers
-//      the auto-respawn indefinitely; the explicit kickstart forces it.
-//   4. If web is dead/hung -> capture the web log tails, build + write a
-//      redacted crash report into the pending/ queue, THEN kickstart -k the web
-//      service. The report is offered to the user on the next restart and filed
-//      only on consent — the watchdog never files anything itself.
+//   3. If the runtime is dead/hung for TWO consecutive ticks -> `launchctl
+//      kickstart -k` the gateway. KeepAlive should respawn it, but on macOS 26
+//      launchd frequently defers the auto-respawn indefinitely; the explicit
+//      kickstart forces it.
+//   4. If web is dead/hung for TWO consecutive ticks -> capture the web log
+//      tails, build + write a redacted crash report into the pending/ queue,
+//      THEN kickstart -k the web service. The report is offered to the user on
+//      the next restart and filed only on consent — the watchdog never files
+//      anything itself.
+//
+// The two-strike rule exists because a single 2s-timeout probe can
+// false-negative a healthy-but-busy service: a post-update Next.js rebuild
+// pegs the CPU, the probe times out, and a first-tick `kickstart -k` (a
+// force-kill with no drain) kills the mid-compile web server — extending the
+// very outage the watchdog exists to shorten. `--once` keeps the threshold at
+// 1 so a single diagnostic tick can still revive.
+//
+// While a runtime update is rewriting ~/.gini/runtime (fresh
+// update-in-progress marker on disk, written by src/runtime/update.ts),
+// every revive action is suppressed: probe misses are expected during the
+// install/build window. The tick still probes and logs
+// "suppressed:update:<kind>"; a marker whose recorded updater pid is dead is
+// deleted on sight, and one older than UPDATE_MARKER_STALE_MS is ignored, so
+// a crashed update can't disarm the watchdog.
 //
 // A tick never throws and the loop never exits on its own; exitCode stays 0 so
 // a `--once` run (or a killed loop) reads as a clean probe to launchd. Every
@@ -32,13 +49,13 @@
 // inter-tick sleep) is injectable so tests never bind real ports, call real
 // launchctl, or sleep real time.
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, statSync } from "node:fs";
 import { arch, platform } from "node:os";
 import { join } from "node:path";
 import type { CliContext } from "../context";
 import { hasFlag } from "../args";
 import { print } from "../output";
-import { logDir, runtimePortPath, webPortPath } from "../../paths";
+import { logDir, runtimePortPath, updateInProgressMarkerPath, webPortPath } from "../../paths";
 import { isLoaded, kickstart, supervisor, type LaunchctlResult, type PlistKind } from "../../integrations/launchd";
 import { isSupervisedWebChild } from "../../runtime/health-probe";
 import { enable } from "./autostart";
@@ -55,9 +72,31 @@ import {
 // localhost health endpoint while keeping the watchdog snappy.
 const PROBE_TIMEOUT_MS = 2000;
 // Steady-state pause between probe ticks. 10s bounds dead-gateway detection
-// latency (tick + 2s probe timeout keeps revival well under 30s) without
-// spinning the CPU on localhost probes.
+// latency without spinning the CPU on localhost probes. Reviving waits for
+// two consecutive failed ticks (REVIVE_FAILURE_THRESHOLD), so a genuinely
+// dead service is revived after roughly two ticks plus two probe timeouts
+// (~10s + 2*2s ≈ 14-24s depending on where in the interval it died) — still
+// under the 30s target — while a one-tick probe miss never hard-kills a
+// healthy-but-busy service.
 export const WATCHDOG_TICK_INTERVAL_MS = 10_000;
+// Consecutive failed ticks a service must accumulate before the loop revives
+// it (and, for web, queues the crash report). A single failed probe is not
+// proof of death: a CPU-pegged host can time out the 2s probe while the
+// service is healthy, and `kickstart -k` is a force-kill with no drain.
+// `--once` overrides this to 1 — a single diagnostic tick must still be able
+// to revive.
+const REVIVE_FAILURE_THRESHOLD = 2;
+// How long the update-in-progress marker (written by updateRuntime in
+// src/runtime/update.ts for the duration of git reset + bun installs + web
+// build) keeps suppressing revive actions. While the marker is fresh, probe
+// misses are expected — node_modules are swapped under the live web server
+// and the build pegs the CPU — so a `kickstart -k` would force-kill a
+// healthy-but-busy service mid-update. The tick still probes and logs
+// (action "suppressed:update:<kind>"). Past this age the marker is stale
+// and revives proceed as normal. This is the BACKSTOP: a dead updater is
+// normally caught immediately by the marker's pid (see updateMarkerFresh),
+// so the full window only mutes revives for a live-but-wedged update.
+export const UPDATE_MARKER_STALE_MS = 15 * 60_000;
 // How many trailing lines of each web log to carry into the crash report.
 // Bounded so a long log doesn't bloat the report.
 const WEB_LOG_TAIL_LINES = 50;
@@ -138,6 +177,61 @@ function readWebLogTail(instance: string, filename: string): RuntimeLogLine[] {
   }
 }
 
+// True while a runtime update is rewriting ~/.gini/runtime (fresh
+// update-in-progress marker on disk; see UPDATE_MARKER_STALE_MS). A missing
+// or unreadable marker reads as "no update" so a stat failure can never
+// disarm the watchdog.
+//
+// The marker body is JSON {"pid": <updater pid>} (written by updateRuntime).
+// When that pid no longer exists, the updater died without reaching its
+// finally — the update is over, however badly — so the marker is stale NOW:
+// delete it and stop suppressing, instead of muting revives for the rest of
+// the 15-minute mtime window while the services it left broken stay down.
+// EPERM from the signal-0 probe means the pid exists (just not ours to
+// signal), so it counts as alive. A legacy/unparseable marker keeps the
+// mtime-only behavior, and the mtime cap stays as the final backstop either
+// way (a live-but-wedged updater must not suppress forever).
+function updateMarkerFresh(clock: () => Date): boolean {
+  const marker = updateInProgressMarkerPath();
+  try {
+    const stat = statSync(marker);
+    if (clock().getTime() - stat.mtimeMs >= UPDATE_MARKER_STALE_MS) return false;
+    let pid: number | null = null;
+    try {
+      const parsed = JSON.parse(readFileSync(marker, "utf8")) as { pid?: unknown };
+      if (typeof parsed.pid === "number" && Number.isInteger(parsed.pid) && parsed.pid > 0) pid = parsed.pid;
+    } catch {
+      // Legacy/unparseable body: fall back to mtime-only freshness.
+    }
+    if (pid !== null) {
+      try {
+        process.kill(pid, 0);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ESRCH") {
+          // The recorded updater is dead — but stat → read → kill → unlink is
+          // not atomic, and a NEW update can rewrite the marker in that
+          // window. Deleting blindly would strip the fresh marker and drop
+          // suppression mid-update, so only remove the marker actually read
+          // above (same mtime); a moved mtime is a rewrite from a live
+          // updater — keep it and stay suppressed this tick.
+          try {
+            if (statSync(marker).mtimeMs !== stat.mtimeMs) return true;
+            rmSync(marker, { force: true });
+          } catch {
+            // Best-effort delete (or the marker vanished under the re-stat);
+            // it reads stale regardless.
+          }
+          return false;
+        }
+        // EPERM (or anything else): the process exists — treat as alive.
+      }
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // Best-effort literal-redaction inputs for the report. Sourcing these must
 // never stop us from reviving web, so any read failure yields undefined — the
 // report's pattern-based redaction still runs regardless.
@@ -183,7 +277,17 @@ export async function watchdog(ctx: CliContext, deps: WatchdogDeps = {}): Promis
   const clock = deps.clock ?? (() => new Date());
   const sleep = deps.sleep ?? defaultSleep;
   const intervalMs = deps.intervalMs ?? WATCHDOG_TICK_INTERVAL_MS;
-  const maxTicks = hasFlag(ctx.cliArgs, "--once") ? 1 : deps.maxTicks ?? Number.POSITIVE_INFINITY;
+  const once = hasFlag(ctx.cliArgs, "--once");
+  const maxTicks = once ? 1 : deps.maxTicks ?? Number.POSITIVE_INFINITY;
+  // Loop mode requires two consecutive failed ticks before reviving (see
+  // REVIVE_FAILURE_THRESHOLD); a `--once` run has exactly one tick, so it
+  // keeps the threshold at 1 to stay able to revive at all.
+  const reviveThreshold = once ? 1 : REVIVE_FAILURE_THRESHOLD;
+  // Per-service consecutive-failure streaks across ticks. Reset to 0 on any
+  // healthy probe so only an UNBROKEN run of failures reaches the threshold,
+  // and after each revive so a sustained outage re-kicks every threshold
+  // ticks (giving the kicked service a boot window) rather than every tick.
+  const failStreak: Record<"gateway" | "web", number> = { gateway: 0, web: 0 };
 
   // A kickstart shellout (or an injected one) that throws must not flip the
   // tick to a non-zero exit. Swallow it here — the next tick retries, and the
@@ -251,13 +355,37 @@ export async function watchdog(ctx: CliContext, deps: WatchdogDeps = {}): Promis
 
       const actions: string[] = [];
 
-      // Runtime dead/hung -> kickstart the gateway. KeepAlive should already
-      // respawn it, but macOS 26 frequently defers that; the explicit kick forces
-      // a stop+start. No crash report here: an in-process uncaughtException already
-      // queues a report via the runtime crash handler, and a hung-but-not-crashed
-      // runtime has no error to attribute.
-      if (!runtimeOk) {
-        actions.push(await reviveService("gateway"));
+      // Advance/reset the streaks before deciding anything: a revive (and the
+      // web crash report below) only fires once a service has failed
+      // reviveThreshold consecutive ticks.
+      failStreak.gateway = runtimeOk ? 0 : failStreak.gateway + 1;
+      failStreak.web = webOk ? 0 : failStreak.web + 1;
+
+      // A fresh update-in-progress marker suppresses every revive action (and
+      // the web crash report) for this tick: the update window makes probe
+      // misses expected, and a kick would kill the mid-update service. Streaks
+      // keep advancing so a service that is still down once the marker clears
+      // is revived on the next tick.
+      const updateInProgress = updateMarkerFresh(clock);
+
+      // Runtime dead/hung past the threshold -> kickstart the gateway.
+      // KeepAlive should already respawn it, but macOS 26 frequently defers
+      // that; the explicit kick forces a stop+start. No crash report here: an
+      // in-process uncaughtException already queues a report via the runtime
+      // crash handler, and a hung-but-not-crashed runtime has no error to
+      // attribute.
+      if (failStreak.gateway >= reviveThreshold) {
+        if (updateInProgress) {
+          actions.push("suppressed:update:gateway");
+        } else {
+          actions.push(await reviveService("gateway"));
+          // Reset the streak after a revive: the freshly kicked service needs
+          // a full threshold window to boot before it can be judged dead
+          // again. Without this, a recovering service that takes more than
+          // one tick to come up is re-`kickstart -k`'d every tick at streak
+          // 3, 4, ... — each kick restarting the very boot it's waiting for.
+          failStreak.gateway = 0;
+        }
       }
 
       // A web crash report is only warranted for a GENUINE web-specific failure:
@@ -272,45 +400,56 @@ export async function watchdog(ctx: CliContext, deps: WatchdogDeps = {}): Promis
       // new episode and may queue a new report.
       if (webOk) webOutageReported = false;
 
-      // Web dead/hung -> build a crash report from the web log tails, queue it into
-      // pending/, then kickstart the web service. The web has no in-process crash
-      // handler (decision: web crash coverage is the watchdog), so this is the only
-      // place a web outage gets captured. The queued report is offered to the user
-      // on the next restart and filed only on consent — nothing is filed here.
-      if (!webOk) {
-        if (shouldReportWebCrash && !webOutageReported) {
-          try {
-            const logTail = [
-              ...readWebLogTail(instance, "web-launchd.err.log"),
-              ...readWebLogTail(instance, "web.log")
-            ];
-            const { secretsEnvBody } = readRedactionLiterals();
-            const report = buildCrashReport({
-              instance,
-              supervisor: supervisorImpl(),
-              // No JS Error object for a web outage — synthesize one so the report's
-              // fingerprint/dedup still works. The message is stable so recurrences
-              // collapse to a single issue.
-              error: new Error("web service health probe failed (dead or hung)"),
-              source: "web",
-              logTail,
-              sysInfo: { platform: platform(), arch: arch(), nodeVersion: process.version },
-              clock,
-              secretsEnvBody
-            });
-            writeCrashReportFile(report);
-            webOutageReported = true;
-            actions.push("report:web");
-          } catch {
-            // Building/writing the report must never stop us from reviving web.
+      // Web dead/hung past the threshold -> build a crash report from the web
+      // log tails, queue it into pending/, then kickstart the web service. The
+      // web has no in-process crash handler (decision: web crash coverage is the
+      // watchdog), so this is the only place a web outage gets captured. The
+      // queued report is offered to the user on the next restart and filed only
+      // on consent — nothing is filed here. The report shares the two-strike
+      // gate with the revive: a one-tick probe miss is not an outage worth
+      // capturing.
+      if (failStreak.web >= reviveThreshold) {
+        if (updateInProgress) {
+          actions.push("suppressed:update:web");
+        } else {
+          if (shouldReportWebCrash && !webOutageReported) {
+            try {
+              const logTail = [
+                ...readWebLogTail(instance, "web-launchd.err.log"),
+                ...readWebLogTail(instance, "web.log")
+              ];
+              const { secretsEnvBody } = readRedactionLiterals();
+              const report = buildCrashReport({
+                instance,
+                supervisor: supervisorImpl(),
+                // No JS Error object for a web outage — synthesize one so the report's
+                // fingerprint/dedup still works. The message is stable so recurrences
+                // collapse to a single issue.
+                error: new Error("web service health probe failed (dead or hung)"),
+                source: "web",
+                logTail,
+                sysInfo: { platform: platform(), arch: arch(), nodeVersion: process.version },
+                clock,
+                secretsEnvBody
+              });
+              writeCrashReportFile(report);
+              webOutageReported = true;
+              actions.push("report:web");
+            } catch {
+              // Building/writing the report must never stop us from reviving web.
+            }
           }
+          actions.push(await reviveService("web"));
+          // Same post-revive reset as the gateway above: give the kicked web
+          // service a full threshold window to boot instead of re-killing it
+          // every tick while it compiles/starts.
+          failStreak.web = 0;
         }
-        actions.push(await reviveService("web"));
       }
 
       // Best-effort log line; a logging failure must not flip the tick's exit.
       try {
-        appendLog(instance, "watchdog.tick", { webOk, runtimeOk, webProbeFailed, shouldReportWebCrash, actions });
+        appendLog(instance, "watchdog.tick", { webOk, runtimeOk, webProbeFailed, shouldReportWebCrash, updateInProgress, failStreak: { ...failStreak }, actions });
       } catch {
         // Logging is observability, not control flow — swallow.
       }

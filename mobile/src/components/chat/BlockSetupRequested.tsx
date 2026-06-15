@@ -12,9 +12,12 @@ export function BlockSetupRequested({
   block: SetupRequestedBlock;
 }) {
   const isConnectorRequest = block.action === "connector.request";
+  // browser.connect covers both sign-in and handoff (payment entry, final
+  // confirmation) uses, and the block carries no payload to tell them
+  // apart — so the copy stays mode-neutral.
   const title =
     block.action === "browser.connect"
-      ? "Browser sign-in needed"
+      ? "Browser action needed"
       : isConnectorRequest
         ? "Connection setup needed"
         : block.action === "browser.fill_secret"
@@ -24,7 +27,7 @@ export function BlockSetupRequested({
     isConnectorRequest
       ? "Finish this setup in Gini on your Mac. This chat is paused until the connection is completed or the turn is stopped."
       : block.action === "browser.connect"
-        ? "Finish signing in from Gini on your Mac. This chat is paused until setup is completed or the turn is stopped."
+        ? "Finish this step from Gini on your Mac. This chat is paused until setup is completed or the turn is stopped."
         : block.action === "browser.fill_secret"
           ? "Enter the requested value from Gini on your Mac. This chat is paused until the value is submitted or the turn is stopped."
           : "Open Gini on your Mac to continue, or stop this turn from the composer.";

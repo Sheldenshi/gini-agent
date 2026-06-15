@@ -46,6 +46,10 @@ export interface ParsedSkillFile {
   // is resolved against a ConnectorRecord with that `name`, not a provider
   // module, so it need NOT be a registered provider.
   requiredCredentials?: string[];
+  // Frontmatter `metadata.gini.requires.approval` — script names that the
+  // skill_run dispatch path always gates behind a user Approve/Deny,
+  // regardless of approval mode. See ADR skill-script-approval-gating.md.
+  requiresApprovalScripts?: string[];
   allowedTools?: string;
   license?: string;
   compatibility?: string;
@@ -404,7 +408,8 @@ export function detectGiniFrontmatterWarnings(
 // Gini extension keys (under `metadata.gini`):
 //   version, author, platforms,
 //   prerequisites: { commands, env },
-//   requires: { credentials: [<name>, ...], connectors: [{ provider, scopes? }, ...] }
+//   requires: { credentials: [<name>, ...], connectors: [{ provider, scopes? }, ...],
+//               approval: [<script name>, ...] }
 //
 // A skill's category (a UI grouping hint) is NOT read from frontmatter —
 // it's derived from the parent directory name in discoverSkillFiles().
@@ -463,6 +468,7 @@ export function parseSkillFile(text: string, sourcePath?: string): ParsedSkillFi
 
   let requiredConnectors: ParsedSkillFile["requiredConnectors"];
   let requiredCredentials: ParsedSkillFile["requiredCredentials"];
+  let requiresApprovalScripts: ParsedSkillFile["requiresApprovalScripts"];
   const requiresSource = pickFromGiniOrTop("requires");
   if (requiresSource && typeof requiresSource === "object" && !Array.isArray(requiresSource)) {
     const reqs = requiresSource as Record<string, unknown>;
@@ -471,6 +477,12 @@ export function parseSkillFile(text: string, sourcePath?: string): ParsedSkillFi
         .map((entry) => (typeof entry === "string" ? entry.trim() : ""))
         .filter((entry) => entry.length > 0);
       if (names.length > 0) requiredCredentials = names;
+    }
+    if (Array.isArray(reqs.approval)) {
+      const scripts = reqs.approval
+        .map((entry) => (typeof entry === "string" ? entry.trim() : ""))
+        .filter((entry) => entry.length > 0);
+      if (scripts.length > 0) requiresApprovalScripts = scripts;
     }
     const connectorList = Array.isArray(reqs.connectors)
       ? reqs.connectors
@@ -530,6 +542,7 @@ export function parseSkillFile(text: string, sourcePath?: string): ParsedSkillFi
     prerequisites,
     requiredConnectors,
     requiredCredentials,
+    requiresApprovalScripts,
     allowedTools,
     license,
     compatibility,
@@ -657,6 +670,7 @@ function upsertSkillFromFile(
       JSON.stringify(existing.prerequisites ?? null) !== JSON.stringify(parsed.prerequisites ?? null) ||
       JSON.stringify(existing.requiredConnectors ?? null) !== JSON.stringify(parsed.requiredConnectors ?? null) ||
       JSON.stringify(existing.requiredCredentials ?? null) !== JSON.stringify(parsed.requiredCredentials ?? null) ||
+      JSON.stringify(existing.requiresApprovalScripts ?? null) !== JSON.stringify(parsed.requiresApprovalScripts ?? null) ||
       (existing.manifestVersion ?? null) !== (parsed.version ?? null);
     if (!changed) return { record: existing, kind: "noop" };
     if (changed) {
@@ -677,6 +691,7 @@ function upsertSkillFromFile(
       existing.prerequisites = parsed.prerequisites;
       existing.requiredConnectors = parsed.requiredConnectors;
       existing.requiredCredentials = parsed.requiredCredentials;
+      existing.requiresApprovalScripts = parsed.requiresApprovalScripts;
       existing.allowedTools = parsed.allowedTools;
       existing.license = parsed.license;
       existing.compatibility = parsed.compatibility;
@@ -705,6 +720,7 @@ function upsertSkillFromFile(
     prerequisites: parsed.prerequisites,
     requiredConnectors: parsed.requiredConnectors,
     requiredCredentials: parsed.requiredCredentials,
+    requiresApprovalScripts: parsed.requiresApprovalScripts,
     allowedTools: parsed.allowedTools,
     license: parsed.license,
     compatibility: parsed.compatibility,
