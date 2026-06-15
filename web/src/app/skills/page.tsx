@@ -12,7 +12,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { PageHeader, EmptyState } from "@/components/PageHeader";
 import { MarkdownContent } from "@/components/chat/MarkdownContent";
 import { api } from "@/lib/api";
-import { useConnectors, useInvalidate, useProviders, useSkills, type ProviderDescriptor } from "@/lib/queries";
+import { useConnectors, useGoogleAccounts, useInvalidate, useProviders, useSkills, type ProviderDescriptor } from "@/lib/queries";
 import { AddConnectorDialog, type CreateConnectorBody } from "@/components/AddConnectorDialog";
 import { GoogleAccountsCard } from "./_components/GoogleAccountsCard";
 import { deriveActivation, type Activation } from "./_activation";
@@ -52,6 +52,10 @@ export default function SkillsPage() {
   const skills = useSkills(debounced);
   const connectors = useConnectors();
   const providers = useProviders();
+  // Machine-global registry — exists even with no google-oauth-desktop
+  // connector record, so the accounts card can render on a registry-only
+  // machine where the connectors enrichment has nothing to attach to.
+  const googleAccounts = useGoogleAccounts();
   const invalidate = useInvalidate();
   const [dialog, setDialog] = useState<InlineDialogState>({ open: false, provider: "", suggestedName: "", mode: "create" });
 
@@ -502,12 +506,17 @@ export default function SkillsPage() {
                               </Button>
                             )}
                             </div>
-                            {/* Tagged Google accounts live on the
-                                google-oauth-desktop connector once it's
-                                configured. Surface them so the user can
+                            {/* Tagged Google accounts. With a configured
+                                connector they ride its `accounts`
+                                enrichment; on a registry-only machine (no
+                                record) they come from the machine-global
+                                registry query. Surface them so the user can
                                 retag / remove / add another. */}
-                            {satisfying?.provider === "google-oauth-desktop" ? (
-                              <GoogleAccountsCard accounts={satisfying.accounts ?? []} />
+                            {provider?.id === "google-oauth-desktop" &&
+                            (satisfying || (googleAccounts.data ?? []).length > 0) ? (
+                              <GoogleAccountsCard
+                                accounts={satisfying?.accounts ?? googleAccounts.data ?? []}
+                              />
                             ) : null}
                           </li>
                         );

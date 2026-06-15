@@ -3,7 +3,7 @@ import { addAudit, appendLog, id, mutateState, now, readState, updateConnectorHe
 import { deleteConnectorSecrets, readSecret, writeSecret } from "../../state/secrets";
 import { syncProviderMcpServers } from "../mcp-sync";
 import { redactSecretsInText } from "../mcp-http";
-import { getProvider, listProviders } from "./registry";
+import { getProvider, listProviders, providerForCredentialName } from "./registry";
 import type { ProviderModule } from "./types";
 
 export interface CreateConnectorInput {
@@ -537,14 +537,26 @@ function connectorIsUsable(connector: ConnectorRecord): boolean {
 // no credential gate (the legacy `requires.connectors` form is mapped to
 // credential names at load time — see canonicalCredentialName in
 // connectors/registry.ts, applied by the skill loader).
+//
+// When NO connector record with the required name exists at all, the provider
+// that owns the credential name gets a final say via its
+// `credentialExternallySatisfied` hook — e.g. a registered machine-global
+// Google account satisfies google-workspace-oauth with no connector record
+// (ADR google-multi-account.md). An existing record of ANY status keeps the
+// `connectorIsUsable`-only semantics: a `disabled` record is an explicit
+// operator off and must not be overridden by an external source.
 export function isSkillActive(state: RuntimeState, skill: SkillRecord): boolean {
   if (skill.validationStatus === "unsupported") return false;
   const credentials = skill.requiredCredentials ?? [];
   for (const name of credentials) {
-    const match = state.connectors.find(
-      (candidate) => candidate.name === name && connectorIsUsable(candidate)
-    );
-    if (!match) return false;
+    const named = state.connectors.filter((candidate) => candidate.name === name);
+    if (named.some(connectorIsUsable)) continue;
+    if (named.length === 0) {
+      const providerId = providerForCredentialName(name);
+      const module = providerId ? getProvider(providerId) : undefined;
+      if (module?.credentialExternallySatisfied?.()) continue;
+    }
+    return false;
   }
   return true;
 }

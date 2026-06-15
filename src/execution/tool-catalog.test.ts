@@ -297,6 +297,36 @@ describe("buildToolCatalog", () => {
     expect(tool?.function.parameters.required).toEqual(["jobId"]);
   });
 
+  test("create_job and update_job offer skillNames with the attach-the-recipe steering", () => {
+    // The skillNames descriptions carry the in-prompt steering that makes
+    // the agent attach integration skills when scheduling (ADR
+    // job-skill-attachments.md). Pin the key clauses so a rewrite that
+    // drops them surfaces as a test failure.
+    const state = stateWithToolsets([]);
+    const catalog = buildToolCatalog(state);
+    const createTool = catalog.find((t) => t.function.name === "create_job");
+    // The top-level description carries the attach-by-default demand — the
+    // param description alone was not enough to make the model reach for it.
+    expect(createTool?.function.description).toContain("ALWAYS set `skillNames`");
+    const createProps = createTool?.function.parameters.properties as Record<string, { description?: string }>;
+    expect(createProps.skillNames).toBeDefined();
+    expect(createProps.skillNames?.description).toContain("loaded into every run");
+    expect(createProps.skillNames?.description).toContain("google-calendar + google-gmail");
+    // Operating recipes only — without this clause the model attaches
+    // one-time setup/install/sign-in skills to recurring jobs.
+    expect(createProps.skillNames?.description).toContain("Never attach one-time setup/installation skills");
+    const updateTool = catalog.find((t) => t.function.name === "update_job");
+    expect(updateTool?.function.description).toContain("skill attachments");
+    const updateProps = updateTool?.function.parameters.properties as Record<string, { type?: unknown; description?: string }>;
+    expect(updateProps.skillNames).toBeDefined();
+    // update is full-replacement; [] or null clears (updateJob treats null
+    // as clear), so the schema must admit null alongside array.
+    expect(updateProps.skillNames?.type).toEqual(["array", "null"]);
+    expect(updateProps.skillNames?.description).toContain("FULL replacement");
+    expect(updateProps.skillNames?.description).toContain("[] (or null) to clear");
+    expect(updateProps.skillNames?.description).toContain("Never attach one-time setup/installation skills");
+  });
+
   test("set_provider's model-facing schema offers bedrock + awsRegion + azure routing; baseUrl is documented as ignored for anthropic/bedrock", () => {
     // This is the schema the MODEL actually sees (the SELF_OPERATIONS schema is
     // documentation-only). It offers bedrock + awsRegion and azure transport

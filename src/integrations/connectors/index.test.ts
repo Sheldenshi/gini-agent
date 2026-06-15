@@ -1,6 +1,9 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { rmSync } from "node:fs";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createEmptyState, mutateState, readState } from "../../state";
+import { writeGoogleAccounts } from "../../state/google-accounts";
 import { writeSecret } from "../../state/secrets";
 import type { ConnectorRecord, RuntimeConfig, SkillRecord } from "../../types";
 import { bindingsForCredentials, checkConnector, createConnector, isSkillActive, resolveSkillEnv } from "./index";
@@ -458,6 +461,112 @@ describe("isSkillActive by credential name", () => {
     state.connectors = [newConnector({ name: "LINEAR_API_KEY", type: "api-key", provider: "linear", status: "disabled", health: "healthy" })];
     const skill = newSkill({ requiredCredentials: ["LINEAR_API_KEY"] });
     expect(isSkillActive(state, skill)).toBe(false);
+  });
+});
+
+describe("isSkillActive with an externally satisfied credential", () => {
+  // google-oauth-desktop's `credentialExternallySatisfied` hook reads the
+  // machine-global account registry (~/.gini/google-accounts/accounts.json).
+  // HOME is pointed at a scratch dir per test — the registry resolves HOME via
+  // process.env.HOME first (see the src/state/google-accounts.ts header) — so
+  // the host machine's real registry never leaks into these assertions.
+  let scratchHome: string;
+  let prevHome: string | undefined;
+
+  beforeEach(() => {
+    scratchHome = mkdtempSync(join(tmpdir(), "gini-connectors-ext-"));
+    prevHome = process.env.HOME;
+    process.env.HOME = scratchHome;
+  });
+
+  afterEach(() => {
+    if (prevHome === undefined) delete process.env.HOME;
+    else process.env.HOME = prevHome;
+    rmSync(scratchHome, { recursive: true, force: true });
+  });
+
+  function registryAccount() {
+    return {
+      id: "gacct_test0001",
+      tag: "personal",
+      email: "me@example.com",
+      configDir: join(scratchHome, ".gini", "google-accounts", "gacct_test0001"),
+      addedAt: "2026-01-01T00:00:00.000Z"
+    };
+  }
+
+  test("a registered Google account activates a workspace skill with zero connectors", () => {
+    writeGoogleAccounts([registryAccount()]);
+    const state = createEmptyState("dev");
+    state.connectors = [];
+    const skill = newSkill({ requiredCredentials: ["google-workspace-oauth"] });
+    expect(isSkillActive(state, skill)).toBe(true);
+  });
+
+  test("an empty or missing registry leaves the workspace skill inactive", () => {
+    const state = createEmptyState("dev");
+    state.connectors = [];
+    const skill = newSkill({ requiredCredentials: ["google-workspace-oauth"] });
+    // Missing registry file.
+    expect(isSkillActive(state, skill)).toBe(false);
+    // Present but empty registry.
+    writeGoogleAccounts([]);
+    expect(isSkillActive(state, skill)).toBe(false);
+  });
+
+  test("an unrelated credential is unaffected by registered Google accounts", () => {
+    writeGoogleAccounts([registryAccount()]);
+    const state = createEmptyState("dev");
+    state.connectors = [];
+    const skill = newSkill({ requiredCredentials: ["LINEAR_API_KEY"] });
+    expect(isSkillActive(state, skill)).toBe(false);
+  });
+
+  test("a disabled workspace connector keeps the skill inactive despite registered accounts", () => {
+    // Explicit operator off stays off: once a connector record with the
+    // required name exists, the hook never overrides its status — only a
+    // fully absent record falls through to the external-satisfaction check.
+    writeGoogleAccounts([registryAccount()]);
+    const state = createEmptyState("dev");
+    state.connectors = [newConnector({
+      name: "google-workspace-oauth",
+      type: "oauth2",
+      provider: "google-oauth-desktop",
+      status: "disabled",
+      health: "healthy"
+    })];
+    const skill = newSkill({ requiredCredentials: ["google-workspace-oauth"] });
+    expect(isSkillActive(state, skill)).toBe(false);
+  });
+
+  test("a usable record satisfies the gate even when a disabled record shares the name", () => {
+    // Two records share the required name: an explicit operator-off and a
+    // configured + healthy one. Any usable record satisfies the credential
+    // before record-presence semantics are consulted, so the disabled
+    // sibling neither blocks activation nor matters to the hook (the
+    // registry is empty here — activation can only come from the usable
+    // record, not external satisfaction).
+    const state = createEmptyState("dev");
+    state.connectors = [
+      newConnector({
+        id: "id_off",
+        name: "google-workspace-oauth",
+        type: "oauth2",
+        provider: "google-oauth-desktop",
+        status: "disabled",
+        health: "healthy"
+      }),
+      newConnector({
+        id: "id_on",
+        name: "google-workspace-oauth",
+        type: "oauth2",
+        provider: "google-oauth-desktop",
+        status: "configured",
+        health: "healthy"
+      })
+    ];
+    const skill = newSkill({ requiredCredentials: ["google-workspace-oauth"] });
+    expect(isSkillActive(state, skill)).toBe(true);
   });
 });
 

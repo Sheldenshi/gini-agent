@@ -42,7 +42,7 @@ export function GoogleAccountsCard({ accounts }: { accounts: GoogleAccountStatus
     onSuccess: (account) => {
       toast.success(`Retagged to ${account.tag}`);
       setEditingId(null);
-      invalidate(["connectors", "google-accounts"]);
+      invalidate(["connectors", "connector-providers", "google-accounts"]);
     },
     onError: (error: Error) => toast.error(error.message)
   });
@@ -52,7 +52,9 @@ export function GoogleAccountsCard({ accounts }: { accounts: GoogleAccountStatus
     onSuccess: () => {
       toast.success("Account removed");
       setRemoving(null);
-      invalidate(["connectors", "google-accounts"]);
+      // "connector-providers" carries the externallySatisfied bit derived
+      // from this registry, so the activation pills refresh immediately.
+      invalidate(["connectors", "connector-providers", "google-accounts"]);
     },
     onError: (error: Error) => toast.error(error.message)
   });

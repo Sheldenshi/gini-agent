@@ -1798,6 +1798,14 @@ export interface JobRecord {
   status: JobStatus;
   deliveryTargets: string[];
   context: string[];
+  // Skill attachments: names of enabled skills whose full bodies are inlined
+  // into every fire's dispatched prompt, so each run follows the skill's
+  // recipe deterministically instead of relying on the model calling
+  // read_skill. Validated at create/update time (every name must resolve to
+  // an enabled skill); a skill that has gone missing/disabled/inactive by
+  // fire time is skipped with a trace event — never fails the fire. See ADR
+  // job-skill-attachments.md.
+  skillNames?: string[];
   retryLimit: number;
   timeoutSeconds: number;
   costBudget?: number;
@@ -1879,6 +1887,14 @@ export interface JobRunRecord {
   summary?: string;
   error?: string;
   cost?: CostRecord;
+  // Skill attachments that were SKIPPED at fire time (a name that resolved at
+  // create time but had gone missing/disabled/inactive by the time the run
+  // dispatched). Durable + structured so /api/job-runs surfaces the
+  // degradation, the model is told (in-prompt directive) not to fabricate
+  // results that need the missing recipe, and the delivery surfaces (chat
+  // system_note + bridge note) name it. Absent when nothing was skipped. See
+  // ADR job-skill-attachments.md ("Surfacing skips").
+  skillSkips?: Array<{ name: string; reason: string }>;
 }
 
 export interface CostRecord {

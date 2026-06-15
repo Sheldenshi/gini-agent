@@ -1606,6 +1606,10 @@ async function createJobTool(
       createDedicatedSession: invokedFromChat && deliverTo !== "chat" ? { title: name } : undefined,
       chatSessionId: deliverTo === "chat" ? originatingSessionId : undefined,
       oneShot,
+      // Skill attachments pass through verbatim — createScheduledJob is the
+      // single validation choke point (shape + enabled-skill resolution),
+      // and its typed `Invalid input: …` surfaces back as a tool error.
+      skillNames: args.skillNames,
       parentTaskId: taskId,
       dangerouslyAutoApprove,
       approvalMode,
@@ -1657,6 +1661,7 @@ async function createJobTool(
           cronExpression,
           cronTimezone,
           oneShot,
+          skillNames: job.skillNames,
           chatSessionId,
           jobId: job.id,
           dangerouslyAutoApprove,
@@ -1684,6 +1689,7 @@ async function createJobTool(
       cronExpression,
       cronTimezone,
       oneShot,
+      skillNames: job.skillNames,
       chatSessionId,
       preRunHookHandlerId: job.preRunHook?.handlerId,
       dangerouslyAutoApprove,
@@ -1758,6 +1764,9 @@ async function listJobsTool(
     nextRunAt: job.nextRunAt,
     lastRunAt: job.lastRunAt,
     chatSessionId: job.chatSessionId,
+    // Surfaced so update_job's REPLACE-only skillNames patch can preserve
+    // attachments the user isn't changing.
+    skillNames: job.skillNames,
     prompt: fullPrompt
       ? job.prompt
       : job.prompt.length > 200
@@ -1827,7 +1836,8 @@ async function updateJobTool(
     "cronTimezone",
     "timeoutSeconds",
     "autoApproveCommands",
-    "dangerouslyAutoApprove"
+    "dangerouslyAutoApprove",
+    "skillNames"
   ] as const;
   for (const key of passthrough) {
     if (key in args) patch[key] = args[key];

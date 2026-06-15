@@ -243,6 +243,29 @@ const COMPACTION_SUMMARY_SYSTEM =
 // tool_transcript rows, so next-turn replay is unaffected.
 export const IN_TURN_COMPACTION_NOTE_PREFIX = "[Context compacted]";
 
+// Test-only override for the base (pre-subagent-filter) tool catalog. When
+// set, resolveBaseCatalog returns this fixed catalog instead of the live
+// buildToolCatalog result, so tests that pin token geometry (the in-turn
+// compaction tests) stay decoupled from the always-on tool-catalog size —
+// growing any always-on tool description can otherwise shift toolSchemaTokens
+// and silently move the compaction crossing point. Default (null) = live
+// behavior. Mirrors the repo's other __set…ForTests seams (e.g. the
+// transformers-loader hook in src/embeddings.ts).
+let baseToolCatalogOverride: ToolCatalogTool[] | null = null;
+
+// Resolve the base tool catalog both buildToolCatalog call sites compose from
+// (system-context build + runLoop). Returns the test override when installed,
+// else the live catalog. The caller still applies filterToolsForSubagent on
+// top, so the override only fixes the pre-filter catalog.
+function resolveBaseCatalog(state: RuntimeState, agentToolsetFilter?: Set<string>): ToolCatalogTool[] {
+  return baseToolCatalogOverride ?? buildToolCatalog(state, agentToolsetFilter);
+}
+
+// Test-only: install (or clear with null) the fixed base tool catalog.
+export function __setBaseToolCatalogForTests(catalog: ToolCatalogTool[] | null): void {
+  baseToolCatalogOverride = catalog;
+}
+
 // Extract the provider-reported prompt token count from a model-call usage
 // record. Anthropic reports `input_tokens` (Bedrock Converse usage is
 // normalized to the same key in provider.ts); OpenAI-compatible providers
@@ -766,7 +789,7 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
   // deferred tools remain unloaded by name + one-line summary. The full
   // schemas join the provider tools array only after load_tools fires.
   const deferredCatalog = filterToolsForSubagent(
-    buildToolCatalog(state, effectiveForAgent.toolsetFilter),
+    resolveBaseCatalog(state, effectiveForAgent.toolsetFilter),
     subagent
   );
   const alreadyLoaded = new Set<string>(task.loadedTools ?? []);
@@ -1778,7 +1801,7 @@ async function runLoop(
   // after a load_tools call so the next provider call sees the new schemas;
   // the hot no-load path never calls recompute and stays byte-identical to
   // the prior frozen-catalog behavior.
-  const fullCatalog = filterToolsForSubagent(buildToolCatalog(state0, effective.toolsetFilter), subagent0);
+  const fullCatalog = filterToolsForSubagent(resolveBaseCatalog(state0, effective.toolsetFilter), subagent0);
   const loadedToolNames = new Set<string>(taskRow?.loadedTools ?? []);
   // Subagent seeding: a subagent whose whitelisted toolsets own deferred
   // tools gets those tools live at entry (no load_tools round-trip), so a

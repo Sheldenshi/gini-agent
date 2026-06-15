@@ -1522,6 +1522,12 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       // page can match a service skill's required-credential connector back
       // to its setup skill and defer the activation pill to it.
       setupSkill: p.setupSkill,
+      // Live result of the provider's credentialExternallySatisfied hook
+      // (e.g. registered machine-global Google accounts). Lets the Skills
+      // page mirror isSkillActive's absent-record fallthrough — the hook
+      // only applies when no connector record with the credential name
+      // exists; the page enforces that record check itself.
+      externallySatisfied: Boolean(p.credentialExternallySatisfied?.()),
       probeIntervalMs: p.probeIntervalMs,
       // Optional credential-template the Add Connector dialog prefills when a
       // provider is picked as a template. Derived from the module's secret

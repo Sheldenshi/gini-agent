@@ -12,7 +12,7 @@
 // Idempotent: if the run is already terminal, this is a no-op.
 
 import type { RuntimeConfig, RuntimeState, Task } from "../types";
-import { addAudit, appendEvent, appendLog, isTerminalTaskStatus, mutateState, now, readState } from "../state";
+import { addAudit, appendEvent, appendLog, insertChatBlock, isTerminalTaskStatus, mutateState, now, readState } from "../state";
 import { syncChatTaskResult } from "../execution/chat";
 import { providerAuthFailureText, providerDisplayLabel, providerReauth } from "../provider";
 // `sendMessagingOutput` is imported lazily inside the bridge-dispatch
@@ -25,15 +25,26 @@ import { providerAuthFailureText, providerDisplayLabel, providerReauth } from ".
 // dynamic import resolves to the already-loaded module the first time
 // a dispatch helper runs.
 
+// Human-readable degradation note naming the skipped recipe(s) + the remedy.
+// Shared by the chat system_note and the bridge mirror so both surfaces carry
+// the same wording.
+function skillSkipNote(skips: Array<{ name: string; reason: string }>): string {
+  const named = skips.map((s) => `${s.name} (${s.reason})`).join(", ");
+  return `Heads up: this run could not use ${skips.length} attached skill recipe(s) — ${named}. Re-enable the skill or re-attach it via update_job to restore full behavior.`;
+}
+
 export async function finalizeJobRunFromTask(config: RuntimeConfig, task: Task): Promise<void> {
   if (!task.jobId) return;
   if (!isTerminalTaskStatus(task.status)) return;
   // Capture session/oneShot context inside the mutateState write so the
   // post-write chat sync uses the same view we used to flip the run.
   // `runFinalized` gates the dispatch tail: a repeat call (run already
-  // terminal) must not re-deliver the reply to bridges.
+  // terminal) must not re-deliver the reply to bridges. The run's fire-time
+  // skill skips ride along so the post-write delivery can name the missing
+  // recipe(s) on the chat + bridge surfaces.
   let chatSessionIdToSync: string | undefined;
   let runFinalized = false;
+  let skillSkips: Array<{ name: string; reason: string }> | undefined;
   await mutateState(config.instance, (state) => {
     // Match the run by taskId first (most reliable), fall back to the
     // most recent running run for the job (covers older runs whose
@@ -48,6 +59,9 @@ export async function finalizeJobRunFromTask(config: RuntimeConfig, task: Task):
     }
     if (!run) return; // already finalized or never tracked
     runFinalized = true;
+    // Capture the run's fire-time skill skips before we flip it terminal so
+    // the post-write delivery can name the missing recipe(s).
+    if (run.skillSkips && run.skillSkips.length > 0) skillSkips = run.skillSkips;
     const job = state.jobs.find((candidate) => candidate.id === task.jobId);
     const completedAt = now();
     if (task.status === "completed") {
@@ -145,6 +159,32 @@ export async function finalizeJobRunFromTask(config: RuntimeConfig, task: Task):
           error: error instanceof Error ? error.message : String(error)
         });
       }
+      // Surface fire-time skill skips as ONE deterministic system_note in the
+      // job thread, after the synced answer. This is the guaranteed (not
+      // model-reliant) user-facing degradation signal for the web surface. Only
+      // for a completed run — a failed run's own error already carries the
+      // signal. Keyed to land in-thread after the answer; idempotent because
+      // finalize early-returns once the run is terminal (so we run once).
+      if (skillSkips && task.status === "completed") {
+        try {
+          insertChatBlock(config.instance, {
+            kind: "system_note",
+            sessionId: chatSessionIdToSync,
+            text: skillSkipNote(skillSkips),
+            taskId: task.id,
+            runId: task.runId,
+            ...(task.threadId != null ? { threadId: task.threadId } : {}),
+            ...(task.parentBlockId != null ? { parentBlockId: task.parentBlockId } : {})
+          });
+        } catch (error) {
+          appendLog(config.instance, "job.skill.skip.note.error", {
+            jobId: task.jobId,
+            taskId: task.id,
+            sessionId: chatSessionIdToSync,
+            error: error instanceof Error ? error.message : String(error)
+          });
+        }
+      }
     }
   }
   // Mirror back to the originating bridge on every terminal status —
@@ -157,7 +197,7 @@ export async function finalizeJobRunFromTask(config: RuntimeConfig, task: Task):
   // (failed task with no error summary) still mirrors nothing.
   let mirroredBridgeId: string | undefined;
   if (liveSessionId) {
-    mirroredBridgeId = await dispatchJobReplyToBridge(config, liveSessionId, task);
+    mirroredBridgeId = await dispatchJobReplyToBridge(config, liveSessionId, task, skillSkips);
   }
   // Independently of the origin mirror, deliver the same reply to any
   // bridges the job names on its own deliveryTargets — the "send my
@@ -165,7 +205,7 @@ export async function finalizeJobRunFromTask(config: RuntimeConfig, task: Task):
   // finalize, including jobs with no chat session at all (the dispatcher
   // falls back to the task summary when no synced assistant message
   // exists).
-  await dispatchJobReplyToDeliveryTargets(config, liveSessionId, task, mirroredBridgeId);
+  await dispatchJobReplyToDeliveryTargets(config, liveSessionId, task, mirroredBridgeId, skillSkips);
 }
 
 // The synced assistant message is the most recent one on the session
@@ -244,7 +284,8 @@ function resolveJobDeliveryText(
 async function dispatchJobReplyToBridge(
   config: RuntimeConfig,
   chatSessionId: string,
-  task: Task
+  task: Task,
+  skillSkips?: Array<{ name: string; reason: string }>
 ): Promise<string | undefined> {
   const state = readState(config.instance);
   const session = state.chatSessions.find((candidate) => candidate.id === chatSessionId);
@@ -262,11 +303,18 @@ async function dispatchJobReplyToBridge(
   if (dispatchTo.kind !== "telegram" && dispatchTo.kind !== "discord") return undefined;
   const replyText = resolveJobReplyText(state, chatSessionId, task);
   if (replyText === undefined) return undefined;
+  // Append the one-line degradation note for bridge/CLI users when the run
+  // skipped attachments — so the chat system_note isn't the only surface that
+  // reports it. Only on a real (non-empty, non-[SILENT]) reply, which
+  // resolveJobReplyText already guarantees.
+  const bridgeText = skillSkips && skillSkips.length > 0
+    ? `${replyText}\n\n${skillSkipNote(skillSkips)}`
+    : replyText;
   try {
     const replyToMessageId = dispatchTo.lastInboundMessageId;
     const { sendMessagingOutput } = await import("../integrations/messaging");
     const record = await sendMessagingOutput(config, dispatchTo.bridgeId, {
-      text: replyText,
+      text: bridgeText,
       target: dispatchTo.target,
       ...(replyToMessageId !== undefined ? { replyToMessageId } : {})
     });
@@ -359,13 +407,20 @@ async function dispatchJobReplyToDeliveryTargets(
   config: RuntimeConfig,
   chatSessionId: string | undefined,
   task: Task,
-  mirroredBridgeId: string | undefined
+  mirroredBridgeId: string | undefined,
+  skillSkips?: Array<{ name: string; reason: string }>
 ): Promise<void> {
   const state = readState(config.instance);
   const job = state.jobs.find((candidate) => candidate.id === task.jobId);
   if (!job || job.deliveryTargets.length === 0) return;
-  const replyText = resolveJobDeliveryText(state, chatSessionId, task);
-  if (replyText === undefined) return;
+  const resolvedReply = resolveJobDeliveryText(state, chatSessionId, task);
+  if (resolvedReply === undefined) return;
+  // Append the same one-line degradation note bridge/CLI users get on the
+  // origin mirror, so deliveryTargets recipients also see the skipped
+  // recipe(s). resolveJobDeliveryText already suppressed empty / [SILENT].
+  const replyText = skillSkips && skillSkips.length > 0
+    ? `${resolvedReply}\n\n${skillSkipNote(skillSkips)}`
+    : resolvedReply;
   // Seed the dedupe set with the bridge the origin mirror actually
   // delivered to. Seeding on confirmed success (not attempt) means an
   // explicitly-listed target still gets its own attempt when the

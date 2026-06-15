@@ -34,6 +34,12 @@ export function setupSkillLabelFor(setupSkillName: string): string {
 // a connector that is healthy OR (when its provider has no probe) configured
 // with unknown health. Without the provider info we'd diverge from the runtime
 // gate for demo / generic providers, which sit at health: "unknown" at rest.
+// Also mirrored: the absent-record fallthrough — when NO connector record
+// with the required name exists at all, the owning provider's live
+// `externallySatisfied` bit (its credentialExternallySatisfied hook, e.g.
+// registered machine-global Google accounts) satisfies the credential. An
+// existing record of any status (including disabled — explicit operator
+// off) keeps the record-based gate.
 export function deriveActivation(
   skill: SkillRecord,
   byName: Map<string, ConnectorRecord[]>,
@@ -53,12 +59,18 @@ export function deriveActivation(
   const ownedProvider = setupSkillProviders.get(skill.name);
   if (ownedProvider) {
     const credentialName = ownedProvider.credentialTemplate?.name;
-    const connector = credentialName
-      ? (byName.get(credentialName) ?? []).find((c) => c.status === "configured")
-      : undefined;
+    const records = credentialName ? (byName.get(credentialName) ?? []) : [];
+    const connector = records.find((c) => c.status === "configured");
     const session = connector?.session;
     if (session?.signedIn) return { label: "active", tone: "ok" };
     if (session?.clientConfigured) return { label: "needs sign-in", tone: "warn" };
+    // Absent-record fallthrough: registered machine-global accounts make
+    // the connection live without any connector record. Presence-only by
+    // design (the runtime gate is too); the accounts card alongside shows
+    // per-account sign-in state.
+    if (records.length === 0 && ownedProvider.externallySatisfied) {
+      return { label: "active", tone: "ok" };
+    }
     return { label: "needs setup", tone: "warn" };
   }
 
@@ -81,7 +93,12 @@ export function deriveActivation(
       const serviceKey = skill.name.replace(/^google-/, "");
       const serviceConnected =
         Boolean(session?.signedIn) && (session?.services?.[serviceKey] ?? true);
-      const tone: Activation["tone"] = serviceConnected
+      // Absent-record fallthrough: the runtime treats this skill as active,
+      // so the deferral pill goes green. A record of any status (e.g.
+      // disabled) keeps the session-based tone.
+      const externallyActive =
+        matches.length === 0 && Boolean(provider?.externallySatisfied);
+      const tone: Activation["tone"] = serviceConnected || externallyActive
         ? "ok"
         : session?.clientConfigured
         ? "warn"
@@ -106,7 +123,16 @@ export function deriveActivation(
       if (!hasProbe && c.health === "unknown") return true;
       return false;
     });
-    if (!satisfied) return { label: "needs setup", tone: "warn" };
+    if (satisfied) continue;
+    // Absent-record fallthrough (mirrors isSkillActive): the hook only
+    // applies when no record with this name exists at all.
+    if (
+      matches.length === 0 &&
+      providerByCredentialName.get(credentialName)?.externallySatisfied
+    ) {
+      continue;
+    }
+    return { label: "needs setup", tone: "warn" };
   }
   return { label: "active", tone: "ok" };
 }

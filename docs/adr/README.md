@@ -39,6 +39,7 @@ Each file in this directory captures one architecture decision: the context, the
 - [Email Watch](email-watch.md)
 - [Pre-LLM Job Hooks](job-pre-run-hooks.md)
 - [Job Concern Fan-Out](job-concern-fanout.md)
+- [Job Skill Attachments](job-skill-attachments.md)
 - [Runtime Identity Injection With Tell-Once + Delta + Periodic Refresh](runtime-identity-injection.md)
 - [Runtime Identity Files (INSTRUCTIONS.md, SOUL.md, USER.md)](runtime-identity-files.md)
 - [Identity-File Long-Horizon Design](identity-file-long-horizon-design.md)

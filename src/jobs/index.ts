@@ -1,7 +1,8 @@
 import { submitTask } from "../agent";
 import { spawnSubagent } from "../capabilities/subagents";
-import type { JobRecord, JobRoute, JobRunRecord, RuntimeConfig, RuntimeState } from "../types";
+import type { JobRecord, JobRoute, JobRunRecord, RuntimeConfig, RuntimeState, SkillRecord } from "../types";
 import { addAudit, appendEvent, appendLog, appendTrace, createChatMessage, createChatSession, createJob, createJobRun, createRun, insertChatBlock, isTerminalTaskStatus, mutateState, now, readState } from "../state";
+import { isSkillActive } from "../integrations/connectors";
 import { resolveEffectiveContext } from "../execution/effective-context";
 import { isKnownHook, runHook, type HookConfig } from "../hooks";
 import { spawn } from "bun";
@@ -25,9 +26,14 @@ const CRON_EXECUTION_HINT = [
   ""
 ].join("\n");
 
-function withCronHint(jobPrompt: string, context: string[]): string {
+function withCronHint(jobPrompt: string, context: string[], skillBlock?: string): string {
+  // The skill block (trusted, operator-registered instructions) precedes
+  // the context block, which may carry untrusted fenced hook content.
+  // Absent skillBlock keeps the assembled prompt byte-identical to the
+  // pre-attachment behavior.
+  const skillSection = skillBlock ? `${skillBlock}\n\n` : "";
   const contextBlock = context.length > 0 ? `Context:\n${context.join("\n")}\n\n` : "";
-  return `${CRON_EXECUTION_HINT}\n${contextBlock}${jobPrompt}`;
+  return `${CRON_EXECUTION_HINT}\n${skillSection}${contextBlock}${jobPrompt}`;
 }
 
 function assertPositiveInt(label: string, value: unknown): number {
@@ -44,6 +50,63 @@ function assertNonNegativeInt(label: string, value: unknown): number {
     throw new Error(`Invalid input: ${label} must be a non-negative integer (got ${String(value)})`);
   }
   return num;
+}
+
+// Hard cap on how many skills a single job may attach. Each attached
+// skill's FULL body is inlined into every fire's prompt, so the cap bounds
+// per-fire prompt growth at the source. See ADR job-skill-attachments.md.
+const MAX_JOB_SKILL_NAMES = 8;
+
+// Total-character budget for inlined skill bodies per fire. A skill that
+// overflows the budget is truncated with an in-prompt note pointing the
+// model at read_skill, and the truncation is traced — see
+// resolveJobSkillAttachments.
+const MAX_INLINED_SKILL_CHARS = 32_000;
+
+// Shape validation for the skillNames field, shared by create and update.
+// Duplicate names are dropped (first occurrence wins) before the cap is
+// enforced, so a repeated name can never inline a body twice or burn a cap
+// slot. Registry resolution happens separately inside the mutateState
+// callback (assertSkillNamesResolve) so it serializes with skill
+// enable/disable writes.
+function parseSkillNamesInput(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    throw new Error(`Invalid input: skillNames must be an array of strings (got ${typeof value})`);
+  }
+  const cleaned: string[] = [];
+  for (const entry of value) {
+    if (typeof entry !== "string" || entry.length === 0) {
+      throw new Error("Invalid input: skillNames entries must be non-empty strings");
+    }
+    if (!cleaned.includes(entry)) cleaned.push(entry);
+  }
+  if (cleaned.length > MAX_JOB_SKILL_NAMES) {
+    throw new Error(`Invalid input: skillNames may list at most ${MAX_JOB_SKILL_NAMES} skills (got ${cleaned.length})`);
+  }
+  return cleaned;
+}
+
+// Resolve a job-attached skill name with the same semantics as the
+// read_skill tool (src/execution/tool-dispatch.ts): exact name match,
+// enabled bundled preferred over enabled user. Returns undefined when no
+// ENABLED record matches — the caller decides whether that's a create-time
+// `Invalid input` or a fire-time skip.
+function resolveEnabledSkill(state: RuntimeState, name: string): SkillRecord | undefined {
+  const matches = state.skills.filter((s) => s.name === name && s.status === "enabled");
+  return matches.find((s) => (s.source ?? "user") === "bundled") ?? matches[0];
+}
+
+// Validate a skillNames list against the registry, naming the first bad
+// entry in a typed `Invalid input: …` so the caller (agent or HTTP client)
+// can correct it. createScheduledJob and updateJob both route here — the
+// single choke point for CLI, HTTP, and the agent's create_job/update_job
+// tools, which all delegate to those two functions.
+function assertSkillNamesResolve(state: RuntimeState, skillNames: string[]): void {
+  for (const name of skillNames) {
+    if (!resolveEnabledSkill(state, name)) {
+      throw new Error(`Invalid input: skillNames entry "${name}" does not match any enabled skill`);
+    }
+  }
 }
 
 export interface CreateScheduledJobOptions {
@@ -285,6 +348,15 @@ export async function createScheduledJob(
     }
     dangerousTerminalPatterns = cleaned;
   }
+  // Skill attachments. Shape-validate up-front; the names resolve against
+  // the registry inside the mutateState callback below so validation
+  // serializes with concurrent skill enable/disable writes. An empty array
+  // normalizes to "no attachments" (field absent on the record).
+  let skillNames: string[] | undefined;
+  if (input.skillNames !== undefined && input.skillNames !== null) {
+    const parsed = parseSkillNamesInput(input.skillNames);
+    if (parsed.length > 0) skillNames = parsed;
+  }
   // A parent task that has already transitioned terminal must not
   // create a durable scheduled job. Without this, a `cancelTask`
   // queued between the dispatcher's lock-free pre-check and our
@@ -315,6 +387,10 @@ export async function createScheduledJob(
         throw new Error(`Cannot create scheduled job: chat session ${chatSessionId} no longer exists.`);
       }
     }
+    // Skill attachments resolve against the registry here, inside the
+    // per-instance lock, so a concurrent disable can't slip a stale name
+    // past validation.
+    if (skillNames !== undefined) assertSkillNamesResolve(state, skillNames);
     // Dedicated-session creation. Done INSIDE the mutateState callback so
     // it shares the same write as `createJob`: a validation failure (e.g.
     // a bad parent task state) leaves no orphan chat row. The new
@@ -378,6 +454,7 @@ export async function createScheduledJob(
       nextRunAt: new Date(initialNextRunAtMs).toISOString(),
       deliveryTargets: Array.isArray(input.deliveryTargets) ? input.deliveryTargets.map(String) : [],
       context: Array.isArray(input.context) ? input.context.map(String) : [],
+      skillNames,
       retryLimit,
       timeoutSeconds,
       costBudget: typeof input.costBudget === "number" ? input.costBudget : undefined,
@@ -831,6 +908,116 @@ export async function runDueJobs(config: RuntimeConfig): Promise<void> {
   }
 }
 
+// Fire-time resolution of a job's skill attachments. Returns undefined for
+// jobs without attachments so both dispatch call sites (dispatchPromptRun,
+// dispatchFanOut) stay byte-identical to the pre-attachment behavior. For
+// jobs WITH attachments:
+//   - each name re-resolves with read_skill semantics (resolveEnabledSkill)
+//     plus the isSkillActive connector gate; a name that no longer resolves
+//     is SKIPPED — the fire proceeds without that skill's instructions
+//     (read_skill rejects missing/disabled/inactive skills too, so the skip
+//     is final for the fire) — and reported in `skipped` for the per-task
+//     trace.
+//   - inlined bodies share the MAX_INLINED_SKILL_CHARS budget; a skill that
+//     overflows it is truncated with an in-prompt note pointing at
+//     read_skill (valid here: a truncated skill is enabled and active) and
+//     reported in `truncated`.
+// See ADR job-skill-attachments.md.
+interface JobSkillAttachments {
+  // The prompt block to inline, or undefined only when the job has NO
+  // attachments at all. When every skill was skipped the block is just the
+  // informational skip directive (sections empty) so the model is still told
+  // the recipes are unavailable — see the directive below.
+  block: string | undefined;
+  attached: Array<{ id: string; name: string; version: number; chars: number }>;
+  skipped: Array<{ name: string; reason: string }>;
+  truncated: string[];
+}
+
+function resolveJobSkillAttachments(state: RuntimeState, job: JobRecord): JobSkillAttachments | undefined {
+  if (!job.skillNames || job.skillNames.length === 0) return undefined;
+  const attached: JobSkillAttachments["attached"] = [];
+  const skipped: JobSkillAttachments["skipped"] = [];
+  const truncated: string[] = [];
+  const sections: string[] = [];
+  let remaining = MAX_INLINED_SKILL_CHARS;
+  for (const name of job.skillNames) {
+    const skill = resolveEnabledSkill(state, name);
+    if (!skill) {
+      skipped.push({ name, reason: "missing or disabled" });
+      continue;
+    }
+    if (!isSkillActive(state, skill)) {
+      skipped.push({ name, reason: "inactive (required connectors not healthy)" });
+      continue;
+    }
+    let body = skill.body;
+    if (body.length > remaining) {
+      body = `${body.slice(0, remaining)}\n[truncated: total inlined skill content exceeds the per-fire cap; call read_skill("${skill.name}") for the full instructions]`;
+      truncated.push(skill.name);
+    }
+    remaining -= Math.min(skill.body.length, remaining);
+    sections.push(`<skill name="${skill.name}" version="${skill.version}">\n${body}\n</skill>`);
+    attached.push({ id: skill.id, name: skill.name, version: skill.version, chars: body.length });
+  }
+  // When some attachments were skipped, prepend an INFORMATIONAL directive so
+  // the model knows the requested recipe is unavailable this fire and must
+  // not invent results that depend on it. This is model-awareness only — the
+  // user-facing degradation notice is owned by the deterministic surfaces in
+  // finalizeJobRunFromTask (chat system_note + bridge note), so we do NOT ask
+  // the model to emit its own notice (avoids double-noting). All-skipped (no
+  // sections) still yields a block of just this directive so the model is
+  // informed even when nothing inlined.
+  const skipDirective = skipped.length > 0
+    ? `Note: ${skipped.length} requested skill recipe(s) are unavailable this run (${skipped
+        .map((s) => `${s.name}: ${s.reason}`)
+        .join("; ")}). Proceed without them and do not fabricate results that would require those skills.`
+    : undefined;
+  const inlinedBlock = sections.length > 0
+    ? `Attached skill instructions (operator-registered; follow these recipes instead of rediscovering CLI usage):\n${sections.join("\n")}`
+    : undefined;
+  const block = [skipDirective, inlinedBlock].filter((part) => part !== undefined).join("\n\n") || undefined;
+  return { block, attached, skipped, truncated };
+}
+
+// Per-task trace of a fire's skill attachments: one event per skipped or
+// truncated skill naming it, plus one summary of what was inlined. Runs
+// only after the spawned task exists (trace files are task-keyed).
+function traceSkillAttachments(
+  config: RuntimeConfig,
+  taskId: string,
+  jobId: string,
+  runId: string,
+  attachments: JobSkillAttachments
+): void {
+  for (const skip of attachments.skipped) {
+    appendTrace(config.instance, taskId, {
+      type: "job",
+      message: `Job skill attachment skipped: ${skip.name} (${skip.reason})`,
+      data: { jobId, runId, skillName: skip.name, reason: skip.reason }
+    });
+  }
+  for (const name of attachments.truncated) {
+    appendTrace(config.instance, taskId, {
+      type: "job",
+      message: `Job skill attachment truncated: ${name} (per-fire inline cap ${MAX_INLINED_SKILL_CHARS} chars)`,
+      data: { jobId, runId, skillName: name }
+    });
+  }
+  if (attachments.attached.length > 0) {
+    appendTrace(config.instance, taskId, {
+      type: "job",
+      message: "Job skill attachments inlined",
+      data: {
+        jobId,
+        runId,
+        skills: attachments.attached.map(({ name, version }) => ({ name, version })),
+        totalChars: attachments.attached.reduce((sum, skill) => sum + skill.chars, 0)
+      }
+    });
+  }
+}
+
 // Build the per-task RuntimeConfig the spawned job-task will see. The
 // returned object is always a fresh clone so we never mutate the
 // operator's global config object. When the job carries no per-job
@@ -897,8 +1084,21 @@ async function dispatchPromptRun(
   // Hook context joins the job's static context block at the single assembly
   // point, traveling alongside the prompt into the same model turn (Claude
   // Code's additionalContext-alongside-the-prompt semantics). Default [] keeps
-  // every non-hook caller byte-identical.
-  const prompt = withCronHint(job.prompt, [...job.context, ...hookContext]);
+  // every non-hook caller byte-identical. Skill attachments resolve at fire
+  // time so a stale name skips (traced below) instead of failing the fire.
+  const attachments = resolveJobSkillAttachments(readState(config.instance), job);
+  const prompt = withCronHint(job.prompt, [...job.context, ...hookContext], attachments?.block);
+  // Persist any fire-time skill skips on the run BEFORE submitTask so the
+  // degradation is durable on /api/job-runs and finalizeJobRunFromTask sees it
+  // — submitTask dispatches the chat task detached, and that task's own
+  // finalize reads run.skillSkips, so stamping it after submitTask returns
+  // would race the finalize. Only stamp when non-empty (absent = no skips).
+  if (attachments && attachments.skipped.length > 0) {
+    await mutateState(config.instance, (state) => {
+      const runItem = state.jobRuns.find((candidate) => candidate.id === run.id);
+      if (runItem) runItem.skillSkips = attachments.skipped;
+    });
+  }
   // Per-job approval envelope: clone the RuntimeConfig (NEVER mutate the
   // original — it's the per-instance runtime-wide config) and overlay the
   // job's opt-in fields before handing it to submitTask. The spawned task
@@ -1005,12 +1205,23 @@ async function dispatchPromptRun(
         session.updatedAt = now();
       }
     }
+    // Stamp the inlined skills onto the spawned task so the UI/telemetry
+    // shows skill usage without parsing the trace file.
+    if (attachments && attachments.attached.length > 0) {
+      const taskItem = state.tasks.find((candidate) => candidate.id === task.id);
+      if (taskItem) {
+        for (const { id } of attachments.attached) {
+          if (!taskItem.skillIds.includes(id)) taskItem.skillIds.push(id);
+        }
+      }
+    }
   });
   appendTrace(config.instance, task.id, {
     type: "job",
     message: "Job spawned task",
     data: { jobId: job.id, runId: run.id, deliveryTargets: job.deliveryTargets, chatSessionId: job.chatSessionId, chatRunId }
   });
+  if (attachments) traceSkillAttachments(config, task.id, job.id, run.id, attachments);
   return { jobId: job.id, runId: run.id, taskId: task.id };
 }
 
@@ -1099,6 +1310,21 @@ async function dispatchFanOut(
 ): Promise<{ dispatchedRouteKeys: string[]; attemptedRouteKeys: string[] }> {
   const dispatchedRouteKeys: string[] = [];
   const attemptedRouteKeys: string[] = [];
+  // Skill attachments resolve ONCE per tick — every route's worker shares
+  // the job's attachment list, mirroring dispatchPromptRun's fire-time
+  // skip/truncate semantics.
+  const attachments = resolveJobSkillAttachments(readState(config.instance), job);
+  // Persist fire-time skips onto the per-tick run so /api/job-runs surfaces
+  // the degradation. Fan-out workers deliver independently (not via
+  // finalizeJobRunFromTask), so the deterministic chat/bridge skip notes
+  // don't apply on this path — the in-prompt directive reaches the workers
+  // and the run record records the skip. See ADR job-skill-attachments.md.
+  if (attachments && attachments.skipped.length > 0) {
+    await mutateState(config.instance, (state) => {
+      const runItem = state.jobRuns.find((candidate) => candidate.id === run.id);
+      if (runItem) runItem.skillSkips = attachments.skipped;
+    });
+  }
   for (const [routeKey, bucketContext] of Object.entries(buckets)) {
     // Empty bucket → no worker (zero-idle-turn discipline).
     if (bucketContext.length === 0) continue;
@@ -1166,13 +1392,14 @@ async function dispatchFanOut(
 
       // Per-route prompt: the route's prompt (or the job's) + the job's static
       // context + this bucket's fenced items, assembled at the same point
-      // dispatchPromptRun assembles its single-turn prompt.
-      const prompt = withCronHint(route?.prompt ?? job.prompt, [...job.context, ...bucketContext]);
+      // dispatchPromptRun assembles its single-turn prompt (including the
+      // job's inlined skill attachments).
+      const prompt = withCronHint(route?.prompt ?? job.prompt, [...job.context, ...bucketContext], attachments?.block);
       // Spawn one constrained worker into the route's session. NO parentTaskId
       // (a parentless constrained subagent — the depth cap no-ops without a
       // parent chain), so the worker runs under the route's systemPrompt/toolsets/
       // skills whitelist exactly like a delegated subagent.
-      await spawnSubagent(config, {
+      const worker = await spawnSubagent(config, {
         name: job.name,
         prompt,
         systemPrompt: route?.systemPrompt,
@@ -1180,6 +1407,7 @@ async function dispatchFanOut(
         skills: route?.skills,
         chatSessionId
       });
+      if (attachments) traceSkillAttachments(config, worker.taskId, job.id, run.id, attachments);
       dispatchedRouteKeys.push(routeKey);
     } catch (error) {
       // One route's failure must not derail its siblings. Log it; the bucket's
@@ -1495,6 +1723,19 @@ export async function updateJob(
     }
   }
 
+  // Skill attachments patch. `undefined` = no change; `null` or `[]` =
+  // clear (mirrors the autoApproveCommands precedent above). A non-empty
+  // list REPLACES the job's previous attachments wholesale — no merge.
+  let skillNamesPatch: string[] | undefined;
+  let clearSkillNames = false;
+  if (input.skillNames === null) {
+    clearSkillNames = true;
+  } else if (input.skillNames !== undefined) {
+    const parsed = parseSkillNamesInput(input.skillNames);
+    if (parsed.length === 0) clearSkillNames = true;
+    else skillNamesPatch = parsed;
+  }
+
   return mutateState(config.instance, (state) => {
     // When invoked from the agent tool path with a `parentTaskId`, refuse
     // to mutate if the parent task has gone terminal. The lock-free
@@ -1651,6 +1892,15 @@ export async function updateJob(
       job.autoApproveCommands = undefined;
     } else if (autoApproveCommandsPatch !== undefined) {
       job.autoApproveCommands = autoApproveCommandsPatch;
+    }
+
+    // Skill attachments resolve inside the lock (same rationale as in
+    // createScheduledJob): a throw here aborts the whole patch — no write.
+    if (clearSkillNames) {
+      job.skillNames = undefined;
+    } else if (skillNamesPatch !== undefined) {
+      assertSkillNamesResolve(state, skillNamesPatch);
+      job.skillNames = skillNamesPatch;
     }
 
     job.updatedAt = now();
