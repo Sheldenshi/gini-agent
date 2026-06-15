@@ -85,53 +85,56 @@ export function TunnelSelectionPanel({
     onConnect(p.id);
   };
 
-  if (pendingSwitch) {
-    const fromName = state.providers.find((p) => p.id === liveProvider)?.name ?? liveProvider;
-    return (
-      <div className={cn("flex w-full flex-col text-card-foreground", className)}>
-        <div className="flex items-start justify-between gap-3 border-b border-border px-4 py-3">
-          <span className="text-sm font-semibold leading-none">Switch tunnel?</span>
-          <Button variant="ghost" size="icon-sm" aria-label="Close" onClick={() => setPendingSwitch(null)}>
-            <X className="size-4" />
-          </Button>
-        </div>
-        <div className="flex flex-col gap-3 p-4">
-          <div className="flex gap-3">
-            <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-500" />
-            <p className="text-sm leading-relaxed text-muted-foreground">
-              Switching to <span className="font-medium text-foreground">{pendingSwitch.name}</span> gives
-              your agent a new public address. Devices paired over{" "}
-              <span className="font-medium text-foreground">{fromName}</span> will need to scan the new QR
-              code to reconnect.
-            </p>
-          </div>
-          <div className="flex items-center justify-end gap-2">
-            <Button variant="ghost" size="sm" onClick={() => setPendingSwitch(null)}>
-              Keep {fromName}
-            </Button>
-            <Button
-              size="sm"
-              aria-label={`Switch to ${pendingSwitch.name}`}
-              onClick={() => {
-                const target = pendingSwitch;
-                setPendingSwitch(null);
-                onConnect(target.id);
-              }}
-            >
-              Switch to {pendingSwitch.name}
-            </Button>
-          </div>
-        </div>
-      </div>
-    );
-  }
+  const fromName = state.providers.find((p) => p.id === liveProvider)?.name ?? liveProvider;
 
   return (
-    <div
-      className={cn("flex w-full flex-col text-card-foreground", className)}
-      aria-label="Tunnel provider"
-      aria-busy={connecting}
-    >
+    <div className={cn("relative w-full text-card-foreground", className)}>
+      {/* The switch confirm is an absolute overlay, not a separate view — the
+          panel stays mounted at full height underneath, so the popover box
+          never resizes when the confirm appears (no jarring height jump). */}
+      {pendingSwitch && (
+        <div className="absolute inset-0 z-10 flex flex-col bg-popover">
+          <div className="flex items-start justify-between gap-3 border-b border-border px-4 py-3">
+            <span className="text-sm font-semibold leading-none">Switch tunnel?</span>
+            <Button variant="ghost" size="icon-sm" aria-label="Close" onClick={() => setPendingSwitch(null)}>
+              <X className="size-4" />
+            </Button>
+          </div>
+          <div className="flex flex-1 flex-col gap-3 p-4">
+            <div className="flex gap-3">
+              <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-500" />
+              <p className="text-sm leading-relaxed text-muted-foreground">
+                Switching to <span className="font-medium text-foreground">{pendingSwitch.name}</span> gives
+                your agent a new public address. Devices paired over{" "}
+                <span className="font-medium text-foreground">{fromName}</span> will need to scan the new QR
+                code to reconnect.
+              </p>
+            </div>
+            <div className="mt-auto flex items-center justify-end gap-2">
+              <Button variant="ghost" size="sm" onClick={() => setPendingSwitch(null)}>
+                Keep {fromName}
+              </Button>
+              <Button
+                size="sm"
+                aria-label={`Switch to ${pendingSwitch.name}`}
+                onClick={() => {
+                  const target = pendingSwitch;
+                  setPendingSwitch(null);
+                  onConnect(target.id);
+                }}
+              >
+                Switch to {pendingSwitch.name}
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+      <div
+        className="flex w-full flex-col"
+        aria-label="Tunnel provider"
+        aria-busy={connecting}
+        aria-hidden={pendingSwitch ? true : undefined}
+      >
       <div className="flex items-start justify-between gap-3 border-b border-border px-4 py-3">
         <div className="flex flex-col gap-1">
           <span className="text-sm font-semibold leading-none">Tunnel provider</span>
@@ -235,11 +238,12 @@ export function TunnelSelectionPanel({
         })}
       </div>
 
-      {state.status === "error" && state.message && (
-        <div className="px-4 pb-3">
-          <p className="text-xs text-destructive">{state.message}</p>
-        </div>
-      )}
+        {state.status === "error" && state.message && (
+          <div className="px-4 pb-3">
+            <p className="text-xs text-destructive">{state.message}</p>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
