@@ -474,6 +474,12 @@ describe("runtime api", () => {
       url: "https://relay.test/consent", redirectUri: "http://127.0.0.1:8765/cb",
       waitForSession: () => Promise.resolve(session), cancel: () => {}
     };
+    // Inert manual drivers so nothing in this flow can shell out to a
+    // host-installed tailscale/ngrok/cloudflared (or flip their catalog rows).
+    const inertDriver = (requires: string) => ({
+      detect: () => Promise.resolve({ enabled: false, requires }),
+      connect: () => Promise.reject(new Error("manual driver must not run"))
+    });
     setTunnelDeps({
       loginUrl: () => Promise.resolve(handle),
       buildTunnel: (_opts: TunnelOptions) => child,
@@ -481,7 +487,12 @@ describe("runtime api", () => {
       resolveDefaults: () => relay,
       openBrowser: () => {},
       resolveLocalPort: () => 4321,
-      probeLocalPort: () => Promise.resolve(true)
+      probeLocalPort: () => Promise.resolve(true),
+      drivers: {
+        tailscale: inertDriver("Tailscale network"),
+        ngrok: inertDriver("ngrok account"),
+        cloudflare: inertDriver("cloudflared CLI")
+      }
     });
 
     try {
@@ -542,16 +553,62 @@ describe("runtime api", () => {
     }
   });
 
+  test("GET /api/tunnel?detect=1 re-probes driver availability and flips catalog rows", async () => {
+    const config = testConfig("tunnel-detect");
+    const handler = createHandler(config);
+    const inert = (requires: string) => ({
+      detect: () => Promise.resolve({ enabled: false, requires }),
+      connect: () => Promise.reject(new Error("unused"))
+    });
+    setTunnelDeps({
+      drivers: {
+        tailscale: { detect: () => Promise.resolve({ enabled: true }), connect: () => Promise.reject(new Error("unused")) },
+        ngrok: inert("ngrok account"),
+        cloudflare: inert("cloudflared CLI")
+      }
+    });
+    try {
+      // A plain GET never spawns detection: the catalog stays default-disabled.
+      const plain = await call(handler, config, "/api/tunnel");
+      const plainRow = plain.providers.find((p: { id: string }) => p.id === "tailscale");
+      expect(plainRow.enabled).toBe(false);
+      // detect=1 probes the drivers and the row flips.
+      const detected = await call(handler, config, "/api/tunnel?detect=1");
+      const row = detected.providers.find((p: { id: string }) => p.id === "tailscale");
+      expect(row.enabled).toBe(true);
+      expect(row.requires).toBeUndefined();
+    } finally {
+      setTunnelDeps();
+    }
+  });
+
   test("POST /api/tunnel/select rejects a disabled provider with a 400", async () => {
     const config = testConfig("tunnel-reject");
     const handler = createHandler(config);
-    const response = await rawCall(handler, config, "/api/tunnel/select", {
-      method: "POST",
-      body: JSON.stringify({ provider: "ngrok" })
-    }, config.token);
-    expect(response.status).toBe(400);
-    const value = await response.json();
-    expect(value.error).toContain("not available");
+    // The select path re-probes a disabled provider's prerequisite before
+    // rejecting — pin detection to disabled so the rejection (and this test)
+    // never depends on which CLIs the host machine happens to have.
+    setTunnelDeps({
+      drivers: {
+        tailscale: { detect: () => Promise.resolve({ enabled: false, requires: "Tailscale network" }), connect: () => Promise.reject(new Error("unused")) },
+        ngrok: { detect: () => Promise.resolve({ enabled: false, requires: "ngrok account" }), connect: () => Promise.reject(new Error("unused")) },
+        cloudflare: { detect: () => Promise.resolve({ enabled: false, requires: "cloudflared CLI" }), connect: () => Promise.reject(new Error("unused")) }
+      }
+    });
+    try {
+      const response = await rawCall(handler, config, "/api/tunnel/select", {
+        method: "POST",
+        body: JSON.stringify({ provider: "ngrok" })
+      }, config.token);
+      expect(response.status).toBe(400);
+      const value = await response.json();
+      expect(value.error).toContain("not available");
+      // The machine-readable code rides along so clients can branch on the
+      // failure kind (the web UI opens the provider's guide on this code).
+      expect(value.code).toBe("provider_unavailable");
+    } finally {
+      setTunnelDeps();
+    }
   });
 
   test("supports V1 skill governance and job run history workflows", async () => {

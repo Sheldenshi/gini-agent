@@ -3,7 +3,15 @@
 // is the only network-facing surface, so every lane is exercised here.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { isLoopbackHost, isRelayHost, trustedOrigins, webBoundRequestAllowed } from "./origin-trust";
+import {
+  clearRuntimeTunnelTrust,
+  isLoopbackHost,
+  isRelayHost,
+  isRuntimeTunnelHost,
+  setRuntimeTunnelTrust,
+  trustedOrigins,
+  webBoundRequestAllowed
+} from "./origin-trust";
 
 const originalTrusted = process.env.GINI_TRUSTED_ORIGINS;
 const originalRelayDomain = process.env.GINI_RELAY_DOMAIN;
@@ -209,5 +217,59 @@ describe("webBoundRequestAllowed — Sec-Fetch-Site", () => {
 
   test("a cross-site subresource (non-document destination) is still refused", () => {
     expect(webBoundRequestAllowed(makeReq({ method: "GET", host: "127.0.0.1:7778", secFetchSite: "cross-site", secFetchDest: "image" }))).toBe(false);
+  });
+});
+
+// The runtime-tunnel lane: a host the runtime itself published (a connected
+// tunnel record's url) is admitted like a relay subdomain, and revoked the
+// moment the record leaves "connected".
+describe("runtime-tunnel trust lane", () => {
+  afterEach(() => {
+    clearRuntimeTunnelTrust();
+  });
+
+  test("a connected tunnel host is trusted for safe no-Origin requests, and revocable", () => {
+    const host = "machine.tail-test.ts.net";
+    expect(webBoundRequestAllowed(makeReq({ method: "GET", host, url: `https://${host}/` }))).toBe(false);
+    setRuntimeTunnelTrust("inst-a", `https://${host}`);
+    expect(isRuntimeTunnelHost(host)).toBe(true);
+    expect(webBoundRequestAllowed(makeReq({ method: "GET", host, url: `https://${host}/` }))).toBe(true);
+    // Default-port equivalence: the recorded https origin matches host:443.
+    expect(isRuntimeTunnelHost(`${host}:443`)).toBe(true);
+    setRuntimeTunnelTrust("inst-a", null);
+    expect(isRuntimeTunnelHost(host)).toBe(false);
+    expect(webBoundRequestAllowed(makeReq({ method: "GET", host, url: `https://${host}/` }))).toBe(false);
+  });
+
+  test("an unsafe request needs a same-host Origin on the tunnel front; cross-host Origins are refused", () => {
+    const host = "abc.trycloudflare.com";
+    setRuntimeTunnelTrust("inst-a", `https://${host}`);
+    // No Origin + unsafe method: refused on every lane, including this one.
+    expect(webBoundRequestAllowed(makeReq({ method: "POST", host, url: `https://${host}/x` }))).toBe(false);
+    // Origin == Host on the tunnel front: trusted.
+    expect(
+      webBoundRequestAllowed(makeReq({ method: "POST", host, origin: `https://${host}`, url: `https://${host}/x` }))
+    ).toBe(true);
+    // A different (attacker) Origin on the tunnel Host: refused.
+    expect(
+      webBoundRequestAllowed(
+        makeReq({ method: "POST", host, origin: "https://attacker.example", url: `https://${host}/x` })
+      )
+    ).toBe(false);
+  });
+
+  test("an unparseable url installs nothing and clears any prior entry", () => {
+    setRuntimeTunnelTrust("inst-a", "https://ok.ngrok-free.app");
+    expect(isRuntimeTunnelHost("ok.ngrok-free.app")).toBe(true);
+    setRuntimeTunnelTrust("inst-a", "not a url");
+    expect(isRuntimeTunnelHost("ok.ngrok-free.app")).toBe(false);
+  });
+
+  test("entries are per instance; clearing one leaves another's front trusted", () => {
+    setRuntimeTunnelTrust("inst-a", "https://a.ngrok-free.app");
+    setRuntimeTunnelTrust("inst-b", "https://b.trycloudflare.com");
+    setRuntimeTunnelTrust("inst-a", null);
+    expect(isRuntimeTunnelHost("a.ngrok-free.app")).toBe(false);
+    expect(isRuntimeTunnelHost("b.trycloudflare.com")).toBe(true);
   });
 });

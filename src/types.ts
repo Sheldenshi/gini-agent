@@ -88,12 +88,15 @@ export type RelayStatus = "disabled" | "configured" | "degraded" | "error";
 
 // Tunnel connectivity (see ADR tunnel-connectivity.md). The tunnel gateway
 // exposes a remote URL for this instance through one of several providers.
-// Only "gini-relay" is enabled for now; the rest are catalog placeholders
-// surfaced to the UI with a `requires` explanation of what's missing.
+// "gini-relay" is always enabled; tailscale/ngrok/cloudflare are
+// detection-gated native drivers (a disabled row carries a `requires`
+// reason).
 export type TunnelProviderId = "gini-relay" | "tailscale" | "ngrok" | "cloudflare";
 
 // One row in the provider catalog. Drives the selection panel: disabled
-// rows render their `requires` string as the reason they can't be picked.
+// rows render their `requires` string as the reason they can't connect yet.
+// The long-form setup guidance lives in docs/remote-access/<id>.md — the web
+// UI opens it when a connect is rejected with `provider_unavailable`.
 export interface TunnelProvider {
   id: TunnelProviderId;
   name: string;
@@ -103,7 +106,8 @@ export interface TunnelProvider {
 
 // The connection lifecycle status surfaced to clients.
 //   idle       — no active tunnel; selection may or may not be set.
-//   connecting — a login/connect is pending; the panel shows "Pending Login…".
+//   connecting — a connect is pending (the relay's OAuth consent, or a manual
+//                driver bringing its tunnel up); the panel shows "Connecting…".
 //   connected  — the tunnel is live; `url` is present.
 //   error      — the last connect failed; `message` carries the reason.
 export type TunnelStatus = "idle" | "connecting" | "connected" | "error";

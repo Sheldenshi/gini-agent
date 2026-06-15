@@ -43,5 +43,7 @@ export async function tunnel(ctx: CliContext): Promise<void> {
   if (sub !== "status") {
     throw new Error(`Unknown tunnel subcommand: ${sub}. Use: status | select | connect | cancel | disconnect.`);
   }
-  print(await api(config, "/api/tunnel"));
+  // detect=1: a status read is the operator looking at the catalog, so re-probe
+  // the manual driver prerequisites (tailscale/ngrok/cloudflared) first.
+  print(await api(config, "/api/tunnel?detect=1"));
 }

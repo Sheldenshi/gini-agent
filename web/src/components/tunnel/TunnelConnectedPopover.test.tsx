@@ -39,7 +39,7 @@ const PROVIDERS: TunnelProvider[] = [
   { id: "gini-relay", name: "Gini Relay", enabled: true },
   { id: "tailscale", name: "Tailscale", enabled: false, requires: "Tailscale network" },
   { id: "ngrok", name: "ngrok", enabled: false, requires: "ngrok account" },
-  { id: "cloudflare", name: "Cloudflare", enabled: false, requires: "Cloudflare account" }
+  { id: "cloudflare", name: "Cloudflare", enabled: false, requires: "cloudflared CLI" }
 ];
 
 function makeState(over: Partial<TunnelState> = {}): TunnelState {
@@ -76,6 +76,42 @@ afterEach(() => {
 });
 
 describe("TunnelConnectedPopover", () => {
+  test("the stability copy is provider-aware: stable fronts say so, churning ones warn", () => {
+    // tailscale (machine-named) keeps its URL across reconnects.
+    const { rerender } = render(
+      <TunnelConnectedPopover state={makeState()} onEdit={() => {}} onDisconnect={() => {}} />
+    );
+    expect(screen.queryByText(/stable link/)).not.toBeNull();
+    // ngrok's free tier mints a fresh subdomain per connect — no 24/7 claim.
+    rerender(
+      <TunnelConnectedPopover
+        state={makeState({ selectedProvider: "ngrok", url: "https://ab12.ngrok-free.app" })}
+        onEdit={() => {}}
+        onDisconnect={() => {}}
+      />
+    );
+    expect(screen.queryByText(/stable link/)).toBeNull();
+    expect(screen.queryByText(/changes on every reconnect/)).not.toBeNull();
+    // cloudflare QUICK tunnels churn too…
+    rerender(
+      <TunnelConnectedPopover
+        state={makeState({ selectedProvider: "cloudflare", url: "https://some-words.trycloudflare.com" })}
+        onEdit={() => {}}
+        onDisconnect={() => {}}
+      />
+    );
+    expect(screen.queryByText(/changes on every reconnect/)).not.toBeNull();
+    // …but a NAMED cloudflare tunnel is a stable custom domain.
+    rerender(
+      <TunnelConnectedPopover
+        state={makeState({ selectedProvider: "cloudflare", url: "https://gini.example.com" })}
+        onEdit={() => {}}
+        onDisconnect={() => {}}
+      />
+    );
+    expect(screen.queryByText(/stable link/)).not.toBeNull();
+  });
+
   test("the QR reveal is two-way: Reveal shows a Hide toggle, Hide re-blurs it", async () => {
     const user = userEvent.setup();
     render(

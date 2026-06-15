@@ -91,25 +91,6 @@ describe("useTunnel", () => {
     expect(result.current.error).toBe("nope");
   });
 
-  test("select() POSTs /select with the provider body and applies the returned state", async () => {
-    const { result } = renderHook(() => useTunnel());
-    await waitFor(() => expect(result.current.loading).toBe(false));
-
-    const selected = makeState({ selectedProvider: "ngrok" });
-    fetchMock.mockResolvedValueOnce(res({ body: selected }));
-
-    await act(async () => {
-      result.current.select("ngrok");
-    });
-
-    expect(fetchMock).toHaveBeenCalledWith(`${BASE}/select`, {
-      method: "POST",
-      headers: { "content-type": "application/json", accept: "application/json" },
-      body: JSON.stringify({ provider: "ngrok" })
-    });
-    expect(result.current.state).toEqual(selected);
-  });
-
   test("connect(provider) POSTs /connect with a provider body", async () => {
     const { result } = renderHook(() => useTunnel());
     await waitFor(() => expect(result.current.loading).toBe(false));
@@ -205,17 +186,49 @@ describe("useTunnel", () => {
     expect(result.current.error).toBe("post-nope");
   });
 
-  test("refresh() triggers another get()", async () => {
+  test("connect() resolves ok:true on success and carries the gateway's failure code on a 400", async () => {
+    const { result } = renderHook(() => useTunnel());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    fetchMock.mockResolvedValueOnce(res({ body: makeState({ status: "connecting" }) }));
+    let outcome: Awaited<ReturnType<typeof result.current.connect>> | undefined;
+    await act(async () => {
+      outcome = await result.current.connect("gini-relay");
+    });
+    expect(outcome).toEqual({ ok: true });
+
+    // The gateway rejects an unavailable provider with a machine-readable
+    // code; the result surfaces it so the menu can open the provider's guide.
+    fetchMock.mockResolvedValueOnce(
+      res({
+        ok: false,
+        status: 400,
+        body: { error: "Tunnel provider Tailscale is not available (requires Tailscale network).", code: "provider_unavailable" }
+      })
+    );
+    await act(async () => {
+      outcome = await result.current.connect("tailscale");
+    });
+    expect(outcome).toEqual({
+      ok: false,
+      message: "Tunnel provider Tailscale is not available (requires Tailscale network).",
+      code: "provider_unavailable"
+    });
+    expect(result.current.error).toContain("not available");
+  });
+
+  test("refresh() triggers a detect=1 get (the panel-open path re-probes drivers); mount stays plain", async () => {
     const { result } = renderHook(() => useTunnel());
     await waitFor(() => expect(result.current.loading).toBe(false));
     expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenLastCalledWith(BASE, { headers: { accept: "application/json" } });
 
     await act(async () => {
       result.current.refresh();
     });
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(fetchMock).toHaveBeenLastCalledWith(BASE, { headers: { accept: "application/json" } });
+    expect(fetchMock).toHaveBeenLastCalledWith(`${BASE}?detect=1`, { headers: { accept: "application/json" } });
   });
 
   test("polling: a connecting state arms the interval, and connected clears it", async () => {

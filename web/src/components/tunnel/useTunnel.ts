@@ -17,18 +17,31 @@ const POLL_MS = 1500;
 const EMPTY: TunnelState = { providers: [], selectedProvider: null, status: "idle" };
 
 async function readState(res: Response): Promise<TunnelState> {
-  const data = (await res.json()) as TunnelState & { error?: string };
-  if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
+  const data = (await res.json()) as TunnelState & { error?: string; code?: string };
+  if (!res.ok) {
+    // Carry the gateway's machine-readable failure code (e.g.
+    // "provider_unavailable") so callers can branch on the failure kind.
+    const error = new Error(data.error ?? `HTTP ${res.status}`) as Error & { code?: string };
+    if (typeof data.code === "string") error.code = data.code;
+    throw error;
+  }
   return data;
 }
 
+// Outcome of a tunnel action. `code` is the gateway's machine-readable
+// failure kind when it sent one — the menu opens a provider's setup guide on
+// "provider_unavailable" instead of leaving just the error banner.
+export type TunnelActionResult = { ok: true } | { ok: false; message: string; code?: string };
+
+// No `select`: the web UI is single-tunnel "tap to switch" (connecting a
+// provider IS the selection), so it never calls /api/tunnel/select. That route
+// stays on the gateway for the CLI (`gini tunnel select <provider>`).
 export type TunnelController = {
   state: TunnelState;
   loading: boolean;
   error: string | null;
   refresh: () => void;
-  select: (provider: TunnelProviderId) => void;
-  connect: (provider?: TunnelProviderId) => void;
+  connect: (provider?: TunnelProviderId) => Promise<TunnelActionResult>;
   cancel: () => void;
   disconnect: () => void;
 };
@@ -44,10 +57,16 @@ export function useTunnel(): TunnelController {
   // a newer state.
   const getSeq = useRef(0);
 
-  const get = useCallback(async () => {
+  // `detect` re-probes the manual driver prerequisites gateway-side; used by
+  // the panel-open refresh so a freshly-installed tailscale/ngrok/cloudflared
+  // flips its row enabled without a runtime restart. Mount + poll reads stay
+  // plain so they never spawn detection subprocesses.
+  const get = useCallback(async (detect = false) => {
     const seq = (getSeq.current += 1);
     try {
-      const next = await readState(await fetch(BASE, { headers: { accept: "application/json" } }));
+      const next = await readState(
+        await fetch(detect ? `${BASE}?detect=1` : BASE, { headers: { accept: "application/json" } })
+      );
       if (seq !== getSeq.current) return;
       setState(next);
       setError(null);
@@ -59,7 +78,7 @@ export function useTunnel(): TunnelController {
     }
   }, []);
 
-  const post = useCallback(async (path: string, body?: Record<string, unknown>) => {
+  const post = useCallback(async (path: string, body?: Record<string, unknown>): Promise<TunnelActionResult> => {
     setError(null);
     try {
       const next = await readState(
@@ -73,8 +92,12 @@ export function useTunnel(): TunnelController {
       // POST's committed state (get() checks getSeq before it commits).
       getSeq.current += 1;
       setState(next);
+      return { ok: true };
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      const message = err instanceof Error ? err.message : String(err);
+      setError(message);
+      const code = err instanceof Error ? (err as Error & { code?: string }).code : undefined;
+      return { ok: false, message, code };
     }
   }, []);
 
@@ -95,13 +118,12 @@ export function useTunnel(): TunnelController {
     return () => clearInterval(id);
   }, [polling]);
 
-  const select = useCallback((provider: TunnelProviderId) => void post("/select", { provider }), [post]);
   const connect = useCallback(
-    (provider?: TunnelProviderId) => void post("/connect", provider ? { provider } : undefined),
+    (provider?: TunnelProviderId) => post("/connect", provider ? { provider } : undefined),
     [post]
   );
   const cancel = useCallback(() => void post("/cancel"), [post]);
   const disconnect = useCallback(() => void post("/disconnect"), [post]);
 
-  return { state, loading, error, refresh: () => void get(), select, connect, cancel, disconnect };
+  return { state, loading, error, refresh: () => void get(true), connect, cancel, disconnect };
 }

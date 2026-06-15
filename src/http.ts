@@ -101,8 +101,8 @@ import { resolveEffectiveContext } from "./execution/effective-context";
 import { completeBrowserConnectSetup, connectBrowser, disconnectBrowser, getBrowserConnection } from "./capabilities/browser-connect";
 import { hermesParityChecks } from "./runtime/parity";
 import { acknowledgeNotification, checkRelay, configureRelay, listRelays, queueNotification, sendQueuedNotifications } from "./integrations/relay";
-import { cancelTunnel, connectTunnel, disconnectTunnel, getTunnel, selectProvider } from "./integrations/tunnel";
-import { isLoopbackHost, isRelayHost, webBoundRequestAllowed } from "./lib/origin-trust";
+import { cancelTunnel, connectTunnel, disconnectTunnel, getTunnel, PROVIDER_UNAVAILABLE, refreshProviderDetection, selectProvider } from "./integrations/tunnel";
+import { isLoopbackHost, isRelayHost, isRuntimeTunnelHost, webBoundRequestAllowed } from "./lib/origin-trust";
 import { cookieValue, serializeCookie } from "./lib/cookies";
 import { RateLimiter } from "./lib/rate-limit";
 import { getSetupStatus, removeSetupProvider, setSetupProvider } from "./runtime/setup-api";
@@ -124,6 +124,10 @@ import { clearWebTargetCache, resolveWebPort } from "./web-target";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import { homedir } from "node:os";
 import type { Server, ServerWebSocket } from "bun";
+
+// Error codes deliberately published in error bodies (see the route-table
+// catch). Everything else stays message-only.
+const PUBLIC_ERROR_CODES = new Set<string>([PROVIDER_UNAVAILABLE]);
 
 type Handler = (request: Request, params: Record<string, string>) => Response | Promise<Response>;
 
@@ -1845,10 +1849,19 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["POST", /^\/api\/relays\/([^/]+)\/health$/, async (_request, params) => json(await checkRelay(config, params[0]))],
     // Tunnel connectivity (ADR tunnel-connectivity.md). Every route returns
     // the full TunnelState so one fetch drives the selection/connect/connected
-    // UI. connect() flips to "connecting" and runs the gini-relay OAuth-loopback
-    // login + frpc handshake in the background; the UI polls GET /api/tunnel
-    // until status flips to "connected" (with url) or "error".
-    ["GET", /^\/api\/tunnel$/, () => json(getTunnel(config))],
+    // UI. connect() flips to "connecting" and runs the selected provider's
+    // background flow (gini-relay: OAuth-loopback login + frpc; manual
+    // drivers: tailscale serve / a spawned agent, no login); the UI polls
+    // GET /api/tunnel until status flips to "connected" (with url) or "error".
+    // `?detect=1` (the panel-open / CLI-status path) re-probes the manual
+    // driver prerequisites first, so a freshly-installed CLI flips its catalog
+    // row without a runtime restart; plain polling GETs never spawn detection.
+    ["GET", /^\/api\/tunnel$/, async (request) => {
+      if (new URL(request.url).searchParams.get("detect") === "1") {
+        await refreshProviderDetection(true).catch(() => {});
+      }
+      return json(getTunnel(config));
+    }],
     ["POST", /^\/api\/tunnel\/select$/, async (request) => json(await selectProvider(config, String((await body(request)).provider ?? "")))],
     ["POST", /^\/api\/tunnel\/connect$/, async (request) => {
       const payload = await body(request);
@@ -1927,7 +1940,14 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
             return withCors(request, await handler(request, Object.fromEntries(match.slice(1).map((value, index) => [String(index), value]))));
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
-            return withCors(request, json({ error: message }, statusFromErrorMessage(message)));
+            // A machine-readable `code` rides along ONLY for the codes we
+            // deliberately publish (clients branch on the failure kind
+            // instead of parsing the human message). Allowlisted so a stray
+            // Node errno (`ENOENT`…) on a thrown fs error can't silently
+            // widen the public API shape.
+            const raw = error instanceof Error ? (error as Error & { code?: unknown }).code : undefined;
+            const code = typeof raw === "string" && PUBLIC_ERROR_CODES.has(raw) ? raw : undefined;
+            return withCors(request, json(code ? { error: message, code } : { error: message }, statusFromErrorMessage(message)));
           }
         }
       }
@@ -2659,13 +2679,15 @@ function randomBindSecret(): string {
   return Array.from(crypto.getRandomValues(new Uint8Array(32)), (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-// Whether to set Secure on pairing cookies. The relay front is always HTTPS and
-// loopback is a secure context, so both get Secure. A plain-http
+// Whether to set Secure on pairing cookies. The relay front is always HTTPS,
+// loopback is a secure context, and a runtime-managed tunnel front (tailscale
+// serve / ngrok / cloudflared) only ever publishes https URLs — all three get
+// Secure regardless of what the proxied hop looks like. A plain-http
 // GINI_TRUSTED_ORIGINS front would otherwise have its Secure cookie silently
 // dropped by the browser; honor X-Forwarded-Proto / the request scheme so such
 // a front can still pair.
 function pairingCookieSecure(request: Request, host: string): boolean {
-  if (isRelayHost(host) || isLoopbackHost(host)) return true;
+  if (isRelayHost(host) || isLoopbackHost(host) || isRuntimeTunnelHost(host)) return true;
   if ((request.headers.get("x-forwarded-proto") ?? "").toLowerCase() === "https") return true;
   return new URL(request.url).protocol === "https:";
 }
@@ -2710,7 +2732,8 @@ function pairingClaimAllowed(request: Request): boolean {
 // names), so their ABSENCE is a reliable "not a browser" signal — an XSS on the
 // /pair page can therefore never coax the token into the body. We also require
 // an explicit opt-in header (so a pre-Sec-Fetch browser that merely lacks the
-// headers is still excluded) and a trusted front (relay/loopback). This single
+// headers is still excluded) and a trusted front (relay, loopback, or a
+// runtime-managed tunnel's connected host). This single
 // gate authorises BOTH the no-Origin CSRF exemption on the POST device routes
 // AND the in-body bind secret / session token — keeping the browser flow
 // (cookie-only, no body token) byte-for-byte unchanged. See ADR
@@ -2731,7 +2754,10 @@ function isNativePairingClient(request: Request, host: string): boolean {
   // and an XSS on /pair could exfiltrate the in-body secret/token. The native
   // client (Expo/RN fetch) sends no Origin, so this never affects it.
   if (request.headers.has("origin")) return false;
-  return isRelayHost(host) || isLoopbackHost(host);
+  // Trusted fronts: the relay, loopback, and a runtime-managed tunnel's
+  // connected host — the same provider-owned-DNS reasoning as the web lanes,
+  // so the mobile app can pair through a tailscale/ngrok/cloudflare front too.
+  return isRelayHost(host) || isLoopbackHost(host) || isRuntimeTunnelHost(host);
 }
 
 // The per-request binding secret, sourced by the single native gate: a verified

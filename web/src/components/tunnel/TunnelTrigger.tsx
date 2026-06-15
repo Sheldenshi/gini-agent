@@ -13,8 +13,8 @@ import { Button } from "@/components/ui/button";
  */
 export const TunnelTrigger = React.forwardRef<
   HTMLButtonElement,
-  React.ComponentProps<typeof Button> & { connected?: boolean }
->(function TunnelTrigger({ connected = false, className, ...props }, ref) {
+  React.ComponentProps<typeof Button> & { connected?: boolean; provider?: string | null }
+>(function TunnelTrigger({ connected = false, provider = null, className, ...props }, ref) {
   return (
     <Button
       ref={ref}
@@ -53,7 +53,7 @@ export const TunnelTrigger = React.forwardRef<
           </span>
         </span>
         <span className="truncate font-mono text-[10px] leading-none text-muted-foreground">
-          {connected ? "gini-relay" : "no tunnel"}
+          {connected ? provider ?? "tunnel" : "no tunnel"}
         </span>
       </span>
     </Button>
