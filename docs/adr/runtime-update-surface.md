@@ -76,19 +76,32 @@ installer-origin guardrails rather than adding a browser-only shortcut.
   revision alone is not completion — version metadata is read from git per
   request, so the still-running old gateway reports the new sha while the
   restart is about to take both servers down. Completion is instead gated
-  on process identity: the gateway must answer `/api/status` with a new
-  `pid`, and the web server must answer its local `/api/runtime/__healthz`
-  with a new `ppid` — the supervising `next` CLI process, i.e. the
-  server-tree identity. (The worker `pid` in that response is diagnostic
+  on the running stack proving itself: the gateway must answer
+  `/api/status` with a new `pid`, and the web server must prove its local
+  `/api/runtime/__healthz` is serving the new code. Under production
+  serving that proof is `buildSha` — the short HEAD sha of the bundle the
+  server is serving (from `GINI_DIST_DIR=.next-prod-<sha12>`), so the old
+  server reports the old build and only the restarted server reports the
+  target; the gate completes the web leg when the target revision starts
+  with the reported `buildSha`. This is a direct, un-raceable identity. When
+  `buildSha` is absent (dev serving, an older server, a build that fell back
+  to dev), the web leg instead requires a new `ppid` — the supervising
+  `next` CLI process, i.e. the server-tree identity, captured as a baseline
+  when the update starts. (The worker `pid` in that response is diagnostic
   only: the `next` CLI respawns its worker in-tree when an update touches
-  `next.config.*`, so it proves nothing about a restart.) Both baselines
-  are captured when the update starts; a leg whose baseline could not be
-  captured falls back to a restart-freshness heuristic. Before reloading,
-  the client re-probes `__healthz` once and drops back to waiting if the
-  web server is not actually serving, so the reload can never land on a
-  dead server. The whole gate is bounded by one shared stall deadline that
-  phase transitions cannot extend; past it the blur is released with a
-  notice instead of trapping the user. The deadline is **progress-aware**:
+  `next.config.*`, so it proves nothing about a restart.) A leg whose
+  baseline could not be captured falls back to a restart-freshness
+  heuristic. Before reloading, the client re-probes `__healthz` once and
+  drops back to waiting if the web server is not actually serving, so the
+  reload can never land on a dead server. The whole gate is bounded by one shared stall deadline that
+  phase transitions cannot extend. The deadline firing means the detectors
+  never latched, not that the update failed, so before releasing the gate
+  does one final definitive read — `/api/version` and `__healthz`, awaited,
+  short timeout, no retries: if the gateway is up and idle on the target
+  revision and the web server is serving the target build, it reloads onto
+  the new app with no error, exactly as a normal completion would. Only
+  when the stack is genuinely not up on the target is the blur released with
+  a notice instead of trapping the user. The deadline is **progress-aware**:
   `GET /api/version` carries `updateInProgress` (the gateway's single-flight
   update guard), the blurred client polls it every ~5s, and each `true`
   answer pushes the deadline out to at least now + 90s — so a genuinely
@@ -146,9 +159,16 @@ installer-origin guardrails rather than adding a browser-only shortcut.
   current runtime is restarted without asking for manual stop/start.
 - A web-triggered update blurs and locks the app for the duration; the
   completion confirmation and reload come only after the restarted gateway
-  (new `/api/status` pid) and the restarted web server (new `__healthz`
-  ppid) have both answered, and the blur survives the restart-triggered
-  reload rather than briefly exposing the app.
+  (new `/api/status` pid) and the restarted web server (the target build's
+  `__healthz` `buildSha` under production serving, or a new `ppid` when
+  `buildSha` is absent) have both answered, and the blur survives the
+  restart-triggered reload rather than briefly exposing the app.
+- `GET /api/runtime/__healthz` reports `buildSha` equal to the served
+  bundle's short sha when `GINI_DIST_DIR=.next-prod-<sha12>`, and omits it
+  under dev serving.
+- If the stall deadline fires while the restarted stack is actually up on
+  the target revision and build, the gate reloads onto the new app instead
+  of showing the "taking longer than expected" notice.
 - `gini update` no longer prints a manual restart instruction.
 - The gateway answers `/api/status` while a `POST /api/update` is running;
   a concurrent `POST /api/update` returns 409; `GET /api/version` reports
