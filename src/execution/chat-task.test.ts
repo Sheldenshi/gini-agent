@@ -4233,7 +4233,7 @@ describe("chat-task loop", () => {
     // reports usage; the resulting calibration gap forces the pre-call trim
     // ahead of the 13th call.
     for (let i = 0; i < 12; i++) {
-      writeFileSync(join(workspaceRoot, `chunk${i}.md`), `chunk-${i} `.repeat(420));
+      writeFileSync(join(workspaceRoot, `chunk${i}.md`), `chunk-${i} `.repeat(411));
       setEchoToolCallingResponse({
         provider,
         text: "",
@@ -4300,7 +4300,8 @@ describe("chat-task loop", () => {
     // Seven mid-size tool results (distinct skills so no loop-breaker trips)
     // give the overflow compaction passes something to shrink, while the
     // estimated total stays under the proactive high-water mark (27,200
-    // tokens against the pinned 12,278-token floor) — the proactive
+    // tokens against the ~12,487-token floor: the 12,207 pinned catalog plus
+    // the system-prompt slice) — the proactive
     // compaction path never fires, so the overflow is driven purely by the
     // stubbed provider failures.
     for (let i = 0; i < 7; i++) {
@@ -5077,13 +5078,14 @@ describe("chat-task loop", () => {
     // live always-on catalog size (cleared in afterEach).
     __setBaseToolCatalogForTests(FIXED_COMPACTION_CATALOG);
 
-    // Twelve modest reads (~950 tokens each). With echo reporting no usage the
+    // Twelve modest reads (~910 tokens each). With echo reporting no usage the
     // calibration gap stays 0, so the only trim trigger is the chars/4 live
     // budget — and the accumulated transcript stays well under it (the budget
-    // is 32,000 − 1,600 reserve − 12,278 pinned floor = 18,122 tokens), so no
+    // is 32,000 − 1,600 reserve − ~12,487 floor [12,207 pinned catalog + the
+    // system-prompt slice] = ~17,913 tokens), so no
     // elision and no proactive compaction ever engages.
     for (let i = 0; i < 12; i++) {
-      await seedBulkSkill(config, `chunk-skill-${i}`, `chunk-${i} ${"x".repeat(3_700)}`);
+      await seedBulkSkill(config, `chunk-skill-${i}`, `chunk-${i} ${"x".repeat(3_630)}`);
       setEchoToolCallingResponse({
         provider,
         text: "",
