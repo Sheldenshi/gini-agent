@@ -204,7 +204,14 @@ remote previews, screen readers) would need the same translation code.
   `redactSensitiveToolArgs` (`src/execution/tool-args-redact.ts`). The
   same helper scrubs the resolved `self.config` approval payload, so a
   tool's secret args never persist to a client-rendered surface (the
-  real values still reach the handler for execution).
+  real values still reach the handler for execution). Browser ref tools
+  (`browser_click`, `browser_type`, `browser_fill_form`, …) enrich
+  `argsPreview` by resolving the `@eN` ref to the snapshot element's
+  role + name — e.g. `button "Buy a License"` instead of `@e38` — via an
+  optional resolver `chatBlockArgsPreviewFor` accepts, wired at emit time
+  to the live browser session by `peekRefLabel` (`src/tools/browser.ts`).
+  The opaque ref stays in `argsFull`, and the preview falls back to the
+  bare ref when the element has no recorded name or the session is gone.
 
 - The SSE endpoint is its own handler (`chatBlockStream` in
   `src/http.ts`), not a reuse of the existing global `eventStream`.
