@@ -220,6 +220,20 @@ an agent chat; the difference is purely the `kind`/`origin` tags that
 drive the rail grouping and the unread-until-opened behavior job
 sessions already had.
 
+Session-level unread is computed client-side
+(`web/src/lib/use-chat-read-state.ts`) and keys on **delivered replies
+only** — the activity timestamp is the newest `updatedAt` among the
+session's runs that carry an `assistantMessageId` (set when a final
+answer is persisted as a durable chat message, with `run.updatedAt`
+stamped to that message's `createdAt`), floored at `session.createdAt`.
+It deliberately ignores `session.updatedAt` and runs without a delivered
+reply, which advance on dispatch, run creation, and subagent attach: a
+job run emits tool calls and finishes subagent runs throughout its
+execution, and counting those would re-flag a channel the user already
+opened while the job is still working. This mirrors the thread rule
+above, where `lastReplyAt` keys on message blocks rather than the
+trailing auxiliary blocks a run appends.
+
 The delivery binding is user-chosen at creation. The `create_job` tool
 takes `deliverTo: "channel" | "chat"` — `"channel"` (the default) mints
 the dedicated channel session above; `"chat"` binds
