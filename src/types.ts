@@ -1358,6 +1358,12 @@ export interface AgentRecord {
   // beyond the always-on SSRF gate. User-managed by editing the agent
   // record (no CLI/UI surface yet — see ADR browser-domain-policy.md).
   browserDomainPolicy?: BrowserDomainPolicy;
+  // ISO timestamp set when the agent is archived (soft delete). Orthogonal
+  // to `status` — `activateAgent` flips `status`, so archive state lives in
+  // its own field. Absent ⇒ not archived. An archived agent cannot be
+  // activated (explicit unarchive required) and its scheduled jobs are
+  // suppressed. See ADR agents-replace-profiles.md.
+  archivedAt?: string;
   createdAt: string;
   updatedAt: string;
 }

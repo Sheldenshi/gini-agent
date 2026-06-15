@@ -8,7 +8,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createAgent, deleteAgent, listAgents, renameAgent, setAgentProvider, useAgent } from "./agents";
+import { archiveAgent, createAgent, deleteAgent, listAgents, renameAgent, setAgentProvider, unarchiveAgent, useAgent } from "./agents";
 import { soulPath } from "../runtime/identity-files";
 import { install } from "../runtime";
 import {
@@ -378,6 +378,73 @@ describe("createAgent", () => {
     expect(listed.agents.some((agent) => agent.id === created.id)).toBe(true);
     expect(listed.agents.some((agent) => agent.id === "agent_default")).toBe(true);
     expect(typeof listed.activeAgentId).toBe("string");
+  });
+
+  test("archiveAgent stamps archivedAt and audits agent.archived", async () => {
+    const config = buildConfig(workspaceRoot, "archive-agent-basic", root);
+    await install(config);
+    const created = await createAgent(config, { name: "scratch" });
+    const archived = await archiveAgent(config, created.id);
+    expect(archived.id).toBe(created.id);
+    expect(typeof archived.archivedAt).toBe("string");
+    const after = readState(config.instance);
+    const stored = after.agents.find((agent) => agent.id === created.id);
+    expect(stored?.archivedAt).toBe(archived.archivedAt);
+    // The agent is NOT removed from the roster — archive is a soft delete.
+    expect(stored).toBeDefined();
+    const audit = after.audit.find(
+      (event) => event.action === "agent.archived" && event.target === created.id
+    );
+    expect(audit).toBeDefined();
+    expect(audit?.evidence).toMatchObject({ agentId: created.id });
+  });
+
+  test("unarchiveAgent clears archivedAt and leaves the agent inactive", async () => {
+    const config = buildConfig(workspaceRoot, "unarchive-agent-basic", root);
+    await install(config);
+    const created = await createAgent(config, { name: "scratch" });
+    await archiveAgent(config, created.id);
+    const restored = await unarchiveAgent(config, created.id);
+    expect(restored.id).toBe(created.id);
+    expect(restored.archivedAt).toBeUndefined();
+    // Restored agents stay inactive — restoration never auto-activates.
+    expect(restored.status).toBe("inactive");
+    const after = readState(config.instance);
+    const stored = after.agents.find((agent) => agent.id === created.id);
+    expect(stored?.archivedAt).toBeUndefined();
+    expect(after.activeAgentId).not.toBe(created.id);
+    const audit = after.audit.find(
+      (event) => event.action === "agent.unarchived" && event.target === created.id
+    );
+    expect(audit).toBeDefined();
+  });
+
+  test("archiveAgent refuses to archive the default agent", async () => {
+    const config = buildConfig(workspaceRoot, "archive-agent-default", root);
+    await install(config);
+    await expect(archiveAgent(config, "agent_default")).rejects.toThrow(
+      "Cannot archive the default agent."
+    );
+  });
+
+  test("archiveAgent refuses to archive the active agent", async () => {
+    const config = buildConfig(workspaceRoot, "archive-agent-active", root);
+    await install(config);
+    const created = await createAgent(config, { name: "active-one" });
+    await useAgent(config, created.id);
+    await expect(archiveAgent(config, created.id)).rejects.toThrow(
+      "Cannot archive the active agent; switch to another agent first."
+    );
+  });
+
+  test("useAgent refuses to activate an archived agent", async () => {
+    const config = buildConfig(workspaceRoot, "archive-agent-use-blocked", root);
+    await install(config);
+    const created = await createAgent(config, { name: "scratch" });
+    await archiveAgent(config, created.id);
+    await expect(useAgent(config, created.id)).rejects.toThrow(
+      "Cannot use an archived agent; restore it first."
+    );
   });
 
   test("setAgentProvider sets providerName+model and audits agent.provider_set", async () => {

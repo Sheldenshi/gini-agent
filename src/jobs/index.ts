@@ -816,6 +816,10 @@ export async function runDueJobs(config: RuntimeConfig): Promise<void> {
     const out: Array<{ job: JobRecord; run: JobRunRecord }> = [];
     for (const job of state.jobs) {
       if (job.status !== "active") continue;
+      // Suppress scheduled runs for an archived (soft-deleted) owning agent.
+      // The job stays "active" so restoring the agent resumes it; we just
+      // skip claiming it while the agent is archived.
+      if (state.agents.find((agent) => agent.id === job.agentId)?.archivedAt) continue;
       const dueAt = new Date(job.nextRunAt).getTime();
       if (dueAt > dateNow) continue;
       // Overlap protection: never start a scheduled run when another run

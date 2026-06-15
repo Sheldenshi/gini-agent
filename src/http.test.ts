@@ -286,6 +286,62 @@ describe("runtime api", () => {
     expect(body.error).toContain("Cannot delete the active agent");
   });
 
+  test("POST /api/agents/:id/archive then /unarchive round-trips archivedAt", async () => {
+    const config = testConfig("agents-archive-roundtrip");
+    const handler = createHandler(config);
+
+    const created = await call(handler, config, "/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "scratch" })
+    });
+    const archived = await call(handler, config, `/api/agents/${created.id}/archive`, { method: "POST" });
+    expect(typeof archived.archivedAt).toBe("string");
+
+    const restored = await call(handler, config, `/api/agents/${created.id}/unarchive`, { method: "POST" });
+    expect(restored.archivedAt).toBeUndefined();
+  });
+
+  test("POST /api/agents/:id/archive rejects the default agent with 400", async () => {
+    const config = testConfig("agents-archive-default");
+    const handler = createHandler(config);
+    const response = await rawCall(handler, config, "/api/agents/agent_default/archive", { method: "POST" }, config.token);
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body.error).toContain("Cannot archive the default agent");
+  });
+
+  test("POST /api/agents/:id/archive rejects the active agent with 400", async () => {
+    const config = testConfig("agents-archive-active");
+    const handler = createHandler(config);
+
+    const created = await call(handler, config, "/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "active" })
+    });
+    await call(handler, config, `/api/agents/${created.id}/use`, { method: "POST" });
+
+    const response = await rawCall(handler, config, `/api/agents/${created.id}/archive`, { method: "POST" }, config.token);
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body.error).toContain("Cannot archive the active agent");
+  });
+
+  test("POST /api/agents/:id/use rejects an archived agent with 400", async () => {
+    const config = testConfig("agents-use-archived");
+    const handler = createHandler(config);
+
+    const created = await call(handler, config, "/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "scratch" })
+    });
+    await call(handler, config, `/api/agents/${created.id}/archive`, { method: "POST" });
+
+    const response = await rawCall(handler, config, `/api/agents/${created.id}/use`, { method: "POST" }, config.token);
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body.error).toContain("Cannot use an archived agent");
+  });
+
   test("PATCH /api/agents/:id renames the agent", async () => {
     const config = testConfig("agents-rename");
     const handler = createHandler(config);

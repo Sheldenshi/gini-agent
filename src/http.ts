@@ -79,7 +79,7 @@ import { inspectImportSource } from "./integrations/importers";
 import { providerCatalogWithStatus, withProviderAuthStatus } from "./provider";
 import { buildModelCatalog } from "./model-routes";
 import { setDefaultModel } from "./runtime/default-model";
-import { createAgent, deleteAgent, listAgents, renameAgent, setAgentProvider, useAgent } from "./capabilities/agents";
+import { archiveAgent, createAgent, deleteAgent, listAgents, renameAgent, setAgentProvider, unarchiveAgent, useAgent } from "./capabilities/agents";
 import {
   approveSoul,
   approveUserProfile,
@@ -1846,6 +1846,9 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     // to set, or both blank/omitted to clear and fall back to the instance
     // default. Credential setup stays on the instance-level setup/provider route.
     ["POST", /^\/api\/agents\/([^/]+)\/provider$/, async (request, params) => json(await setAgentProvider(config, decodeURIComponent(params[0]), await body(request)))],
+    // Archive (soft-delete) / restore an agent. Body-less POSTs, mirroring /use.
+    ["POST", /^\/api\/agents\/([^/]+)\/archive$/, async (_request, params) => json(await archiveAgent(config, decodeURIComponent(params[0])))],
+    ["POST", /^\/api\/agents\/([^/]+)\/unarchive$/, async (_request, params) => json(await unarchiveAgent(config, decodeURIComponent(params[0])))],
     ["PATCH", /^\/api\/agents\/([^/]+)$/, async (request, params) => json(await renameAgent(config, decodeURIComponent(params[0]), String((await body(request)).name ?? "")))],
     ["DELETE", /^\/api\/agents\/([^/]+)$/, async (_request, params) => json(await deleteAgent(config, params[0]))],
     ["GET", /^\/api\/parity\/hermes$/, () => json(hermesParityChecks(config))],
@@ -3094,9 +3097,12 @@ function statusFromErrorMessage(message: string): number {
   if (message === "New agent name is required.") return 400;
   if (message === '"default" is a reserved name.') return 400;
   if (message.startsWith("Invalid input")) return 400;
-  // Agent delete guards (default agent, active agent) throw user-input
-  // errors that should surface as 400.
+  // Agent delete/archive guards (default agent, active agent) and the
+  // archived-agent activation guard throw user-input errors that should
+  // surface as 400 rather than the catch-all 500.
   if (message.startsWith("Cannot delete")) return 400;
+  if (message.startsWith("Cannot archive")) return 400;
+  if (message.startsWith("Cannot use an archived agent")) return 400;
   // Hindsight memory routes (/memory/retain, /memory/recall,
   // /memory/reflect) and identity-file edit tools throw this when no
   // agent is active. Map to 400 so callers see a clean user-input error

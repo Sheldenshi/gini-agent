@@ -21,6 +21,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Cron } from "croner";
 import { createScheduledJob, runDueJobs } from "./index";
+import { archiveAgent, createAgent } from "../capabilities/agents";
 import { mutateState, readState } from "../state";
 import type { RuntimeConfig } from "../types";
 
@@ -291,5 +292,46 @@ describe("runDueJobs with a cron-driven job", () => {
     // (this-hour + 1h):00 which is strictly in the future, so the walk
     // stops there. missedRuns increments by exactly 2.
     expect(updated.missedRuns).toBe(2);
+  });
+
+  test("skips a due active job whose owning agent is archived", async () => {
+    // An archived agent's scheduled jobs are suppressed: the job stays
+    // "active" but runDueJobs must not claim it while the agent is
+    // archived. A sibling job owned by a non-archived agent still fires.
+    const { install } = await import("../runtime");
+    const config = buildConfig("archived-agent-job-skip");
+    await install(config);
+
+    // Own one job to a fresh (archivable) agent and another to the active
+    // default agent, so the run proves the skip is per-agent, not global.
+    const archivable = await createAgent(config, { name: "archivable" });
+    const archivedJob = await createScheduledJob(
+      config,
+      { name: "archived-owner", prompt: "x", intervalSeconds: 3600, script: "echo archived" },
+      { originatingAgentId: archivable.id }
+    );
+    const liveJob = await createScheduledJob(config, {
+      name: "live-owner",
+      prompt: "x",
+      intervalSeconds: 3600,
+      script: "echo live"
+    });
+    expect(archivedJob.agentId).toBe(archivable.id);
+
+    await archiveAgent(config, archivable.id);
+
+    // Force both jobs overdue so only the archive guard decides the outcome.
+    const overdue = new Date(Date.now() - 60_000).toISOString();
+    await mutateState(config.instance, (state) => {
+      for (const job of state.jobs) job.nextRunAt = overdue;
+    });
+
+    await runDueJobs(config);
+
+    const after = readState(config.instance);
+    expect(after.jobRuns.filter((run) => run.jobId === archivedJob.id)).toHaveLength(0);
+    const liveRuns = after.jobRuns.filter((run) => run.jobId === liveJob.id);
+    expect(liveRuns).toHaveLength(1);
+    expect(liveRuns[0]?.status).toBe("completed");
   });
 });
