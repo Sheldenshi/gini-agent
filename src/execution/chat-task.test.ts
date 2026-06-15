@@ -42,6 +42,7 @@ import {
   recordProviderAuthFailure
 } from "../state";
 import { echoEmbed } from "../embeddings";
+import { storeUpload } from "../state/uploads";
 import { resolveDefaultPriorContextTokenBudget } from "../provider-capabilities";
 import type { AgentIdentity, GoogleAccount, JobRecord, RuntimeConfig, RuntimeState, SkillRecord, Task, ToolsetRecord } from "../types";
 import { createSkillFromInput, setSkillStatus } from "../capabilities/skills";
@@ -461,6 +462,27 @@ describe("chat-task loop", () => {
     expect(after.status).toBe("failed");
     expect(after.toolCallState).toBeUndefined();
     expect(existsSync(join(workspaceRoot, "x.txt"))).toBe(false);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("image attachment on a non-vision model fails the task with an actionable message", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-image-no-vision");
+
+    // The echo provider resolves to vision:false; a PNG header is enough since
+    // the guard never reads the bytes — it gates on mime alone.
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01]);
+    const upload = storeUpload(config.instance, png, "image/png", "pic.png");
+
+    const task = await submitTask(config, "see this", {
+      mode: "chat",
+      images: [{ id: upload.id, mimeType: "image/png", size: upload.size }]
+    });
+    const finished = await waitForTerminal(config, task.id);
+
+    expect(finished.status).toBe("failed");
+    expect(finished.error).toContain("doesn't support images");
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });

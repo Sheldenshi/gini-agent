@@ -793,6 +793,15 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
   // the prior-transcript rebuild and the live user message deliver files the
   // same way (native doc vs extracted-text vs path-only).
   const modality = resolveProviderModality(effectiveForAgent.provider);
+  // A text-only model (no vision) can't ingest image content parts: an image_url
+  // part 400s the whole turn on e.g. DeepSeek ("unknown variant image_url, expected
+  // text"), taking the user's text question down with it. Reject up front with an
+  // actionable message instead of surfacing a raw provider deserialization error.
+  // Non-image attachments (PDF, CSV) are fine on text-only models — they flow through
+  // the document/extracted-text path — so gate specifically on image mime.
+  if (!modality.vision && (task.images ?? []).some((a) => a.mimeType.startsWith("image/"))) {
+    throw new Error("Gini's current model doesn't support images. Switch to a model that supports images and try again.");
+  }
   const ephemeralContext = subagent ? "" : renderEphemeralContext(identityBlock, recalledContext);
   const currentUserMessage = await buildUserMessage(config, task, modality);
   const nonPriorMessages: ToolCallingMessage[] = [
@@ -1249,7 +1258,11 @@ function wrapInlinedFile(
 //
 // Images are inlined as data URLs (the provider can't authenticate against
 // /api/uploads/:id, so we inline base64 bytes); a missing/unreadable image is
-// dropped with a trace. The image path is NOT gated on `modality.vision`.
+// dropped with a trace. The image path IS gated on `modality.vision`: a
+// non-vision model degrades an image attachment to a text note instead of an
+// image_url part, and current-turn image attachments are rejected upstream by
+// runChatTask's vision guard, so a text-only provider never receives an
+// image_url part it would 400 on.
 //
 // Non-image files are delivered deterministically by capability, in core, with
 // no skill dependency: every file is materialized to the workspace, then —
@@ -1272,6 +1285,16 @@ export async function buildAttachmentContent(
   const files = attachments.filter((a) => !a.mimeType.startsWith("image/"));
   const loaded: Array<{ id: string; mimeType: string; size: number }> = [];
   for (const image of images) {
+    if (!modality.vision) {
+      // Non-vision model: the current turn is rejected upstream by runChatTask's vision
+      // guard, so we only reach here on a prior-turn replay. Degrade the image to a note
+      // rather than emitting an image_url part a text-only provider would 400 on.
+      parts.push({
+        type: "text",
+        text: `[Attached image: ${image.id} (${image.mimeType}, ${formatBytes(image.size)}) — not shown: the active model can't view images.]`
+      });
+      continue;
+    }
     const dataUrl = uploadDataUrl(config.instance, image.id);
     if (!dataUrl) {
       appendLog(config.instance, "chat.image.missing", { uploadId: image.id });
