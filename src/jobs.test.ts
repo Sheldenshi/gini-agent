@@ -14,6 +14,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { readFileSync, rmSync } from "node:fs";
+import "./hooks/builtins"; // populates the registry so create_job's preRunHook resolves isKnownHook("skill-script")
 import { createHandler } from "./http";
 import { runDueJobs, runJobNow } from "./jobs";
 import { advanceCronNextRunAt, createScheduledJob, rebindJobDelivery, updateJob } from "./jobs/index";
@@ -888,6 +889,105 @@ describe("cron lifecycle", () => {
     expect(jobs).toHaveLength(1);
     expect(jobs[0]?.approvalMode).toBe("yolo");
     expect(jobs[0]?.dangerouslyAutoApprove).toBe(true);
+  });
+
+  test("create_job dispatch accepts and persists preRunHook", async () => {
+    // The tool passes preRunHook through to createScheduledJob unvalidated —
+    // the same seam the HTTP /api/jobs route uses — so the persisted
+    // JobRecord must carry the validated hook verbatim, and the audit row
+    // must pin the handler id.
+    const config = testConfig("jobs-create-tool-prerunhook");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "create_job",
+      "call_create_job_hook",
+      JSON.stringify({
+        name: "call-watch c-123",
+        intervalSeconds: 30,
+        prompt: "report the call result",
+        timeoutSeconds: 120,
+        preRunHook: {
+          handlerId: "skill-script",
+          config: { skill: "phone-call", script: "call-watch", callId: "c-123" },
+          timeoutMs: 25000
+        }
+      })
+    );
+    expect(result.kind).toBe("sync");
+
+    const jobs = readState(config.instance).jobs;
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0]?.preRunHook).toEqual({
+      handlerId: "skill-script",
+      config: { skill: "phone-call", script: "call-watch", callId: "c-123" },
+      timeoutMs: 25000
+    });
+    const audit = readState(config.instance).audit.find(
+      (event) => event.action === "job.created" && event.target === jobs[0]!.id
+    );
+    expect(audit?.evidence?.preRunHookHandlerId).toBe("skill-script");
+  });
+
+  test("create_job dispatch rejects an unknown preRunHook handlerId", async () => {
+    // The registry gate in createScheduledJob is the security boundary: an
+    // unregistered handlerId must be rejected at create time and persist
+    // nothing.
+    const config = testConfig("jobs-create-tool-prerunhook-bad");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    await expect(
+      dispatchToolCall(
+        config,
+        taskId,
+        "create_job",
+        "call_create_job_hook_bad",
+        JSON.stringify({
+          name: "bad-hook",
+          intervalSeconds: 60,
+          prompt: "x",
+          preRunHook: { handlerId: "not-a-handler", config: {} }
+        })
+      )
+    ).rejects.toThrow(/not a known hook handler/);
+    expect(readState(config.instance).jobs).toHaveLength(0);
+  });
+
+  test("create_job dispatch rejects a null preRunHook config", async () => {
+    // `typeof null === "object"`, so a bare typeof check would let
+    // config: null through to a hook that can never resolve its payload.
+    const config = testConfig("jobs-create-tool-prerunhook-null-config");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    await expect(
+      dispatchToolCall(
+        config,
+        taskId,
+        "create_job",
+        "call_create_job_hook_null_config",
+        JSON.stringify({
+          name: "null-hook-config",
+          intervalSeconds: 60,
+          prompt: "x",
+          preRunHook: { handlerId: "skill-script", config: null }
+        })
+      )
+    ).rejects.toThrow(/preRunHook\.config must be an object/);
+    expect(readState(config.instance).jobs).toHaveLength(0);
   });
 
   test("create_job dispatch persists cronExpression + cronTimezone", async () => {

@@ -88,12 +88,15 @@ export type RelayStatus = "disabled" | "configured" | "degraded" | "error";
 
 // Tunnel connectivity (see ADR tunnel-connectivity.md). The tunnel gateway
 // exposes a remote URL for this instance through one of several providers.
-// Only "gini-relay" is enabled for now; the rest are catalog placeholders
-// surfaced to the UI with a `requires` explanation of what's missing.
+// "gini-relay" is always enabled; tailscale/ngrok/cloudflare are
+// detection-gated native drivers (a disabled row carries a `requires`
+// reason).
 export type TunnelProviderId = "gini-relay" | "tailscale" | "ngrok" | "cloudflare";
 
 // One row in the provider catalog. Drives the selection panel: disabled
-// rows render their `requires` string as the reason they can't be picked.
+// rows render their `requires` string as the reason they can't connect yet.
+// The long-form setup guidance lives in docs/remote-access/<id>.md — the web
+// UI opens it when a connect is rejected with `provider_unavailable`.
 export interface TunnelProvider {
   id: TunnelProviderId;
   name: string;
@@ -103,7 +106,8 @@ export interface TunnelProvider {
 
 // The connection lifecycle status surfaced to clients.
 //   idle       — no active tunnel; selection may or may not be set.
-//   connecting — a login/connect is pending; the panel shows "Pending Login…".
+//   connecting — a connect is pending (the relay's OAuth consent, or a manual
+//                driver bringing its tunnel up); the panel shows "Connecting…".
 //   connected  — the tunnel is live; `url` is present.
 //   error      — the last connect failed; `message` carries the reason.
 export type TunnelStatus = "idle" | "connecting" | "connected" | "error";
@@ -855,6 +859,12 @@ export interface Task {
   // under ~/.gini/instances/<inst>/uploads/<id>.<ext>; this array only
   // carries the refs.
   images?: ImageAttachment[];
+  // Client surface of the user message that spawned this task. Stamped on
+  // submission (same rationale as `images`: the agent loop reads a single
+  // record instead of racing the chat-message write) so the per-turn prompt
+  // can tell the model which surface the CURRENT message came from. Absent
+  // when the surface is unknown. See ADR client-surface-context.md.
+  clientSurface?: ChatClientSurface;
   // Thread membership for the task's emitted chat blocks. Set when a task is
   // spawned to reply inside a thread (Phase 0c thread-reply endpoint), in
   // which case the whole response threads with no routing directive needed.
@@ -1021,6 +1031,16 @@ export type ChatSessionSource =
   // structured field instead of string-matching the title (which the
   // operator can rename via `gini chat rename`).
   | { kind: "openclaw"; openclawSessionId: string; openclawAgentId: string };
+
+// Client surface an inbound chat message was sent from. Per-MESSAGE, not
+// per-session — the same session can be used from phone and desktop
+// alternately, so the surface is resolved on every submit. UI clients tag
+// each POST with a `client` body field ("web" | "mobile" | "cli"); messaging
+// bridges don't send the field — their surface derives from the session's
+// `source.kind`. An absent/unrecognized value resolves to undefined
+// (unknown), never an error, so older clients keep working. See ADR
+// client-surface-context.md.
+export type ChatClientSurface = "web" | "mobile" | "cli" | "telegram" | "discord" | "openclaw";
 
 export interface ChatMessageRecord {
   id: string;
@@ -1517,6 +1537,10 @@ export type AuthorizationAction =
   | "browser.upload_file"
   | "browser.download"
   | "messaging.send"
+  // skill_run on a script the skill declares under
+  // `metadata.gini.requires.approval` — ALWAYS gated, regardless of
+  // approval mode. See ADR skill-script-approval-gating.md.
+  | "skill.run"
   | "self.config";
 
 export interface Authorization {
@@ -1664,6 +1688,13 @@ export interface SkillRecord {
   // ConnectorRecord with that `name`, and resolveSkillEnv resolves the skill's
   // prerequisites.env from those named credentials. Defaults to [].
   requiredCredentials?: string[];
+  // Frontmatter `metadata.gini.requires.approval` — script names (the
+  // skill_run `script` arg) that always pause for an explicit user
+  // Approve/Deny before running, regardless of approval mode. Only the
+  // skill_run dispatch path enforces this; internal invokeSkillScript
+  // callers (pre-run hooks, the approved-action executor) are unaffected.
+  // See ADR skill-script-approval-gating.md.
+  requiresApprovalScripts?: string[];
   // Per-(skill, connector) consent: the credential NAMES the user has granted
   // this skill access to (the field name is kept for back-compat; the contents
   // are now names, not provider strings). `resolveSkillEnv` injects a named

@@ -212,7 +212,7 @@ function ChatSurface({
     mutationFn: ({ content, images }: { content: string; images: UploadRef[] }) =>
       api<{ taskId: string }>(`/chat/${sessionId}/messages`, {
         method: "POST",
-        body: JSON.stringify({ content, ...(images.length > 0 ? { images } : {}) })
+        body: JSON.stringify({ content, client: "web", ...(images.length > 0 ? { images } : {}) })
       }),
     onSuccess: () => {
       setText("");

@@ -88,6 +88,8 @@ Don't stop at typecheck — "it compiles" and "the screen loaded" are not "it wo
 
 For runtime / agent changes (tools, dispatch, providers, memory, skills), "the affected surface" is a **real chat turn**, not a unit test. Start the gateway, create a session, send a message through the chat flow (`gini chat new` → `gini chat send <session> "<prompt>"`, which posts to `/api/chat/<id>/messages` — the same path the web UI uses), wait for the task to complete, and confirm from the task's `recentToolCalls` + summary that the agent selected the right tool and produced the right result. Unit tests verify the mechanism; the chat turn verifies the model actually reaches for it. Test against the worktree's own instance, never `default`.
 
+When the change is a **behavioral steer** (you want the agent to *reach for* a tool or path on its own), the chat turn must use a prompt a real user would actually send — and nothing more. Never narrate the intended behavior into the message ("drive the purchase as far as you can before involving me", "use your handoff flow"). That tests instruction-following, not the default — and a coached prompt routinely makes a behavior look more robust than it is, even producing a structured affordance (e.g. an `ask_user` choice card) that the bare prompt never triggers. Send the bare request, then judge whether the agent gets there unprompted. The behavior belongs in `INSTRUCTIONS.md`, never in the user's mouth. (Claude Code: the full dogfooding runbook is the checked-in `dogfood-as-user` skill under `.claude/skills/`.)
+
 ## Logs
 
 Spawned child stdio is appended under:

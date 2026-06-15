@@ -20,7 +20,7 @@ import { closeAll as closeBrowserSessions, setBrowserInstance, setBrowserRecordi
 import { createTelegramPollerSupervisor } from "./integrations/telegram-poller";
 import { createDiscordPollerSupervisor } from "./integrations/discord-poller";
 import { createApnsDispatcher } from "./integrations/apns/dispatcher";
-import { reconcileTunnelOnStartup, stopAllTunnels } from "./integrations/tunnel";
+import { reconcileTunnelOnStartup, refreshProviderDetection, stopAllTunnels } from "./integrations/tunnel";
 
 // Marks the moment this module finished loading (ms since process start), so
 // the runtime.started log can split total boot into module-load vs. the boot
@@ -106,6 +106,17 @@ setBrowserRecording(config.browserRecording === true);
 // keeps the never-crash-boot guarantee. See ADR tunnel-connectivity.md.
 const gatewayReady = Promise.withResolvers<void>();
 const tunnelReconcileStartedMs = performance.now();
+// Probe the manual tunnel drivers (tailscale/ngrok/cloudflared) once at boot so
+// the catalog's enabled flags fill in shortly after bind. Fire-and-forget: a
+// wedged provider CLI takes up to 4500ms to settle (2000ms DETECT_TIMEOUT_MS
+// SIGTERM + 2000ms SIGKILL escalation + 500ms bail), and `gini start` SIGKILLs
+// a boot that isn't healthy within its 5000ms window — detection must never
+// eat that budget. Until the probe lands the catalog is merely
+// default-disabled, and every user path (panel-open `?detect=1`,
+// select/connect of a disabled provider) forces its own probe. The reconcile
+// below still awaits detection internally when a manual record needs it —
+// that's the one case worth blocking for.
+void refreshProviderDetection().catch(() => {});
 await reconcileTunnelOnStartup(config, { gatewayReady: gatewayReady.promise }).catch((error) => {
   appendLog(config.instance, "tunnel.reconcile.error", {
     error: error instanceof Error ? error.message : String(error)
@@ -422,11 +433,16 @@ const discordDone: Promise<void> = (async function discordReconcileLoop(): Promi
 // confuses launchd.
 let shutdownStarted = false;
 
-process.on("SIGTERM", async () => {
+// SIGTERM (daemon stop / launchd / self-signal) and SIGINT (Ctrl-C on a
+// foreground `gini run`) share the same drain. Without the SIGINT hook the
+// default handler killed the process with NO drain at all — frpc/agent
+// children were orphaned and a live tailscale serve config kept fronting the
+// gateway port after exit.
+async function shutdown(signal: "SIGTERM" | "SIGINT"): Promise<void> {
   if (shutdownStarted) return;
   shutdownStarted = true;
   const shutdownStartedMs = performance.now();
-  appendLog(config.instance, "runtime.stopped", { signal: "SIGTERM" });
+  appendLog(config.instance, "runtime.stopped", { signal });
   schedulerStopped = true;
   reprobeStopped = true;
   telegramStopped = true;
@@ -470,8 +486,12 @@ process.on("SIGTERM", async () => {
   //
   // Bound the wait at SCHEDULER_DRAIN_TIMEOUT_MS: a hung tick (e.g. a
   // script job that spawned a child blocking on stdio) shouldn't block
-  // shutdown forever. After the timeout we proceed even if the tick
-  // hasn't unwound — the OS will reap the child process tree on exit.
+  // shutdown forever. After the timeout we proceed even if the tick hasn't
+  // unwound. NOTE: children that survive are NOT reliably reaped on exit —
+  // in daemon mode (`gini start` spawns the runtime detached, its own
+  // process group) an orphan is reparented and keeps running, which is why
+  // stopAllTunnels kills in-flight tunnel agents explicitly before this
+  // deadline can fire.
   const SCHEDULER_DRAIN_TIMED_OUT = Symbol("scheduler-drain-timed-out");
   const drained = Promise.race([
     Promise.all([
@@ -532,11 +552,14 @@ process.on("SIGTERM", async () => {
         error: error instanceof Error ? error.message : String(error)
       });
     }
-    process.stdout.write(`Gini runtime shutting down (SIGTERM) instance=${config.instance}\n`, () => {
+    process.stdout.write(`Gini runtime shutting down (${signal}) instance=${config.instance}\n`, () => {
       appendLog(config.instance, "runtime.stop.drained", {
         drainMs: Math.round(performance.now() - shutdownStartedMs)
       });
       process.exit(0);
     });
   });
-});
+}
+
+process.on("SIGTERM", () => void shutdown("SIGTERM"));
+process.on("SIGINT", () => void shutdown("SIGINT"));

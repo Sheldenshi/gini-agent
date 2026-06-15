@@ -20,6 +20,7 @@ import { legacyMigrationStatus } from "../memory";
 import { embeddingStatus, listBanksWithModelMismatch } from "../memory/embedding";
 import { rerankerStatus } from "../memory/reranker";
 import { defaultRuntimePort, defaultWebPort, ensureDir, logDir, pidPath, projectRoot, runtimePortPath, webPortPath } from "../paths";
+import { resolveWebProdDistDir } from "../runtime/update";
 import { api, auth, url } from "./api";
 
 export interface WebOptions {
@@ -316,6 +317,27 @@ export async function existingWebUrl(config: RuntimeConfig, webPort: number): Pr
   return null;
 }
 
+// The bun command + GINI_DIST_DIR pair startWeb spawns the inner Next server
+// with. Prod (a current-sha bundle exists): `next start` from that bundle.
+// Dev (no bundle): `next dev` with a per-instance `.next-<instance>` dist dir
+// — without the namespacing, two parallel `next dev` instances in the same
+// web/ refuse to start (Next.js grabs an exclusive lock at `<distDir>/lock`;
+// `next start` is read-only on the dist dir, so prod instances can share a
+// bundle). The dist dir must stay inside the project (Next.js rejects
+// `../`-style paths), so the instance name is sanitized to [A-Za-z0-9_-].
+// Standalone `bun run dev` still defaults to `.next` because the env var is
+// unset there. Both modes carry `-H 127.0.0.1` — see the security note at
+// the call site. Exported for tests pinning the prod-vs-dev pick.
+export function webLaunchPlan(
+  prodDistDir: string | null,
+  instance: string,
+  port: number
+): { command: string[]; distDir: string } {
+  const flags = ["--", "-H", "127.0.0.1", "-p", String(port)];
+  if (prodDistDir) return { command: ["run", "start", ...flags], distDir: prodDistDir };
+  return { command: ["run", "dev", ...flags], distDir: `.next-${instance.replace(/[^a-zA-Z0-9_-]/g, "_")}` };
+}
+
 export async function startWeb(config: RuntimeConfig, options: WebOptions): Promise<{ webUrl: string; child?: ChildProcess }> {
   const webRoot = join(projectRoot(), "web");
   if (!existsSync(join(webRoot, "package.json"))) {
@@ -345,29 +367,31 @@ export async function startWeb(config: RuntimeConfig, options: WebOptions): Prom
     // behavior is to fail loudly so they can stop the squatter or pick another.
     throw new Error(`Requested web port ${requestedPort} is busy. Stop the other process or pick a different --web-port.`);
   }
-  // Always use `bun run dev` for the local control plane. Production builds
-  // (`bun run start`) require an explicit prior `bun run build` step, which
-  // is hostile to fresh-clone "gini start" workflows: a stale .next/ from a
-  // previous checkout will silently serve outdated code. Dev mode compiles
-  // on demand and always reflects the current source.
+  // Serve the sha-keyed production bundle when one exists for the CURRENT
+  // checkout (web/.next-prod-<sha12> with a BUILD_ID, <sha12> = `git
+  // rev-parse --short=12 HEAD`); fall back to `next dev` otherwise. Only the
+  // update/install flows create these dirs, and the sha key pins a bundle to
+  // the commit it was built from — a fresh clone, a worktree, or a checkout
+  // that moved past its last build all miss the key and land on dev mode,
+  // which compiles on demand and always reflects the current source. The key
+  // sees HEAD, not the working tree: the installed runtime is `reset --hard`
+  // clean so its bundle always matches the source, but a repo checkout with
+  // uncommitted edits and a hand-built bundle for its HEAD serves that
+  // bundle anyway. The launchd web shim (src/cli/autostart.ts buildWebShim)
+  // applies the same rule in sh.
   // Bind the inner Next server to loopback (-H 127.0.0.1). Next defaults to
-  // 0.0.0.0 (all interfaces), which would make the web port LAN-reachable; the
-  // BFF trusts a loopback `Host` for its owner-bearer injection, and a Host
-  // header is forgeable by a non-browser client, so a LAN peer hitting the inner
-  // port directly could obtain owner access and bypass the gateway's
-  // Host/Origin + relay-session gate. The gateway (the only intended ingress)
-  // already binds 127.0.0.1 and reverse-proxies to this child over loopback.
-  const command = ["run", "dev", "--", "-H", "127.0.0.1", "-p", String(port)];
+  // 0.0.0.0 (all interfaces) in BOTH modes, which would make the web port
+  // LAN-reachable; the BFF trusts a loopback `Host` for its owner-bearer
+  // injection, and a Host header is forgeable by a non-browser client, so a
+  // LAN peer hitting the inner port directly could obtain owner access and
+  // bypass the gateway's Host/Origin + relay-session gate. The gateway (the
+  // only intended ingress) already binds 127.0.0.1 and reverse-proxies to
+  // this child over loopback.
+  const prodDistDir = resolveWebProdDistDir(projectRoot());
+  const { command, distDir } = webLaunchPlan(prodDistDir, config.instance, port);
   // detached: true puts the child in its own process group so we can SIGTERM
   // the entire group on stop (`bun run dev` re-execs into Next.js, leaving an
   // orphaned grandchild if we only kill the recorded pid).
-  // Each instance gets its own `.next-<instance>` build dir. Without this, two
-  // parallel `next dev` instances in the same web/ refuse to start: Next.js
-  // grabs an exclusive lock at `<distDir>/lock`. The dist dir must stay
-  // inside the project (Next.js rejects `../`-style paths), so we sanitize
-  // and namespace per instance. Standalone `bun run dev` still defaults to
-  // `.next` because that env var is unset.
-  const instanceSlug = config.instance.replace(/[^a-zA-Z0-9_-]/g, "_");
   const foreground = options.foreground === true;
   // Foreground: keep the web child attached and tee dev-server stdio to both
   // the user's terminal and web.log. Daemon (gini start) keeps the historic
@@ -383,7 +407,7 @@ export async function startWeb(config: RuntimeConfig, options: WebOptions): Prom
       GINI_RUNTIME_URL: url(config),
       GINI_TOKEN: config.token,
       GINI_INSTANCE: config.instance,
-      GINI_DIST_DIR: `.next-${instanceSlug}`,
+      GINI_DIST_DIR: distDir,
       PORT: String(port)
     }
   });

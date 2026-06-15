@@ -16,7 +16,7 @@ import {
   readState,
   renameChatSession
 } from "../state";
-import type { AssistantTextBlock, AudioAttachment, ChatBlock, ChatMessageRecord, ChatSessionRecord, ImageAttachment, Instance, RuntimeConfig, TaskStatus, UserTextBlock } from "../types";
+import type { AssistantTextBlock, AudioAttachment, ChatBlock, ChatClientSurface, ChatMessageRecord, ChatSessionRecord, ImageAttachment, Instance, RuntimeConfig, TaskStatus, UserTextBlock } from "../types";
 import { readUpload, uploadStat } from "../state/uploads";
 import { getSttProvider } from "../stt";
 import { generateStructured, providerAuthFailureText, providerDisplayLabel, providerReauth } from "../provider";
@@ -325,6 +325,27 @@ function parseAudioAttachment(instance: string, raw: unknown): AudioAttachment |
   return { id, mimeType: stat.mimeType, size: stat.size, ...(durationMs !== undefined ? { durationMs } : {}) };
 }
 
+// Surfaces UI clients may claim in the `client` body field. Bridge kinds are
+// deliberately NOT claimable here — those derive from the session source.
+const CLIENT_SURFACE_VALUES: ReadonlySet<string> = new Set(["web", "mobile", "cli"]);
+
+// Resolve the client surface of an inbound message. UI clients (web, mobile,
+// CLI) tag each POST with `client`; an unrecognized or absent value is
+// treated as unknown — never a 400, so older clients keep working. Messaging
+// bridges don't send the field: their surface derives from the session's
+// `source.kind` ("telegram" | "discord" | "openclaw"). Per-MESSAGE, not
+// per-session, because the same session can be used from phone and desktop
+// alternately. See ADR client-surface-context.md.
+function resolveClientSurface(
+  input: Record<string, unknown>,
+  session: ChatSessionRecord
+): ChatClientSurface | undefined {
+  if (typeof input.client === "string" && CLIENT_SURFACE_VALUES.has(input.client)) {
+    return input.client as ChatClientSurface;
+  }
+  return session.source?.kind;
+}
+
 // Shared submit preparation for both the main-chat and thread-reply paths.
 // Resolves content + image + audio attachments, transcribes a voice message
 // when the content is empty, guards against an empty submission, and
@@ -340,6 +361,7 @@ async function prepareChatSubmission(
   images: ImageAttachment[];
   audio: AudioAttachment | undefined;
   liveSession: ChatSessionRecord;
+  clientSurface: ChatClientSurface | undefined;
 }> {
   let content = String(input.content ?? "").trim();
   const images = parseAttachments(config.instance, input.images);
@@ -383,11 +405,11 @@ async function prepareChatSubmission(
   const liveState = readState(config.instance);
   const liveSession = liveState.chatSessions.find((item) => item.id === sessionId);
   if (!liveSession) throw new Error(`Chat session not found: ${sessionId}`);
-  return { content, images, audio, liveSession };
+  return { content, images, audio, liveSession, clientSurface: resolveClientSurface(input, liveSession) };
 }
 
 export async function submitChatMessage(config: RuntimeConfig, sessionId: string, input: Record<string, unknown>) {
-  const { content, images, audio, liveSession } = await prepareChatSubmission(config, sessionId, input);
+  const { content, images, audio, liveSession, clientSurface } = await prepareChatSubmission(config, sessionId, input);
   const run = await createConversationRun(config, { conversationId: sessionId, input: content });
   // Chat messages run through the tool-calling agent loop. The legacy
   // prefix-dispatch path stays available for the imperative CLI.
@@ -398,6 +420,7 @@ export async function submitChatMessage(config: RuntimeConfig, sessionId: string
     mode: "chat",
     chatSessionId: sessionId,
     agentId: liveSession.agentId,
+    ...(clientSurface ? { clientSurface } : {}),
     ...(images.length > 0 ? { images } : {})
   });
   await linkRunToTask(config, run.id, task);
@@ -490,7 +513,7 @@ export async function submitThreadReply(
     if (!parent) throw new Error("Thread not found: parent message not found in this chat");
     parentBlockId = parent.id;
   }
-  const { content, images, audio, liveSession } = await prepareChatSubmission(config, sessionId, input);
+  const { content, images, audio, liveSession, clientSurface } = await prepareChatSubmission(config, sessionId, input);
   const run = await createConversationRun(config, { conversationId: sessionId, input: content });
   const task = await submitTask(config, content, {
     runId: run.id,
@@ -499,6 +522,7 @@ export async function submitThreadReply(
     agentId: liveSession.agentId,
     threadId,
     parentBlockId,
+    ...(clientSurface ? { clientSurface } : {}),
     ...(images.length > 0 ? { images } : {})
   });
   await linkRunToTask(config, run.id, task);

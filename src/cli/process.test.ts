@@ -10,7 +10,7 @@ import { spawn } from "node:child_process";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { createServer, type Server } from "node:net";
 import { join } from "node:path";
-import { awaitForegroundLogFlush, setupChildLog, waitForPortFree } from "./process";
+import { awaitForegroundLogFlush, setupChildLog, waitForPortFree, webLaunchPlan } from "./process";
 
 function uniqueInstance(tag: string): string {
   return `process-test-${tag}-${process.pid}-${Math.floor(Math.random() * 1_000_000)}`;
@@ -118,6 +118,29 @@ describe("setupChildLog", () => {
     const logPath = join(logRoot, instance, "child.log");
     const contents = readFileSync(logPath, "utf8");
     expect(contents).toContain("TAIL_MARKER_LINE");
+  });
+});
+
+// The prod-vs-dev pick for the inner Next server. Both branches MUST carry
+// -H 127.0.0.1: Next defaults to 0.0.0.0 and the BFF trusts a loopback Host
+// for owner-bearer injection, so an all-interfaces bind would hand owner
+// access to any LAN peer.
+describe("webLaunchPlan", () => {
+  test("serves next start from the prod bundle when one matches the current sha", () => {
+    const plan = webLaunchPlan(".next-prod-abc123def456", "default", 7777);
+    expect(plan.command).toEqual(["run", "start", "--", "-H", "127.0.0.1", "-p", "7777"]);
+    expect(plan.distDir).toBe(".next-prod-abc123def456");
+  });
+
+  test("falls back to next dev with the per-instance dist dir when no bundle matches", () => {
+    const plan = webLaunchPlan(null, "default", 7777);
+    expect(plan.command).toEqual(["run", "dev", "--", "-H", "127.0.0.1", "-p", "7777"]);
+    expect(plan.distDir).toBe(".next-default");
+  });
+
+  test("dev fallback sanitizes the instance name for the dist dir", () => {
+    const plan = webLaunchPlan(null, "feat/x", 7777);
+    expect(plan.distDir).toBe(".next-feat_x");
   });
 });
 

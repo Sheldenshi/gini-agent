@@ -3,7 +3,8 @@ node_modules/
 .DS_Store
 .playwright-cli/
 .playwright-mcp/
-.claude/
+.claude/*
+!.claude/skills/
 web/.next/
 web/.turbo/
 web/next-env.d.ts

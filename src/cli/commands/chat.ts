@@ -16,7 +16,7 @@ export async function chat(ctx: CliContext): Promise<void> {
     if (!sessionId || contentParts.length === 0) throw new Error("Usage: gini chat send <session-id> <message>");
     print(await api(config, `/api/chat/${sessionId}/messages`, {
       method: "POST",
-      body: JSON.stringify({ content: contentParts.join(" ") })
+      body: JSON.stringify({ content: contentParts.join(" "), client: "cli" })
     }));
     return;
   }

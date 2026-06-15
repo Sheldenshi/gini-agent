@@ -67,7 +67,7 @@ export function GoogleAccountsCard({ accounts }: { accounts: GoogleAccountStatus
       });
       await api(`/chat/${session.id}/messages`, {
         method: "POST",
-        body: JSON.stringify({ content: "Connect another Google account." })
+        body: JSON.stringify({ content: "Connect another Google account.", client: "web" })
       });
       return session;
     },

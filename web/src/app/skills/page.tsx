@@ -157,7 +157,8 @@ export default function SkillsPage() {
       await api(`/chat/${session.id}/messages`, {
         method: "POST",
         body: JSON.stringify({
-          content: `Please help me set up the ${skill.name} skill.`
+          content: `Please help me set up the ${skill.name} skill.`,
+          client: "web"
         })
       });
       return session;
@@ -184,7 +185,8 @@ export default function SkillsPage() {
       await api(`/chat/${session.id}/messages`, {
         method: "POST",
         body: JSON.stringify({
-          content: `The ${args.skill.name} skill needs the ${args.credentialName} credential, which has no provider module. Please request it from me so I can enter it securely.`
+          content: `The ${args.skill.name} skill needs the ${args.credentialName} credential, which has no provider module. Please request it from me so I can enter it securely.`,
+          client: "web"
         })
       });
       return session;

@@ -59,7 +59,7 @@ export function ReplyInThreadPill({ onPress }: { onPress: () => void }) {
       accessibilityRole="button"
       accessibilityLabel="Reply in thread"
     >
-      <Feather name="message-square" size={14} color="#3554D1" />
+      <Feather name="message-square" size={12} color="#8A93A6" />
       <Text style={styles.replyPillText}>Reply in thread</Text>
     </TouchableOpacity>
   );
@@ -69,19 +69,15 @@ const styles = StyleSheet.create({
   replyPill: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 7,
+    gap: 5,
     alignSelf: "flex-start",
-    backgroundColor: "#EEF2FF",
-    borderWidth: 1,
-    borderColor: "#D7DEFA",
     borderRadius: 8,
-    paddingVertical: 6,
-    paddingHorizontal: 10
+    padding: 2
   },
   replyPillText: {
-    color: "#3554D1",
-    fontFamily: family("HankenGrotesk", 600),
-    fontSize: 13
+    color: "#8A93A6",
+    fontFamily: family("HankenGrotesk", 500),
+    fontSize: 12
   },
   chip: {
     flexDirection: "row",

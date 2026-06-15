@@ -125,6 +125,19 @@ reference a structured result it produced earlier (a created issue's id)
 and so an invoked skill body (`read_skill`) stays in context instead of
 being re-read every turn.
 
+- The turn-ending assistant answer is itself persisted as a durable
+  `ChatMessageRecord` — a plain assistant row, NOT `kind:"tool_transcript"`
+  — by `persistFinalAnswerRow` on every chat-task completion exit (the
+  no-tool-calls answer, the context-exhaustion partial result, and the
+  iteration-cap/loop-stall summary). This is what makes the
+  "user/assistant text interleaved" replay above hold: without it the
+  model replays its own prior turns as unanswered questions and re-answers
+  them. The write is server-side and depends on no client callback;
+  `syncChatTaskResult` (mobile `/sync`, the messaging pollers, job
+  finalize) stays for callers that need the record returned and is
+  idempotent against this row via a shared dedup short-circuit. `jobId`
+  turns are excluded (`finalizeJobRunFromTask` owns their row + delivery)
+  and `[SILENT]` turns persist nothing.
 - Replay applies a defensive pairing pass: each `role:"tool"` row is
   grouped under the assistant `tool_calls` row that emitted its id;
   orphan tool rows and assistant rows missing any paired result are
@@ -177,4 +190,8 @@ being re-read every turn.
   in turn 2's replayed provider messages as a `role:"tool"` row paired
   with its assistant `tool_calls` row, while the JSON chat views exclude
   every `kind:"tool_transcript"` row.
+- A turn-1 answer with no client `/sync` call still appears in turn 2's
+  replayed provider messages: `persistFinalAnswerRow` lands the durable
+  assistant row, and a later `syncChatTaskResult` short-circuits to it
+  rather than writing a second row.
 - `bun run typecheck` and `bun test` are green.

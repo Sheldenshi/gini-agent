@@ -249,6 +249,7 @@ export function emitToolCallRunning(
     toolName: string;
     callId: string;
     args: Record<string, unknown>;
+    resolveRefLabel?: (ref: string) => { role: string; name: string } | undefined;
   }
 ): ChatBlock | undefined {
   if (!ctx) return undefined;
@@ -256,7 +257,7 @@ export function emitToolCallRunning(
     kind: "tool_call",
     toolName: params.toolName,
     displayLabel: chatBlockLabelFor(params.toolName),
-    argsPreview: chatBlockArgsPreviewFor(params.toolName, params.args),
+    argsPreview: chatBlockArgsPreviewFor(params.toolName, params.args, params.resolveRefLabel),
     argsFull: redactSensitiveToolArgs(params.args),
     status: "running",
     callId: params.callId,

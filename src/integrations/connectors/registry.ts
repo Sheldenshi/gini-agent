@@ -13,6 +13,7 @@ import { codexProvider } from "./codex";
 import { googleOauthDesktopProvider } from "./google-oauth-desktop";
 import { braveSearchProvider } from "./brave-search";
 import { exaProvider } from "./exa";
+import { blandProvider } from "./bland";
 
 const REGISTRY = new Map<string, ProviderModule>();
 
@@ -31,6 +32,7 @@ register(codexProvider);
 register(googleOauthDesktopProvider);
 register(braveSearchProvider);
 register(exaProvider);
+register(blandProvider);
 
 export function getProvider(id: string): ProviderModule | undefined {
   return REGISTRY.get(id);

@@ -5,7 +5,8 @@
 A web request reaching the gateway on a **loopback** host
 (`127.0.0.1` / `localhost` / `[::1]`) is trusted with no pairing — it is the
 operator's own machine. A web request on any **non-loopback** front (the
-gini-relay tunnel subdomain, or a `GINI_TRUSTED_ORIGINS` host) must carry a
+gini-relay tunnel subdomain, a runtime-managed tunnel's connected host, or a
+`GINI_TRUSTED_ORIGINS` host) must carry a
 valid **session cookie** (`gini_session`) or it cannot reach the proxied web app
 or the `/api/runtime/*` BFF namespace. A device obtains that cookie through an
 operator-approved pairing handshake.
@@ -182,11 +183,12 @@ admin to anything but the operator's own loopback dev port.
   Path=/api/pairing`. Only the browser that created a request holds it, so a
   third party that learns a request id can neither claim its session nor cancel
   it. Cleared on claim/cancel.
-- `Secure` is conditional (`pairingCookieSecure`): set on relay (always HTTPS)
-  and loopback fronts and any HTTPS request, and omitted only on a deliberately
-  plain-HTTP `GINI_TRUSTED_ORIGINS` front — where a `Secure` cookie would be
-  silently dropped by the browser and the whole connection is already cleartext
-  by the operator's transport choice. Use HTTPS for any remote front.
+- `Secure` is conditional (`pairingCookieSecure`): set on relay and
+  runtime-managed tunnel fronts (both always HTTPS), loopback fronts, and any
+  HTTPS request, and omitted only on a deliberately plain-HTTP
+  `GINI_TRUSTED_ORIGINS` front — where a `Secure` cookie would be silently
+  dropped by the browser and the whole connection is already cleartext by the
+  operator's transport choice. Use HTTPS for any remote front.
 
 ## Native pairing client (mobile app)
 
@@ -206,7 +208,9 @@ A **verified native client** is therefore exempted, gated by
 - the explicit opt-in header `X-Gini-Pair-Client: native`, **and**
 - the **absence of every `Sec-Fetch-*` header**, **and**
 - the **absence of an `Origin` header**, **and**
-- a trusted front (relay or loopback Host).
+- a trusted front (relay, loopback, or runtime-managed tunnel Host — the same
+  fronts the web flow trusts, so the mobile app can pair through a
+  tailscale/ngrok/cloudflare front the runtime itself brought up).
 
 `Sec-Fetch-*` absence is the primary anchor: modern browsers always send those on
 `fetch`/XHR and page JS **cannot set or strip them** (forbidden header names), so

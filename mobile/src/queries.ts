@@ -696,7 +696,7 @@ export function useReplyToThread(sessionId: string | null, threadId: string | nu
   >({
     mutationFn: ({ content, images, audio, alsoToMain, parentBlockId }: ThreadReplyInput) => {
       if (!sessionId || !threadId) throw new Error("No thread selected");
-      const payload: Record<string, unknown> = { content };
+      const payload: Record<string, unknown> = { content, client: "mobile" };
       if (images && images.length > 0) payload.images = images;
       if (audio) payload.audio = audio;
       if (alsoToMain) payload.alsoToMain = true;
@@ -804,7 +804,7 @@ export function useSendMessage(sessionId: string | null) {
   return useMutation<{ taskId: string }, Error, SendMessageInput>({
     mutationFn: ({ content, images, audio }: SendMessageInput) => {
       if (!sessionId) throw new Error("No session selected");
-      const body: Record<string, unknown> = { content };
+      const body: Record<string, unknown> = { content, client: "mobile" };
       if (images && images.length > 0) body.images = images;
       if (audio) body.audio = audio;
       return api<{ taskId: string }>(`/chat/${sessionId}/messages`, {

@@ -1,13 +1,26 @@
-import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
-import { logDir, projectRoot } from "../paths";
+import { logDir, projectRoot, updateInProgressMarkerPath } from "../paths";
 import { supervisor } from "../integrations/launchd";
 import type { Instance } from "../types";
 
 const EXPECTED_ORIGIN = "https://github.com/Lilac-Labs/gini-agent";
 const MAX_INSTALL_FAILURE_OUTPUT = 4000;
+
+// Sha-keyed production web bundles. The update/install flows build the
+// Next.js app into web/<prefix><sha12>, where <sha12> is `git rev-parse
+// --short=12 HEAD` of the checkout that was built. Every serving path (the
+// launchd web shim in src/cli/autostart.ts and startWeb in
+// src/cli/process.ts) serves `next start` from that dir iff it exists with a
+// BUILD_ID for the CURRENT checkout, falling back to `next dev` otherwise.
+// The sha key pins a bundle to the commit it was built from — note it sees
+// HEAD, not the working tree, so only the installed runtime (kept clean by
+// `git reset --hard`) is stale-proof by construction; a repo checkout with
+// uncommitted edits and a hand-built bundle for its HEAD serves that bundle
+// anyway. See ADR web-production-serving.md.
+export const WEB_PROD_DIST_PREFIX = ".next-prod-";
 
 export interface GiniVersionInfo {
   packageVersion: string;
@@ -62,57 +75,169 @@ export function currentVersionInfo(runtimeDir = projectRoot()): GiniVersionInfo 
   };
 }
 
-export function refreshVersionInfo(runtimeDir = projectRoot()): GiniVersionInfo {
+export async function refreshVersionInfo(runtimeDir = projectRoot()): Promise<GiniVersionInfo> {
   const support = updateSupport(runtimeDir);
   if (!support.supported) return currentVersionInfo(runtimeDir);
   if (existsSync(join(runtimeDir, ".git"))) {
-    const fetchRes = spawnSync("git", ["-C", runtimeDir, "fetch", "origin"], { encoding: "utf8" });
+    const fetchRes = await runStep("git", ["-C", runtimeDir, "fetch", "origin"], { stdio: "pipe" });
     if (fetchRes.status !== 0) {
-      const stderr = (fetchRes.stderr ?? "").trim();
+      const stderr = fetchRes.stderr.trim();
       throw new Error(`gini update check: git fetch origin failed${stderr ? `: ${stderr}` : "."}`);
     }
   }
   return currentVersionInfo(runtimeDir);
 }
 
-export function updateRuntime(runtimeDir = installedRuntimeDir(), options: { stdio?: "inherit" | "pipe" } = {}): GiniUpdateResult {
+// Outcome of an awaited subprocess step.
+export interface RunStepResult {
+  status: number | null;
+  stdout: string;
+  stderr: string;
+}
+
+// Awaited async runner for the update's long steps (the git fetch, both bun
+// installs, and the web production build). Together these can take 40-90s+;
+// running them via spawnSync inside the gateway's POST /api/update handler
+// blocked the event loop for the whole window — the gateway couldn't answer
+// /api/status, so the watchdog read a healthy-but-updating gateway as dead
+// and force-killed it mid-update. spawn + await keeps the loop free.
+// Injectable seam for tests (mirrors the spawnImpl seam in
+// src/runtime/autostart-refresh.ts) so no real subprocess runs.
+export type RunStepImpl = (
+  cmd: string,
+  args: string[],
+  options: { cwd?: string; env?: NodeJS.ProcessEnv; stdio: "inherit" | "pipe" }
+) => Promise<RunStepResult>;
+
+function runStep(
+  cmd: string,
+  args: string[],
+  options: { cwd?: string; env?: NodeJS.ProcessEnv; stdio: "inherit" | "pipe" }
+): Promise<RunStepResult> {
+  const { promise, resolve } = Promise.withResolvers<RunStepResult>();
+  const child = spawn(cmd, args, {
+    cwd: options.cwd,
+    env: options.env,
+    stdio: options.stdio === "inherit" ? "inherit" : ["ignore", "pipe", "pipe"]
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout?.setEncoding("utf8");
+  child.stderr?.setEncoding("utf8");
+  child.stdout?.on("data", (chunk: string) => { stdout += chunk; });
+  child.stderr?.on("data", (chunk: string) => { stderr += chunk; });
+  // A spawn failure (e.g. ENOENT) emits "error" and may never emit "close";
+  // resolve with a null status so callers surface it like a non-zero exit.
+  child.on("error", (error) => { resolve({ status: null, stdout, stderr: stderr || error.message }); });
+  child.on("close", (code) => { resolve({ status: code, stdout, stderr }); });
+  return promise;
+}
+
+export interface UpdateRuntimeOptions {
+  stdio?: "inherit" | "pipe";
+  runStepImpl?: RunStepImpl;
+}
+
+// Single-flight guard: at most one update mutates the runtime at a time.
+// Two interleaved updates would race `git reset --hard` against each
+// other's bun installs / build and could leave a half-installed tree, so a
+// second caller is rejected with a stable message that the HTTP layer maps
+// to 409 (statusFromErrorMessage in src/http.ts). Module-level, so
+// process-local: it serializes the gateway's own update entry points but
+// not a concurrent CLI `gini update` from another process, which still
+// races against the same ~/.gini/runtime.
+let updateInFlight: Promise<GiniUpdateResult> | null = null;
+
+// Whether THIS process currently has an update in flight (the single-flight
+// guard above is held). Surfaced as `updateInProgress` on GET /api/version
+// so the browser's UpdateGate can tell a still-working update from a hung
+// one and extend its blur deadline only while work is actually happening.
+export function isUpdateInFlight(): boolean {
+  return updateInFlight !== null;
+}
+
+export function updateRuntime(runtimeDir = installedRuntimeDir(), options: UpdateRuntimeOptions = {}): Promise<GiniUpdateResult> {
+  if (updateInFlight) {
+    return Promise.reject(new Error("gini update already in progress."));
+  }
+  const run = performUpdate(runtimeDir, options);
+  updateInFlight = run;
+  return run.finally(() => { updateInFlight = null; });
+}
+
+async function performUpdate(runtimeDir: string, options: UpdateRuntimeOptions): Promise<GiniUpdateResult> {
   assertUpdateTarget(runtimeDir);
   const stdio = options.stdio ?? "pipe";
+  const runStepImpl = options.runStepImpl ?? runStep;
 
-  const beforeSha = requireGit(runtimeDir, ["rev-parse", "HEAD"], "could not read current HEAD");
-  const fetchRes = spawnSync("git", ["-C", runtimeDir, "fetch", "origin"], { encoding: "utf8" });
-  if (fetchRes.status !== 0) {
-    const stderr = (fetchRes.stderr ?? "").trim();
-    throw new Error(`gini update: git fetch origin failed${stderr ? `: ${stderr}` : "."}`);
+  // Mark the update window on disk for the watchdog: while this marker is
+  // fresh it suppresses revive actions, because probe misses are EXPECTED
+  // here — the bun installs swap node_modules under the live web server and
+  // the build pegs the CPU, so a 2s health probe can time out against a
+  // healthy-but-busy service. Removed in the finally below. The body carries
+  // OUR pid so the watchdog can tell a live update from a dead one: if the
+  // updating process is gone (it crashed, or was killed, before the finally
+  // ran), the marker is stale immediately rather than muting the safety net
+  // for the full 15-minute mtime backstop. Advisory only — a marker I/O
+  // failure never fails the update.
+  const marker = updateInProgressMarkerPath();
+  try {
+    mkdirSync(dirname(marker), { recursive: true });
+    writeFileSync(marker, `${JSON.stringify({ pid: process.pid })}\n`);
+  } catch {
+    // Advisory marker; proceed without watchdog suppression.
   }
 
-  const resetRes = spawnSync("git", ["-C", runtimeDir, "reset", "--hard", "origin/HEAD"], { encoding: "utf8" });
-  if (resetRes.status !== 0) {
-    const stderr = (resetRes.stderr ?? "").trim();
-    throw new Error(`gini update: git reset --hard origin/HEAD failed${stderr ? `: ${stderr}` : "."}`);
+  try {
+    const beforeSha = requireGit(runtimeDir, ["rev-parse", "HEAD"], "could not read current HEAD");
+    const fetchRes = await runStepImpl("git", ["-C", runtimeDir, "fetch", "origin"], { stdio: "pipe" });
+    if (fetchRes.status !== 0) {
+      const stderr = fetchRes.stderr.trim();
+      throw new Error(`gini update: git fetch origin failed${stderr ? `: ${stderr}` : "."}`);
+    }
+
+    const resetRes = spawnSync("git", ["-C", runtimeDir, "reset", "--hard", "origin/HEAD"], { encoding: "utf8" });
+    if (resetRes.status !== 0) {
+      const stderr = (resetRes.stderr ?? "").trim();
+      throw new Error(`gini update: git reset --hard origin/HEAD failed${stderr ? `: ${stderr}` : "."}`);
+    }
+
+    const afterSha = requireGit(runtimeDir, ["rev-parse", "HEAD"], "could not read new HEAD");
+    await runBunInstall(runtimeDir, "bun install", stdio, runStepImpl);
+
+    const webDir = join(runtimeDir, "web");
+    if (existsSync(join(webDir, "package.json"))) {
+      await runBunInstall(webDir, "bun install in web/", stdio, runStepImpl);
+      // Build the sha-keyed production bundle for the NEW head so the
+      // restarted web service serves prebuilt assets via `next start` instead
+      // of JIT-compiling every route under `next dev` (the cause of the
+      // post-update outage when a Next version bump invalidates the dev
+      // cache). On failure this throws like the install steps above, so the
+      // caller never schedules a restart and the old server keeps serving.
+      const sha12 = requireGit(runtimeDir, ["rev-parse", "--short=12", "HEAD"], "could not read new HEAD short sha");
+      await buildWebProdBundle(runtimeDir, sha12, stdio, { runStepImpl });
+    }
+
+    const upToDate = beforeSha === afterSha;
+    const commitCount = upToDate
+      ? "0"
+      : git(runtimeDir, ["rev-list", "--count", `${beforeSha}..${afterSha}`]) ?? "?";
+
+    return {
+      beforeSha,
+      afterSha,
+      commitCount,
+      upToDate,
+      runtimeDir,
+      version: currentVersionInfo(runtimeDir)
+    };
+  } finally {
+    try {
+      rmSync(marker, { force: true });
+    } catch {
+      // Best-effort: a leftover marker goes stale after 15 minutes anyway.
+    }
   }
-
-  const afterSha = requireGit(runtimeDir, ["rev-parse", "HEAD"], "could not read new HEAD");
-  runBunInstall(runtimeDir, "bun install", stdio);
-
-  const webDir = join(runtimeDir, "web");
-  if (existsSync(join(webDir, "package.json"))) {
-    runBunInstall(webDir, "bun install in web/", stdio);
-  }
-
-  const upToDate = beforeSha === afterSha;
-  const commitCount = upToDate
-    ? "0"
-    : git(runtimeDir, ["rev-list", "--count", `${beforeSha}..${afterSha}`]) ?? "?";
-
-  return {
-    beforeSha,
-    afterSha,
-    commitCount,
-    upToDate,
-    runtimeDir,
-    version: currentVersionInfo(runtimeDir)
-  };
 }
 
 // Test seams for scheduleRuntimeRestart. Production callers (http.ts POST
@@ -148,9 +273,9 @@ export function scheduleRuntimeRestart(instance: Instance, options: ScheduleRest
   }
 
   // Under launchd, the runtime is a KeepAlive:true job. updateRuntime has
-  // already run `git reset --hard` + `bun install` synchronously by the
-  // time we get here, so the working tree is the fresh code with no
-  // install/respawn race. We:
+  // already been awaited to completion (`git reset --hard` + `bun install`
+  // + the web build) by the time we get here, so the working tree is the
+  // fresh code with no install/respawn race. We:
   //   1. Spawn detached, unref'd `gini autostart kick` children for the web
   //      service (re-execs with any new web/ deps) AND the watchdog. The
   //      watchdog is a long-lived KeepAlive loop, so nothing else replaces
@@ -248,13 +373,76 @@ export function formatInstallFailure(
   const output = [toText(stdout), toText(stderr)].filter(Boolean).join("\n").trim();
   const base = `gini update: ${label} failed (exit ${status ?? "null"}).`;
   if (!output) return base;
-  return `${base}\n\n----- bun install output -----\n${truncateOutput(output)}`;
+  return `${base}\n\n----- ${label} output -----\n${truncateOutput(output)}`;
 }
 
-function runBunInstall(cwd: string, label: string, stdio: "inherit" | "pipe"): void {
-  const result = stdio === "inherit"
-    ? spawnSync("bun", ["install"], { cwd, stdio: "inherit" })
-    : spawnSync("bun", ["install"], { cwd, encoding: "utf8" });
+// Resolve the production dist dir to serve for the checkout at repoDir:
+// web/<prefix><sha12> with a BUILD_ID (next build's completion marker — a
+// dir without one is an aborted build and must not be served). Returns the
+// dir NAME (relative, the shape GINI_DIST_DIR wants) or null when no bundle
+// matches the current HEAD — the caller falls back to `next dev`.
+export function resolveWebProdDistDir(repoDir: string): string | null {
+  const sha12 = git(repoDir, ["rev-parse", "--short=12", "HEAD"]);
+  if (!sha12) return null;
+  const distDir = `${WEB_PROD_DIST_PREFIX}${sha12}`;
+  return existsSync(join(repoDir, "web", distDir, "BUILD_ID")) ? distDir : null;
+}
+
+// Test seam for buildWebProdBundle: tests inject an async runner recorder so
+// no real `next build` runs.
+export interface BuildWebProdOptions {
+  runStepImpl?: RunStepImpl;
+}
+
+// Build the production web bundle for sha12 into web/<prefix><sha12>.
+// Idempotent: a dir that already carries a BUILD_ID is kept as-is (re-update
+// onto the same head). On success, every OTHER <prefix>* dir is deleted —
+// they can never be served again (the sha no longer matches) and each one
+// holds a full Next build. The still-running old server may 500 on a
+// not-yet-loaded route for the moment between this GC and its restart;
+// that's accepted (the updating tab sits behind the UpdateGate blur). On
+// build failure this throws so updateRuntime aborts before any restart is
+// scheduled.
+export async function buildWebProdBundle(
+  runtimeDir: string,
+  sha12: string,
+  stdio: "inherit" | "pipe",
+  options: BuildWebProdOptions = {}
+): Promise<{ distDir: string; built: boolean }> {
+  const runStepImpl = options.runStepImpl ?? runStep;
+  const webDir = join(runtimeDir, "web");
+  const distDir = `${WEB_PROD_DIST_PREFIX}${sha12}`;
+  const alreadyBuilt = existsSync(join(webDir, distDir, "BUILD_ID"));
+  if (!alreadyBuilt) {
+    const env = { ...process.env, GINI_DIST_DIR: distDir };
+    const result = await runStepImpl("bun", ["run", "build"], { cwd: webDir, env, stdio });
+    if (result.status !== 0) {
+      throw new Error(formatInstallFailure("bun run build in web/", result.status, result.stdout, result.stderr));
+    }
+  }
+  for (const entry of readdirSync(webDir)) {
+    // GC only dirs shaped like OUR sha-keyed bundles (<prefix> + a hex sha
+    // of >=12 chars, matching `git rev-parse --short=12`, which lengthens
+    // on ambiguity). A bare prefix match would also delete the `next dev`
+    // dist dir of an instance literally named e.g. `prod-foo`
+    // (`.next-prod-foo`).
+    if (entry === distDir || !PROD_DIST_GC_PATTERN.test(entry)) continue;
+    try {
+      rmSync(join(webDir, entry), { recursive: true, force: true });
+    } catch {
+      // GC is best-effort: a leftover dir wastes disk but can never be
+      // served (its sha doesn't match), so it must not fail the update.
+    }
+  }
+  return { distDir, built: !alreadyBuilt };
+}
+
+// Shape of a GC-able sha-keyed bundle dir name. Must agree with
+// WEB_PROD_DIST_PREFIX; the trailing hex run is the short sha.
+const PROD_DIST_GC_PATTERN = /^\.next-prod-[0-9a-f]{12,}$/;
+
+async function runBunInstall(cwd: string, label: string, stdio: "inherit" | "pipe", runStepImpl: RunStepImpl): Promise<void> {
+  const result = await runStepImpl("bun", ["install"], { cwd, stdio });
   if (result.status !== 0) {
     throw new Error(formatInstallFailure(label, result.status, result.stdout, result.stderr));
   }

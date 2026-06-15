@@ -215,7 +215,7 @@ export async function createScheduledJob(
     if (!isKnownHook(hook.handlerId)) {
       throw new Error(`Invalid input: preRunHook.handlerId "${hook.handlerId}" is not a known hook handler`);
     }
-    if (hook.config === undefined || typeof hook.config !== "object" || Array.isArray(hook.config)) {
+    if (hook.config === undefined || hook.config === null || typeof hook.config !== "object" || Array.isArray(hook.config)) {
       throw new Error(`Invalid input: preRunHook.config must be an object`);
     }
     let timeoutMs: number | undefined;

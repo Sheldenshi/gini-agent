@@ -796,7 +796,7 @@ async function rotateConnector(
 async function updateSelf(config: RuntimeConfig, taskId: string): Promise<string> {
   try {
     assertCurrentRuntimeUpdateSupported();
-    const result = updateRuntime(projectRoot());
+    const result = await updateRuntime(projectRoot());
     const restart = result.upToDate ? false : scheduleRuntimeRestart(config.instance);
     appendTrace(config.instance, taskId, {
       type: "tool",

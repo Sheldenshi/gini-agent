@@ -29,13 +29,14 @@ import {
 } from "../provider";
 import { decideApproval, failTask } from "../agent";
 import { __setTransformersLoaderForTests } from "../stt";
-import { createChatMessage, insertChatBlock, listChatBlocks, mutateState, readState } from "../state";
+import { createChatMessage, createChatSession, insertChatBlock, listChatBlocks, mutateState, readState } from "../state";
 import { storeUpload } from "../state/uploads";
 import { createScheduledJob } from "../jobs";
 import {
   getChatSession,
   listChatSessions,
   submitChatMessage,
+  submitThreadReply,
   syncChatTaskResult,
   createChat,
   deleteChat
@@ -1093,5 +1094,112 @@ describe("chat list pendingApprovalCount enrichment", () => {
 
     const row = listChatSessions(config).find((s) => s.id === session.id);
     expect(row?.pendingApprovalCount).toBe(0);
+  });
+});
+
+// Client-surface resolution on message submit. UI clients tag each POST with
+// a `client` body field; bridge sessions derive the surface from
+// `source.kind`; anything else resolves to unknown (no clientSurface on the
+// task) — never a submit error. See ADR client-surface-context.md.
+describe("chat message client surface", () => {
+  let root: string;
+  let workspaceRoot: string;
+  let prevState: string | undefined;
+  let prevLog: string | undefined;
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "gini-chat-surface-"));
+    workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-surface-ws-"));
+    prevState = process.env.GINI_STATE_ROOT;
+    prevLog = process.env.GINI_LOG_ROOT;
+    process.env.GINI_STATE_ROOT = root;
+    process.env.GINI_LOG_ROOT = `${root}-logs`;
+    clearEchoToolCallingResponses();
+  });
+
+  afterEach(() => {
+    if (prevState === undefined) delete process.env.GINI_STATE_ROOT;
+    else process.env.GINI_STATE_ROOT = prevState;
+    if (prevLog === undefined) delete process.env.GINI_LOG_ROOT;
+    else process.env.GINI_LOG_ROOT = prevLog;
+    rmSync(root, { recursive: true, force: true });
+    rmSync(workspaceRoot, { recursive: true, force: true });
+    clearEchoToolCallingResponses();
+  });
+
+  function stubTurn(config: RuntimeConfig): void {
+    setEchoToolCallingResponse({
+      provider: normalizeProvider(config.provider),
+      text: "ok",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+  }
+
+  function taskSurface(config: RuntimeConfig, taskId: string): string | undefined {
+    return readState(config.instance).tasks.find((t) => t.id === taskId)?.clientSurface;
+  }
+
+  test("stores each valid client value on the spawned task", async () => {
+    const config = buildConfig(workspaceRoot, "chat-surface-valid");
+    for (const client of ["web", "mobile", "cli"] as const) {
+      stubTurn(config);
+      const session = await createChat(config, { title: `surface-${client}` });
+      const submitted = await submitChatMessage(config, session.id, { content: "hi", client });
+      expect(taskSurface(config, submitted.taskId)).toBe(client);
+    }
+  });
+
+  test("treats an unrecognized client value as unknown without rejecting the message", async () => {
+    const config = buildConfig(workspaceRoot, "chat-surface-invalid");
+    stubTurn(config);
+    const session = await createChat(config, { title: "surface-invalid" });
+    const submitted = await submitChatMessage(config, session.id, { content: "hi", client: "smartwatch" });
+    expect(taskSurface(config, submitted.taskId)).toBeUndefined();
+  });
+
+  test("treats an absent client field as unknown", async () => {
+    const config = buildConfig(workspaceRoot, "chat-surface-absent");
+    stubTurn(config);
+    const session = await createChat(config, { title: "surface-absent" });
+    const submitted = await submitChatMessage(config, session.id, { content: "hi" });
+    expect(taskSurface(config, submitted.taskId)).toBeUndefined();
+  });
+
+  test("stamps the client surface on a thread reply's spawned task", async () => {
+    const config = buildConfig(workspaceRoot, "chat-surface-thread");
+    stubTurn(config);
+    const session = await createChat(config, { title: "surface-thread" });
+    // Root the new thread on a main-chat block — the message being
+    // branched from.
+    const parent = insertChatBlock(config.instance, {
+      kind: "user_text",
+      sessionId: session.id,
+      text: "original message",
+      agentId: null
+    });
+    const submitted = await submitThreadReply(config, session.id, "thread_surface", {
+      content: "reply from my phone",
+      client: "mobile",
+      parentBlockId: parent.id
+    });
+    expect(taskSurface(config, submitted.taskId)).toBe("mobile");
+  });
+
+  test("derives the surface from a bridge session source without a client field", async () => {
+    const config = buildConfig(workspaceRoot, "chat-surface-bridge");
+    const sources = [
+      { kind: "telegram" as const, bridgeId: "b1", chatId: 7, target: "7" },
+      { kind: "discord" as const, bridgeId: "b2", channelId: "c1", target: "c1" },
+      { kind: "openclaw" as const, openclawSessionId: "s1", openclawAgentId: "a1" }
+    ];
+    for (const source of sources) {
+      stubTurn(config);
+      const session = await mutateState(config.instance, (state) =>
+        createChatSession(state, `bridge-${source.kind}`, source)
+      );
+      const submitted = await submitChatMessage(config, session.id, { content: "hi" });
+      expect(taskSurface(config, submitted.taskId)).toBe(source.kind);
+    }
   });
 });

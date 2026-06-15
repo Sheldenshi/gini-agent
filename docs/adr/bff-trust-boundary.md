@@ -124,8 +124,8 @@ The gateway fronts the BFF as a single origin (ADR
 authoritative trust front. For every web-bound request (non-`/api` and
 `/api/runtime/*`) the gateway runs the host/origin guard
 (`webBoundRequestAllowed` in `src/lib/origin-trust.ts`) — the loopback /
-gini-relay / `GINI_TRUSTED_ORIGINS` lanes plus the `Sec-Fetch-Site` check (with
-the top-level-navigation exemption) — and
+gini-relay / runtime-managed-tunnel / `GINI_TRUSTED_ORIGINS` lanes plus the
+`Sec-Fetch-Site` check (with the top-level-navigation exemption) — and
 only then reverse-proxies to the Next.js BFF, rewriting `Host` and `Origin` to
 loopback on the way. The BFF therefore always sees an internal loopback request:
 it keeps its own loopback/allowlist guard as defense-in-depth for direct access
@@ -136,10 +136,15 @@ token injection remains the BFF's job and the browser still never sees the
 token.
 
 The operational knob is the same as direct exposure, now enforced at the
-gateway: if the gateway is exposed on a non-loopback, non-relay hostname (the
-tailnet/public case), the gateway guard fails closed unless
-`GINI_TRUSTED_ORIGINS` includes the gateway's external origin. The relay lane is
-the only auto-trusted non-loopback case, because the relay owns its DNS.
+gateway: if the gateway is exposed on a non-loopback hostname the runtime
+doesn't know about, the gateway guard fails closed unless
+`GINI_TRUSTED_ORIGINS` includes the gateway's external origin. Two
+non-loopback cases are auto-trusted, both because the runtime established the
+front and the name's DNS is provider-owned: the relay lane, and a
+**runtime-managed tunnel's connected URL** (`setRuntimeTunnelTrust` in
+`src/lib/origin-trust.ts` — admitted exactly while the tunnel record is
+`connected`, revoked atomically with any transition away; see
+[Tunnel Connectivity](tunnel-connectivity.md)).
 
 ## Alternatives considered
 

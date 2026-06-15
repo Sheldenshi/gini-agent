@@ -13,8 +13,9 @@ const rehypePlugins = [rehypeHighlight];
 // Reconstruct the original fenced-block source from a hast node. rehype-highlight
 // wraps code text in <span> tokens, so we collect text descendants rather than
 // reading a single string child — this stays correct whether or not the language
-// was highlighted.
-function hastText(node: unknown): string {
+// was highlighted. Exported so tests can pin the non-element folds (null,
+// childless nodes) that never occur in rendered markdown.
+export function hastText(node: unknown): string {
   const n = node as { type?: string; value?: string; children?: unknown[] } | null;
   if (!n) return "";
   if (n.type === "text") return n.value ?? "";
@@ -23,7 +24,8 @@ function hastText(node: unknown): string {
 }
 
 // Read the fenced-block language (```lang) from a hast <code> node's class list.
-function fenceLang(codeNode: unknown): string | undefined {
+// Exported for the same direct-fold tests as hastText.
+export function fenceLang(codeNode: unknown): string | undefined {
   const classes = (codeNode as { properties?: { className?: unknown } } | null)?.properties?.className;
   if (!Array.isArray(classes)) return undefined;
   const prefix = "language-";

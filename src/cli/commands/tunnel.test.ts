@@ -71,12 +71,13 @@ describe("tunnel CLI", () => {
 
   const STATE = { providers: [], selectedProvider: "gini-relay", status: "idle" };
 
-  // `gini tunnel` (no sub-verb) → GET /api/tunnel.
-  test("`gini tunnel` GETs /api/tunnel and prints the state", async () => {
+  // `gini tunnel` (no sub-verb) → GET /api/tunnel?detect=1 (a status read is
+  // the operator looking at the catalog, so it re-probes driver availability).
+  test("`gini tunnel` GETs /api/tunnel?detect=1 and prints the state", async () => {
     mockFetch(() => ({ status: 200, body: STATE }));
     await tunnel(makeCtx(["tunnel"]));
     expect(captured).toHaveLength(1);
-    expect(captured[0]?.url).toBe("http://127.0.0.1:7337/api/tunnel");
+    expect(captured[0]?.url).toBe("http://127.0.0.1:7337/api/tunnel?detect=1");
     expect(captured[0]?.method).toBe("GET");
     expect(captured[0]?.body).toBeUndefined();
     expect(captured[0]?.headers.authorization).toBe("Bearer test-token");
@@ -156,12 +157,12 @@ describe("tunnel CLI", () => {
     expect(stdout()).toBe("");
   });
 
-  // Explicit `gini tunnel status` still GETs /api/tunnel.
-  test("`status` GETs /api/tunnel", async () => {
+  // Explicit `gini tunnel status` GETs the same detect-refreshing read.
+  test("`status` GETs /api/tunnel?detect=1", async () => {
     mockFetch(() => ({ status: 200, body: STATE }));
     await tunnel(makeCtx(["tunnel", "status"]));
     expect(captured).toHaveLength(1);
-    expect(captured[0]?.url).toBe("http://127.0.0.1:7337/api/tunnel");
+    expect(captured[0]?.url).toBe("http://127.0.0.1:7337/api/tunnel?detect=1");
     expect(captured[0]?.method).toBe("GET");
   });
 

@@ -74,6 +74,12 @@ interface PersistedGate {
   // complete WITHOUT this marker resumes into "restarting" and re-proves the
   // stack is up instead of reloading blind.
   verified?: boolean;
+  // When the gate first left idle (epoch ms). A resumed gate anchors its base
+  // stall deadline and the absolute hard cap to THIS instant, not the reload:
+  // re-arming the 30-minute ceiling on every restart-triggered reload would
+  // let a wedged-but-alive update hold the blur indefinitely, one reload at a
+  // time.
+  startedAt?: number;
 }
 
 function readPersistedGate(): PersistedGate | null {
@@ -94,7 +100,8 @@ function readPersistedGate(): PersistedGate | null {
       beforePid: typeof parsed.beforePid === "number" ? parsed.beforePid : undefined,
       beforeWebPpid: typeof parsed.beforeWebPpid === "number" ? parsed.beforeWebPpid : undefined,
       restartExpected: typeof parsed.restartExpected === "boolean" ? parsed.restartExpected : undefined,
-      verified: parsed.verified === true ? true : undefined
+      verified: parsed.verified === true ? true : undefined,
+      startedAt: typeof parsed.startedAt === "number" ? parsed.startedAt : undefined
     };
   } catch {
     return null;
@@ -111,29 +118,82 @@ function writePersistedGate(value: PersistedGate | null): void {
   }
 }
 
+// Cross-tab gate channel. One update should blur EVERY open tab, not just
+// the one that clicked: an unblurred sibling tab keeps hitting the stack
+// mid-restart and can hard-navigate onto a dead port. The owner tab
+// broadcasts {type:"start"} the moment its gate engages and {type:"done"}
+// when its update ends (release or completion); every other provider
+// follows — same blur, same completion detection, same deadline rules.
+const GATE_CHANNEL_NAME = "gini-update-gate";
+
+// The slice of BroadcastChannel the gate uses, injectable for tests (the
+// test DOM may not implement it) and null when the platform lacks it.
+export interface GateChannel {
+  postMessage: (message: unknown) => void;
+  close: () => void;
+  onmessage: ((event: MessageEvent) => void) | null;
+}
+
+function defaultGateChannel(): GateChannel | null {
+  // No BroadcastChannel (an old WebView, a non-browser DOM): the gate
+  // degrades to single-tab behavior rather than failing.
+  if (typeof BroadcastChannel === "undefined") return null;
+  return new BroadcastChannel(GATE_CHANNEL_NAME);
+}
+
 // Hold the "complete" confirmation on screen this long before the final
 // pre-reload probe and the reload onto the freshly built assets.
 const COMPLETE_RELOAD_DELAY_MS = 1_500;
 // Whole-gate deadline: a generous ceiling on the entire update (git + bun
-// install in both roots, the restart, and the pre-reload probe). The deadline
-// is fixed the moment the gate leaves idle; phase transitions and probe
-// drop-backs reschedule against it with the remaining time, never extending
-// it. If the update hasn't reloaded by then, the gate releases rather than
-// trapping the user behind a permanent blur. The completion detectors
-// normally tear the gate down long before this fires.
-const STALL_TIMEOUT_MS = 120_000;
+// install in both roots, the sha-keyed production `next build` of the web
+// app — itself up to ~90s — the restart, and the pre-reload probe). The
+// deadline is set the moment the gate leaves idle; phase transitions and
+// probe drop-backs reschedule against it with the remaining time. The ONLY
+// thing that moves it is the progress poll below — a gateway that answers
+// `updateInProgress: true` proves work is still happening, so the deadline
+// is pushed out (capped by GATE_HARD_CAP_MS); a hung or dead gateway extends
+// nothing and this base deadline releases the blur as before. If the update
+// hasn't reloaded by the deadline, the gate releases rather than trapping
+// the user behind a permanent blur. The completion detectors normally tear
+// the gate down long before this fires.
+const STALL_TIMEOUT_MS = 240_000;
+// While the gate is waiting, GET /api/version (via the BFF proxy) is polled
+// at this cadence for the gateway's `updateInProgress` flag — the
+// single-flight update guard, true exactly while updateRuntime is running.
+const PROGRESS_POLL_INTERVAL_MS = 5_000;
+// Each `updateInProgress: true` answer pushes the stall deadline out to at
+// least now + this much. 90s comfortably outlasts the poll cadence and the
+// longest single step (the production `next build`) between answers, while
+// keeping the post-progress release window short once the gateway goes
+// quiet. `false`, errors, and silence extend nothing.
+const PROGRESS_EXTEND_MS = 90_000;
+// Absolute ceiling on the whole gate, measured from the moment it leaves
+// idle. Progress extensions never push the deadline past this — a gateway
+// stuck in a wedged-but-alive update (the single-flight promise never
+// settles) must not blur the app forever.
+const GATE_HARD_CAP_MS = 30 * 60_000;
 
 export function UpdateGateProvider({
   children,
   // The whole-gate deadline is injectable so tests can drive the stall release
-  // without advancing fake time across the 120s default — a single advance that
-  // long fires the 1.5s status/healthz poll intervals 80 times each (120000 /
-  // 1500) and wedges the worker under `bun test --isolate`. Production always
-  // uses the constant default.
-  stallTimeoutMs = STALL_TIMEOUT_MS
+  // without advancing fake time across the 240s default — a single advance that
+  // long fires the 1.5s status/healthz poll intervals 160 times each (240000 /
+  // 1500) and wedges the worker under `bun test --isolate`. The progress-poll
+  // timings below are injectable for the same reason. Production always uses
+  // the constant defaults.
+  stallTimeoutMs = STALL_TIMEOUT_MS,
+  progressPollIntervalMs = PROGRESS_POLL_INTERVAL_MS,
+  progressExtendMs = PROGRESS_EXTEND_MS,
+  gateHardCapMs = GATE_HARD_CAP_MS,
+  // The cross-tab channel factory, injectable for tests.
+  createGateChannel = defaultGateChannel
 }: {
   children: ReactNode;
   stallTimeoutMs?: number;
+  progressPollIntervalMs?: number;
+  progressExtendMs?: number;
+  gateHardCapMs?: number;
+  createGateChannel?: () => GateChannel | null;
 }) {
   const qc = useQueryClient();
   const [phase, setPhase] = useState<UpdatePhase>("idle");
@@ -144,9 +204,27 @@ export function UpdateGateProvider({
   const [restartExpected, setRestartExpected] = useState(true);
   // When the gate entered "restarting" — see the pid-less fallbacks below.
   const [restartingSince, setRestartingSince] = useState<number | null>(null);
-  // Wall-clock deadline for the whole gate, set once when it leaves "idle"
-  // and cleared when it returns — see the stall safety net below.
+  // Wall-clock deadline for the whole gate, set when it leaves "idle" and
+  // cleared when it returns — see the stall safety net below. Pushed out by
+  // the progress poll while the gateway reports updateInProgress, capped by
+  // hardCapRef.
   const stallDeadlineRef = useRef<number | null>(null);
+  // Absolute ceiling for progress extensions, fixed when the gate leaves
+  // "idle": no amount of gateway progress holds the blur past this.
+  const hardCapRef = useRef<number | null>(null);
+  // When the gate first left idle. Persisted with the gate and restored on
+  // resume so the deadline and hard cap above stay anchored to the ORIGINAL
+  // start across mid-update reloads (see PersistedGate.startedAt).
+  const startedAtRef = useRef<number | null>(null);
+  // Bumped whenever the progress poll moves the deadline so the stall effect
+  // below re-runs and re-arms its timer against the new deadline (a ref
+  // change alone re-schedules nothing).
+  const [deadlineExtensions, setDeadlineExtensions] = useState(0);
+  // The live cross-tab channel (null when unsupported) and whether THIS tab
+  // owns the in-flight POST. Only the owner broadcasts; a follower blurs,
+  // detects completion, and reloads entirely on its own.
+  const channelRef = useRef<GateChannel | null>(null);
+  const ownerRef = useRef(false);
 
   // Poll status fast while updating/restarting so the new revision — and then
   // the restarted gateway — are picked up promptly.
@@ -174,6 +252,38 @@ export function UpdateGateProvider({
   });
   const healthzPpid = typeof healthz.data?.ppid === "number" ? healthz.data.ppid : null;
 
+  // Progress poll: while waiting, ask the gateway whether its single-flight
+  // update is still running. Only an affirmative answer feeds the deadline
+  // extension below; retry: false keeps failed polls on the interval cadence
+  // (and a failed poll extends nothing by construction — dataUpdatedAt only
+  // advances on success).
+  const progress = useQuery({
+    queryKey: ["version", "progress"],
+    queryFn: () => api<{ updateInProgress?: boolean }>("/version"),
+    enabled: waiting,
+    refetchInterval: progressPollIntervalMs,
+    retry: false
+  });
+
+  // Each fresh `updateInProgress: true` answer pushes the stall deadline out
+  // to at least now + progressExtendMs, never past the hard cap. Keyed on
+  // dataUpdatedAt so only a NEW successful poll extends: `false`, errors,
+  // and a silent gateway leave the deadline where it was, so a hung update
+  // still releases on the fixed-deadline fallback exactly as before. The
+  // retained `true` from a previous poll can re-run this on a phase flip,
+  // which is harmless: at gate start the remaining time exceeds the
+  // extension, so max() keeps the base deadline.
+  const progressUpdatedAt = progress.dataUpdatedAt;
+  const progressInFlight = progress.data?.updateInProgress === true;
+  useEffect(() => {
+    if (!waiting || !progressInFlight) return;
+    if (stallDeadlineRef.current == null || hardCapRef.current == null) return;
+    const extended = Math.min(hardCapRef.current, Math.max(stallDeadlineRef.current, Date.now() + progressExtendMs));
+    if (extended === stallDeadlineRef.current) return;
+    stallDeadlineRef.current = extended;
+    setDeadlineExtensions((n) => n + 1);
+  }, [waiting, progressInFlight, progressUpdatedAt, progressExtendMs]);
+
   const versionCheck = useQuery({
     queryKey: ["version", "check"],
     queryFn: () => api<GiniVersionInfo>("/update/check", { method: "POST" }),
@@ -184,6 +294,12 @@ export function UpdateGateProvider({
   const updateAvailable = version?.git.updateAvailable === true;
 
   const reset = useCallback(() => {
+    // The owner's exit is broadcast so follower tabs don't sit blurred
+    // behind their own deadlines after an update that ends without a
+    // restart (upToDate, a structured pre-flight error, a stall release).
+    if (ownerRef.current) channelRef.current?.postMessage({ type: "done" });
+    ownerRef.current = false;
+    startedAtRef.current = null;
     setPhase("idle");
     setTargetSha(null);
     setBeforeSha(null);
@@ -216,7 +332,8 @@ export function UpdateGateProvider({
         beforeSha: beforeSha ?? undefined,
         beforePid: beforePid ?? undefined,
         beforeWebPpid: beforeWebPpid ?? undefined,
-        restartExpected: expectRestart
+        restartExpected: expectRestart,
+        startedAt: startedAtRef.current ?? undefined
       });
     },
     onError: (error: Error) => {
@@ -232,6 +349,17 @@ export function UpdateGateProvider({
       // and release the gate in exactly the window it exists to cover.
       const { status, unreachable } = error as ApiError;
       if (typeof status === "number" && !unreachable) {
+        // One structured error must NOT release: the gateway's single-flight
+        // guard answers 409 when another tab's POST won the race inside the
+        // broadcast latency. An update IS running — just not this tab's — so
+        // a reset() here would broadcast {type:"done"} and unblur every
+        // follower while the winner's update is mid-flight. Demote this tab
+        // to follower instead: keep the blur (and its engage-time baselines)
+        // and finish through the follower completion detection.
+        if (status === 409) {
+          ownerRef.current = false;
+          return;
+        }
         reset();
         toast.error(error.message);
       }
@@ -239,17 +367,25 @@ export function UpdateGateProvider({
   });
   const { mutate, isPending } = update;
 
-  const start = useCallback(() => {
+  // Engage the gate in this tab. The owner (the tab whose update control was
+  // clicked) additionally broadcasts the start to sibling tabs and fires the
+  // POST; a follower (engaged by that broadcast) runs everything else — the
+  // same baseline capture, persistence, completion detection, and deadline
+  // rules — and probe-then-reloads itself on completion. Either way the blur
+  // goes up immediately: the POST itself (git + bun install + build) is the
+  // slow part, so the gate must not wait for it.
+  const engage = useCallback((owner: boolean) => {
     if (phase !== "idle") return;
-    // Blur immediately on click — the POST itself (git + bun install) is the
-    // slow part, so the gate must go up before awaiting it.
+    ownerRef.current = owner;
+    startedAtRef.current = Date.now();
     setBeforeSha(statusSha);
     setBeforePid(statusPid);
     setPhase("updating");
     writePersistedGate({
       phase: "updating",
       beforeSha: statusSha ?? undefined,
-      beforePid: statusPid ?? undefined
+      beforePid: statusPid ?? undefined,
+      startedAt: startedAtRef.current
     });
     // Capture the web server's tree identity (ppid) once, in parallel with
     // the POST. The POST takes seconds (git + install), so this settles long
@@ -259,8 +395,46 @@ export function UpdateGateProvider({
     api<{ ppid?: number }>("/__healthz")
       .then((h) => setBeforeWebPpid(typeof h.ppid === "number" ? h.ppid : null))
       .catch(() => {});
-    mutate();
+    if (owner) {
+      channelRef.current?.postMessage({ type: "start" });
+      mutate();
+    }
   }, [phase, statusSha, statusPid, mutate]);
+
+  const start = useCallback(() => engage(true), [engage]);
+
+  // Cross-tab messages, dispatched through a render-refreshed ref so the
+  // mount effect below subscribes once without re-opening the channel every
+  // time phase or engage identity changes. (Null only before first render's
+  // assignment below, which precedes every effect and message.)
+  const onGateMessageRef = useRef<((data: unknown) => void) | null>(null);
+  onGateMessageRef.current = (data: unknown) => {
+    const type = (data as { type?: unknown } | null)?.type;
+    // A sibling tab started an update: blur here too, in follower mode.
+    if (type === "start") engage(false);
+    // The owner's update ended. A follower still in "updating" — the sha
+    // never moved, so the update released without a restart (upToDate, a
+    // pre-flight failure, a stall) — releases with it; one already in
+    // "restarting"/"complete" ignores the message and finishes through its
+    // own detection + probe-then-reload, which is what lands it on the
+    // freshly built assets.
+    if (type === "done" && !ownerRef.current && phase === "updating") reset();
+  };
+
+  // Open the cross-tab channel once per mount. The factory is read through a
+  // ref so an inline prop value can't churn the subscription.
+  const createGateChannelRef = useRef(createGateChannel);
+  createGateChannelRef.current = createGateChannel;
+  useEffect(() => {
+    const channel = createGateChannelRef.current();
+    if (!channel) return;
+    channelRef.current = channel;
+    channel.onmessage = (event) => onGateMessageRef.current?.(event.data);
+    return () => {
+      channelRef.current = null;
+      channel.close();
+    };
+  }, []);
 
   // Resume an in-flight gate after a restart-triggered reload. Only a
   // verified complete (written after reachability was proven) may resume into
@@ -271,6 +445,11 @@ export function UpdateGateProvider({
   useEffect(() => {
     const persisted = readPersistedGate();
     if (!persisted) return;
+    // Restore the original gate start FIRST (every resumed shape needs it):
+    // the stall effect anchors the deadline and hard cap on it, so a resume
+    // must not re-arm them from "now". A legacy gate without it falls back
+    // to anchoring at the resume.
+    startedAtRef.current = persisted.startedAt ?? null;
     if (persisted.phase === "complete" && persisted.verified) {
       setPhase("complete");
       return;
@@ -303,13 +482,14 @@ export function UpdateGateProvider({
       writePersistedGate({
         phase: "restarting",
         beforePid: beforePid ?? undefined,
-        beforeWebPpid: beforeWebPpid ?? undefined
+        beforeWebPpid: beforeWebPpid ?? undefined,
+        startedAt: startedAtRef.current ?? undefined
       });
     } else {
       // No restart scheduled → the servers never go down, so this complete
       // is verified by construction.
       setPhase("complete");
-      writePersistedGate({ phase: "complete", verified: true });
+      writePersistedGate({ phase: "complete", verified: true, startedAt: startedAtRef.current ?? undefined });
     }
   }, [phase, targetSha, beforeSha, statusSha, isPending, restartExpected, beforePid, beforeWebPpid]);
 
@@ -343,21 +523,32 @@ export function UpdateGateProvider({
   // down the polls just reject; react-query keeps refetching on the interval.
   const statusUpdatedAt = status.dataUpdatedAt;
   const healthzUpdatedAt = healthz.dataUpdatedAt;
+  // While the gateway's LATEST progress answer reports the update still
+  // running, the time-based fallback legs must not latch: the restart
+  // hasn't happened, so any poll that succeeds now succeeded against the
+  // still-old stack. The exposure is a gate with BOTH baselines unknown —
+  // a follower engages without a pending POST, so it can sit in
+  // "restarting" minutes before the real restart, and the first successful
+  // polls would otherwise complete it onto stale assets. The identity legs
+  // stay as-is (a flipped pid/ppid is restart proof regardless). A `false`
+  // answer or a poll failure newer than the last success (errorUpdatedAt
+  // past dataUpdatedAt) drops the hold and the plain fallback resumes.
+  const progressHoldsFallback = progressInFlight && progress.errorUpdatedAt <= progress.dataUpdatedAt;
   useEffect(() => {
     if (phase !== "restarting") return;
     const gatewayRestarted =
       beforePid != null
         ? statusPid != null && statusPid !== beforePid
-        : restartingSince != null && statusUpdatedAt > restartingSince;
+        : !progressHoldsFallback && restartingSince != null && statusUpdatedAt > restartingSince;
     const webRestarted =
       beforeWebPpid != null
         ? healthzPpid != null && healthzPpid !== beforeWebPpid
-        : restartingSince != null && healthzUpdatedAt > restartingSince;
+        : !progressHoldsFallback && restartingSince != null && healthzUpdatedAt > restartingSince;
     if (gatewayRestarted && webRestarted) {
       setPhase("complete");
-      writePersistedGate({ phase: "complete", verified: true });
+      writePersistedGate({ phase: "complete", verified: true, startedAt: startedAtRef.current ?? undefined });
     }
-  }, [phase, beforePid, statusPid, beforeWebPpid, healthzPpid, restartingSince, statusUpdatedAt, healthzUpdatedAt]);
+  }, [phase, beforePid, statusPid, beforeWebPpid, healthzPpid, restartingSince, statusUpdatedAt, healthzUpdatedAt, progressHoldsFallback]);
 
   // Once complete, reload onto the fresh assets — after one last __healthz
   // probe. The identity proofs above are point-in-time: the web server can
@@ -378,6 +569,9 @@ export function UpdateGateProvider({
       api("/__healthz", { signal: AbortSignal.timeout(5_000) })
         .then(() => {
           if (cancelled) return;
+          // Completion side of the cross-tab contract (see GATE_CHANNEL_NAME):
+          // the owner announces the update is over right before reloading.
+          if (ownerRef.current) channelRef.current?.postMessage({ type: "done" });
           writePersistedGate(null);
           window.location.reload();
         })
@@ -387,7 +581,8 @@ export function UpdateGateProvider({
           writePersistedGate({
             phase: "restarting",
             beforePid: beforePid ?? undefined,
-            beforeWebPpid: beforeWebPpid ?? undefined
+            beforeWebPpid: beforeWebPpid ?? undefined,
+            startedAt: startedAtRef.current ?? undefined
           });
         });
     }, COMPLETE_RELOAD_DELAY_MS);
@@ -402,17 +597,25 @@ export function UpdateGateProvider({
   // revision, or a stack that proved its restart and then died — the latter
   // cycles complete ↔ restarting on pre-reload probe failures because the
   // latched identity legs re-complete the gate instantly). The deadline is
-  // fixed when the gate leaves idle: phase changes re-run this effect, but
-  // each run schedules the remaining time against that one deadline, so no
-  // amount of transitions or drop-backs can extend the blur. Releasing from
+  // set when the gate leaves idle: phase changes re-run this effect, but
+  // each run schedules the remaining time against the one shared deadline,
+  // so transitions and drop-backs cannot extend the blur. Only the progress
+  // poll above moves the deadline — each move bumps deadlineExtensions so
+  // this effect re-arms against it — and its hard cap (fixed here alongside
+  // the deadline) bounds the whole gate absolutely. Releasing from
   // "complete" also tears down the pending probe/reload via that effect's
   // cancelled-flag cleanup.
   useEffect(() => {
     if (phase === "idle") {
       stallDeadlineRef.current = null;
+      hardCapRef.current = null;
       return;
     }
-    stallDeadlineRef.current ??= Date.now() + stallTimeoutMs;
+    // Anchor both on the gate's first start — the persisted one for a
+    // resumed gate — so a mid-update reload cannot re-arm the deadline or
+    // the hard cap from "now".
+    stallDeadlineRef.current ??= (startedAtRef.current ?? Date.now()) + stallTimeoutMs;
+    hardCapRef.current ??= (startedAtRef.current ?? Date.now()) + gateHardCapMs;
     const timer = setTimeout(() => {
       reset();
       toast.error("Update is taking longer than expected. Reload to check on it.");
@@ -420,7 +623,7 @@ export function UpdateGateProvider({
       qc.invalidateQueries({ queryKey: ["version", "check"] });
     }, stallDeadlineRef.current - Date.now());
     return () => clearTimeout(timer);
-  }, [phase, reset, qc, stallTimeoutMs]);
+  }, [phase, reset, qc, stallTimeoutMs, gateHardCapMs, deadlineExtensions]);
 
   const value = useMemo<UpdateGateValue>(
     () => ({ version, updateSupported, updateAvailable, phase, start }),

@@ -165,8 +165,11 @@ remote previews, screen readers) would need the same translation code.
       destination" badge so the human reviewer can spot a target
       mismatch. See ADR [browser-fill-secret.md](browser-fill-secret.md).
     - `browser.connect` — Connect button posts to
-      `/api/setup-requests/<id>/open-browser`; the follow-up "I've
-      signed in" posts to `/api/setup-requests/<id>/complete`.
+      `/api/setup-requests/<id>/open-browser`; the follow-up
+      completion button ("I've signed in", or "I'm done" when the
+      payload carries `mode: "handoff"` — see
+      [browser-connect-handoff.md](browser-connect-handoff.md))
+      posts to `/api/setup-requests/<id>/complete`.
     - `messaging.add_bridge` — render an inline form with a name
       input (pre-seeded from `setupRequest.payload.suggestedName`)
       and a password-masked bot-token input. Submit posts
@@ -204,7 +207,14 @@ remote previews, screen readers) would need the same translation code.
   `redactSensitiveToolArgs` (`src/execution/tool-args-redact.ts`). The
   same helper scrubs the resolved `self.config` approval payload, so a
   tool's secret args never persist to a client-rendered surface (the
-  real values still reach the handler for execution).
+  real values still reach the handler for execution). Browser ref tools
+  (`browser_click`, `browser_type`, `browser_fill_form`, …) enrich
+  `argsPreview` by resolving the `@eN` ref to the snapshot element's
+  role + name — e.g. `button "Buy a License"` instead of `@e38` — via an
+  optional resolver `chatBlockArgsPreviewFor` accepts, wired at emit time
+  to the live browser session by `peekRefLabel` (`src/tools/browser.ts`).
+  The opaque ref stays in `argsFull`, and the preview falls back to the
+  bare ref when the element has no recorded name or the session is gone.
 
 - The SSE endpoint is its own handler (`chatBlockStream` in
   `src/http.ts`), not a reuse of the existing global `eventStream`.
@@ -239,11 +249,14 @@ remote previews, screen readers) would need the same translation code.
    for v1 — the mobile client doesn't have SSE wired up yet.
 
 4. **Phase 4 (cleanup, future):** retire the legacy
-   `/api/chat/:id` shape that mixes messages + tasks. Drop
-   `syncChatTaskResult` and the synthesized streaming placeholder in
-   `getChatSession`. Stop dual-writing ChatMessageRecord rows for
-   chat-task assistant output (user messages keep landing for
-   prior-turn rehydration via `priorChatMessages`).
+   `/api/chat/:id` shape that mixes messages + tasks. Drop the
+   `/sync` endpoint and the synthesized streaming placeholder in
+   `getChatSession`. The durable ChatMessageRecord rows are NOT part
+   of this cleanup: user rows and the final assistant answer row
+   (written server-side by `persistFinalAnswerRow` on chat-task
+   completion) keep landing, because they are model-facing replay
+   state — `priorChatMessages` rehydrates them so the model sees its
+   own prior answers — not a UI legacy.
 
 ## Read And Write Semantics
 

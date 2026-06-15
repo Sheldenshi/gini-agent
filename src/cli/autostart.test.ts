@@ -402,8 +402,8 @@ describe("resolveLaunchSpec", () => {
     // could drive the web dev server while the gateway runs under a
     // different Bun.
     const shim = pair.web.programArguments[pair.web.programArguments.length - 1] ?? "";
-    expect(shim).toContain(`exec "/opt/bun/bin/bun" run dev`);
-    expect(shim).not.toMatch(/exec bun run dev$/m);
+    expect(shim).toContain(`exec "/opt/bun/bin/bun" run dev -- -H 127.0.0.1`);
+    expect(shim).not.toMatch(/exec bun run dev/m);
   });
 
   test("buildWebShim rejects bunPath with shell-special characters", async () => {
@@ -452,7 +452,7 @@ describe("resolveLaunchSpecPair", () => {
     rmSync(home, { recursive: true, force: true });
   });
 
-  test("web spec is a sh -c shim that gates on /api/status before exec'ing bun run dev", async () => {
+  test("web spec is a sh -c shim that gates on /api/status before exec'ing Next.js", async () => {
     const { resolveLaunchSpecPair } = await import("./autostart");
     const pair = resolveLaunchSpecPair({
       instance: "main",
@@ -468,10 +468,37 @@ describe("resolveLaunchSpecPair", () => {
     expect(shim).toContain("/api/status");
     // Shim execs the resolved absolute bunPath (not bare `bun`) so a
     // shell-provided bun on the launchd PATH can't run a different
-    // binary than the gateway.
-    expect(shim).toContain(`exec "/opt/bun/bin/bun" run dev`);
+    // binary than the gateway — and binds loopback (`next dev` defaults
+    // to 0.0.0.0 like `next start`).
+    expect(shim).toContain(`exec "/opt/bun/bin/bun" run dev -- -H 127.0.0.1`);
     // Polls the gateway port file under the state root.
     expect(shim).toContain("instances/main/runtime.port");
+  });
+
+  test("web shim serves the sha-keyed prod bundle on loopback, with dev fallback", async () => {
+    const { resolveLaunchSpecPair } = await import("./autostart");
+    const pair = resolveLaunchSpecPair({
+      instance: "main",
+      homeOverride: home,
+      bunPathOverride: "/opt/bun/bin/bun",
+      projectRootOverride: "/repo/gini",
+      cwdOverride: "/tmp/neutral",
+      readSecretsFile: () => null
+    });
+    const shim = pair.web.programArguments[2]!;
+    // The prod pick is keyed on the CURRENT checkout's short sha and gated on
+    // next build's completion marker, so a stale or aborted bundle can never
+    // be served.
+    expect(shim).toContain("git rev-parse --short=12 HEAD");
+    expect(shim).toContain(`[ -f ".next-prod-$sha/BUILD_ID" ]`);
+    // The prod branch must override the plist's dev dist dir and — SECURITY —
+    // pass -H 127.0.0.1: `next start` defaults to 0.0.0.0 and the BFF trusts
+    // a loopback Host for owner-bearer injection.
+    expect(shim).toContain(`export GINI_DIST_DIR=".next-prod-$sha"`);
+    expect(shim).toContain(`exec "/opt/bun/bin/bun" run start -- -H 127.0.0.1`);
+    // Dev fallback survives as the unconditional last exec — and it must
+    // bind loopback too (`next dev` also defaults to 0.0.0.0).
+    expect(shim.trimEnd().endsWith(`exec "/opt/bun/bin/bun" run dev -- -H 127.0.0.1`)).toBe(true);
   });
 
   test("gateway and web share the same workingDirectory", async () => {
