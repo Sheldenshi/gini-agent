@@ -239,18 +239,22 @@ export function UpdateGateProvider({
   // either order, so /status (proxied to the gateway) can't vouch for the web
   // server it transited: a poll can reach the NEW gateway through the
   // still-alive OLD web server. Poll the web-local __healthz route alongside
-  // status while waiting so the web server proves its own identity. `ppid` —
-  // not the worker pid — is that identity: see the route. retry: false keeps
-  // the cadence on the refetch interval while the server is down instead of
+  // status while waiting so the web server proves its own identity. Under
+  // production serving `buildSha` is that identity — the sha of the code the
+  // server is serving, so only the restarted server reports the target;
+  // `ppid` (the supervising next CLI, not the worker pid — see the route) is
+  // the dev/legacy fallback when `buildSha` is absent. retry: false keeps the
+  // cadence on the refetch interval while the server is down instead of
   // stretching each cycle through exponential retry backoff.
   const healthz = useQuery({
     queryKey: ["web", "healthz"],
-    queryFn: () => api<{ ppid?: number }>("/__healthz"),
+    queryFn: () => api<{ ppid?: number; buildSha?: string }>("/__healthz"),
     enabled: waiting,
     refetchInterval: 1_500,
     retry: false
   });
   const healthzPpid = typeof healthz.data?.ppid === "number" ? healthz.data.ppid : null;
+  const healthzBuildSha = typeof healthz.data?.buildSha === "string" ? healthz.data.buildSha : null;
 
   // Progress poll: while waiting, ask the gateway whether its single-flight
   // update is still running. Only an affirmative answer feeds the deadline
@@ -508,11 +512,19 @@ export function UpdateGateProvider({
   //   - Gateway leg: /status reports a pid different from beforePid. Cached
   //     query data still carries the old pid, so a differing pid is
   //     intrinsically a fresh post-restart response.
-  //   - Web leg: the local __healthz route reports a ppid different from
-  //     beforeWebPpid — proof the web server TREE was replaced. The worker
-  //     pid would lie here: the next CLI respawns its worker (new pid, same
-  //     still-old tree) when an update's checkout touches next.config.*, but
-  //     the supervising ppid only changes on a kickstart / stop+start.
+  //   - Web leg: under production serving, __healthz reports a buildSha equal
+  //     to the target revision — the sha of the code the server is serving, so
+  //     the OLD server reports the OLD build and only the restarted server
+  //     reports the target. This is definitive and un-raceable (no transition
+  //     to miss), unlike the ppid proxy below: targetSha is the full sha and
+  //     buildSha the --short form, so the prefix match is the robust compare.
+  //     When buildSha is absent (dev serving, an older server, a build that
+  //     fell back to dev), the leg drops to the legacy signal — __healthz
+  //     reports a ppid different from beforeWebPpid, proof the web server TREE
+  //     was replaced. The worker pid would lie there: the next CLI respawns
+  //     its worker (new pid, same still-old tree) when an update's checkout
+  //     touches next.config.*, but the supervising ppid only changes on a
+  //     kickstart / stop+start.
   // Each leg falls back when its starting identity is unknown (a gate
   // persisted by an older page, or the probe failing/omitting the field): the
   // first poll on that query that succeeds after entering this phase —
@@ -540,15 +552,18 @@ export function UpdateGateProvider({
       beforePid != null
         ? statusPid != null && statusPid !== beforePid
         : !progressHoldsFallback && restartingSince != null && statusUpdatedAt > restartingSince;
+    const webBuildMatchesTarget =
+      targetSha != null && healthzBuildSha != null && targetSha.startsWith(healthzBuildSha);
     const webRestarted =
-      beforeWebPpid != null
+      webBuildMatchesTarget ||
+      (beforeWebPpid != null
         ? healthzPpid != null && healthzPpid !== beforeWebPpid
-        : !progressHoldsFallback && restartingSince != null && healthzUpdatedAt > restartingSince;
+        : !progressHoldsFallback && restartingSince != null && healthzUpdatedAt > restartingSince);
     if (gatewayRestarted && webRestarted) {
       setPhase("complete");
       writePersistedGate({ phase: "complete", verified: true, startedAt: startedAtRef.current ?? undefined });
     }
-  }, [phase, beforePid, statusPid, beforeWebPpid, healthzPpid, restartingSince, statusUpdatedAt, healthzUpdatedAt, progressHoldsFallback]);
+  }, [phase, targetSha, healthzBuildSha, beforePid, statusPid, beforeWebPpid, healthzPpid, restartingSince, statusUpdatedAt, healthzUpdatedAt, progressHoldsFallback]);
 
   // Once complete, reload onto the fresh assets — after one last __healthz
   // probe. The identity proofs above are point-in-time: the web server can

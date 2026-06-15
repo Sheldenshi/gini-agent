@@ -72,6 +72,9 @@ let statusPid: number | null;
 let statusFailing: boolean;
 let webPid: number | null;
 let webPpid: number | null;
+// The served-build identity __healthz reports under production serving. null
+// models dev serving (the sha-less dist dir), where the gate keys on ppid.
+let webBuildSha: string | null;
 let healthzFailing: boolean;
 // The gateway's GET /api/version progress flag: true while its single-flight
 // update guard is held. Drives the stall-deadline extension.
@@ -93,6 +96,7 @@ beforeEach(() => {
   statusFailing = false;
   webPid = 333;
   webPpid = 444;
+  webBuildSha = null;
   healthzFailing = false;
   updateInProgressFlag = false;
   versionFailing = false;
@@ -102,7 +106,13 @@ beforeEach(() => {
     const url = String(input);
     if (url.includes("/__healthz")) {
       if (healthzFailing) throw new TypeError("connection refused");
-      return jsonResponse({ ok: true, service: "gini-web", pid: webPid ?? undefined, ppid: webPpid ?? undefined });
+      return jsonResponse({
+        ok: true,
+        service: "gini-web",
+        pid: webPid ?? undefined,
+        ppid: webPpid ?? undefined,
+        buildSha: webBuildSha ?? undefined
+      });
     }
     if (url.includes("/version")) {
       if (versionFailing) throw new TypeError("connection refused");
@@ -280,6 +290,63 @@ describe("UpdateGate", () => {
     expect(reloadSpy).toHaveBeenCalledTimes(1);
     // The persisted gate is cleared first so the reloaded page comes up clean.
     expect(window.sessionStorage.getItem(STORAGE_KEY)).toBeNull();
+  });
+
+  test("production serving completes the web leg on a matching buildSha even when the ppid never changes", async () => {
+    jest.useFakeTimers();
+    // The user's race: the supervising ppid transition is missed/never
+    // observed, so the legacy proxy leg can't latch. Under production serving
+    // __healthz also reports buildSha — the sha of the code it serves — so the
+    // restarted server proves itself directly. afterSha is the full revision;
+    // buildSha is the --short form, so the gate prefix-matches.
+    const targetSha = "0123456789abcdef0123456789abcdef01234567";
+    updateResponse = async () => jsonResponse(updateResult({ afterSha: targetSha, version: versionInfo(targetSha) }));
+    const { client } = renderGate();
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: "start-update" }));
+    await flush();
+
+    statusSha = targetSha;
+    await pollStatus(client);
+    expect(phase()).toBe("restarting");
+
+    // The gateway restarts (pid flips). The web server restarts too, but its
+    // ppid is UNCHANGED — only the served build moved to the target's short
+    // sha. The legacy leg would hold forever here; the buildSha leg releases.
+    statusPid = 222;
+    webBuildSha = targetSha.slice(0, 12);
+    await pollStatus(client);
+    await pollHealthz(client);
+    expect(phase()).toBe("complete");
+
+    await act(async () => {
+      jest.advanceTimersByTime(1_500);
+    });
+    await flush();
+    expect(reloadSpy).toHaveBeenCalledTimes(1);
+  });
+
+  test("dev serving without a buildSha still completes the web leg via the ppid fallback", async () => {
+    const { client } = renderGate();
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: "start-update" }));
+    await flush();
+    statusSha = "sha-new";
+    await pollStatus(client);
+    expect(phase()).toBe("restarting");
+
+    // No buildSha (dev dist dir) and the ppid is unchanged: neither web signal
+    // is satisfied, so the gate holds exactly as before this signal existed.
+    statusPid = 222;
+    await pollStatus(client);
+    await pollHealthz(client);
+    expect(phase()).toBe("restarting");
+    expect(reloadSpy).not.toHaveBeenCalled();
+
+    // The ppid flips → the legacy web leg latches → complete.
+    webPpid = 555;
+    await pollHealthz(client);
+    expect(phase()).toBe("complete");
   });
 
   test("a worker respawn — new worker pid, same tree ppid — does not satisfy the web leg", async () => {
