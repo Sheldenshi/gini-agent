@@ -9,27 +9,30 @@ import type { ChatSession, ThreadSummary } from "./view-types";
 // but is intentionally per-device — runtime-side read state would
 // require a multi-client sync model the gateway doesn't have yet.
 //
-// Activity timestamp is the max of `session.updatedAt` and the latest
-// terminal-run `updatedAt`. The list endpoint reports session.updatedAt
-// at message-persistence time, but messages are only materialized when
-// the user is actively viewing the chat. A run's updatedAt advances on
-// status transitions (including completion) regardless of who's
-// watching, so checking terminal-run timestamps catches the case where
-// the user clicked away mid-stream and the assistant reply finished
+// Activity timestamp is the createdAt of the latest DELIVERED assistant
+// message — never mid-run progress. A run carries `assistantMessageId`
+// only once its terminal answer is persisted as a durable chat message
+// (syncChatTaskResult / persistFinalAnswerRow), and its `updatedAt` is
+// stamped to that message's createdAt at the same write. So a run with
+// `assistantMessageId` set means "a final reply landed in this channel
+// at run.updatedAt" — exactly the unread signal we want, and it's
+// stamped server-side regardless of who's watching, which catches the
+// case where the user clicked away mid-stream and the reply finished
 // while another chat was on screen.
-
-const TERMINAL_RUN_STATUSES: ReadonlySet<string> = new Set([
-  "completed",
-  "failed",
-  "cancelled"
-]);
+//
+// We deliberately IGNORE `session.updatedAt` and bare terminal runs.
+// session.updatedAt advances on dispatch, run creation, and subagent
+// attach; subagent child runs go terminal one-by-one mid-parent-run.
+// All of that is "something is happening" (tool calls, streaming) that
+// must NOT re-flag a job channel as unread while it's still working —
+// the channel should surface as unread only when the final reply lands.
 
 // The list endpoint enriches each ChatSessionRecord with `runs`. The
 // shared ChatSession type doesn't reflect that, so we narrow locally
 // to just the fields we read.
 interface SessionLikeRun {
-  status: string;
   updatedAt: string;
+  assistantMessageId?: string;
 }
 interface SessionLike {
   id: string;
@@ -40,9 +43,12 @@ interface SessionLike {
 }
 
 function activityAt(session: SessionLike): string {
-  let max = session.updatedAt ?? session.createdAt;
+  // Floor at createdAt (immutable) — never session.updatedAt, which
+  // advances on mid-run activity. Only delivered assistant replies
+  // (runs with assistantMessageId) move the timestamp forward.
+  let max = session.createdAt;
   for (const run of session.runs ?? []) {
-    if (!TERMINAL_RUN_STATUSES.has(run.status)) continue;
+    if (!run.assistantMessageId) continue;
     if (run.updatedAt > max) max = run.updatedAt;
   }
   return max;
