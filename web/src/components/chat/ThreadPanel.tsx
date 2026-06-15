@@ -5,7 +5,13 @@ import { X } from "lucide-react";
 import { toast } from "sonner";
 import type { ChatBlock } from "@runtime/types";
 import type { UploadRef } from "@/lib/api";
-import { useChatBlocks, useReplyToThread, useThread } from "@/lib/queries";
+import {
+  latestInFlightTaskId,
+  useCancelTask,
+  useChatBlocks,
+  useReplyToThread,
+  useThread
+} from "@/lib/queries";
 import { groupExchanges, type ChatRenderItem } from "@/lib/group-exchanges";
 import { useStickToBottom } from "@/lib/use-stick-to-bottom";
 import type { ThreadSummary } from "@/lib/view-types";
@@ -46,6 +52,7 @@ export function ThreadPanel({
   const { blocks: sessionBlocks } = useChatBlocks(sessionId);
   const parentBlock = sessionBlocks.find((b) => b.id === thread.parentBlockId);
   const reply = useReplyToThread(sessionId, thread.threadId);
+  const cancel = useCancelTask();
   const [text, setText] = useState("");
   // Snap to the latest reply instantly when the panel opens (the inbox reuses
   // one panel across threads, so key on threadId to re-arm per thread); follow
@@ -78,14 +85,10 @@ export function ThreadPanel({
 
   const renderItems = useMemo<ChatRenderItem[]>(() => groupExchanges(visibleBlocks), [visibleBlocks]);
 
-  const inflight = useMemo(() => {
-    for (let i = blocks.length - 1; i >= 0; i--) {
-      const b = blocks[i]!;
-      if (b.kind === "phase") return !TERMINAL_PHASE_LABELS.has(b.label);
-      if (b.kind === "tool_call" && b.status === "running") return true;
-    }
-    return false;
-  }, [blocks]);
+  // In-flight detection over the thread's block stream — mirrors the main
+  // chat. Yields the running turn's task id so the composer's stop button can
+  // cancel it; null when the thread is quiescent.
+  const inflightTaskId = useMemo(() => latestInFlightTaskId(blocks), [blocks]);
 
   const submit = (images: UploadRef[]) => {
     const trimmed = text.trim();
@@ -211,7 +214,14 @@ export function ThreadPanel({
           value={text}
           onChange={setText}
           onSubmit={submit}
-          busy={inflight || reply.isPending}
+          busy={Boolean(inflightTaskId) || reply.isPending}
+          onStop={() => {
+            if (inflightTaskId) {
+              cancel.mutate(inflightTaskId, {
+                onError: (error) => toast.error(error.message)
+              });
+            }
+          }}
           placeholder="Reply in thread…"
         />
       </div>
