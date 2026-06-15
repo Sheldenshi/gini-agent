@@ -198,10 +198,11 @@ silently bypassing the filter.
   via `POST /api/agents/:id/unarchive` (also `gini agent archive` /
   `gini agent unarchive`). Archive sets `AgentRecord.archivedAt`; the
   agent is retained (memory and history preserved) but suppressed.
-  Restore clears `archivedAt` and leaves the agent inactive. The default
-  and active agents cannot be archived, and an archived agent cannot be
-  activated — all three guards return 400 with a typed error. A due,
-  active scheduled job whose owning agent is archived is skipped by
+  Restore clears `archivedAt` and leaves the agent inactive. Only the
+  default agent (`agent_default`) cannot be archived; archiving the active
+  agent is allowed and hands "active" back to the default. An archived
+  agent cannot be activated — both guards return 400 with a typed error. A
+  due, active scheduled job whose owning agent is archived is skipped by
   `runDueJobs`.
 - `bun run typecheck`, `bun test`, and `bun run gini smoke` are
   green.
@@ -269,11 +270,15 @@ agent's `status` on each switch and would clobber an "archived" status.
 mirror `deleteAgent`'s structure (load state, mutate, persist, audit,
 return the updated record) and emit `agent.archived` / `agent.unarchived`
 audit events attributed to the subject agent (see ADR
-agent-attribution-invariant.md). Archive is guarded like delete: the
-default agent and the active agent cannot be archived. A restored agent
-stays inactive — restoration never auto-activates. `activateAgent` (and
-the `/use` path) refuse an archived agent so reactivation is an explicit
-restore.
+agent-attribution-invariant.md). Only the default agent (`agent_default`)
+is non-archivable — it's the always-present fallback selection. The active
+agent can be archived: archiving the current selection hands "active" back
+to the default via `activateAgent`, so the active pointer, per-agent
+statuses, and the `agent.activated` audit stay consistent. A restored
+agent stays inactive — restoration never auto-activates. `activateAgent`
+(and the `/use` path) refuse an archived agent so reactivation is an
+explicit restore. `listAgents` returns `defaultAgentId` alongside
+`activeAgentId` so the web can tell which agent is non-archivable.
 
 Two consequences:
 

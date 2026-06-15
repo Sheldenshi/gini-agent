@@ -29,7 +29,7 @@ export function ArchiveAgentDialog({
     mutationFn: (id: string) => api(`/agents/${encodeURIComponent(id)}/archive`, { method: "POST" }),
     onSuccess: () => {
       toast.success(agent ? `Agent "${agent.name}" archived` : "Agent archived");
-      invalidate(["agents", "state", "status"]);
+      invalidate(["agents", "state", "status", "memory", "agent-chat"]);
       onOpenChange(false);
     },
     onError: (error: Error) => toast.error(error.message)

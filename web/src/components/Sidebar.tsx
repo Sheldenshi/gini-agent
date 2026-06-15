@@ -59,9 +59,10 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
   const activeAgentId = status.data?.activeAgent?.id;
   const agentsQuery = useQuery({
     queryKey: ["agents"],
-    queryFn: () => api<{ agents: AgentRow[]; activeAgentId?: string }>("/agents")
+    queryFn: () => api<{ agents: AgentRow[]; activeAgentId?: string; defaultAgentId?: string }>("/agents")
   });
   const allAgents = agentsQuery.data?.agents ?? [];
+  const defaultAgentId = agentsQuery.data?.defaultAgentId;
   // `archivedAt` is a soft-delete marker, orthogonal to `status`. Split the
   // roster so archived agents render in their own collapsible group instead
   // of the active list.
@@ -212,10 +213,11 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
                 agents.map((agent) => {
                   const active = onChat && !selectedSession && agent.id === activeAgentId;
                   const unread = !active && agentUnread.get(agent.id) === true;
-                  // The active agent has no kebab: archiving it is blocked
-                  // server-side (switch first), so don't offer a guaranteed
-                  // error. The kebab is reserved for non-active agents.
-                  const canArchive = agent.id !== activeAgentId;
+                  // The default agent has no kebab: it's the always-present
+                  // fallback selection and can't be archived server-side, so
+                  // don't offer a guaranteed error. Every other agent — the
+                  // active one included — gets it.
+                  const canArchive = agent.id !== defaultAgentId;
                   return (
                     <li key={agent.id} className="group relative">
                       <button

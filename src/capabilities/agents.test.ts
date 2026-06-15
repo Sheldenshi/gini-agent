@@ -378,6 +378,7 @@ describe("createAgent", () => {
     expect(listed.agents.some((agent) => agent.id === created.id)).toBe(true);
     expect(listed.agents.some((agent) => agent.id === "agent_default")).toBe(true);
     expect(typeof listed.activeAgentId).toBe("string");
+    expect(listed.defaultAgentId).toBe("agent_default");
   });
 
   test("archiveAgent stamps archivedAt and audits agent.archived", async () => {
@@ -481,14 +482,22 @@ describe("createAgent", () => {
     );
   });
 
-  test("archiveAgent refuses to archive the active agent", async () => {
+  test("archiveAgent archives the active agent and hands active to the default", async () => {
     const config = buildConfig(workspaceRoot, "archive-agent-active", root);
     await install(config);
     const created = await createAgent(config, { name: "active-one" });
     await useAgent(config, created.id);
-    await expect(archiveAgent(config, created.id)).rejects.toThrow(
-      "Cannot archive the active agent; switch to another agent first."
-    );
+    const archived = await archiveAgent(config, created.id);
+    expect(archived.id).toBe(created.id);
+    expect(typeof archived.archivedAt).toBe("string");
+    const after = readState(config.instance);
+    // Active selection hands back to the always-present default agent.
+    expect(after.activeAgentId).toBe("agent_default");
+    expect(after.agents.find((agent) => agent.id === "agent_default")?.status).toBe("active");
+    // The archived agent is soft-deleted: retained but inactive.
+    const stored = after.agents.find((agent) => agent.id === created.id);
+    expect(stored?.archivedAt).toBe(archived.archivedAt);
+    expect(stored?.status).toBe("inactive");
   });
 
   test("useAgent refuses to activate an archived agent", async () => {

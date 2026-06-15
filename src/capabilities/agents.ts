@@ -16,7 +16,7 @@ import { DEFAULT_AGENT_TOOLSETS } from "../state/defaults";
 
 export function listAgents(config: RuntimeConfig) {
   const state = readState(config.instance);
-  return { activeAgentId: state.activeAgentId, agents: state.agents };
+  return { activeAgentId: state.activeAgentId, defaultAgentId: "agent_default", agents: state.agents };
 }
 
 export async function createAgent(config: RuntimeConfig, input: Record<string, unknown>) {
@@ -318,10 +318,13 @@ export async function deleteAgent(
 // `state.agents` (its memory pool and history are preserved) but moves to
 // the UI's Archived section, can't be activated until restored, and has its
 // scheduled jobs suppressed by runDueJobs.
-// Guards mirror deleteAgent:
-//   - The default agent (`agent_default`) cannot be archived.
-//   - The active agent cannot be archived — switch to another agent first.
+// Guards:
+//   - The default agent (`agent_default`) cannot be archived — it's the
+//     always-present fallback selection.
 //   - Unknown agent id/name throws (mapped to 404 by the HTTP layer).
+// The active agent CAN be archived: archiving the current selection hands
+// "active" back to the default agent (via activateAgent) so the active
+// pointer, per-agent statuses, and the agent.activated audit stay consistent.
 // A no-op (already archived) returns the record without bumping updatedAt or
 // writing a second audit row.
 export async function archiveAgent(
@@ -334,10 +337,8 @@ export async function archiveAgent(
     if (agent.id === "agent_default") {
       throw new Error("Cannot archive the default agent.");
     }
-    if (state.activeAgentId === agent.id) {
-      throw new Error("Cannot archive the active agent; switch to another agent first.");
-    }
     if (agent.archivedAt) return agent;
+    const wasActive = state.activeAgentId === agent.id;
     agent.archivedAt = now();
     agent.updatedAt = now();
     // The archived agent is the subject — attribute the audit to it so the
@@ -353,6 +354,12 @@ export async function archiveAgent(
       },
       { agentId: agent.id }
     );
+    // Archiving the active selection leaves the instance without an active
+    // agent; hand "active" back to the always-present default so statuses,
+    // `activeAgentId`, and the agent.activated audit are set consistently.
+    if (wasActive) {
+      activateAgent(state, "agent_default");
+    }
     return agent;
   });
 }

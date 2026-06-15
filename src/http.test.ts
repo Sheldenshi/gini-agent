@@ -310,7 +310,7 @@ describe("runtime api", () => {
     expect(body.error).toContain("Cannot archive the default agent");
   });
 
-  test("POST /api/agents/:id/archive rejects the active agent with 400", async () => {
+  test("POST /api/agents/:id/archive archives the active agent and hands active to the default", async () => {
     const config = testConfig("agents-archive-active");
     const handler = createHandler(config);
 
@@ -320,10 +320,13 @@ describe("runtime api", () => {
     });
     await call(handler, config, `/api/agents/${created.id}/use`, { method: "POST" });
 
-    const response = await rawCall(handler, config, `/api/agents/${created.id}/archive`, { method: "POST" }, config.token);
-    expect(response.status).toBe(400);
-    const body = await response.json();
-    expect(body.error).toContain("Cannot archive the active agent");
+    const archived = await call(handler, config, `/api/agents/${created.id}/archive`, { method: "POST" });
+    expect(typeof archived.archivedAt).toBe("string");
+
+    // Active selection reassigns to the always-present default agent.
+    const agents = await call(handler, config, "/api/agents");
+    expect(agents.activeAgentId).toBe("agent_default");
+    expect(agents.defaultAgentId).toBe("agent_default");
   });
 
   test("POST /api/agents/:id/use rejects an archived agent with 400", async () => {
