@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { docsRoot } from "./docs";
 import {
   clearEchoAuxTextResponses,
   clearEchoToolCallingResponses,
@@ -3976,6 +3977,21 @@ describe("anthropic provider", () => {
     } finally {
       restore();
     }
+  });
+
+  test("every catalog setupDocUrl resolves to an existing docs/providers/<id>.md", () => {
+    // The catalog derives setupDocUrl by convention (<base>/providers/<id>),
+    // and the web client renders that doc inline. Guard against a provider id
+    // added/renamed without a matching guide — which would link to a 404. echo
+    // is the dev/test provider with no guide, so it carries no setupDocUrl.
+    const docs = providerCatalog().filter((p) => p.setupDocUrl);
+    expect(docs.length).toBeGreaterThan(0);
+    for (const p of docs) {
+      expect(p.setupDocUrl!.endsWith(`/providers/${p.id}`)).toBe(true);
+      const file = join(docsRoot(), "providers", `${p.id}.md`);
+      expect(existsSync(file)).toBe(true);
+    }
+    expect(providerCatalog().find((p) => p.id === "echo")?.setupDocUrl).toBeUndefined();
   });
 
   test("tool-calling: non-stream request shape, headers, and tool_use parsing", async () => {

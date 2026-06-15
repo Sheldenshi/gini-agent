@@ -8,7 +8,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { render, screen } from "@testing-library/react";
-import { fenceLang, hastText, MarkdownContent } from "./MarkdownContent";
+import { fenceLang, hastText, MarkdownContent, resolveDocHref } from "./MarkdownContent";
 
 describe("MarkdownContent", () => {
   test("renders markdown links with target=_blank and rel", () => {
@@ -17,6 +17,37 @@ describe("MarkdownContent", () => {
     expect(link?.getAttribute("href")).toBe("https://example.com/docs");
     expect(link?.getAttribute("target")).toBe("_blank");
     expect(link?.getAttribute("rel")).toBe("noopener noreferrer");
+  });
+
+  test("without linkBaseUrl, a doc-relative link is left as authored", () => {
+    render(<MarkdownContent text="see [Codex](codex.md)" />);
+    expect(screen.getByText("Codex").closest("a")?.getAttribute("href")).toBe("codex.md");
+  });
+
+  test("with linkBaseUrl, doc-relative links resolve absolute against the hosted doc URL", () => {
+    const base = "https://gini.lilaclabs.ai/docs/providers/openai";
+    render(<MarkdownContent text="see [Codex](codex.md) and [ADR](../adr/x.md)" linkBaseUrl={base} />);
+    expect(screen.getByText("Codex").closest("a")?.getAttribute("href"))
+      .toBe("https://gini.lilaclabs.ai/docs/providers/codex.md");
+    expect(screen.getByText("ADR").closest("a")?.getAttribute("href"))
+      .toBe("https://gini.lilaclabs.ai/docs/adr/x.md");
+  });
+
+  test("with linkBaseUrl, an absolute link is left untouched", () => {
+    render(<MarkdownContent text="see [site](https://example.com/x)" linkBaseUrl="https://gini.lilaclabs.ai/docs/providers/openai" />);
+    expect(screen.getByText("site").closest("a")?.getAttribute("href")).toBe("https://example.com/x");
+  });
+
+  test("resolveDocHref folds: no href, no base, absolute, protocol-relative, relative, unparseable", () => {
+    const base = "https://gini.lilaclabs.ai/docs/providers/openai";
+    expect(resolveDocHref(undefined, base)).toBeUndefined();
+    expect(resolveDocHref("codex.md", undefined)).toBe("codex.md");
+    expect(resolveDocHref("https://example.com/x", base)).toBe("https://example.com/x");
+    expect(resolveDocHref("mailto:a@b.c", base)).toBe("mailto:a@b.c");
+    expect(resolveDocHref("//cdn.example.com/x", base)).toBe("//cdn.example.com/x");
+    expect(resolveDocHref("#anchor", base)).toBe("https://gini.lilaclabs.ai/docs/providers/openai#anchor");
+    // An unparseable base makes new URL throw → href falls through unchanged.
+    expect(resolveDocHref("codex.md", "not a url")).toBe("codex.md");
   });
 
   test("a language fence renders as a highlighted <pre>, not a draft card", () => {

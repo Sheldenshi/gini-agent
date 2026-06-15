@@ -2,7 +2,7 @@
 // it's reachable from other devices on the LAN. Serves only files under deck/
 // (path-traversal guarded). Run: bun scripts/serve-deck.ts
 import { file } from "bun";
-import { join, normalize } from "node:path";
+import { join, normalize, sep } from "node:path";
 
 const ROOT = join(import.meta.dir, "..", "deck");
 const PORT = Number(process.env.DECK_PORT ?? 8651);
@@ -20,9 +20,13 @@ const server = Bun.serve({
   async fetch(req) {
     const url = new URL(req.url);
     const rel = decodeURIComponent(url.pathname === "/" ? "/index.html" : url.pathname);
-    // Resolve under ROOT and reject anything that escapes it.
+    // Resolve under ROOT and reject anything that escapes it. The boundary must
+    // be ROOT itself OR a path under ROOT + separator — a bare startsWith(ROOT)
+    // would also admit a sibling whose name merely begins with "deck"
+    // (e.g. deck-private/). decodeURIComponent runs first, so encoded "%2e%2e"
+    // traversals are normalized here too.
     const abs = normalize(join(ROOT, rel));
-    if (!abs.startsWith(ROOT)) return new Response("Forbidden", { status: 403 });
+    if (abs !== ROOT && !abs.startsWith(ROOT + sep)) return new Response("Forbidden", { status: 403 });
     const f = file(abs);
     if (!(await f.exists())) return new Response("Not found", { status: 404 });
     const ext = abs.slice(abs.lastIndexOf("."));

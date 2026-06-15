@@ -132,7 +132,10 @@ export function DocSheet({
             </div>
           ) : state.data ? (
             <div className="doc-panel">
-              <MarkdownContent text={state.data.markdown} />
+              {/* Resolve doc-relative links (sibling .md, ../adr/*.md, #anchors)
+                  against the doc's own hosted URL so a click opens the real doc
+                  instead of 404-ing under the current app route. */}
+              <MarkdownContent text={state.data.markdown} linkBaseUrl={url} />
             </div>
           ) : null}
         </div>

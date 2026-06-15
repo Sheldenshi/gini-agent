@@ -35,34 +35,57 @@ export function fenceLang(codeNode: unknown): string | undefined {
     ?.slice(prefix.length);
 }
 
-const components = {
-  a: (props: React.AnchorHTMLAttributes<HTMLAnchorElement>) => (
-    <a {...props} target="_blank" rel="noopener noreferrer" />
-  ),
-  // A ```email-draft fenced block renders as an inline draft card instead of a
-  // code block. `node` is destructured out so it isn't spread onto the DOM <pre>.
-  pre: ({ node, className, ...props }: React.HTMLAttributes<HTMLPreElement> & { node?: unknown }) => {
-    const codeNode = (node as { children?: unknown[] } | undefined)?.children?.[0];
-    if (codeNode && fenceLang(codeNode) === "email-draft") {
-      return <EmailDraftCard raw={hastText(codeNode)} />;
-    }
-    return <pre {...props} className={cn("hljs", className)} />;
+// Resolve a markdown link's href for rendering. When `base` is set (the doc
+// viewer passes the doc's own hosted URL), doc-relative targets — sibling
+// `foo.md`, `../adr/bar.md`, and bare `#anchor` fragments — are resolved
+// ABSOLUTE against that base so a click lands on the real hosted doc instead of
+// 404-ing against the current app route (e.g. `/settings/codex.md`). Absolute
+// URLs (http/https/mailto/protocol-relative) pass through untouched. Without a
+// base (chat, skills) every href is left exactly as authored.
+export function resolveDocHref(href: string | undefined, base?: string): string | undefined {
+  if (!href || !base) return href;
+  if (/^[a-z][a-z0-9+.-]*:/i.test(href) || href.startsWith("//")) return href;
+  try {
+    return new URL(href, base).toString();
+  } catch {
+    return href;
   }
-};
+}
+
+function makeComponents(linkBaseUrl?: string) {
+  return {
+    a: ({ href, ...props }: React.AnchorHTMLAttributes<HTMLAnchorElement>) => (
+      <a {...props} href={resolveDocHref(href, linkBaseUrl)} target="_blank" rel="noopener noreferrer" />
+    ),
+    // A ```email-draft fenced block renders as an inline draft card instead of a
+    // code block. `node` is destructured out so it isn't spread onto the DOM <pre>.
+    pre: ({ node, className, ...props }: React.HTMLAttributes<HTMLPreElement> & { node?: unknown }) => {
+      const codeNode = (node as { children?: unknown[] } | undefined)?.children?.[0];
+      if (codeNode && fenceLang(codeNode) === "email-draft") {
+        return <EmailDraftCard raw={hastText(codeNode)} />;
+      }
+      return <pre {...props} className={cn("hljs", className)} />;
+    }
+  };
+}
 
 export const MarkdownContent = memo(function MarkdownContent({
   text,
-  streaming
+  streaming,
+  linkBaseUrl
 }: {
   text: string;
   streaming?: boolean;
+  // When set, doc-relative links resolve absolute against this URL (the doc
+  // viewer passes the doc's hosted URL); omit it for chat/skills rendering.
+  linkBaseUrl?: string;
 }) {
   return (
     <div className="chat-markdown">
       <ReactMarkdown
         remarkPlugins={remarkPlugins}
         rehypePlugins={rehypePlugins}
-        components={components}
+        components={makeComponents(linkBaseUrl)}
       >
         {text}
       </ReactMarkdown>
