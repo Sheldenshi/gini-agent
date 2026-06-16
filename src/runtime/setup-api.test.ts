@@ -119,6 +119,68 @@ describe("setup-api", () => {
     // /setup gate still asks the user to finish onboarding.
     expect(status.current).toBe("codex");
     expect(status.providerConfigured).toBe(false);
+    // No fallback exists either (no other provider configured), so the
+    // fallback fields report the selected provider dispatching directly.
+    expect(status.usingFallback).toBe(false);
+    expect(status.selectedProvider).toBe("codex");
+    expect(status.activeProvider).toBe("codex");
+  });
+
+  test("status: providerConfigured is true via a transient fallback when the selected provider is unconfigured", () => {
+    // Select bedrock (no AWS creds) but configure deepseek — the app must stay
+    // usable (no /setup bounce), dispatching via the deepseek fallback.
+    const prevDeepseek = process.env.DEEPSEEK_API_KEY;
+    const prevAk = process.env.AWS_ACCESS_KEY_ID;
+    const prevSk = process.env.AWS_SECRET_ACCESS_KEY;
+    const prevAwsFile = process.env.AWS_SHARED_CREDENTIALS_FILE;
+    const prevAwsProfile = process.env.AWS_PROFILE;
+    delete process.env.AWS_ACCESS_KEY_ID;
+    delete process.env.AWS_SECRET_ACCESS_KEY;
+    process.env.AWS_SHARED_CREDENTIALS_FILE = "/nonexistent/gini-setup-fallback/credentials";
+    delete process.env.AWS_PROFILE;
+    process.env.DEEPSEEK_API_KEY = "ds-key";
+    config.provider = { name: "bedrock", model: "us.amazon.nova-pro-v1:0" };
+    try {
+      const status = getSetupStatus(config);
+      // The proxy reads ONLY providerConfigured — it must be true so the
+      // loopback nav isn't 307'd to /setup.
+      expect(status.providerConfigured).toBe(true);
+      expect(status.usingFallback).toBe(true);
+      expect(status.selectedProvider).toBe("bedrock");
+      expect(status.activeProvider).toBe("deepseek");
+      expect(status.current).toBe("bedrock");
+    } finally {
+      if (prevDeepseek === undefined) delete process.env.DEEPSEEK_API_KEY; else process.env.DEEPSEEK_API_KEY = prevDeepseek;
+      if (prevAk === undefined) delete process.env.AWS_ACCESS_KEY_ID; else process.env.AWS_ACCESS_KEY_ID = prevAk;
+      if (prevSk === undefined) delete process.env.AWS_SECRET_ACCESS_KEY; else process.env.AWS_SECRET_ACCESS_KEY = prevSk;
+      if (prevAwsFile === undefined) delete process.env.AWS_SHARED_CREDENTIALS_FILE; else process.env.AWS_SHARED_CREDENTIALS_FILE = prevAwsFile;
+      if (prevAwsProfile === undefined) delete process.env.AWS_PROFILE; else process.env.AWS_PROFILE = prevAwsProfile;
+    }
+  });
+
+  test("status: a genuinely-unconfigured instance with no fallback still reports providerConfigured false (preserves the /setup gate)", () => {
+    // Select bedrock with no AWS creds AND no other provider configured — the
+    // fail-open setup gate must still fire (providerConfigured false).
+    const prevAk = process.env.AWS_ACCESS_KEY_ID;
+    const prevSk = process.env.AWS_SECRET_ACCESS_KEY;
+    const prevAwsFile = process.env.AWS_SHARED_CREDENTIALS_FILE;
+    const prevAwsProfile = process.env.AWS_PROFILE;
+    delete process.env.AWS_ACCESS_KEY_ID;
+    delete process.env.AWS_SECRET_ACCESS_KEY;
+    process.env.AWS_SHARED_CREDENTIALS_FILE = "/nonexistent/gini-setup-fallback/credentials";
+    delete process.env.AWS_PROFILE;
+    config.provider = { name: "bedrock", model: "us.amazon.nova-pro-v1:0" };
+    try {
+      const status = getSetupStatus(config);
+      expect(status.providerConfigured).toBe(false);
+      expect(status.usingFallback).toBe(false);
+      expect(status.activeProvider).toBe("bedrock");
+    } finally {
+      if (prevAk === undefined) delete process.env.AWS_ACCESS_KEY_ID; else process.env.AWS_ACCESS_KEY_ID = prevAk;
+      if (prevSk === undefined) delete process.env.AWS_SECRET_ACCESS_KEY; else process.env.AWS_SECRET_ACCESS_KEY = prevSk;
+      if (prevAwsFile === undefined) delete process.env.AWS_SHARED_CREDENTIALS_FILE; else process.env.AWS_SHARED_CREDENTIALS_FILE = prevAwsFile;
+      if (prevAwsProfile === undefined) delete process.env.AWS_PROFILE; else process.env.AWS_PROFILE = prevAwsProfile;
+    }
   });
 
   test("POST openai with apiKey writes secrets.env, sets process.env, updates config", async () => {

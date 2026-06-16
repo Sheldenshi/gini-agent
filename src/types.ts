@@ -2184,6 +2184,11 @@ export interface RuntimeStatus {
   memoryUnits?: number;
   version?: GiniVersionInfo;
   provider?: ProviderHealth;
+  // Set when the selected provider is unconfigured but a configured fallback is
+  // transiently serving turns. `selected` is the user's unconfigured choice;
+  // `using` is the fallback. The web reads this to show a "finish setup" banner;
+  // config.provider is never mutated, so it persists until setup completes.
+  providerFallback?: { selected: ProviderName; using: ProviderName };
   activeAgent?: ActiveAgentSnapshot;
 }
 

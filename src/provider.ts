@@ -197,6 +197,50 @@ export function isProviderConfigured(
   return false;
 }
 
+// Transient dispatch-provider resolution. When the configured active provider
+// has usable credentials it dispatches verbatim (no fallback). When it does
+// NOT — e.g. an instance pinned to bedrock with no AWS creds — but ANOTHER
+// real provider IS configured (e.g. deepseek via DEEPSEEK_API_KEY), this
+// returns that fallback so a chat turn still completes instead of throwing.
+// The fallback is computed per-call and NEVER persisted: config.provider stays
+// the user's selection so the setup banner persists until they finish wiring
+// it. When nothing is configured the active provider is returned unchanged
+// (usingFallback:false) — a genuinely-unconfigured instance still drives the
+// /setup gate.
+//
+// Candidate selection reuses providerCatalogWithStatus: echo always reports
+// unconfigured (never a candidate), and azure/local report configured only
+// when they're the active provider (so they're never picked as a fallback for
+// a DIFFERENT active provider). The catalog's first model is the fallback
+// model — the same `default == models[0]` invariant normalizeProvider keeps.
+export type DispatchProviderResolution =
+  | { provider: ProviderConfig; usingFallback: false }
+  | { provider: ProviderConfig; usingFallback: true; selected: ProviderName; using: ProviderName };
+
+export function resolveDispatchProvider(config: RuntimeConfig): DispatchProviderResolution {
+  const active = normalizeProvider(config.provider);
+  if (providerHealth(config).configured) {
+    return { provider: active, usingFallback: false };
+  }
+  const catalog = providerCatalogWithStatus(active.name, active.apiKeyEnv, active.baseUrl);
+  const fallback = catalog.find((item) => item.configured && item.name !== active.name);
+  if (!fallback) {
+    return { provider: active, usingFallback: false };
+  }
+  // Every catalog entry's name is a real ProviderName (the `| string` widening
+  // on ProviderCatalogItem covers external ids the runtime never emits here).
+  const fallbackName = fallback.name as ProviderName;
+  return {
+    provider: normalizeProvider({
+      name: fallbackName,
+      model: fallback.models[0] ?? ""
+    }),
+    usingFallback: true,
+    selected: active.name,
+    using: fallbackName
+  };
+}
+
 // Catalog enriched with the per-provider configured flag. Used by the
 // settings UI to hide rows the user hasn't connected; the static
 // providerCatalog() stays in place for callers that just need the list of

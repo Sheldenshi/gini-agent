@@ -399,25 +399,36 @@ describe("runtime api", () => {
   test("POST /api/agents/:id/provider sets the agent's provider and /status reflects it", async () => {
     const config = testConfig("agents-set-provider");
     const handler = createHandler(config);
-    const created = await call(handler, config, "/api/agents", {
-      method: "POST",
-      body: JSON.stringify({ name: "research" })
-    });
-    await call(handler, config, `/api/agents/${created.id}/use`, { method: "POST" });
+    // Configure the pinned provider so the resolved provider dispatches verbatim;
+    // an unconfigured pin would transiently fall back to any other configured
+    // provider (e.g. an ambient codex auth.json on the dev machine), which is a
+    // separate path covered by the dispatch-fallback tests.
+    const prevOpenai = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = "sk-test-agent-provider";
+    try {
+      const created = await call(handler, config, "/api/agents", {
+        method: "POST",
+        body: JSON.stringify({ name: "research" })
+      });
+      await call(handler, config, `/api/agents/${created.id}/use`, { method: "POST" });
 
-    const updated = await call(handler, config, `/api/agents/${created.id}/provider`, {
-      method: "POST",
-      body: JSON.stringify({ providerName: "openai", model: "gpt-4o" })
-    });
-    expect(updated.providerName).toBe("openai");
-    expect(updated.model).toBe("gpt-4o");
+      const updated = await call(handler, config, `/api/agents/${created.id}/provider`, {
+        method: "POST",
+        body: JSON.stringify({ providerName: "openai", model: "gpt-4o" })
+      });
+      expect(updated.providerName).toBe("openai");
+      expect(updated.model).toBe("gpt-4o");
 
-    // The override drives inference: the active-agent block resolves the
-    // agent's provider, not the instance default (echo in this config).
-    const status = await call(handler, config, "/api/status");
-    expect(status.activeAgent.resolvedProvider.name).toBe("openai");
-    expect(status.activeAgent.resolvedProvider.model).toBe("gpt-4o");
-    expect(status.activeAgent.providerSource).toBe("agent");
+      // The override drives inference: the active-agent block resolves the
+      // agent's provider, not the instance default (echo in this config).
+      const status = await call(handler, config, "/api/status");
+      expect(status.activeAgent.resolvedProvider.name).toBe("openai");
+      expect(status.activeAgent.resolvedProvider.model).toBe("gpt-4o");
+      expect(status.activeAgent.providerSource).toBe("agent");
+    } finally {
+      if (prevOpenai === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = prevOpenai;
+    }
   });
 
   test("POST /api/agents/:id/provider with blank fields clears the override", async () => {

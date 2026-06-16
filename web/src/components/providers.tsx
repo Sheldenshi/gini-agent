@@ -6,6 +6,7 @@ import { useState, type ReactNode } from "react";
 import { usePathname } from "next/navigation";
 import { Toaster } from "sonner";
 import { ConnectionBanner } from "./ConnectionBanner";
+import { ProviderFallbackBanner } from "./ProviderFallbackBanner";
 import { RuntimeStreamBridge } from "./RuntimeStreamBridge";
 import { UpdateGateProvider } from "./UpdateGate";
 
@@ -65,6 +66,10 @@ export function Providers({ children }: { children: ReactNode }) {
             is a passive observer, so /pair (which mounts neither) stays
             silent. */}
         {!onPairPage && <ConnectionBanner />}
+        {/* Provider-fallback pill reads /status; shown when the selected
+            provider is unconfigured but a configured fallback is serving turns.
+            Skipped on /pair like the reconnecting pill. */}
+        {!onPairPage && <ProviderFallbackBanner />}
         {/* The update gate blurs the app while a self-update applies. It needs
             /status, so skip it on the pre-auth /pair screen (same as the
             stream bridge); Toaster stays outside it so error toasts render

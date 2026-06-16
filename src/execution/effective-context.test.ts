@@ -2,7 +2,7 @@
 // it takes a RuntimeState + RuntimeConfig and returns an EffectiveContext —
 // so these tests build state in memory without touching disk.
 
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { rmSync, mkdirSync, writeFileSync } from "node:fs";
 import { resolveEffectiveContext, providerOverrideForRuntime } from "./effective-context";
 import type {
@@ -97,6 +97,42 @@ function buildState(overrides: Partial<RuntimeState> = {}): RuntimeState {
   return { ...base, ...overrides };
 }
 
+// Provider credential env vars that could let a provider read as "configured"
+// and so trip the transient dispatch fallback during a pure resolution check.
+const FALLBACK_TRIGGER_ENV = [
+  "OPENAI_API_KEY",
+  "OPENROUTER_API_KEY",
+  "DEEPSEEK_API_KEY",
+  "GINI_LOCAL_API_KEY",
+  "MY_LOCAL_KEY",
+  "ANTHROPIC_API_KEY",
+  "AZURE_OPENAI_API_KEY",
+  "AWS_ACCESS_KEY_ID",
+  "AWS_SECRET_ACCESS_KEY"
+];
+
+// Scrub every provider credential (and ambient codex/AWS resolution), then set
+// the requested keys, so a resolution test sees ONLY the pinned provider as
+// configured — no surprise fallback from an ambient ~/.codex/auth.json or a
+// shell-exported provider key. Returns a restore() that reverts every change.
+function stubProviderEnv(set: Record<string, string>): () => void {
+  const names = new Set([...FALLBACK_TRIGGER_ENV, "CODEX_AUTH_JSON", "AWS_SHARED_CREDENTIALS_FILE", "AWS_PROFILE", ...Object.keys(set)]);
+  const saved: Record<string, string | undefined> = {};
+  for (const name of names) {
+    saved[name] = process.env[name];
+    delete process.env[name];
+  }
+  process.env.CODEX_AUTH_JSON = "/nonexistent/gini-effective-resolution/auth.json";
+  process.env.AWS_SHARED_CREDENTIALS_FILE = "/nonexistent/gini-effective-resolution/credentials";
+  for (const [name, value] of Object.entries(set)) process.env[name] = value;
+  return () => {
+    for (const name of names) {
+      if (saved[name] === undefined) delete process.env[name];
+      else process.env[name] = saved[name];
+    }
+  };
+}
+
 function buildConfig(provider: ProviderConfig = { name: "echo", model: "gini-echo-v0" }): RuntimeConfig {
   return {
     instance: "test",
@@ -123,14 +159,22 @@ describe("resolveEffectiveContext", () => {
   });
 
   test("agent provider override wins when both providerName and model are set", () => {
-    const agent = buildAgent({ providerName: "openai", model: "gpt-5.4" });
-    const state = buildState({ agents: [agent], activeAgentId: agent.id });
-    const config = buildConfig({ name: "codex", model: "gpt-5.5" });
-    const ctx = resolveEffectiveContext(state, config);
-    expect(ctx.providerSource).toBe("agent");
-    expect(ctx.provider.name).toBe("openai");
-    expect(ctx.provider.model).toBe("gpt-5.4");
-    expect(ctx.agentId).toBe(agent.id);
+    // The pinned provider is configured, so resolution returns it verbatim with
+    // no dispatch fallback (the fallback only kicks in for an UNCONFIGURED pin).
+    const restore = stubProviderEnv({ OPENAI_API_KEY: "sk-key" });
+    try {
+      const agent = buildAgent({ providerName: "openai", model: "gpt-5.4" });
+      const state = buildState({ agents: [agent], activeAgentId: agent.id });
+      const config = buildConfig({ name: "codex", model: "gpt-5.5" });
+      const ctx = resolveEffectiveContext(state, config);
+      expect(ctx.providerSource).toBe("agent");
+      expect(ctx.provider.name).toBe("openai");
+      expect(ctx.provider.model).toBe("gpt-5.4");
+      expect(ctx.providerFallback).toBeUndefined();
+      expect(ctx.agentId).toBe(agent.id);
+    } finally {
+      restore();
+    }
   });
 
   test("cross-provider agent override does not inherit instance baseUrl/apiKeyEnv", () => {
@@ -141,18 +185,23 @@ describe("resolveEffectiveContext", () => {
     // The migrated agent then POSTs to the wrong endpoint with the
     // wrong key — a silent correctness bug for anyone importing
     // openclaw agents that don't match their gini instance's provider.
-    const agent = buildAgent({ providerName: "openrouter", model: "openai/gpt-4o" });
-    const state = buildState({ agents: [agent], activeAgentId: agent.id });
-    const config = buildConfig({
-      name: "openai",
-      model: "gpt-5.4-mini",
-      baseUrl: "https://api.openai.com/v1",
-      apiKeyEnv: "OPENAI_API_KEY"
-    });
-    const ctx = resolveEffectiveContext(state, config);
-    expect(ctx.provider.name).toBe("openrouter");
-    expect(ctx.provider.baseUrl).toBe("https://openrouter.ai/api/v1");
-    expect(ctx.provider.apiKeyEnv).toBe("OPENROUTER_API_KEY");
+    const restore = stubProviderEnv({ OPENROUTER_API_KEY: "or-key" });
+    try {
+      const agent = buildAgent({ providerName: "openrouter", model: "openai/gpt-4o" });
+      const state = buildState({ agents: [agent], activeAgentId: agent.id });
+      const config = buildConfig({
+        name: "openai",
+        model: "gpt-5.4-mini",
+        baseUrl: "https://api.openai.com/v1",
+        apiKeyEnv: "OPENAI_API_KEY"
+      });
+      const ctx = resolveEffectiveContext(state, config);
+      expect(ctx.provider.name).toBe("openrouter");
+      expect(ctx.provider.baseUrl).toBe("https://openrouter.ai/api/v1");
+      expect(ctx.provider.apiKeyEnv).toBe("OPENROUTER_API_KEY");
+    } finally {
+      restore();
+    }
   });
 
   test("same-provider agent override still inherits instance baseUrl/apiKeyEnv", () => {
@@ -160,19 +209,27 @@ describe("resolveEffectiveContext", () => {
     // server still wants their per-agent overrides (model only) to use
     // the same endpoint. Only cross-provider overrides should drop the
     // inheritance.
-    const agent = buildAgent({ providerName: "openai", model: "gpt-5.4-mini" });
-    const state = buildState({ agents: [agent], activeAgentId: agent.id });
-    const config = buildConfig({
-      name: "openai",
-      model: "gpt-5.4",
-      baseUrl: "http://localhost:8000/v1",
-      apiKeyEnv: "MY_LOCAL_KEY"
-    });
-    const ctx = resolveEffectiveContext(state, config);
-    expect(ctx.provider.name).toBe("openai");
-    expect(ctx.provider.model).toBe("gpt-5.4-mini");
-    expect(ctx.provider.baseUrl).toBe("http://localhost:8000/v1");
-    expect(ctx.provider.apiKeyEnv).toBe("MY_LOCAL_KEY");
+    // The same-provider override inherits the instance's custom apiKeyEnv
+    // (MY_LOCAL_KEY); set it so the resolved provider is configured and no
+    // dispatch fallback fires over this resolution check.
+    const restore = stubProviderEnv({ MY_LOCAL_KEY: "local-key" });
+    try {
+      const agent = buildAgent({ providerName: "openai", model: "gpt-5.4-mini" });
+      const state = buildState({ agents: [agent], activeAgentId: agent.id });
+      const config = buildConfig({
+        name: "openai",
+        model: "gpt-5.4",
+        baseUrl: "http://localhost:8000/v1",
+        apiKeyEnv: "MY_LOCAL_KEY"
+      });
+      const ctx = resolveEffectiveContext(state, config);
+      expect(ctx.provider.name).toBe("openai");
+      expect(ctx.provider.model).toBe("gpt-5.4-mini");
+      expect(ctx.provider.baseUrl).toBe("http://localhost:8000/v1");
+      expect(ctx.provider.apiKeyEnv).toBe("MY_LOCAL_KEY");
+    } finally {
+      restore();
+    }
   });
 
   test("agent without providerName falls back to instance provider", () => {
@@ -243,6 +300,79 @@ describe("resolveEffectiveContext", () => {
     const ctx = resolveEffectiveContext(state, buildConfig());
     expect(ctx.warnings).toEqual([]);
     expect(ctx.providerSource).toBe("agent");
+  });
+});
+
+// Transient dispatch fallback: when the resolved provider (instance OR
+// agent-pinned) is unconfigured but another real provider is, the bundle's
+// `provider` is swapped for the fallback and `providerFallback` records the
+// selected→using pair. config.provider is never touched.
+describe("resolveEffectiveContext (transient dispatch fallback)", () => {
+  const PROVIDER_ENV_VARS = [
+    "OPENAI_API_KEY",
+    "OPENROUTER_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "GINI_LOCAL_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "AZURE_OPENAI_API_KEY",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY"
+  ];
+  const saved: Record<string, string | undefined> = {};
+  beforeEach(() => {
+    for (const name of [...PROVIDER_ENV_VARS, "CODEX_AUTH_JSON", "AWS_SHARED_CREDENTIALS_FILE", "AWS_PROFILE"]) {
+      saved[name] = process.env[name];
+      delete process.env[name];
+    }
+    // Keep ambient codex/AWS creds from leaking into the "nothing configured"
+    // baseline these tests rely on.
+    process.env.CODEX_AUTH_JSON = "/nonexistent/gini-effective-fallback/auth.json";
+    process.env.AWS_SHARED_CREDENTIALS_FILE = "/nonexistent/gini-effective-fallback/credentials";
+  });
+  afterEach(() => {
+    for (const name of Object.keys(saved)) {
+      if (saved[name] === undefined) delete process.env[name];
+      else process.env[name] = saved[name];
+    }
+  });
+
+  test("instance branch: unconfigured instance provider + configured fallback → swaps and records the pair", () => {
+    process.env.DEEPSEEK_API_KEY = "ds-key";
+    const state = buildState();
+    const config = buildConfig({ name: "bedrock", model: "us.amazon.nova-pro-v1:0" });
+    const ctx = resolveEffectiveContext(state, config);
+    expect(ctx.providerSource).toBe("instance");
+    expect(ctx.provider.name).toBe("deepseek");
+    expect(ctx.providerFallback).toEqual({ selected: "bedrock", using: "deepseek" });
+    // config.provider is untouched — the fallback is transient.
+    expect(config.provider.name).toBe("bedrock");
+  });
+
+  test("agent-pinned branch: agent pinned to an unconfigured provider falls back too", () => {
+    process.env.DEEPSEEK_API_KEY = "ds-key";
+    const agent = buildAgent({ providerName: "bedrock", model: "us.amazon.nova-pro-v1:0" });
+    const state = buildState({ agents: [agent], activeAgentId: agent.id });
+    const config = buildConfig({ name: "openai", model: "gpt-5.4-mini" });
+    const ctx = resolveEffectiveContext(state, config);
+    expect(ctx.provider.name).toBe("deepseek");
+    expect(ctx.providerFallback).toEqual({ selected: "bedrock", using: "deepseek" });
+  });
+
+  test("no swap when the resolved provider is configured", () => {
+    process.env.OPENAI_API_KEY = "sk-key";
+    const state = buildState();
+    const config = buildConfig({ name: "openai", model: "gpt-5.4-mini" });
+    const ctx = resolveEffectiveContext(state, config);
+    expect(ctx.provider).toBe(config.provider);
+    expect(ctx.providerFallback).toBeUndefined();
+  });
+
+  test("no swap when nothing is configured (genuinely unconfigured → /setup still applies)", () => {
+    const state = buildState();
+    const config = buildConfig({ name: "bedrock", model: "us.amazon.nova-pro-v1:0" });
+    const ctx = resolveEffectiveContext(state, config);
+    expect(ctx.provider).toBe(config.provider);
+    expect(ctx.providerFallback).toBeUndefined();
   });
 });
 

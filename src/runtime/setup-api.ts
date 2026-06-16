@@ -49,7 +49,7 @@
 // child's responsibility.
 
 import { writeRuntimeConfig } from "../paths";
-import { anthropicNeedsHttps, azureNeedsBaseUrl, azureNeedsHttps, CODEX_RETRY_REWRITE_DELAY_MS, hasUsableAwsCredentials, hasUsableCodexCredentials, isValidAwsRegion, normalizeProvider, probeCodexCredentials, providerCatalog, providerHealth } from "../provider";
+import { anthropicNeedsHttps, azureNeedsBaseUrl, azureNeedsHttps, CODEX_RETRY_REWRITE_DELAY_MS, hasUsableAwsCredentials, hasUsableCodexCredentials, isValidAwsRegion, normalizeProvider, probeCodexCredentials, providerCatalog, providerHealth, resolveDispatchProvider } from "../provider";
 import { codexAccessTokenExpiredAt } from "../integrations/connectors/codex";
 import { clearProviderAuthFailureIfPresent } from "../state";
 import { isValidEnvVarName, removeKeyFromSecretsEnv, writeKeyToSecretsEnv } from "../state/secrets-env";
@@ -83,6 +83,17 @@ export interface SetupStatus {
   providerConfigured: boolean;
   providers: SupportedProvider[];
   current: string | null;
+  // The user's SELECTED active provider (config.provider.name). Equals
+  // `current`; surfaced under a stable name so the fallback fields read
+  // unambiguously alongside `activeProvider`.
+  selectedProvider: string | null;
+  // The provider actually dispatching turns — the selected one when it's
+  // configured, otherwise the transient fallback resolveDispatchProvider picks.
+  activeProvider: string | null;
+  // True when the selected provider is unconfigured but a real configured
+  // fallback is serving turns. The web reads this to show the "finish setup"
+  // banner; providerConfigured stays true so the /setup gate doesn't fire.
+  usingFallback: boolean;
   // Echoed from providerHealth so the browser knows why setup is needed
   // (e.g. "Set OPENAI_API_KEY to use the openai provider").
   message: string;
@@ -97,12 +108,24 @@ export function getSetupStatus(config: RuntimeConfig): SetupStatus {
   // provider in /setup. Other configured providers (openai with key,
   // codex with auth.json) pass through.
   const isRealProvider = current === "openai" || current === "codex" || current === "openrouter" || current === "local" || current === "deepseek" || current === "anthropic" || current === "bedrock" || current === "azure";
-  const providerConfigured = isRealProvider && Boolean(health.configured);
+  // A graceful, transient fallback (the selected provider is unconfigured but
+  // another real one is) keeps the app usable instead of bouncing to /setup:
+  // resolveDispatchProvider returns usingFallback when a configured fallback
+  // exists. providerConfigured is what the proxy setup gate reads, so it must
+  // be true whenever turns can actually dispatch — directly OR via fallback —
+  // and only flips false→true when a REAL fallback exists (genuinely
+  // unconfigured instances still drive /setup, preserving the fail-open gate).
+  const dispatch = resolveDispatchProvider(config);
+  const usingFallback = dispatch.usingFallback;
+  const providerConfigured = isRealProvider && (Boolean(health.configured) || usingFallback);
   return {
     ok: true,
     providerConfigured,
     providers: [...SUPPORTED_PROVIDERS],
     current,
+    selectedProvider: current,
+    activeProvider: usingFallback ? dispatch.provider.name : current,
+    usingFallback,
     message: typeof health.message === "string" ? health.message : ""
   };
 }

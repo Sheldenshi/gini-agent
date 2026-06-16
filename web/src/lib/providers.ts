@@ -53,3 +53,22 @@ export function displayProviderName(item: { displayName: string; name: string })
   if (item.name === "codex") return "Codex";
   return item.displayName.replace(/\s+Compatible$/i, "");
 }
+
+// Short brand label keyed by provider name alone, for surfaces that carry only
+// the name (e.g. the fallback banner reading status.providerFallback). Mirrors
+// the runtime providerDisplayLabel so the web copy reads the same brands the
+// settings rows show; falls back to the raw name for an unknown value.
+export function providerBrandLabel(name: string): string {
+  const labels: Record<string, string> = {
+    codex: "Codex",
+    openai: "OpenAI",
+    openrouter: "OpenRouter",
+    deepseek: "DeepSeek",
+    anthropic: "Anthropic",
+    bedrock: "Amazon Bedrock",
+    azure: "Azure OpenAI",
+    local: "Local",
+    echo: "Gini Echo"
+  };
+  return labels[name] ?? name;
+}
