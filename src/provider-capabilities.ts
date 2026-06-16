@@ -219,6 +219,18 @@ export function resolveProviderModality(provider: ProviderConfig): ProviderModal
   }
 }
 
+// Maximum decoded image bytes a single image content part may carry. The
+// choke point is Anthropic's Messages API, which rejects any image whose
+// decoded `image.source.bytes` exceeds 5,242,880 (5 MB) server-side. We target
+// 5,000,000 — a margin under that ceiling — for every provider: anthropic and
+// bedrock share the limit, openrouter can route to an Anthropic upstream, and
+// providers that allow more (e.g. openai's 20 MB) are still safely served by a
+// smaller, high-quality JPEG. Kept as a per-provider hook so a future provider
+// with a different ceiling can be tuned here without touching the build path.
+export function resolveImageByteLimit(_provider: ProviderConfig): number {
+  return 5_000_000;
+}
+
 // Bedrock Converse tool use (function calling) is per-model. Every family in the
 // catalog accepts a `toolConfig` EXCEPT DeepSeek, whose R1 reasoning model
 // Converse rejects with a ValidationException ("This model doesn't support tool

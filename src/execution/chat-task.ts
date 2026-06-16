@@ -43,9 +43,11 @@ import {
   type MessageContentPart,
   type ToolCall
 } from "../provider";
-import { uploadDataUrl, uploadStat, sanitizeFilename, readUpload } from "../state/uploads";
+import { uploadStat, sanitizeFilename, readUpload } from "../state/uploads";
+import { visionImageDataUrl } from "../media/image-compress";
 import {
   resolveDefaultPriorContextTokenBudget,
+  resolveImageByteLimit,
   resolveProviderContextWindowTokens,
   resolveProviderModality,
   type ProviderModality
@@ -1312,6 +1314,9 @@ export async function buildAttachmentContent(
   const images = attachments.filter((a) => a.mimeType.startsWith("image/"));
   const files = attachments.filter((a) => !a.mimeType.startsWith("image/"));
   const loaded: Array<{ id: string; mimeType: string; size: number }> = [];
+  // Provider per-image byte ceiling (Anthropic's 5 MB choke point). Computed
+  // once; oversized images are auto-compressed to fit at visionImageDataUrl.
+  const imageLimit = resolveImageByteLimit(config.provider);
   for (const image of images) {
     if (!modality.vision) {
       // Non-vision model: degrade the image to a terse note rather than emitting an
@@ -1323,7 +1328,7 @@ export async function buildAttachmentContent(
       });
       continue;
     }
-    const dataUrl = uploadDataUrl(config.instance, image.id);
+    const dataUrl = await visionImageDataUrl(config.instance, image.id, imageLimit);
     if (!dataUrl) {
       appendLog(config.instance, "chat.image.missing", { uploadId: image.id });
       continue;

@@ -116,6 +116,33 @@ export function uploadExists(instance: Instance, id: string): boolean {
   return existsSync(join(uploadsDir(instance), `${id}.json`));
 }
 
+// Vision variant: a derived, downscaled JPEG of an oversized upload, produced
+// to fit a provider's per-image byte limit (e.g. Anthropic's 5 MB). Images
+// replay on every turn, so the derived bytes are computed once and cached on
+// disk next to the original. The output is always JPEG, so the limit is baked
+// into the filename — a different limit produces a different cache file and a
+// fresh recompress. The original upload is never mutated.
+function visionVariantPath(instance: Instance, id: string, limitBytes: number): string {
+  return join(uploadsDir(instance), `${id}.vis-${limitBytes}.jpg`);
+}
+
+export function readVisionVariant(instance: Instance, id: string, limitBytes: number): Uint8Array | null {
+  const path = visionVariantPath(instance, id, limitBytes);
+  if (!existsSync(path)) return null;
+  return new Uint8Array(readFileSync(path));
+}
+
+export function writeVisionVariant(instance: Instance, id: string, limitBytes: number, bytes: Uint8Array): void {
+  // Best-effort: the cache is an optimization, so a write failure (e.g. disk
+  // full, races) must not break the turn — the caller already has the bytes.
+  try {
+    ensureUploadsDir(instance);
+    writeFileSync(visionVariantPath(instance, id, limitBytes), bytes);
+  } catch {
+    // ignore — recompute next turn.
+  }
+}
+
 // Best-effort metadata read used by /api/uploads/:id HEAD and for
 // downstream callers that just need size/type without the bytes.
 export function uploadStat(instance: Instance, id: string): { size: number; mimeType: string; filename?: string } | null {
