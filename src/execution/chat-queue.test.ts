@@ -85,6 +85,18 @@ async function seedInFlightTask(config: RuntimeConfig, sessionId: string): Promi
   return taskId;
 }
 
+// Settle a seeded task to a terminal status so the session reads as idle —
+// the precondition the auto-dispatch guard requires before it pops the queue.
+async function settleTask(config: RuntimeConfig, taskId: string, status: Task["status"]): Promise<void> {
+  await mutateState(config.instance, (state) => {
+    const task = state.tasks.find((t) => t.id === taskId);
+    if (task) {
+      task.status = status;
+      task.updatedAt = new Date().toISOString();
+    }
+  });
+}
+
 function session(config: RuntimeConfig, sessionId: string) {
   return readState(config.instance).chatSessions.find((s) => s.id === sessionId);
 }
@@ -169,12 +181,12 @@ describe("chat message queue", () => {
     expect(readState(config.instance).tasks).toHaveLength(0);
   });
 
-  test("dispatchNextPendingChatMessage pops FIFO and runs the next message", async () => {
+  test("dispatchNextPendingChatMessage pops FIFO and runs the next message once the turn settles", async () => {
     const config = buildConfig(workspaceRoot, "queue-dispatch");
     stubTurn(config);
     const chat = await createChat(config, { title: "dispatch" });
     // Queue two messages behind an in-flight task.
-    await seedInFlightTask(config, chat.id);
+    const inFlight = await seedInFlightTask(config, chat.id);
     await submitChatMessage(config, chat.id, { content: "alpha" });
     await submitChatMessage(config, chat.id, { content: "beta" });
     expect((session(config, chat.id)?.pendingMessages ?? []).map((p) => p.content)).toEqual([
@@ -182,6 +194,9 @@ describe("chat message queue", () => {
       "beta"
     ]);
     const tasksBefore = readState(config.instance).tasks.length;
+    // Settle the in-flight turn so the session reads as idle — the guarded
+    // dispatch only pops once no live turn remains.
+    await settleTask(config, inFlight, "completed");
 
     await dispatchNextPendingChatMessage(config, chat.id);
 
@@ -204,6 +219,41 @@ describe("chat message queue", () => {
 
     expect(readState(config.instance).tasks.length).toBe(tasksBefore);
     expect(session(config, chat.id)?.pendingMessages ?? []).toHaveLength(0);
+  });
+
+  test("does NOT dispatch while a turn is paused at waiting_approval, then drains once it settles", async () => {
+    const config = buildConfig(workspaceRoot, "queue-waiting-approval");
+    stubTurn(config);
+    const chat = await createChat(config, { title: "approval" });
+    // Seed a turn paused for approval and a queued message behind it. The
+    // premature `.finally` at waiting_approval (the turn paused, not ended)
+    // would otherwise start the queued message as a second concurrent turn.
+    const paused = await seedInFlightTask(config, chat.id);
+    await settleTask(config, paused, "waiting_approval");
+    await submitChatMessage(config, chat.id, { content: "queued during approval" });
+    expect((session(config, chat.id)?.pendingMessages ?? []).map((p) => p.content)).toEqual([
+      "queued during approval"
+    ]);
+    const tasksBefore = readState(config.instance).tasks.length;
+
+    // waiting_approval counts as in-flight: the guard refuses to pop.
+    await dispatchNextPendingChatMessage(config, chat.id);
+
+    expect((session(config, chat.id)?.pendingMessages ?? []).map((p) => p.content)).toEqual([
+      "queued during approval"
+    ]);
+    expect(readState(config.instance).tasks.length).toBe(tasksBefore);
+
+    // Once the paused turn reaches a terminal status, the same call drains it.
+    await settleTask(config, paused, "completed");
+    await dispatchNextPendingChatMessage(config, chat.id);
+
+    expect(session(config, chat.id)?.pendingMessages ?? []).toHaveLength(0);
+    expect(readState(config.instance).tasks.length).toBe(tasksBefore + 1);
+    const userMsg = readState(config.instance).chatMessages.find(
+      (m) => m.sessionId === chat.id && m.role === "user" && m.content === "queued during approval"
+    );
+    expect(userMsg).toBeDefined();
   });
 
   test("removePendingChatMessageById removes the right item and reports unknown ids", async () => {
