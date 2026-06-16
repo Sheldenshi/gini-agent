@@ -2,7 +2,9 @@
 
 ## Decision
 
-A chat session serializes its turns through a **per-session FIFO message queue owned by the gateway**. While a session has an in-flight chat task, a newly posted message is enqueued on the session record (`ChatSessionRecord.pendingMessages: PendingChatMessage[]` in `src/types.ts`) instead of starting a concurrent task. When the current turn ends — for any reason — the next queued message auto-dispatches as its own real chat turn (one per turn). The queue is part of durable session state and propagates to every client over the existing `chat_session` SSE event.
+An **interactive-client** chat submission serializes its turns through a **per-session FIFO message queue owned by the gateway**. "Interactive client" means the web/mobile/CLI composer, where a human queues follow-ups while watching a turn run. While a session has an in-flight chat task, a newly posted interactive message is enqueued on the session record (`ChatSessionRecord.pendingMessages: PendingChatMessage[]` in `src/types.ts`) instead of starting a concurrent task. When the current turn ends — for any reason — the next queued message auto-dispatches as its own real chat turn (one per turn). The queue is part of durable session state and propagates to every client over the existing `chat_session` SSE event.
+
+The **messaging bridge** (Telegram/Discord inbound) bypasses the queue: each inbound message runs immediately, retaining its prior concurrent behavior by design (see "Why messaging bypasses the queue" below).
 
 ## Context
 
@@ -17,7 +19,7 @@ The gateway owns durable state and execution; web, mobile, CLI, and messaging br
 - **Implement the policy once.** Web and mobile render the same queue from the same session state instead of each reimplementing enqueue/drain logic.
 - **It survives reload and is consistent across devices.** A queued message typed on a phone is visible on the desktop, and a page refresh doesn't lose the queue.
 - **It drains even when no client is watching.** Auto-dispatch is driven by task lifecycle on the gateway, so the queue advances whether or not the app is foregrounded.
-- **It fixes the latent concurrent-task bug.** Serialization is now a runtime invariant for every surface, not a web-composer affordance.
+- **Serialization is a runtime invariant for interactive submissions**, not a web-composer affordance — a second interactive submit to a busy session enqueues instead of starting a concurrent task. (Messaging inbound is the deliberate exception below; it keeps its prior concurrent behavior because its reply-mirror needs a per-message task.)
 
 ## Data model
 
@@ -28,6 +30,8 @@ The state helpers operate on `RuntimeState` inside a `mutateState` callback, mat
 ## Enqueue policy
 
 `submitChatMessage` (`src/execution/chat.ts`) runs `prepareChatSubmission` first, so audio transcription and content/image validation surface errors at enqueue time exactly as on the run-now path. It then enqueues when **either** the session has an in-flight chat task **or** its `pendingMessages` is already non-empty — the second condition keeps a later submit from jumping ahead of earlier queued messages while the current turn runs. On enqueue it appends inside `mutateState`, publishes the updated session via `publishChatSession`, and returns `{ sessionId, queued: true, pendingId }`. Otherwise it delegates to the shared run-now body.
+
+An optional `{ bypassQueue: true }` skips the enqueue decision entirely and always runs now. Only the messaging bridge passes it (see "Why messaging bypasses the queue"); a function overload narrows the return type to the run-now shape for that caller so it gets a `taskId` without discriminating on `queued`. Interactive clients omit the option and keep the discriminated union.
 
 `runChatSubmission(config, sessionId, prepared)` is the extracted run-now body (create the conversation run, `submitTask`, link the run, persist the user `ChatMessageRecord` + `user_text` `ChatBlock`). Both the immediate path and the auto-dispatch path call it so a queued message becomes an identical real turn when it runs.
 
@@ -61,7 +65,13 @@ Every queue mutation publishes the full session over the existing `chat_session`
 - `POST /api/chat/:id/messages` returns the run-now shape `{ sessionId, runId, taskId, status }` when the message runs immediately, and `{ sessionId, queued: true, pendingId }` when it is enqueued. Clients discriminate on the `queued` field.
 - `DELETE /api/chat/:id/pending/:pendingId` removes a queued (not-yet-dispatched) message, publishing the updated session; returns `{ removed: true }` or 404 when the id isn't queued.
 
-Messaging inbound (`src/integrations/messaging.ts`) tolerates the queued result: a bridge message enqueued behind an in-flight turn lands its `MessagingMessageRecord` with no task linkage (the task is created later at dispatch).
+## Why messaging bypasses the queue
+
+The Telegram/Discord pollers mirror the agent's reply back to the originating chat via a per-inbound-message task: `receiveMessagingInput` (`src/integrations/messaging.ts`) returns the `taskId` of the task it just created, and the poller's `maintainTypingAndMirrorReply` waits on exactly that task (`syncChatTaskResult`) to show "typing…" and send the reply out (`sendMessagingOutput`). That mirror is the only path that delivers the assistant's response back to the user.
+
+A queued submit returns `{ queued: true }` with no `taskId` — the task is created later at auto-dispatch — so routing messaging through the interactive queue would strand the inbound message without a task for the mirror to wait on, and the agent's eventual reply would never be sent back. This is routine: a user double-texting, or two updates arriving in one poll batch, both produce an inbound message while a turn is already in flight.
+
+So messaging passes `{ bypassQueue: true }` to `submitChatMessage` and always runs each inbound message immediately, retaining its pre-queue concurrent behavior by design. Each inbound message gets its own task and its own reply mirror. The interactive queue is the right model for a human watching a single turn; the messaging bridge is a distinct ingestion path with a different reply contract.
 
 ## Acceptance checks
 
@@ -71,4 +81,5 @@ Messaging inbound (`src/integrations/messaging.ts`) tolerates the queued result:
 - `dispatchNextPendingChatMessage` pops FIFO and runs the next message once the session is idle (creates a task + user row for the popped content; the queue shrinks); it is a no-op on an empty queue (`src/execution/chat-queue.test.ts`).
 - The guard holds the queue while a turn is paused at `waiting_approval` (calling the chokepoint pops nothing and starts no second task), then drains the queued message once the paused task reaches a terminal status (`src/execution/chat-queue.test.ts`).
 - `removePendingChatMessageById` removes the right item and returns false for an unknown id; the DELETE route maps that to 404 (`src/execution/chat-queue.test.ts`, `src/http.test.ts`).
-- Two inbound bridge messages to the same session serialize through the queue and both land, in order, once it drains (`src/integrations/messaging.test.ts`).
+- `bypassQueue: true` runs immediately even while a turn is in flight: it returns the run-now shape with a `taskId`, creates a new task, and leaves `pendingMessages` empty (`src/execution/chat-queue.test.ts`).
+- Two inbound bridge messages to the same session bypass the queue and each runs its own task immediately; both user rows land in order, synchronously (`src/integrations/messaging.test.ts`).

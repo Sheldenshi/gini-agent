@@ -58,28 +58,6 @@ async function waitForTaskSettled(
   throw new Error(`Tasks did not settle within ${timeoutMs}ms: ${taskIds.join(", ")}`);
 }
 
-// Poll until a session has at least `expected` user-role chat messages, then
-// return their contents in order. The per-session message queue (ADR
-// chat-message-queue.md) serializes turns, so a follow-up message lands only
-// after the prior turn completes and the queue drains.
-async function waitForUserMessages(
-  config: RuntimeConfig,
-  sessionId: string,
-  expected: number,
-  timeoutMs = 5000
-): Promise<string[]> {
-  const { readState } = await import("../state");
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const userMessages = readState(config.instance).chatMessages.filter(
-      (m) => m.sessionId === sessionId && m.role === "user"
-    );
-    if (userMessages.length >= expected) return userMessages.map((m) => m.content);
-    await Bun.sleep(10);
-  }
-  throw new Error(`Session ${sessionId} did not reach ${expected} user messages within ${timeoutMs}ms`);
-}
-
 function stubClient(overrides: Partial<TelegramClient> = {}): { client: TelegramClient; calls: StubCall[] } {
   const calls: StubCall[] = [];
   const client: TelegramClient = {
@@ -360,7 +338,7 @@ describe("messaging telegram wiring", () => {
     setMessagingDeps({ telegramClientFactory: () => client });
 
     const { receiveMessagingInput, findTelegramChatSession } = await import("./messaging");
-    const { readState, isTerminalTaskStatus } = await import("../state");
+    const { readState } = await import("../state");
 
     const bridge = await addMessagingBridge(config, {
       name: "tg",
@@ -369,11 +347,6 @@ describe("messaging telegram wiring", () => {
       botToken: "TOK"
     });
 
-    // Two inbound messages to the same chat serialize through the per-session
-    // queue (ADR chat-message-queue.md): the second enqueues behind the first
-    // turn and auto-dispatches when it completes. Both still land in the same
-    // session, in order — but the second user row appears only after the queue
-    // drains, so poll for it.
     await receiveMessagingInput(config, bridge.id, { text: "first", target: "555" });
     await receiveMessagingInput(config, bridge.id, { text: "second", target: "555" });
 
@@ -392,16 +365,14 @@ describe("messaging telegram wiring", () => {
     const found = findTelegramChatSession(config, bridge.id, 555);
     expect(found?.id).toBe(telegramSessions[0]!.id);
 
-    // Both user turns land in the same session, in FIFO order, once the
-    // queue has drained.
-    const userContents = await waitForUserMessages(config, telegramSessions[0]!.id, 2);
-    expect(userContents).toEqual(["first", "second"]);
-
-    // Scope the detached task lifecycle to this test — see the discord
-    // sibling for the GINI_STATE_ROOT rebind rationale.
-    const sessionTaskIds = readState(config.instance).chatSessions
-      .find((s) => s.id === telegramSessions[0]!.id)!.taskIds;
-    await waitForTaskSettled(config, sessionTaskIds, isTerminalTaskStatus);
+    // Both user turns landed in the same session. Messaging bypasses the
+    // interactive-client queue (ADR chat-message-queue.md), so each inbound
+    // message runs its own task immediately and its user row is present
+    // synchronously — no drain to wait on.
+    const userMessages = readState(config.instance).chatMessages.filter(
+      (m) => m.sessionId === telegramSessions[0]!.id && m.role === "user"
+    );
+    expect(userMessages.map((m) => m.content)).toEqual(["first", "second"]);
   });
 
   test("non-telegram bridges keep using the standalone-task path", async () => {
@@ -1340,11 +1311,8 @@ describe("messaging discord wiring", () => {
       botToken: "TOK"
     });
 
-    // Two inbound messages to the same channel serialize through the
-    // per-session queue (ADR chat-message-queue.md): the second enqueues
-    // behind the first turn and auto-dispatches when it completes.
-    await receiveMessagingInput(config, bridge.id, { text: "first", target: "chan-1" });
-    await receiveMessagingInput(config, bridge.id, { text: "second", target: "chan-1" });
+    const first = await receiveMessagingInput(config, bridge.id, { text: "first", target: "chan-1" });
+    const second = await receiveMessagingInput(config, bridge.id, { text: "second", target: "chan-1" });
 
     const sessions = readState(config.instance).chatSessions;
     const discordSessions = sessions.filter(
@@ -1361,10 +1329,13 @@ describe("messaging discord wiring", () => {
     const found = findDiscordChatSession(config, bridge.id, "chan-1");
     expect(found?.id).toBe(discordSessions[0]!.id);
 
-    // Both user turns land in the same session, in FIFO order, once the
-    // queue has drained.
-    const userContents = await waitForUserMessages(config, discordSessions[0]!.id, 2);
-    expect(userContents).toEqual(["first", "second"]);
+    // Messaging bypasses the interactive-client queue (ADR
+    // chat-message-queue.md): each inbound message runs its own task
+    // immediately, so both user rows are present synchronously.
+    const userMessages = readState(config.instance).chatMessages.filter(
+      (m) => m.sessionId === discordSessions[0]!.id && m.role === "user"
+    );
+    expect(userMessages.map((m) => m.content)).toEqual(["first", "second"]);
 
     // Wait for the spawned chat tasks to reach a terminal state before
     // returning. submitTask runs runTask detached (.catch(failTask));
@@ -1372,9 +1343,7 @@ describe("messaging discord wiring", () => {
     // task still in flight would resolve its state path against the
     // new root and throw "Task not found". Awaiting here keeps the
     // task lifecycle scoped to this test.
-    const sessionTaskIds = readState(config.instance).chatSessions
-      .find((s) => s.id === discordSessions[0]!.id)!.taskIds;
-    await waitForTaskSettled(config, sessionTaskIds, isTerminalTaskStatus);
+    await waitForTaskSettled(config, [first.taskId!, second.taskId!], isTerminalTaskStatus);
   });
 
   test("addMessagingBridge rejects bot tokens with non-printable / whitespace characters", async () => {
