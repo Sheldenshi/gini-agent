@@ -979,11 +979,17 @@ export async function reconcileInFlightTasks(
     return { resumeIds, failIds };
   });
   for (const id of failIds) {
-    await failTask(
-      config,
-      id,
-      new Error("Interrupted by a gateway restart before it could finish; not resumed automatically.")
-    );
+    // Isolate per task: a failTask throw for one orphan must not abort the
+    // loop and leave the remaining orphans stuck running/queued forever.
+    try {
+      await failTask(
+        config,
+        id,
+        new Error("Interrupted by a gateway restart before it could finish; not resumed automatically.")
+      );
+    } catch (err) {
+      appendLog(config.instance, "tasks.reconcile.fail_error", { taskId: id, error: String(err) });
+    }
   }
   for (const id of resumeIds) {
     appendTrace(config.instance, id, { type: "task", message: "Task resumed after gateway restart", data: {} });
