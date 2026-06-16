@@ -19,7 +19,10 @@
 import type { RuntimeConfig } from "../types";
 import { supervisor } from "../integrations/launchd";
 import { createScheduledJob } from "../jobs";
+import { readState } from "../state";
 import { appendLog } from "../state/trace";
+import { getOrCreateAgentChat } from "../execution/chat";
+import { resolveEffectiveContext } from "../execution/effective-context";
 import {
   listPendingReports,
   markAsked,
@@ -70,6 +73,24 @@ export interface MaybeAskDeps {
   listPendingImpl?: () => Array<{ path: string; report: CrashReport }>;
   markAskedImpl?: (fingerprint: string, atIso: string) => void;
   wasAskedRecentlyImpl?: (fingerprint: string, nowMs: number, windowMs: number) => boolean;
+  // Resolves the chat session the consent question is delivered into. Defaults
+  // to the active agent's canonical (main) chat; returns undefined when there's
+  // no agent to post into. Injectable so the unit tests stay hermetic against a
+  // temp state root that has no agents.
+  resolveDeliverySessionImpl?: (config: RuntimeConfig) => Promise<string | undefined>;
+}
+
+// The consent question goes into the active agent's canonical chat — the
+// conversation the user actually reads — NOT a dedicated job channel. A
+// one-time ask doesn't bury an ongoing conversation (the reason dedicated
+// channels exist for recurring jobs), and a dedicated one-shot channel is
+// filtered out of the "Recurring jobs" sidebar, leaving the ask unreachable.
+// Returns undefined when no agent is active so the caller can skip the ask.
+async function resolveAgentChatSession(config: RuntimeConfig): Promise<string | undefined> {
+  const agentId = resolveEffectiveContext(readState(config.instance), config).agentId;
+  if (!agentId) return undefined;
+  const chat = await getOrCreateAgentChat(config.instance, agentId);
+  return chat.id;
 }
 
 export async function maybeAskAboutCrashes(
@@ -82,6 +103,7 @@ export async function maybeAskAboutCrashes(
   const listPendingImpl = deps.listPendingImpl ?? listPendingReports;
   const markAskedImpl = deps.markAskedImpl ?? markAsked;
   const wasAskedRecentlyImpl = deps.wasAskedRecentlyImpl ?? wasAskedRecently;
+  const resolveDeliverySessionImpl = deps.resolveDeliverySessionImpl ?? resolveAgentChatSession;
 
   try {
     // Only supervised instances on the ask-allowlist bother the user; everything
@@ -112,6 +134,16 @@ export async function maybeAskAboutCrashes(
     }
     if (freshFingerprints.length === 0) return;
 
+    // Resolve the delivery surface BEFORE stamping lastAskedAt. If there's no
+    // agent chat to post into, skip without stamping so a later boot (once an
+    // agent exists) can still ask — stamping first would silently swallow the
+    // ask for the 24h window.
+    const deliverySessionId = await resolveDeliverySessionImpl(config);
+    if (!deliverySessionId) {
+      appendLog(config.instance, "crash.recovery.no-delivery-session", { instance: config.instance });
+      return;
+    }
+
     // Stamp lastAskedAt BEFORE creating the job so a crash that respawns the
     // gateway mid-ask can't produce a second question for the same crash.
     for (const fp of freshFingerprints) {
@@ -124,7 +156,7 @@ export async function maybeAskAboutCrashes(
       intervalSeconds: 2,
       oneShot: true,
       timeoutSeconds: 120,
-      createDedicatedSession: { title: "Crash report" }
+      chatSessionId: deliverySessionId
     });
   } catch (err) {
     appendLog(config.instance, "crash.recovery.error", { error: String(err) });
