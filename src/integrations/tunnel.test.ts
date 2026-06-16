@@ -12,7 +12,7 @@
 // frpc child.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -3320,5 +3320,41 @@ describe("tunnel auto-reconnect", () => {
     await stopAllTunnels();
     // The resumable record was preserved as connected (not the transient connecting).
     expect(readState(config.instance).tunnel?.status).toBe("connected");
+  });
+
+  // The watcher's catch is a backstop for an UNEXPECTED throw out of the reconnect
+  // machinery (e.g. a state-write failure) — it must trace the failure (so a field
+  // incident isn't invisible) without becoming an unhandled rejection. Force the
+  // throw by making the instance's state dir read-only AFTER connecting, so the
+  // reconnect flip's writeState throws; the log dir uses a separate root
+  // (GINI_LOG_ROOT), so appendLog still lands.
+  test("an unexpected throw in the reconnect machinery is logged, not swallowed silently", async () => {
+    const live = crashableChild();
+    setTunnelDeps(deps({ buildTunnel: () => live }));
+    await connectTunnel(config, "gini-relay");
+    await awaitTunnelSettled(config.instance);
+    expect(getTunnel(config).status).toBe("connected");
+
+    const stateDir = join(ROOT, "instances", config.instance);
+    chmodSync(stateDir, 0o500); // read+execute, no write — writeState will throw
+    try {
+      live.crash(1); // watcher fires; the flip's writeState throws into the catch
+      const logPath = join(`${ROOT}-logs`, config.instance, "runtime.jsonl");
+      let logged = false;
+      for (let i = 0; i < 600; i += 1) {
+        try {
+          if (readFileSync(logPath, "utf8").includes("tunnel.reconnect.error")) {
+            logged = true;
+            break;
+          }
+        } catch {
+          // log file not created yet
+        }
+        await Bun.sleep(5);
+      }
+      expect(logged).toBe(true);
+    } finally {
+      chmodSync(stateDir, 0o700); // restore so afterEach cleanup can remove it
+    }
   });
 });

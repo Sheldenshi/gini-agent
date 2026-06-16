@@ -1761,10 +1761,19 @@ function watchChildExit(
   void child.exited.then(async (code) => {
     try {
       await reconnectAfterExit(config, provider, sup, child, code);
-    } catch {
+    } catch (error) {
       // Best-effort watcher: a failure anywhere in the reconnect machinery must
       // never become an unhandled rejection (which the crash handlers would treat
-      // as fatal). Worst case the record is left as the last write made it.
+      // as fatal). Worst case the record is left as the last write made it — but
+      // trace it so an unexpected throw (e.g. a state-write failure) isn't
+      // invisible, matching the file's *_failed logging convention. (appendLog is
+      // a best-effort synchronous writer, called bare here as elsewhere in the
+      // file; the reconnect machinery's own throw, not logging, is the concern.)
+      appendLog(config.instance, "tunnel.reconnect.error", {
+        provider,
+        code,
+        message: error instanceof Error ? error.message : String(error)
+      });
     }
   });
 }
