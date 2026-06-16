@@ -1,11 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import {
-  isGatewaySwitch,
-  isPairableHost,
-  isRelayHost,
-  RELAY_DOMAIN,
-  relayPairingRedirect
-} from "./relay-link";
+import { isPairableHost, isRelayHost, RELAY_DOMAIN, relayPairingRedirect } from "./relay-link";
 
 describe("isRelayHost", () => {
   test.each([
@@ -36,27 +30,6 @@ describe("isPairableHost", () => {
     ["example.com", false]
   ])("%p -> %p", (host, expected) => {
     expect(isPairableHost(host)).toBe(expected);
-  });
-});
-
-describe("isGatewaySwitch", () => {
-  const A = `https://aaa.${RELAY_DOMAIN}`;
-  const B = `https://bbb.${RELAY_DOMAIN}`;
-  test("no existing credentials → no confirmation (first-time pair)", () => {
-    expect(isGatewaySwitch(null, A)).toBe(false);
-    expect(isGatewaySwitch(undefined, A)).toBe(false);
-    expect(isGatewaySwitch("", A)).toBe(false);
-  });
-  test("same host → no confirmation (re-pair)", () => {
-    expect(isGatewaySwitch(A, A)).toBe(false);
-    expect(isGatewaySwitch(`${A}`, `${A}`)).toBe(false);
-  });
-  test("different host → confirmation required (gateway switch)", () => {
-    expect(isGatewaySwitch(A, B)).toBe(true);
-  });
-  test("a malformed existing or incoming value errs toward confirming", () => {
-    expect(isGatewaySwitch("not a url", A)).toBe(true);
-    expect(isGatewaySwitch(A, "not a url")).toBe(true);
   });
 });
 

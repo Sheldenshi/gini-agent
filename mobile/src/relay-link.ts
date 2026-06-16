@@ -40,33 +40,6 @@ export function isPairableHost(host: string): boolean {
   );
 }
 
-// Whether a deep-link auto-pair should pause for explicit confirmation: only when
-// credentials ALREADY exist AND the incoming relay host differs from the stored
-// one. This blocks a silent gateway switch — a relay link to an attacker's own
-// tenant (which passes isPairableHost) would otherwise repoint an already-paired
-// app to the attacker's backend after they approve their own request. A
-// first-time pair, or re-pairing the SAME host, proceeds without a prompt. A
-// malformed/unparseable existing or incoming value errs toward confirming.
-export function isGatewaySwitch(
-  existingBaseUrl: string | null | undefined,
-  incomingOrigin: string
-): boolean {
-  if (!existingBaseUrl) return false;
-  let existingHost: string;
-  let incomingHost: string;
-  try {
-    existingHost = new URL(existingBaseUrl).host.toLowerCase();
-  } catch {
-    return true;
-  }
-  try {
-    incomingHost = new URL(incomingOrigin).host.toLowerCase();
-  } catch {
-    return true;
-  }
-  return existingHost !== incomingHost;
-}
-
 // Map an incoming deep-link URL to an in-app route. An https link to a relay
 // host becomes `/pair?relay=<https origin>` so the pair screen knows which
 // gateway to pair with (the host identifies the gateway; the link's own path is
