@@ -9,6 +9,7 @@ import { BlockRenderer } from "@/components/chat/BlockRenderer";
 import { BlockToolCallsCollapsed } from "@/components/chat/BlockToolCallsCollapsed";
 import { GeneratedFilesCard } from "@/components/chat/GeneratedFilesCard";
 import { Composer } from "@/components/chat/Composer";
+import { QueuedMessages } from "@/components/chat/QueuedMessages";
 import { AgentChatHeader } from "@/components/chat/AgentChatHeader";
 import { ChannelViewJob } from "@/components/chat/ChannelViewJob";
 import { ChatSearchBox } from "@/components/chat/ChatSearchBox";
@@ -34,6 +35,7 @@ import {
   useChatBlocks,
   useChatSessions,
   useInvalidate,
+  useRemovePendingChatMessage,
   useStatus,
   useThreads
 } from "@/lib/queries";
@@ -153,7 +155,10 @@ function ChatSurface({
     [allJobs.data, isChannel, sessionId]
   );
 
-  const { blocks, isLoading: blocksLoading, refetch } = useChatBlocks(sessionId);
+  const { blocks, isLoading: blocksLoading, refetch, pendingMessages } = useChatBlocks(
+    sessionId,
+    session.pendingMessages
+  );
   const threadsQuery = useThreads(sessionId);
   const threads = useMemo(() => threadsQuery.data ?? [], [threadsQuery.data]);
   const { markThreadRead, isThreadUnread } = useThreadReadState(threads);
@@ -225,6 +230,7 @@ function ChatSurface({
   });
 
   const cancel = useCancelTask();
+  const removePending = useRemovePendingChatMessage(sessionId);
 
   const submit = (images: UploadRef[]) => {
     const trimmed = text.trim();
@@ -441,6 +447,15 @@ function ChatSurface({
 
             <div className="px-6 pb-5 pt-2">
               <div className="mx-auto w-full max-w-3xl">
+                <QueuedMessages
+                  sessionId={sessionId}
+                  pending={pendingMessages}
+                  onRemove={(pendingId) =>
+                    removePending.mutate(pendingId, {
+                      onError: (error) => toast.error(error.message)
+                    })
+                  }
+                />
                 <Composer
                   value={text}
                   onChange={setText}
