@@ -361,6 +361,13 @@ export async function cancelTask(
   // recursively. Walk the runtime state for any task whose parentTaskId is
   // this task and is not already terminal, then cancel them.
   await cancelDescendantTasks(config, taskId);
+  // Drain the per-session queue (ADR chat-message-queue.md). Cancelling a
+  // `waiting_approval` task sets it terminal with no active runTask promise,
+  // so the submitTask `.finally` chokepoint never fires for it. Guarded +
+  // idempotent: a no-op unless the session is now idle. Top-level chat only.
+  if (task.mode === "chat" && task.chatSessionId && !task.parentTaskId) {
+    void dispatchNextPendingChatMessage(config, task.chatSessionId);
+  }
   return task;
 }
 
@@ -1215,6 +1222,15 @@ export async function decideApproval(config: RuntimeConfig, approvalId: string, 
       // denial leaves its running subagent children executing with
       // tools.
       await cancelDescendantTasks(config, approval.task.id);
+      // Drain the per-session queue (ADR chat-message-queue.md). The deny
+      // branch flips the task to `failed` INLINE in its own mutateState
+      // rather than via failTask, and the original runTask `.finally`
+      // chokepoint already resolved when the turn paused for approval — so a
+      // stranded queue would never advance without this trigger. Guarded +
+      // idempotent: a no-op unless the session is now idle. Top-level chat only.
+      if (approval.task.mode === "chat" && approval.task.chatSessionId && !approval.task.parentTaskId) {
+        void dispatchNextPendingChatMessage(config, approval.task.chatSessionId);
+      }
     }
   }
   return approval.item;

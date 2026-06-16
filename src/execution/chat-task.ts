@@ -116,7 +116,7 @@ import { dispatchToolCall, parseToolArgsLenient, ToolDisplayError } from "./tool
 import { parseLeadingRouteDirective } from "./route-directive";
 import { getSubagentForTask, syncSubagentFromTask } from "../capabilities/subagents";
 import { listEnabledSkillScripts } from "../capabilities/skill-scripts";
-import { autoRenameChatAfterTurn } from "./chat";
+import { autoRenameChatAfterTurn, dispatchNextPendingChatMessage } from "./chat";
 import { finalizeJobRunFromTask } from "../jobs/finalize";
 import { listJobs } from "../jobs";
 import { peekRefLabel } from "../tools/browser";
@@ -3712,5 +3712,16 @@ export async function resumeChatTask(
     data: { resumedAt: snapshot.iterations }
   });
 
-  return runLoop(config, taskId, messages, snapshot.iterations);
+  const finished = await runLoop(config, taskId, messages, snapshot.iterations);
+  // Drain the per-session queue after an approval resume settles (ADR
+  // chat-message-queue.md). The submitTask `.finally` chokepoint only fires
+  // for the original runTask promise, which already resolved when the turn
+  // paused for approval — so a queue stranded behind a resumed turn would
+  // never advance without this trigger. The dispatch is guarded + idempotent:
+  // if the loop paused for approval AGAIN (still in-flight) it no-ops, and it
+  // only pops once the resumed turn is truly terminal. Top-level chat only.
+  if (finished.mode === "chat" && finished.chatSessionId && !finished.parentTaskId) {
+    void dispatchNextPendingChatMessage(config, finished.chatSessionId);
+  }
+  return finished;
 }

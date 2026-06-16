@@ -519,12 +519,24 @@ export async function submitChatMessage(config: RuntimeConfig, sessionId: string
 // then runs it as its own real chat turn. A run failure is logged and
 // swallowed so a single bad turn doesn't crash the dispatch chain; the rest
 // of the queue stays intact for the next terminal transition.
+//
+// Idempotent + in-flight-guarded: the busy-check AND the FIFO shift happen
+// inside ONE mutateState so the pop only fires when the session is truly
+// idle. This closes two races: the submitTask `.finally` hook fires when a
+// chat task resolves into the NON-terminal `waiting_approval` status (the
+// turn paused, not ended), and several terminal owners (approval-resume
+// completion, deny-while-paused, cancel-while-paused) fire this redundantly.
+// `sessionHasInFlightChatTask` treats queued/running/waiting_approval as
+// in-flight, so a premature or redundant call pops nothing and no-ops; at
+// most one queued message drains, and only once the session has no live turn.
 export async function dispatchNextPendingChatMessage(config: RuntimeConfig, sessionId: string): Promise<void> {
   const state = readState(config.instance);
   const session = state.chatSessions.find((item) => item.id === sessionId);
   if (!session) return;
-  if ((session.pendingMessages?.length ?? 0) === 0) return;
-  const popped = await mutateState(config.instance, (current) => shiftPendingChatMessage(current, sessionId));
+  const popped = await mutateState(config.instance, (current) => {
+    if (sessionHasInFlightChatTask(current, sessionId)) return undefined;
+    return shiftPendingChatMessage(current, sessionId);
+  });
   if (!popped) return;
   const afterShift = readState(config.instance).chatSessions.find((item) => item.id === sessionId);
   if (!afterShift) return;
