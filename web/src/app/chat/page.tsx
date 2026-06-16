@@ -208,9 +208,12 @@ function ChatSurface({
     return map;
   }, [threads]);
 
+  // Run-now responses carry { taskId }; enqueued ones carry { queued, pendingId }.
+  // The server decides which based on whether a turn is already in flight; the
+  // client treats both as success (the pill / transcript update via SSE).
   const send = useMutation({
     mutationFn: ({ content, images }: { content: string; images: UploadRef[] }) =>
-      api<{ taskId: string }>(`/chat/${sessionId}/messages`, {
+      api<{ taskId?: string; queued?: boolean; pendingId?: string }>(`/chat/${sessionId}/messages`, {
         method: "POST",
         body: JSON.stringify({ content, client: "web", ...(images.length > 0 ? { images } : {}) })
       }),
@@ -225,8 +228,10 @@ function ChatSurface({
 
   const submit = (images: UploadRef[]) => {
     const trimmed = text.trim();
-    if (send.isPending) return;
     if (!trimmed && images.length === 0) return;
+    // Don't gate on send.isPending: successive Enters while a turn runs must
+    // each POST so they queue in order. The server serializes (run-vs-queue),
+    // so concurrent POSTs are safe.
     send.mutate({ content: trimmed, images });
   };
 

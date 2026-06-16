@@ -74,11 +74,16 @@ export function Composer({
 
   const readyRefs = (): UploadRef[] => images.filter((image) => image.ref).map((image) => image.ref!);
   const anyUploading = images.some((image) => image.status === "uploading");
-  const canSend =
-    !disabled && !busy && !anyUploading && (value.trim().length > 0 || readyRefs().length > 0);
+  const hasContent = value.trim().length > 0 || readyRefs().length > 0;
+  // Submission is allowed even while a turn is in flight — the message is
+  // queued server-side (ADR chat-message-queue.md). It is gated only on having
+  // content, nothing uploading, and the composer not being hard-disabled.
+  const canSubmit = !disabled && !anyUploading && hasContent;
+  // The Send button only shows when not busy; it stays gated on content.
+  const canSend = !busy && canSubmit;
 
   const submit = () => {
-    if (!canSend) return;
+    if (!canSubmit) return;
     const refs = readyRefs();
     onSubmit(refs);
     for (const image of images) {
