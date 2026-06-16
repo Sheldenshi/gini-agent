@@ -25,7 +25,7 @@ import {
 import { print, printStartBanner } from "../output";
 import { COLOR, header, footer, step, info, warn, tildify } from "../styling";
 import { disableForUninstall, enable, stopViaBootout } from "./autostart";
-import { isLoaded, kickstart, plistPathFor, supervisor, type PlistKind } from "../autostart";
+import { isLaunchdManaged, isLoaded, kickstart, plistPathFor, supervisor, type LaunchdManagedDeps, type PlistKind } from "../autostart";
 import { installedRuntimeDir, updateRuntime } from "../../runtime/update";
 import { api, url } from "../api";
 
@@ -128,33 +128,13 @@ export async function start(ctx: CliContext): Promise<boolean> {
   return runtimeStarted;
 }
 
-const STOP_KINDS: PlistKind[] = ["gateway", "web", "watchdog"];
-
-export interface ShouldStopViaBootoutDeps {
-  isLoaded: (instance: string, kind?: PlistKind) => boolean;
-  plistExists: (path: string) => boolean;
-  plistPathFor: (instance: string, kind?: PlistKind) => string;
-}
-
-// True when launchd is the supervisor for this instance: any of its services is
-// loaded OR any of its plists exists on disk (a stopped-but-registered launchd
-// instance). The decision is based on the TARGET INSTANCE's launchd state, not
-// the calling process's env — a user running a CLI command from a terminal has
-// no GINI_SUPERVISOR, so supervisor() would say "foreground" and miss a launchd
-// instance. Pure + injectable so it's unit-testable without a real launchctl.
-// `gini start` and `gini stop` both route on this so they stay symmetric: stop
-// boots the services out; start ensures them via launchd instead of spawning a
-// competing detached daemon.
-export function isLaunchdManaged(
-  instance: string,
-  deps: ShouldStopViaBootoutDeps = { isLoaded, plistExists: existsSync, plistPathFor }
-): boolean {
-  for (const kind of STOP_KINDS) {
-    if (deps.isLoaded(instance, kind)) return true;
-    if (deps.plistExists(deps.plistPathFor(instance, kind))) return true;
-  }
-  return false;
-}
+// The launchd-state predicate `isLaunchdManaged` lives in
+// src/integrations/launchd.ts (re-exported through ../autostart) so runtime
+// modules — notably scheduleRuntimeRestart in src/runtime/update.ts — can route
+// on it without importing this CLI command surface. The deps shape is the same;
+// keep the old name as an alias so existing call sites and tests are unchanged.
+export type ShouldStopViaBootoutDeps = LaunchdManagedDeps;
+export { isLaunchdManaged };
 
 // Decide whether `gini stop` must use `launchctl bootout` instead of a
 // SIGTERM. KeepAlive is `true` on a launchd instance, so a SIGTERM would just
@@ -266,6 +246,17 @@ export async function startInstance(
     : startLifecycle(config, web);
 }
 
+// After a `launchctl bootout`, the runtime/web were SIGKILLed by launchctl and
+// never wrote their pid/port files on the way out — sweep the same four files
+// stopRuntime removes so `gini status` doesn't misreport a stale instance.
+function cleanupRuntimeFiles(config: RuntimeConfig): void {
+  const instance = config.instance;
+  rmSync(pidPath(instance), { force: true });
+  rmSync(runtimePortPath(instance), { force: true });
+  rmSync(join(config.stateRoot, "web.pid"), { force: true });
+  rmSync(webPortPath(instance), { force: true });
+}
+
 export function stop(ctx: CliContext): void {
   // Under launchd, KeepAlive is `true`, so a SIGTERM to the runtime pid
   // would just be respawned. The only way to actually stop a supervised
@@ -279,13 +270,7 @@ export function stop(ctx: CliContext): void {
   const instance = ctx.config.instance;
   if (supervisor() === "launchd" || shouldStopViaBootout(instance)) {
     const result = stopViaBootout(instance);
-    // bootout unloads the launchd job; the runtime/web no longer write
-    // their pid/port files on the way out (they were SIGKILLed by
-    // launchctl), so clean them up here the same way stopRuntime does.
-    rmSync(pidPath(instance), { force: true });
-    rmSync(runtimePortPath(instance), { force: true });
-    rmSync(join(ctx.config.stateRoot, "web.pid"), { force: true });
-    rmSync(webPortPath(instance), { force: true });
+    cleanupRuntimeFiles(ctx.config);
     print(result);
     return;
   }
@@ -328,14 +313,60 @@ export async function update(ctx: CliContext): Promise<void> {
 
   if (await runningRuntimeNeedsRestart(ctx.config, result)) {
     step("Restarting running instance");
-    const stopResult = stopRuntime(ctx.config);
-    const stopped = await waitForRuntimeStopped(ctx.config, typeof stopResult.pid === "number" ? stopResult.pid : undefined);
-    if (!stopped) {
-      throw new Error(`Timed out waiting for instance '${ctx.config.instance}' to stop before restart.`);
-    }
-    await startInstance(ctx.config, ctx.web);
+    await restartUpdatedInstance(ctx.config, ctx.web);
     step("Running instance restarted");
   }
+}
+
+// Injectable seams for restartUpdatedInstance so the launchd-vs-foreground
+// restart branch is unit-testable without real launchctl, SIGTERM, or
+// wall-clock waits. Defaults are the real impls.
+export interface RestartUpdatedInstanceDeps {
+  isLaunchdManaged: (instance: string) => boolean;
+  stopViaBootout: typeof stopViaBootout;
+  cleanupRuntimeFiles: (config: RuntimeConfig) => void;
+  stopRuntime: typeof stopRuntime;
+  waitForRuntimeStopped: typeof waitForRuntimeStopped;
+  startInstance: typeof startInstance;
+}
+
+const DEFAULT_RESTART_UPDATED_INSTANCE_DEPS: RestartUpdatedInstanceDeps = {
+  isLaunchdManaged,
+  stopViaBootout,
+  cleanupRuntimeFiles,
+  stopRuntime,
+  waitForRuntimeStopped,
+  startInstance
+};
+
+// Stop the running instance and start it on the fresh code, routing on the
+// instance's launchd state. On a launchd-managed instance KeepAlive respawns a
+// plain SIGTERM, so stopRuntime + waitForRuntimeStopped would time out; bootout
+// unloads the service (KeepAlive no longer applies), then we sweep the pid/port
+// files the launchctl-killed runtime never wrote and wait until the booted-out
+// gateway stops answering. The non-launchd path keeps the SIGTERM-based stop.
+// startInstance (already launchd-aware) brings it back up either way.
+export async function restartUpdatedInstance(
+  config: RuntimeConfig,
+  web: WebOptions,
+  deps: RestartUpdatedInstanceDeps = DEFAULT_RESTART_UPDATED_INSTANCE_DEPS
+): Promise<void> {
+  const instance = config.instance;
+  if (deps.isLaunchdManaged(instance)) {
+    deps.stopViaBootout(instance);
+    deps.cleanupRuntimeFiles(config);
+    const stopped = await deps.waitForRuntimeStopped(config);
+    if (!stopped) {
+      throw new Error(`Timed out waiting for instance '${instance}' to stop before restart.`);
+    }
+  } else {
+    const stopResult = deps.stopRuntime(config);
+    const stopped = await deps.waitForRuntimeStopped(config, typeof stopResult.pid === "number" ? stopResult.pid : undefined);
+    if (!stopped) {
+      throw new Error(`Timed out waiting for instance '${instance}' to stop before restart.`);
+    }
+  }
+  await deps.startInstance(config, web);
 }
 
 interface UpdateRestartInput {

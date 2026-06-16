@@ -161,8 +161,18 @@ process hasn't yet released its socket. This makes every reload caller safe,
 including the detached reconcile/refresh relaunch racing KeepAlive's own
 respawn. The watchdog binds nothing, so it skips the wait.
 
-Auto-update no longer orphans the runtime. For a launchd instance,
-`scheduleRuntimeRestart` (`src/runtime/update.ts`) self-SIGTERMs after the
+Auto-update no longer orphans the runtime. Both restart paths — the web-update
+self-restart (`scheduleRuntimeRestart`, `src/runtime/update.ts`) and the
+`gini update` CLI restart (`src/cli/commands/admin.ts`) — route on the
+**instance's** launchd state (`isLaunchdManaged`: any service loaded or any
+plist on disk), not solely the gateway's own `GINI_SUPERVISOR` env. The common
+case is a launchd-spawned gateway, but a foreground gateway running on an
+instance that also has launchd plists (dual supervision — a pre-existing state
+or a manual `gini run` on a launchd instance) restarts through launchd too,
+rather than the foreground stop+start helper that could spawn a competing
+daemon and walk the canonical port to an offset.
+
+For a launchd instance, `scheduleRuntimeRestart` self-SIGTERMs after the
 update has already run `git reset --hard` + `bun install` synchronously;
 the server's SIGTERM handler drains and exits 0, and KeepAlive respawns
 the gateway with the freshly checked-out code. The drain is bounded so the
@@ -173,8 +183,11 @@ idle keep-alive connections would otherwise never let the graceful
 inter-tick sleep on shutdown instead of sleeping out its full interval (up to
 60s for the connector re-probe). A detached
 `gini autostart kick --kind web` re-execs the web service so any new `web/`
-dependencies take effect. Foreground keeps the existing detached
-stop+start helper because there is no KeepAlive to respawn it. See
+dependencies take effect. The `gini update` CLI restart, on a launchd
+instance, `launchctl bootout`s the gateway (a plain SIGTERM would be respawned
+by KeepAlive) and re-ensures it via launchd; foreground keeps the
+SIGTERM-based stop and the existing detached stop+start helper because there is
+no KeepAlive to respawn it. See
 [Runtime Update Surface And Automatic Restart](runtime-update-surface.md)
 for the update API surface this restart path serves.
 
@@ -229,10 +242,14 @@ launchd instances so foreground/conductor/tmux runs are unaffected.
   service, still inside the 30s detection target, for never force-killing a
   healthy-but-busy one on a single timed-out probe — even
   while launchd is deferring its own respawns.
-- Foreground / `gini run` / conductor / tmux instances keep their existing
-  behavior end to end: no KeepAlive, PID-kill stop, and the detached
-  stop+start update helper. The `GINI_SUPERVISOR` marker is the single
-  switch that keeps the two worlds apart.
+- True foreground / `gini run` / conductor / tmux instances (no
+  `GINI_SUPERVISOR` env AND no launchd plists) keep their existing behavior end
+  to end: no KeepAlive, PID-kill stop, and the detached stop+start update
+  helper. An instance with launchd plists is launchd-managed regardless of the
+  calling process's env, so its restart paths route through launchd (see the
+  auto-update acceptance check below) — the env marker drives the gateway's own
+  runtime behavior, while `isLaunchdManaged` (any service loaded or any plist on
+  disk) drives how the CLI/web-update paths stop and start the instance.
 - A crash-looping service is bounded by `ThrottleInterval` (10s) rather
   than respawning as fast as it dies. A crash also leaves a redacted report
   in a local queue, which the user is asked to file as a GitHub issue on the
@@ -261,13 +278,20 @@ launchd instances so foreground/conductor/tmux runs are unaffected.
   yields a `webError` banner rather than throwing or hanging. On a
   non-launchd instance, start takes the existing detached-daemon path
   unchanged.
-- An auto-update on a launchd instance self-SIGTERMs and is respawned by
-  KeepAlive with the new code, and dispatches detached
-  `gini autostart kick` children for web AND the watchdog — the long-lived
-  watchdog loop never exits on its own and a code-only update leaves its
-  plist stamp unchanged, so the explicit kick is the only thing that
-  replaces its process with the new code. On a foreground instance the
-  update uses the detached stop+start helper.
+- Both restart paths route on the instance's launchd state (`isLaunchdManaged`:
+  any service loaded or any plist on disk), not solely the gateway's
+  `GINI_SUPERVISOR` env, so a dual-supervisor anomaly (no env but plists exist)
+  restarts cleanly through launchd rather than the foreground helper. An
+  auto-update (`scheduleRuntimeRestart`) on a launchd-managed instance
+  self-SIGTERMs and is respawned by KeepAlive with the new code, and dispatches
+  detached `gini autostart kick` children for web AND the watchdog — the
+  long-lived watchdog loop never exits on its own and a code-only update leaves
+  its plist stamp unchanged, so the explicit kick is the only thing that
+  replaces its process with the new code. The `gini update` CLI restart on a
+  launchd-managed instance boots out the gateway (a plain SIGTERM would be
+  respawned by KeepAlive), sweeps the pid/port files, waits for it to stop
+  answering, then re-ensures via launchd. On a true foreground / no-plist
+  instance both paths use the detached SIGTERM-based stop+start helper.
 - A `gini watchdog` tick against a healthy instance takes no action; with
   the gateway down for two consecutive ticks it `kickstart -k`s the
   gateway; with web down for two consecutive ticks it `kickstart -k`s web

@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { logDir, projectRoot, updateInProgressMarkerPath } from "../paths";
-import { supervisor } from "../integrations/launchd";
+import { isLaunchdManaged, supervisor } from "../integrations/launchd";
 import type { Instance } from "../types";
 
 const EXPECTED_ORIGIN = "https://github.com/Lilac-Labs/gini-agent";
@@ -255,6 +255,7 @@ async function performUpdate(runtimeDir: string, options: UpdateRuntimeOptions):
 export interface ScheduleRestartOptions {
   spawnImpl?: typeof spawn;
   killImpl?: (pid: number, signal: NodeJS.Signals | number) => void;
+  isLaunchdManagedImpl?: (instance: Instance) => boolean;
 }
 
 export function scheduleRuntimeRestart(instance: Instance, options: ScheduleRestartOptions = {}): boolean {
@@ -263,6 +264,7 @@ export function scheduleRuntimeRestart(instance: Instance, options: ScheduleRest
   const logFile = join(logDir(instance), "update-restart.log");
   const spawnFn = options.spawnImpl ?? spawn;
   const killFn = options.killImpl ?? ((pid: number, signal: NodeJS.Signals | number) => { process.kill(pid, signal); });
+  const launchdManaged = options.isLaunchdManagedImpl ?? isLaunchdManaged;
   try {
     mkdirSync(dirname(logFile), { recursive: true });
     appendFileSync(logFile, `[${new Date().toISOString()}] restart requested cwd=${root} supervisor=${supervisor() ?? "none"}\n`);
@@ -279,10 +281,21 @@ export function scheduleRuntimeRestart(instance: Instance, options: ScheduleRest
     // Fall back to ignored stdio.
   }
 
-  // Under launchd, the runtime is a KeepAlive:true job. updateRuntime has
-  // already been awaited to completion (`git reset --hard` + `bun install`
-  // + the web build) by the time we get here, so the working tree is the
-  // fresh code with no install/respawn race. We:
+  // Route on the INSTANCE's launchd state, not solely the gateway's own
+  // GINI_SUPERVISOR env. The common case is a launchd-spawned gateway
+  // (supervisor()==="launchd"); but a foreground gateway running on an
+  // instance that ALSO has launchd plists (dual supervision — a pre-existing
+  // state or a manual `gini run` on a launchd instance) must take this same
+  // path: its self-SIGTERM frees the canonical port, the launchd gateway
+  // service binds it, and web/watchdog are kicked. Falling through to the
+  // foreground stop+start helper there could spawn a competing detached
+  // daemon and walk the canonical port to an offset. NORMAL launchd
+  // (env set) is unchanged; a true foreground / no-plist instance
+  // (launchdManaged false) is unchanged — only the dual anomaly flips here.
+  //
+  // updateRuntime has already been awaited to completion (`git reset --hard`
+  // + `bun install` + the web build) by the time we get here, so the working
+  // tree is the fresh code with no install/respawn race. We:
   //   1. Spawn detached, unref'd `gini autostart kick` children for the web
   //      service (re-execs with any new web/ deps) AND the watchdog. The
   //      watchdog is a long-lived KeepAlive loop, so nothing else replaces
@@ -297,7 +310,7 @@ export function scheduleRuntimeRestart(instance: Instance, options: ScheduleRest
   // This keeps the gateway under launchd supervision (no detached
   // stop+start helper that would reparent the respawn to PID 1 and orphan
   // it outside KeepAlive).
-  if (supervisor() === "launchd") {
+  if (supervisor() === "launchd" || launchdManaged(instance)) {
     try {
       for (const kind of ["web", "watchdog"] as const) {
         const child = spawnFn(process.execPath, [
@@ -334,8 +347,9 @@ export function scheduleRuntimeRestart(instance: Instance, options: ScheduleRest
     return true;
   }
 
-  // Foreground / `gini run` (supervisor()===null): no launchd KeepAlive to
-  // respawn us, so keep the detached bash helper that waits for our exit
+  // True foreground / `gini run` (no GINI_SUPERVISOR AND no launchd plists):
+  // no launchd KeepAlive to respawn us, so keep the detached bash helper that
+  // waits for our exit
   // then stop+starts the instance itself.
   const script = `
 cd ${shellQuote(root)}

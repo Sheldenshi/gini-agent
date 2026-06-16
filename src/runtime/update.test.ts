@@ -394,6 +394,43 @@ describe("scheduleRuntimeRestart", () => {
     expect(kills[0]!.signal).toBe("SIGTERM");
   });
 
+  test("dual supervision (no GINI_SUPERVISOR but launchd manages the instance): takes the launchd branch", async () => {
+    // A foreground gateway running on an instance that ALSO has launchd plists.
+    // supervisor() is null (env unset) but the instance is launchd-managed, so
+    // the restart must route through launchd — kick web+watchdog and
+    // self-SIGTERM — NOT the foreground stop+start bash helper that could spawn
+    // a competing daemon and walk the port to an offset.
+    delete process.env.GINI_SUPERVISOR;
+    const { calls, spawn } = makeSpawnRecorder();
+    const kills: Array<{ pid: number; signal: NodeJS.Signals | number }> = [];
+
+    const result = scheduleRuntimeRestart("restart-dual", {
+      spawnImpl: spawn as never,
+      killImpl: (pid, signal) => { kills.push({ pid, signal }); },
+      isLaunchdManagedImpl: () => true
+    });
+    expect(result).toBe(true);
+
+    // Same launchd behavior as the env-set case: kick web + watchdog, no bash
+    // helper, gateway NOT kicked.
+    expect(calls.length).toBe(2);
+    const kickedKinds: string[] = [];
+    for (const call of calls) {
+      expect(call.cmd).not.toBe("bash");
+      expect(call.args).toContain("autostart");
+      expect(call.args).toContain("kick");
+      expect(call.args).toEqual(expect.arrayContaining(["--instance", "restart-dual"]));
+      kickedKinds.push(call.args[call.args.indexOf("--kind") + 1]!);
+    }
+    expect(kickedKinds.sort()).toEqual(["watchdog", "web"]);
+    expect(kickedKinds).not.toContain("gateway");
+
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(kills.length).toBe(1);
+    expect(kills[0]!.pid).toBe(process.pid);
+    expect(kills[0]!.signal).toBe("SIGTERM");
+  });
+
   test("foreground (no supervisor): uses the detached bash stop+start helper", async () => {
     delete process.env.GINI_SUPERVISOR;
     const { calls, spawn } = makeSpawnRecorder();

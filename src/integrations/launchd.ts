@@ -15,6 +15,7 @@
 // in tests and CLI commands keep working without churn.
 
 import { spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { Instance } from "../types";
@@ -156,6 +157,39 @@ export function loadedLastExitStatus(instance: Instance, kind?: PlistKind): stri
   if (!res.ok) return null;
   const match = res.stdout.match(/^\s*last exit code\s*=\s*(.+)$/m);
   return match && match[1] ? match[1].trim() : null;
+}
+
+// The three per-instance launchd kinds we probe to decide whether launchd
+// manages an instance. Kept here so both isLaunchdManaged and its CLI callers
+// (start/stop routing) agree on the set.
+const LAUNCHD_MANAGED_KINDS: PlistKind[] = ["gateway", "web", "watchdog"];
+
+// Injectable seams for isLaunchdManaged so it's unit-testable without a real
+// launchctl or on-disk plists. Defaults are the real impls.
+export interface LaunchdManagedDeps {
+  isLoaded: (instance: Instance, kind?: PlistKind) => boolean;
+  plistExists: (path: string) => boolean;
+  plistPathFor: (instance: Instance, kind?: PlistKind) => string;
+}
+
+// True when launchd is the supervisor for this instance: any of its services is
+// loaded OR any of its plists exists on disk (a stopped-but-registered launchd
+// instance). The decision is based on the TARGET INSTANCE's launchd state, not
+// the calling process's env — a user running a CLI command from a terminal has
+// no GINI_SUPERVISOR, so supervisor() would say "foreground" and miss a launchd
+// instance. Pure + injectable so it's unit-testable without a real launchctl.
+// `gini start`/`gini stop` and the update restart paths all route on this so
+// they stay symmetric: stop boots the services out; start ensures them via
+// launchd instead of spawning a competing detached daemon.
+export function isLaunchdManaged(
+  instance: Instance,
+  deps: LaunchdManagedDeps = { isLoaded, plistExists: existsSync, plistPathFor }
+): boolean {
+  for (const kind of LAUNCHD_MANAGED_KINDS) {
+    if (deps.isLoaded(instance, kind)) return true;
+    if (deps.plistExists(deps.plistPathFor(instance, kind))) return true;
+  }
+  return false;
 }
 
 export function bootstrap(_instance: Instance, plistPath: string): LaunchctlResult {

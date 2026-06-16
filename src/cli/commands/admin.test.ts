@@ -20,9 +20,11 @@ import type { ProviderConfig, RuntimeConfig } from "../../types";
 import {
   install_,
   isLaunchdManaged,
+  restartUpdatedInstance,
   shouldStopViaBootout,
   startViaLaunchd,
   stop,
+  type RestartUpdatedInstanceDeps,
   type StartViaLaunchdDeps
 } from "./admin";
 import { loadConfig } from "../../paths";
@@ -527,6 +529,76 @@ describe("startViaLaunchd (ensure via launchd, never spawn a daemon)", () => {
     expect(banner.webUrl).toBeUndefined();
     expect(banner.url).toBe("http://127.0.0.1:7777");
     expect(runtimeStarted).toBe(true);
+  });
+});
+
+// The `gini update` restart routes on the instance's launchd state. On a
+// launchd-managed instance a plain SIGTERM is respawned by KeepAlive, so the
+// restart must bootout (not stopRuntime) before re-ensuring via launchd —
+// otherwise waitForRuntimeStopped would time out and throw. All seams are
+// injected so no real launchctl / SIGTERM / wall-clock wait runs.
+describe("restartUpdatedInstance (update restart launchd routing)", () => {
+  const config = { instance: "inst", stateRoot: "/fake/state" } as unknown as RuntimeConfig;
+  const web: WebOptions = { webPort: 8777, webPortPinned: false, noWeb: false };
+
+  interface Recorder {
+    bootouts: string[];
+    cleanups: number;
+    stopRuntimes: number;
+    starts: number;
+  }
+
+  function makeDeps(opts: {
+    rec: Recorder;
+    launchdManaged: boolean;
+    stopped: boolean;
+  }): RestartUpdatedInstanceDeps {
+    return {
+      isLaunchdManaged: () => opts.launchdManaged,
+      stopViaBootout: ((instance: string) => {
+        opts.rec.bootouts.push(instance);
+        return { ok: true } as never;
+      }) as unknown as RestartUpdatedInstanceDeps["stopViaBootout"],
+      cleanupRuntimeFiles: () => { opts.rec.cleanups += 1; },
+      stopRuntime: (() => {
+        opts.rec.stopRuntimes += 1;
+        return { stopped: true, pid: 1234 } as never;
+      }) as unknown as RestartUpdatedInstanceDeps["stopRuntime"],
+      waitForRuntimeStopped: (async () => opts.stopped) as RestartUpdatedInstanceDeps["waitForRuntimeStopped"],
+      startInstance: (async () => {
+        opts.rec.starts += 1;
+        return { banner: {}, runtimeStarted: true };
+      }) as RestartUpdatedInstanceDeps["startInstance"]
+    };
+  }
+
+  test("launchd-managed -> bootout (NOT stopRuntime), then start; no SIGTERM-timeout throw", async () => {
+    const rec: Recorder = { bootouts: [], cleanups: 0, stopRuntimes: 0, starts: 0 };
+    const deps = makeDeps({ rec, launchdManaged: true, stopped: true });
+    await restartUpdatedInstance(config, web, deps);
+    // Bootout path: bootout + pid/port cleanup, never a SIGTERM stopRuntime.
+    expect(rec.bootouts).toEqual(["inst"]);
+    expect(rec.cleanups).toBe(1);
+    expect(rec.stopRuntimes).toBe(0);
+    expect(rec.starts).toBe(1);
+  });
+
+  test("not launchd-managed -> stopRuntime (SIGTERM) path, then start", async () => {
+    const rec: Recorder = { bootouts: [], cleanups: 0, stopRuntimes: 0, starts: 0 };
+    const deps = makeDeps({ rec, launchdManaged: false, stopped: true });
+    await restartUpdatedInstance(config, web, deps);
+    expect(rec.stopRuntimes).toBe(1);
+    expect(rec.bootouts).toEqual([]);
+    expect(rec.cleanups).toBe(0);
+    expect(rec.starts).toBe(1);
+  });
+
+  test("launchd-managed but the booted-out gateway never stops -> throws, no start", async () => {
+    const rec: Recorder = { bootouts: [], cleanups: 0, stopRuntimes: 0, starts: 0 };
+    const deps = makeDeps({ rec, launchdManaged: true, stopped: false });
+    await expect(restartUpdatedInstance(config, web, deps)).rejects.toThrow(/Timed out waiting/);
+    expect(rec.bootouts).toEqual(["inst"]);
+    expect(rec.starts).toBe(0);
   });
 });
 

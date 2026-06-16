@@ -77,6 +77,8 @@ export {
   isLoaded,
   loadedPid,
   loadedLastExitStatus,
+  isLaunchdManaged,
+  type LaunchdManagedDeps,
   bootstrap,
   bootout,
   bootoutTarget,
