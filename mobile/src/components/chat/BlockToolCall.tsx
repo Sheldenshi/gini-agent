@@ -18,6 +18,9 @@ import { iconForTool } from "./tool-icons";
 //   - Default: the row above; failed (error/denied) calls add an error
 //     string below — red by default, muted gray when errorSeverity is
 //     "info" (a calm needs-setup notice, e.g. web_search with no connector).
+//     terminal_exec renders no chip (its argsPreview is masked server-side);
+//     the full command lives in argsFull.command and is revealed on expand,
+//     prefixed with `$ `.
 //   - Inline spinner (status === "running" && !result, no runningHint):
 //     a small ActivityIndicator sits at the end of the row. Right for
 //     short-lived tools.
@@ -47,7 +50,9 @@ export function BlockToolCall({
   const running = block.status === "running" && !result;
   const waitingCard = running && Boolean(block.runningHint);
   const inlineSpinner = running && !waitingCard;
-  const canExpand = Boolean(result);
+  const command =
+    block.toolName === "terminal_exec" ? String(block.argsFull?.command ?? "") : "";
+  const canExpand = Boolean(result) || Boolean(command);
   const icon = iconForTool(block.toolName);
 
   const handleCancel = async () => {
@@ -131,6 +136,14 @@ export function BlockToolCall({
           {block.errorMessage}
         </Text>
       ) : null}
+      {expanded && command ? (
+        <View style={styles.resultBox}>
+          <Text style={styles.resultText} numberOfLines={20}>
+            <Text style={styles.commandPrompt}>$ </Text>
+            {command}
+          </Text>
+        </View>
+      ) : null}
       {expanded && result ? (
         <View style={styles.resultBox}>
           <Text style={styles.resultText} numberOfLines={20}>
@@ -207,6 +220,9 @@ const styles = StyleSheet.create({
     fontFamily: family("JetBrainsMono"),
     fontSize: 12,
     lineHeight: 16
+  },
+  commandPrompt: {
+    color: theme.muted
   },
   amberCard: {
     alignSelf: "stretch",
