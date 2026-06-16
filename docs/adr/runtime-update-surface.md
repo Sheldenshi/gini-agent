@@ -175,9 +175,11 @@ installer-origin guardrails rather than adding a browser-only shortcut.
   `updateInProgress: true` exactly while an update is in flight; the
   update-in-progress marker exists exactly for the duration of
   `updateRuntime` (removed on success and on failure).
-- After a non-upToDate update, `web/` contains exactly one `.next-prod-*`
-  dir keyed to the new HEAD's short sha; a failed web build surfaces a
-  structured error and schedules no restart.
+- After a non-upToDate update, `web/` contains a `.next-prod-*` dir keyed to
+  the new HEAD's short sha AND the previous HEAD's bundle (kept so a
+  still-running server isn't pulled out from under it; strictly-older bundles
+  are GC'd, and the previous one is reclaimed by a later update); a failed web
+  build surfaces a structured error and schedules no restart.
 - Existing guardrails still reject missing runtimes and unexpected git
   origins.
 - `bun run typecheck`, `bun test`, and `bun run gini smoke` pass.
