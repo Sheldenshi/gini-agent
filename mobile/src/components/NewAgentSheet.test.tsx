@@ -1,5 +1,4 @@
 import { describe, expect, mock, test } from "bun:test";
-import * as ReactActual from "react";
 
 // Identity-comparable stand-ins for the native primitives the sheet renders.
 // Tests never mount them; they assert on element.type === Modal etc. and walk
@@ -149,6 +148,25 @@ describe("bug #371: New Agent sheet keyboard + backdrop", () => {
     expect(typeof onPress).toBe("function");
     onPress?.();
     expect(cancelled).toBe(true);
+  });
+
+  test("the Android back gesture (onRequestClose) dismisses when idle", () => {
+    let cancelled = false;
+    const modal = flatten(render({ onCancel: () => (cancelled = true) })).find(
+      (n) => n.type === Modal
+    );
+    (modal?.props?.onRequestClose as () => void)();
+    expect(cancelled).toBe(true);
+  });
+
+  test("backdrop tap and back gesture are inert while creating", () => {
+    let cancelled = 0;
+    const nodes = flatten(render({ creating: true, onCancel: () => (cancelled += 1) }));
+    const backdrop = nodes.find((n) => n.type === Pressable);
+    const modal = nodes.find((n) => n.type === Modal);
+    (backdrop?.props?.onPress as () => void)();
+    (modal?.props?.onRequestClose as () => void)();
+    expect(cancelled).toBe(0);
   });
 
   test("still renders the Agent name input and Create control", () => {

@@ -40,18 +40,22 @@ export function NewAgentSheet({
   const insets = useSafeAreaInsets();
   if (!visible) return null;
   const submitDisabled = creating || name.trim().length === 0;
+  // While a create request is in flight the Cancel button is disabled, so the
+  // backdrop tap and the Android hardware-back gesture are gated the same way —
+  // otherwise they'd dismiss the sheet behind the user's back mid-request.
+  const dismiss = creating ? () => {} : onCancel;
   return (
     <Modal
       visible
       transparent
       animationType="fade"
-      onRequestClose={onCancel}
+      onRequestClose={dismiss}
       statusBarTranslucent
     >
       <View style={styles.root}>
         <Pressable
           style={StyleSheet.absoluteFill}
-          onPress={onCancel}
+          onPress={dismiss}
           accessibilityRole="button"
           accessibilityLabel="Dismiss new agent"
         >
