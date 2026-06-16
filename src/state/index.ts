@@ -91,7 +91,6 @@ export type { QueryResult, ExecuteResult, TableInfo } from "./agent-data-db";
 export {
   storeUpload,
   readUpload,
-  uploadDataUrl,
   uploadExists,
   uploadStat,
   isPlausibleMime,

@@ -247,7 +247,7 @@ describe("attachment delivery", () => {
   });
 
   test("current-turn image on a non-vision provider degrades to a note plus a steering directive", async () => {
-    // A real-ish PNG header is enough; uploadDataUrl just base64s the bytes.
+    // A real-ish PNG header is enough; the non-vision path never decodes the bytes.
     const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01]);
     const upload = storeUpload(config.instance, png, "image/png", "pic.png");
 

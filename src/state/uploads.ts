@@ -105,13 +105,6 @@ export function readUpload(instance: Instance, id: string): { bytes: Uint8Array;
   return { bytes: new Uint8Array(bytes), mimeType: manifest.mimeType, filename: manifest.filename };
 }
 
-export function uploadDataUrl(instance: Instance, id: string): string | null {
-  const upload = readUpload(instance, id);
-  if (!upload) return null;
-  const base64 = Buffer.from(upload.bytes).toString("base64");
-  return `data:${upload.mimeType};base64,${base64}`;
-}
-
 export function uploadExists(instance: Instance, id: string): boolean {
   return existsSync(join(uploadsDir(instance), `${id}.json`));
 }

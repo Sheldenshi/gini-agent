@@ -71,6 +71,22 @@ describe("compressImageToFit", () => {
     const result = await compressImageToFit(garbage, "image/png", 2);
     expect(result).toBeNull();
   });
+
+  test("exhausts the ladder gracefully under a pathologically tiny limit", async () => {
+    const png = await photoLikePng(1500, 1500);
+    const limit = 100;
+    expect(png.length).toBeGreaterThan(limit);
+
+    // No JPEG of a real raster fits in 100 bytes, so the ladder runs to the end
+    // and returns its smallest best-effort JPEG — non-null, decodable, but still
+    // over the limit. The over-limit guard lives in visionImageDataUrl.
+    const result = await compressImageToFit(png, "image/png", limit);
+    expect(result).not.toBeNull();
+    expect(result!.mimeType).toBe("image/jpeg");
+    expect(result!.bytes.length).toBeGreaterThan(limit);
+    const meta = await sharp(result!.bytes).metadata();
+    expect(meta.format).toBe("jpeg");
+  });
 });
 
 describe("visionImageDataUrl", () => {
@@ -123,6 +139,17 @@ describe("visionImageDataUrl", () => {
     expect(url!.startsWith("data:image/png;base64,")).toBe(true);
     // No vision variant written for an under-limit image.
     expect(existsSync(join(uploadsDir(instance), `${upload.id}.vis-5000000.jpg`))).toBe(false);
+  });
+
+  test("returns null when the image can't be compressed under a tiny limit", async () => {
+    const png = await photoLikePng(1500, 1500);
+    const limit = 100; // no real-raster JPEG fits — over-limit guard drops it.
+    const upload = storeUpload(instance, png, "image/png", "photo.png");
+
+    const url = await visionImageDataUrl(instance, upload.id, limit);
+    expect(url).toBeNull();
+    // No over-limit variant cached: nothing was emitted.
+    expect(existsSync(join(uploadsDir(instance), `${upload.id}.vis-${limit}.jpg`))).toBe(false);
   });
 
   test("returns null for a missing upload", async () => {

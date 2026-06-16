@@ -38,46 +38,36 @@ export async function compressImageToFit(
   // workers on teardown — and needlessly loads it at cold start even when no
   // oversized image is ever sent.
   const sharp = (await import("sharp")).default;
-
+  // Attempt ladder, best quality first. The first attempt only re-encodes
+  // (no downscale) so an image that's just over the limit keeps full
+  // resolution; each later attempt downscales harder and drops quality. The
+  // final attempt is a small, low-quality JPEG (tens of KB) that fits any
+  // realistic per-image limit, so any decodable image converges. maxEdge=null
+  // means "do not resize".
+  const attempts: Array<{ maxEdge: number | null; quality: number }> = [
+    { maxEdge: null, quality: 85 },
+    { maxEdge: 2560, quality: 80 },
+    { maxEdge: 2000, quality: 75 },
+    { maxEdge: 1600, quality: 68 },
+    { maxEdge: 1100, quality: 60 },
+    { maxEdge: 640, quality: 48 },
+  ];
   try {
-    const meta = await sharp(bytes, { failOn: "none" }).metadata();
-    const longestEdge = Math.max(meta.width ?? 0, meta.height ?? 0);
-    // Start no larger than 2000px on the longest edge — well above what any
-    // model needs for vision, but a big reduction from a full phone capture.
-    let maxEdge = Math.min(longestEdge || 2000, 2000);
-    let quality = 82;
-    const qualityFloor = 50;
-    const edgeFloor = 512;
-
     let smallest: Uint8Array | null = null;
-    // Bounded so the loop always terminates: drop quality to the floor, then
-    // shrink the longest edge 20% and reset quality, until under the limit.
-    for (let i = 0; i < 8; i++) {
-      const out = await sharp(bytes, { failOn: "none" })
-        .rotate()
-        .flatten({ background: "#ffffff" })
-        .resize({ width: maxEdge, height: maxEdge, fit: "inside", withoutEnlargement: true })
-        .jpeg({ quality, mozjpeg: true })
-        .toBuffer();
-      const result = new Uint8Array(out);
-      if (smallest === null || result.length < smallest.length) smallest = result;
-      if (result.length <= limitBytes) return { bytes: result, mimeType: "image/jpeg" };
-
-      if (quality > qualityFloor) {
-        quality = Math.max(qualityFloor, quality - 15);
-      } else if (maxEdge > edgeFloor) {
-        maxEdge = Math.max(edgeFloor, Math.round(maxEdge * 0.8));
-        quality = 82;
-      } else {
-        break;
+    for (const a of attempts) {
+      let pipeline = sharp(bytes, { failOn: "none" }).rotate().flatten({ background: "#ffffff" });
+      if (a.maxEdge !== null) {
+        pipeline = pipeline.resize({ width: a.maxEdge, height: a.maxEdge, fit: "inside", withoutEnlargement: true });
       }
+      const out = new Uint8Array(await pipeline.jpeg({ quality: a.quality, mozjpeg: true }).toBuffer());
+      if (smallest === null || out.length < smallest.length) smallest = out;
+      if (out.length <= limitBytes) return { bytes: out, mimeType: "image/jpeg" };
     }
-    // Nothing fit, but the smallest JPEG is still strictly better than the
-    // original (which already failed the limit) — return it best-effort.
+    // Nothing fit (only possible for a pathologically small limit): the smallest
+    // JPEG is still strictly better than the original. Caller decides whether to
+    // send it (see visionImageDataUrl, which refuses to send an over-limit one).
     return smallest ? { bytes: smallest, mimeType: "image/jpeg" } : null;
   } catch {
-    // Undecodable format or corrupt bytes: let the caller fall back to the
-    // original rather than dropping the image.
     return null;
   }
 }
@@ -85,8 +75,9 @@ export async function compressImageToFit(
 // Build the image_url data URL for a vision attachment, respecting the
 // provider's per-image byte limit. Under-limit uploads pass through untouched
 // (sharp is never invoked). Oversized uploads are compressed once and cached;
-// later turns reuse the cached JPEG. Returns null only when the upload itself
-// is missing.
+// later turns reuse the cached JPEG. Returns null when the upload is missing,
+// undecodable, or still over the limit after max compression — the caller skips
+// the image so the provider never gets an over-limit image_url to 400 on.
 export async function visionImageDataUrl(
   instance: Instance,
   id: string,
@@ -105,7 +96,7 @@ export async function visionImageDataUrl(
   if (cached) return `data:image/jpeg;base64,${base64(cached)}`;
 
   const result = await compressImageToFit(upload.bytes, upload.mimeType, limitBytes);
-  if (result) {
+  if (result && result.bytes.length <= limitBytes) {
     writeVisionVariant(instance, id, limitBytes, result.bytes);
     appendLog(instance, "chat.image.compressed", {
       uploadId: id,
@@ -116,13 +107,15 @@ export async function visionImageDataUrl(
     return `data:${result.mimeType};base64,${base64(result.bytes)}`;
   }
 
-  // Couldn't compress (undecodable): send the original and let the provider
-  // decide — nothing else we can do here.
+  // Undecodable (result null) or still over the limit after max compression
+  // (a pathologically small limit). Don't emit an image_url the provider would
+  // reject — drop it so the turn still succeeds. The caller logs chat.image.missing.
   appendLog(instance, "chat.image.compress_failed", {
     uploadId: id,
     bytes: upload.bytes.length,
+    finalBytes: result ? result.bytes.length : null,
     limitBytes,
     mimeType: upload.mimeType
   });
-  return `data:${upload.mimeType};base64,${base64(upload.bytes)}`;
+  return null;
 }
