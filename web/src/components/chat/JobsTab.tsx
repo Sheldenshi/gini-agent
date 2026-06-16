@@ -492,9 +492,9 @@ function JobDetailPanel({
       {(job.skillNames?.length ?? 0) > 0 ? (
         <DetailSection title="Skill attachments">
           <div className="flex flex-wrap gap-1.5">
-            {job.skillNames?.map((name) => (
+            {job.skillNames?.map((name, i) => (
               <span
-                key={name}
+                key={`${name}-${i}`}
                 className="rounded-md border border-border bg-card/50 px-2 py-0.5 font-mono text-[11px] text-muted-foreground"
               >
                 {name}
@@ -507,9 +507,9 @@ function JobDetailPanel({
       {(job.context?.length ?? 0) > 0 ? (
         <DetailSection title="Context">
           <div className="flex flex-wrap gap-1.5">
-            {job.context.map((item) => (
+            {job.context.map((item, i) => (
               <span
-                key={item}
+                key={`${item}-${i}`}
                 className="rounded-md border border-border bg-card/50 px-2 py-0.5 font-mono text-[11px] text-muted-foreground"
               >
                 {item}
