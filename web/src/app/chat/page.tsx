@@ -375,7 +375,7 @@ function ChatSurface({
                       if (item.kind === "tool_group") {
                         return (
                           <li key={item.id}>
-                            <BlockToolCallsCollapsed calls={item.calls} resultsByCallId={toolResultsByCallId} />
+                            <BlockToolCallsCollapsed calls={item.calls} steps={item.steps} resultsByCallId={toolResultsByCallId} />
                           </li>
                         );
                       }

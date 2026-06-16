@@ -1,6 +1,7 @@
 import { Feather } from "@expo/vector-icons";
 import { useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
+import type { ProcessStep } from "@/src/group-exchanges";
 import { family, theme } from "@/src/theme";
 import type { ToolCallBlock, ToolResultBlock } from "@/src/types";
 import { BlockToolCall } from "./BlockToolCall";
@@ -10,13 +11,17 @@ import { iconForTool } from "./tool-icons";
 // exchange (user_text → final assistant_text). The trailing icon strip
 // shows one glyph per *unique* tool category invoked, so a user can
 // glance at the row and know whether the assistant touched files, ran
-// shell commands, hit the browser, etc., without expanding.
+// shell commands, hit the browser, etc., without expanding. Expanding
+// replays the turn's process — tool calls and the model's pre-tool
+// narration — in chronological order.
 
 export function BlockToolCallsCollapsed({
   calls,
+  steps,
   resultsByCallId
 }: {
   calls: ToolCallBlock[];
+  steps: ProcessStep[];
   resultsByCallId: Map<string, ToolResultBlock>;
 }) {
   const [expanded, setExpanded] = useState(false);
@@ -66,13 +71,19 @@ export function BlockToolCallsCollapsed({
       </Pressable>
       {expanded ? (
         <View style={styles.expandedList}>
-          {calls.map((call) => (
-            <BlockToolCall
-              key={call.id}
-              block={call}
-              result={resultsByCallId.get(call.callId)}
-            />
-          ))}
+          {steps.map((step) =>
+            step.kind === "tool_call" ? (
+              <BlockToolCall
+                key={step.block.id}
+                block={step.block}
+                result={resultsByCallId.get(step.block.callId)}
+              />
+            ) : (
+              <Text key={step.block.id} style={styles.narration}>
+                {step.block.text}
+              </Text>
+            )
+          )}
         </View>
       ) : null}
     </View>
@@ -121,5 +132,14 @@ const styles = StyleSheet.create({
   expandedList: {
     paddingLeft: 27,
     gap: 6
+  },
+  // Pre-tool narration rendered muted so it reads as process, not a
+  // standalone reply. Narration is always settled (the streaming path
+  // never collapses), so no cursor.
+  narration: {
+    color: theme.muted,
+    fontFamily: family("HankenGrotesk", 500),
+    fontSize: 14,
+    lineHeight: 20
   }
 });

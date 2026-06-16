@@ -399,15 +399,23 @@ export default function ThreadViewScreen() {
                 renderItems.map((item) => {
                   if (item.kind === "tool_group") {
                     // tool_group items only appear after groupExchanges
-                    // folds a completed exchange; render each call inline
-                    // via BlockRenderer to keep the thread surface simple.
-                    return item.calls.map((call) => (
-                      <BlockRenderer
-                        key={call.id}
-                        block={call}
-                        toolResult={toolResultsByCallId.get(call.callId)}
-                      />
-                    ));
+                    // folds a completed exchange; replay the process
+                    // inline — tool calls via BlockRenderer, the model's
+                    // pre-tool narration as a muted line — to keep the
+                    // thread surface simple.
+                    return item.steps.map((step) =>
+                      step.kind === "tool_call" ? (
+                        <BlockRenderer
+                          key={step.block.id}
+                          block={step.block}
+                          toolResult={toolResultsByCallId.get(step.block.callId)}
+                        />
+                      ) : (
+                        <Text key={step.block.id} style={styles.threadNarration}>
+                          {step.block.text}
+                        </Text>
+                      )
+                    );
                   }
                   if (item.kind === "file_artifact") {
                     return <GeneratedFilesCard key={item.id} files={item.files} />;
@@ -646,6 +654,14 @@ const styles = StyleSheet.create({
   },
 
   replies: { paddingHorizontal: 14, paddingBottom: 8, gap: 12 },
+  // Pre-tool narration rendered muted so it reads as process, not a
+  // standalone reply, mirroring the collapsed tool group's narration.
+  threadNarration: {
+    color: theme.muted,
+    fontFamily: family("HankenGrotesk", 500),
+    fontSize: 14,
+    lineHeight: 20
+  },
   repliesEmpty: {
     color: theme.muted,
     fontFamily: family("HankenGrotesk", 500),
