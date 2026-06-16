@@ -17,8 +17,16 @@ import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } 
 import { join } from "node:path";
 import type { CliContext } from "../context";
 import type { ProviderConfig, RuntimeConfig } from "../../types";
-import { install_, shouldStopViaBootout, stop } from "./admin";
+import {
+  install_,
+  isLaunchdManaged,
+  shouldStopViaBootout,
+  startViaLaunchd,
+  stop,
+  type StartViaLaunchdDeps
+} from "./admin";
 import { loadConfig } from "../../paths";
+import type { WebOptions } from "../process";
 import type { PlistKind } from "../autostart";
 
 describe("install_ provider env override", () => {
@@ -340,6 +348,176 @@ describe("shouldStopViaBootout (target launchd state, not process env)", () => {
       plistPathFor: plistFor
     });
     expect(decision).toBe(false);
+  });
+});
+
+// `gini start` routes on the same TARGET-instance launchd state as `gini stop`:
+// a service loaded OR a plist on disk means launchd manages the instance, so
+// start must ensure it via launchd instead of spawning a competing daemon.
+// Mirrors the shouldStopViaBootout cases (start delegates to this predicate).
+describe("isLaunchdManaged (start/stop launchd routing)", () => {
+  const noPlist = () => false;
+  const plistFor = (instance: string, kind?: PlistKind) => `/fake/${instance}.${kind}.plist`;
+
+  test("any service loaded -> managed", () => {
+    const decision = isLaunchdManaged("inst", {
+      isLoaded: (_inst: string, kind?: PlistKind) => kind === "gateway",
+      plistExists: noPlist,
+      plistPathFor: plistFor
+    });
+    expect(decision).toBe(true);
+  });
+
+  test("a plist on disk (registered but stopped) -> managed", () => {
+    const decision = isLaunchdManaged("inst", {
+      isLoaded: () => false,
+      plistExists: (path: string) => path.includes("web"),
+      plistPathFor: plistFor
+    });
+    expect(decision).toBe(true);
+  });
+
+  test("nothing loaded and no plist -> not managed", () => {
+    const decision = isLaunchdManaged("inst", {
+      isLoaded: () => false,
+      plistExists: noPlist,
+      plistPathFor: plistFor
+    });
+    expect(decision).toBe(false);
+  });
+});
+
+// startViaLaunchd ensures a launchd-managed instance's services VIA launchd
+// (kickstart a loaded-but-down kind, bootstrap a not-loaded one via enable) and
+// no-ops when already healthy — never spawning a competing detached daemon. All
+// seams (isRunning/existingWebUrl/isLoaded/kickstart/enable/sleep + the health
+// deadline) are injected so the test runs instantly with no real launchctl,
+// fetch, or wall-clock waits.
+describe("startViaLaunchd (ensure via launchd, never spawn a daemon)", () => {
+  const config = { instance: "inst", port: 7777 } as unknown as RuntimeConfig;
+  const web: WebOptions = { webPort: 8777, webPortPinned: false, noWeb: false };
+
+  interface Recorder {
+    kickstarts: Array<{ kind?: PlistKind }>;
+    enables: Array<{ kinds: PlistKind[] }>;
+  }
+
+  // Build a fully-stubbed deps set. `loaded` decides isLoaded() per kind;
+  // `runtimeUp`/`webUp` are the INITIAL health state. Any revive action
+  // (kickstart or enable) flips the instance to healthy when
+  // `healthyAfterRevive` is true; otherwise web never reports healthy and the
+  // poll runs out the (tiny, injected) deadline.
+  function makeDeps(opts: {
+    rec: Recorder;
+    loaded: (kind?: PlistKind) => boolean;
+    runtimeUp: boolean;
+    webUp: boolean;
+    healthyAfterRevive: boolean;
+  }): StartViaLaunchdDeps {
+    let revived = false;
+    const markRevived = () => {
+      if (opts.healthyAfterRevive) revived = true;
+    };
+    return {
+      isRunning: async () => revived || opts.runtimeUp,
+      existingWebUrl: async () => (revived ? "http://localhost:8777" : opts.webUp ? "http://localhost:8777" : null),
+      isLoaded: (_inst: string, kind?: PlistKind) => opts.loaded(kind),
+      kickstart: (_inst: string, kind?: PlistKind) => { opts.rec.kickstarts.push({ kind }); markRevived(); },
+      enable: async ({ kinds }) => { opts.rec.enables.push({ kinds }); markRevived(); },
+      sleep: async () => { /* no real wait */ },
+      // Zero deadline => the health loop runs exactly one poll then exits on the
+      // deadline check, so the unhealthy case is instant and deterministic (no
+      // wall-clock dependence); the healthy cases break on success first.
+      healthDeadlineMs: 0,
+      healthIntervalMs: 1
+    };
+  }
+
+  test("already healthy -> running banner, runtimeStarted:false, ZERO launchd churn", async () => {
+    const rec: Recorder = { kickstarts: [], enables: [] };
+    const deps = makeDeps({
+      rec,
+      loaded: () => true, // watchdog loaded
+      runtimeUp: true,
+      webUp: true,
+      healthyAfterRevive: true
+    });
+    const { banner, runtimeStarted } = await startViaLaunchd(config, web, deps);
+    expect(runtimeStarted).toBe(false);
+    expect(banner.running).toBe(true);
+    expect(banner.webUrl).toBe("http://localhost:7777");
+    expect(banner.webError).toBeUndefined();
+    // The happy path must not touch launchd at all.
+    expect(rec.kickstarts).toEqual([]);
+    expect(rec.enables).toEqual([]);
+  });
+
+  test("gateway down + gateway loaded -> kickstart gateway, NOT enable", async () => {
+    const rec: Recorder = { kickstarts: [], enables: [] };
+    const deps = makeDeps({
+      rec,
+      // gateway + watchdog loaded; gateway is down (runtimeUp:false) so it gets kickstarted.
+      loaded: (kind) => kind === "gateway" || kind === "watchdog",
+      runtimeUp: false,
+      webUp: false,
+      healthyAfterRevive: true
+    });
+    const { banner, runtimeStarted } = await startViaLaunchd(config, web, deps);
+    expect(rec.kickstarts.some((k) => k.kind === "gateway")).toBe(true);
+    expect(rec.enables.some((e) => e.kinds.includes("gateway"))).toBe(false);
+    expect(runtimeStarted).toBe(true);
+    expect(banner.started).toBe(true);
+  });
+
+  test("gateway down + gateway NOT loaded -> enable gateway, NOT kickstart", async () => {
+    const rec: Recorder = { kickstarts: [], enables: [] };
+    const deps = makeDeps({
+      rec,
+      // nothing loaded → gateway must be bootstrapped via enable.
+      loaded: () => false,
+      runtimeUp: false,
+      webUp: false,
+      healthyAfterRevive: true
+    });
+    await startViaLaunchd(config, web, deps);
+    expect(rec.enables.some((e) => e.kinds.includes("gateway"))).toBe(true);
+    expect(rec.kickstarts.some((k) => k.kind === "gateway")).toBe(false);
+  });
+
+  test("web down (runtime up) + watchdog not loaded -> revive web and watchdog", async () => {
+    const rec: Recorder = { kickstarts: [], enables: [] };
+    const deps = makeDeps({
+      rec,
+      // web loaded but down; watchdog NOT loaded (must be ensured via enable).
+      loaded: (kind) => kind === "web",
+      runtimeUp: true,
+      webUp: false,
+      healthyAfterRevive: true
+    });
+    const { runtimeStarted } = await startViaLaunchd(config, web, deps);
+    // gateway was already up → not revived.
+    expect(rec.kickstarts.some((k) => k.kind === "gateway")).toBe(false);
+    expect(rec.enables.some((e) => e.kinds.includes("gateway"))).toBe(false);
+    // web loaded-but-down → kickstart; watchdog not loaded → enable.
+    expect(rec.kickstarts.some((k) => k.kind === "web")).toBe(true);
+    expect(rec.enables.some((e) => e.kinds.includes("watchdog"))).toBe(true);
+    expect(runtimeStarted).toBe(false);
+  });
+
+  test("health never comes up within deadline -> banner with webError, no throw/hang", async () => {
+    const rec: Recorder = { kickstarts: [], enables: [] };
+    const deps = makeDeps({
+      rec,
+      loaded: () => false,
+      runtimeUp: false,
+      webUp: false,
+      healthyAfterRevive: false // web never reports healthy
+    });
+    const { banner, runtimeStarted } = await startViaLaunchd(config, web, deps);
+    expect(banner.started).toBe(true);
+    expect(typeof banner.webError).toBe("string");
+    expect(banner.url).toBe("http://127.0.0.1:7777");
+    expect(runtimeStarted).toBe(true);
   });
 });
 

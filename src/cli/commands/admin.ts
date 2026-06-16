@@ -7,22 +7,26 @@ import { join } from "node:path";
 import * as readline from "node:readline/promises";
 import type { RuntimeConfig } from "../../types";
 import type { CliContext } from "../context";
+import type { WebOptions } from "../process";
 import { hasFlag } from "../args";
 import { install, resetInstance, uninstallAll, uninstallInstance } from "../../runtime";
 import { configPath, loadConfig, parseInstance, pidPath, runtimePortPath, webPortPath, writeRuntimeConfig } from "../../paths";
 import {
   awaitForegroundLogFlush,
   doctor,
+  existingWebUrl,
   isRunning,
+  operatorWebUrl,
   remoteOrLocalStatus,
   start as startLifecycle,
   stopRuntime,
   waitForRuntimeStopped
 } from "../process";
+import { url } from "../api";
 import { print, printStartBanner } from "../output";
 import { COLOR, header, footer, step, info, warn, tildify } from "../styling";
-import { disableForUninstall, stopViaBootout } from "./autostart";
-import { isLoaded, plistPathFor, supervisor, type PlistKind } from "../autostart";
+import { disableForUninstall, enable, stopViaBootout } from "./autostart";
+import { isLoaded, kickstart, plistPathFor, supervisor, type PlistKind } from "../autostart";
 import { installedRuntimeDir, updateRuntime } from "../../runtime/update";
 import { api } from "../api";
 
@@ -120,7 +124,7 @@ export async function install_(ctx: CliContext): Promise<void> {
 }
 
 export async function start(ctx: CliContext): Promise<boolean> {
-  const { banner, runtimeStarted } = await startLifecycle(ctx.config, ctx.web);
+  const { banner, runtimeStarted } = await startInstance(ctx.config, ctx.web);
   printStartBanner(banner);
   return runtimeStarted;
 }
@@ -133,15 +137,16 @@ export interface ShouldStopViaBootoutDeps {
   plistPathFor: (instance: string, kind?: PlistKind) => string;
 }
 
-// Decide whether `gini stop` must use `launchctl bootout` instead of a
-// SIGTERM. The decision is based on the TARGET INSTANCE's launchd state, not
-// the calling process's env: a user running `gini stop` from a terminal has
-// no GINI_SUPERVISOR, so supervisor() would say "foreground" and a SIGTERM
-// would just be respawned by KeepAlive. We bootout when any of the instance's
-// services is loaded OR any of its plists exists on disk (a stopped-but-
-// registered launchd instance). Pure + injectable so it's unit-testable
-// without a real launchctl.
-export function shouldStopViaBootout(
+// True when launchd is the supervisor for this instance: any of its services is
+// loaded OR any of its plists exists on disk (a stopped-but-registered launchd
+// instance). The decision is based on the TARGET INSTANCE's launchd state, not
+// the calling process's env — a user running a CLI command from a terminal has
+// no GINI_SUPERVISOR, so supervisor() would say "foreground" and miss a launchd
+// instance. Pure + injectable so it's unit-testable without a real launchctl.
+// `gini start` and `gini stop` both route on this so they stay symmetric: stop
+// boots the services out; start ensures them via launchd instead of spawning a
+// competing detached daemon.
+export function isLaunchdManaged(
   instance: string,
   deps: ShouldStopViaBootoutDeps = { isLoaded, plistExists: existsSync, plistPathFor }
 ): boolean {
@@ -150,6 +155,117 @@ export function shouldStopViaBootout(
     if (deps.plistExists(deps.plistPathFor(instance, kind))) return true;
   }
   return false;
+}
+
+// Decide whether `gini stop` must use `launchctl bootout` instead of a
+// SIGTERM. KeepAlive is `true` on a launchd instance, so a SIGTERM would just
+// be respawned — we bootout whenever launchd manages the instance.
+export function shouldStopViaBootout(
+  instance: string,
+  deps: ShouldStopViaBootoutDeps = { isLoaded, plistExists: existsSync, plistPathFor }
+): boolean {
+  return isLaunchdManaged(instance, deps);
+}
+
+// Injectable seams for startViaLaunchd so a unit test runs instantly without
+// real launchctl, fetch, or wall-clock waits. Defaults are the real impls.
+export interface StartViaLaunchdDeps {
+  isRunning: typeof isRunning;
+  existingWebUrl: typeof existingWebUrl;
+  isLoaded: (instance: string, kind?: PlistKind) => boolean;
+  kickstart: (instance: string, kind?: PlistKind) => unknown;
+  enable: (options: { instance: string; kinds: PlistKind[] }) => Promise<unknown>;
+  sleep: (ms: number) => Promise<void>;
+  // Health-wait budget. A kind is "up" once both isRunning() and
+  // existingWebUrl() succeed; we poll until then or this deadline.
+  healthDeadlineMs: number;
+  healthIntervalMs: number;
+}
+
+const DEFAULT_START_VIA_LAUNCHD_DEPS: StartViaLaunchdDeps = {
+  isRunning,
+  existingWebUrl,
+  isLoaded,
+  kickstart,
+  enable,
+  sleep: (ms) => Bun.sleep(ms),
+  healthDeadlineMs: 45_000,
+  healthIntervalMs: 500
+};
+
+// Ensure a launchd-managed instance's services are up VIA launchd, mirroring
+// the watchdog's revive shape (kickstart a loaded-but-down kind, bootstrap a
+// not-loaded one with `autostart enable`) instead of spawning a competing
+// detached daemon. Returns the same { banner, runtimeStarted } shape as
+// startLifecycle so printStartBanner and the desktop app's health-wait + web
+// URL read work unchanged. The happy path — everything already healthy, the
+// common case where launchd started it at login — is a zero-churn no-op.
+export async function startViaLaunchd(
+  config: RuntimeConfig,
+  web: WebOptions,
+  deps: StartViaLaunchdDeps = DEFAULT_START_VIA_LAUNCHD_DEPS
+): Promise<{ banner: Record<string, unknown>; runtimeStarted: boolean }> {
+  const instance = config.instance;
+  const runtimeUp = await deps.isRunning(config);
+  const webUrl = runtimeUp ? await deps.existingWebUrl(config, web.webPort) : null;
+  const watchdogLoaded = deps.isLoaded(instance, "watchdog");
+
+  if (runtimeUp && webUrl && watchdogLoaded) {
+    // Happy-path no-op: launchd already started everything (e.g. at login or a
+    // desktop relaunch). Do NOT bootout/kickstart/enable — zero launchd churn.
+    return {
+      banner: { running: true, url: url(config), instance, webUrl: operatorWebUrl(config) },
+      runtimeStarted: false
+    };
+  }
+
+  // Revive only what's down, gateway BEFORE web (the web plist shim waits on
+  // the gateway): a loaded-but-down kind is kickstarted; a not-loaded kind is
+  // bootstrapped via `autostart enable`.
+  const ensureUp = async (kind: PlistKind): Promise<void> => {
+    if (deps.isLoaded(instance, kind)) deps.kickstart(instance, kind);
+    else await deps.enable({ instance, kinds: [kind] });
+  };
+  if (!runtimeUp) await ensureUp("gateway");
+  if (!webUrl) await ensureUp("web");
+  if (!watchdogLoaded) await ensureUp("watchdog");
+
+  // Wait for health: both the gateway and the web must come up. Poll until
+  // both succeed or the deadline passes.
+  let healthyWebUrl: string | null = null;
+  const deadline = Date.now() + deps.healthDeadlineMs;
+  for (;;) {
+    const healthyRuntime = await deps.isRunning(config);
+    healthyWebUrl = healthyRuntime ? await deps.existingWebUrl(config, web.webPort) : null;
+    if (healthyRuntime && healthyWebUrl) break;
+    if (Date.now() >= deadline) break;
+    await deps.sleep(deps.healthIntervalMs);
+  }
+
+  const banner: Record<string, unknown> = {
+    started: true,
+    url: url(config),
+    instance,
+    webUrl: operatorWebUrl(config)
+  };
+  if (!healthyWebUrl) {
+    // Mirror how startLifecycle reports a web failure: keep the gateway-up
+    // result, carry a webError string rather than throwing.
+    banner.webError = `Web did not become healthy within ${Math.round(deps.healthDeadlineMs / 1000)}s.`;
+  }
+  return { banner, runtimeStarted: !runtimeUp };
+}
+
+// Route `gini start` on the TARGET INSTANCE's launchd state, symmetric to
+// `gini stop`. A launchd-managed instance is started via launchd (no competing
+// detached daemon); everything else takes the existing daemon/foreground path.
+export async function startInstance(
+  config: RuntimeConfig,
+  web: WebOptions
+): Promise<{ banner: Record<string, unknown>; runtimeStarted: boolean }> {
+  return isLaunchdManaged(config.instance)
+    ? startViaLaunchd(config, web)
+    : startLifecycle(config, web);
 }
 
 export function stop(ctx: CliContext): void {
@@ -219,7 +335,7 @@ export async function update(ctx: CliContext): Promise<void> {
     if (!stopped) {
       throw new Error(`Timed out waiting for instance '${ctx.config.instance}' to stop before restart.`);
     }
-    await startLifecycle(ctx.config, ctx.web);
+    await startInstance(ctx.config, ctx.web);
     step("Running instance restarted");
   }
 }
