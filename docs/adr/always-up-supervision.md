@@ -30,6 +30,24 @@ The model rests on four pieces:
   `gini run` / conductor / tmux instances do not use launchd KeepAlive and
   keep their existing PID-kill stop.
 
+- **`gini start` is launchd-aware, symmetric to `gini stop`.** Both route on
+  the same TARGET-instance launchd state — any service loaded OR any plist on
+  disk means launchd owns the instance — rather than on the calling process's
+  env (a terminal `gini start` has no `GINI_SUPERVISOR`). On a launchd-managed
+  instance, `gini start` (and the CLI update path's restart) ensures the
+  services *via launchd*: it kickstarts a loaded-but-down kind and bootstraps a
+  not-loaded one (`autostart enable`), gateway before web (the web plist shim
+  waits on the gateway), then waits for both to report healthy. When everything
+  is already healthy — the common case where launchd started the instance at
+  login — it is a zero-churn no-op (no bootout/kickstart/enable). It never
+  spawns a competing detached daemon. Spawning one created *dual supervision*:
+  the launchd web already held the canonical port, so the daemon's web couldn't
+  bind it and `availablePort` silently walked it to an offset port, splitting
+  the UI onto a port nothing points at — which made an update restart appear to
+  hang. Foreground / `gini run` / conductor / tmux instances (no plists, no
+  loaded services) are not launchd-managed and keep the existing detached-daemon
+  start byte-for-byte.
+
 - **Supervisor detection via a baked-in plist env var.** Each plist's
   `EnvironmentVariables` carries `GINI_SUPERVISOR=launchd`. At runtime
   `supervisor()` (`src/integrations/launchd.ts`) reads that env var and
@@ -235,6 +253,14 @@ launchd instances so foreground/conductor/tmux runs are unaffected.
   watchdog targets (a target that isn't loaded counts as a successful
   stop); on a foreground instance it SIGTERMs the PID and does not call
   bootout.
+- `gini start` on a launchd-managed instance (a service loaded or a plist on
+  disk) ensures the services via launchd and never spawns a detached daemon:
+  already-healthy is a no-op with zero kickstart/enable/bootout calls; a
+  loaded-but-down kind is kickstarted; a not-loaded kind is bootstrapped via
+  `autostart enable`; and a web that never comes healthy within the deadline
+  yields a `webError` banner rather than throwing or hanging. On a
+  non-launchd instance, start takes the existing detached-daemon path
+  unchanged.
 - An auto-update on a launchd instance self-SIGTERMs and is respawned by
   KeepAlive with the new code, and dispatches detached
   `gini autostart kick` children for web AND the watchdog — the long-lived
