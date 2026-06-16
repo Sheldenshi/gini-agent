@@ -925,6 +925,70 @@ describe("runtime api", () => {
     expect(tasks.find((t) => t.id === untagged.taskId)?.clientSurface).toBeUndefined();
   });
 
+  test("queues a chat message posted during an in-flight turn and DELETE drops it", async () => {
+    // While a session has a non-terminal chat task, a new POST enqueues onto
+    // the session instead of starting a concurrent task; the queued item is
+    // removable via DELETE /api/chat/:id/pending/:pendingId. See ADR
+    // chat-message-queue.md.
+    const config = testConfig("chat-queue-http");
+    const handler = createHandler(config);
+
+    const session = await call(handler, config, "/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ title: "queue chat" })
+    });
+    // Seed a non-terminal task on the session so the next submit reads as busy
+    // (without depending on a still-running agent loop).
+    await mutateState(config.instance, (state) => {
+      const at = new Date().toISOString();
+      state.tasks.push({
+        id: "task_busy",
+        title: "busy",
+        input: "busy",
+        status: "running",
+        instance: state.instance,
+        createdAt: at,
+        updatedAt: at,
+        tracePath: "",
+        auditIds: [],
+        approvalIds: [],
+        skillIds: [],
+        chatSessionId: session.id
+      });
+      const record = state.chatSessions.find((s) => s.id === session.id);
+      if (record) record.taskIds.push("task_busy");
+    });
+
+    const queued = await call(handler, config, `/api/chat/${session.id}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ content: "while you were out" })
+    });
+    expect(queued.queued).toBe(true);
+    expect(queued.pendingId).toBeString();
+    expect(queued.taskId).toBeUndefined();
+
+    let pending = readState(config.instance).chatSessions.find((s) => s.id === session.id)?.pendingMessages ?? [];
+    expect(pending.map((p: { content: string }) => p.content)).toEqual(["while you were out"]);
+
+    // Unknown pending id → 404.
+    const missing = await rawCall(
+      handler,
+      config,
+      `/api/chat/${session.id}/pending/pending_nope`,
+      { method: "DELETE" },
+      config.token
+    );
+    expect(missing.status).toBe(404);
+
+    // Removing the real pending id clears the queue and reports removed:true.
+    const removed = await call(handler, config, `/api/chat/${session.id}/pending/${queued.pendingId}`, {
+      method: "DELETE"
+    });
+    expect(removed.removed).toBe(true);
+    pending = readState(config.instance).chatSessions.find((s) => s.id === session.id)?.pendingMessages ?? [];
+    expect(pending).toHaveLength(0);
+  });
+
   test("approval-gated file patch produces a diff approval", async () => {
     // Memory CRUD via `/api/memory` was removed alongside the
     // state.memories consolidation. See ADR
