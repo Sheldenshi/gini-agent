@@ -111,10 +111,16 @@ export interface AgentRecord {
   messagingTargets?: unknown[];
   createdAt: string;
   updatedAt: string;
+  // Archived marker (absent = active). Archived agents keep their memory
+  // pool and history but move to the UI's Archived section and stop running.
+  archivedAt?: string;
 }
 
 export interface AgentsResponse {
   activeAgentId?: string;
+  // The always-present fallback agent. It can't be archived server-side, so
+  // the agent list suppresses the archive affordance for this id.
+  defaultAgentId?: string;
   agents: AgentRecord[];
 }
 

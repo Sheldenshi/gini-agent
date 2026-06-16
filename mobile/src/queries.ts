@@ -80,6 +80,40 @@ export function useUseAgent() {
   });
 }
 
+// Soft-deletes an agent (POST /agents/:id/archive): the runtime stamps
+// `archivedAt`, moves it to the Archived section, and stops its scheduled
+// jobs. Archiving the active agent hands "active" back to the default
+// server-side, so we invalidate the same keys as useUseAgent — the active
+// selection (status) and its chat list both shift.
+export function useArchiveAgent() {
+  const qc = useQueryClient();
+  return useMutation<AgentRecord, Error, string>({
+    mutationFn: (agentId: string) =>
+      api<AgentRecord>(`/agents/${agentId}/archive`, { method: "POST" }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["agents"] });
+      qc.invalidateQueries({ queryKey: ["status"] });
+      qc.invalidateQueries({ queryKey: ["chats"] });
+    }
+  });
+}
+
+// Restores an archived agent (POST /agents/:id/unarchive): clears
+// `archivedAt` so it rejoins the active list (still inactive — restore never
+// auto-activates). Same invalidation set as archive for symmetry.
+export function useUnarchiveAgent() {
+  const qc = useQueryClient();
+  return useMutation<AgentRecord, Error, string>({
+    mutationFn: (agentId: string) =>
+      api<AgentRecord>(`/agents/${agentId}/unarchive`, { method: "POST" }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["agents"] });
+      qc.invalidateQueries({ queryKey: ["status"] });
+      qc.invalidateQueries({ queryKey: ["chats"] });
+    }
+  });
+}
+
 // POST /api/agents only requires `name`; the runtime copies provider /
 // toolsets / messaging targets from the default agent (see
 // src/capabilities/agents.ts). The created agent is returned so callers

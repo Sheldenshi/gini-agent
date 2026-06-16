@@ -3,6 +3,7 @@ import { router, Stack } from "expo-router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
+  Alert,
   RefreshControl,
   ScrollView,
   StyleSheet,
@@ -11,6 +12,8 @@ import {
   TouchableOpacity,
   View
 } from "react-native";
+import ReanimatedSwipeable from "react-native-gesture-handler/ReanimatedSwipeable";
+import type { SwipeableMethods } from "react-native-gesture-handler/ReanimatedSwipeable";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { api, ApiError } from "@/src/api";
 import { clearCredentials } from "@/src/auth";
@@ -18,9 +21,11 @@ import { AgentAvatar } from "@/src/components/chat/AgentAvatar";
 import { chatListTime, jobCadence } from "@/src/format";
 import {
   useAgents,
+  useArchiveAgent,
   useChannels,
   useCreateAgent,
   useJobs,
+  useUnarchiveAgent,
   useUnreadCounts
 } from "@/src/queries";
 import { family, theme } from "@/src/theme";
@@ -36,6 +41,8 @@ export default function ChannelsScreen() {
   const channels = useChannels();
   const jobs = useJobs("all");
   const createAgent = useCreateAgent();
+  const archiveMutation = useArchiveAgent();
+  const unarchiveMutation = useUnarchiveAgent();
   const unreadCountsQuery = useUnreadCounts();
   const unreadCounts = unreadCountsQuery.data ?? {};
 
@@ -73,12 +80,60 @@ export default function ChannelsScreen() {
 
   const agentList = useMemo<AgentRecord[]>(() => agents.data?.agents ?? [], [agents.data]);
   const channelList = channels.data ?? [];
+  const defaultAgentId = agents.data?.defaultAgentId;
+
+  // `archivedAt` is a soft-delete marker orthogonal to `status`. Archived
+  // agents leave the main "Agents" list and render in their own section, so
+  // the main list and its search filter operate on the active set only.
+  const activeAgents = useMemo(
+    () => agentList.filter((a) => !a.archivedAt),
+    [agentList]
+  );
+  const archivedAgents = useMemo(
+    () => agentList.filter((a) => a.archivedAt),
+    [agentList]
+  );
 
   const filteredAgents = useMemo(() => {
     const q = query.trim().toLowerCase();
-    if (!q) return agentList;
-    return agentList.filter((a) => a.name.toLowerCase().includes(q));
-  }, [agentList, query]);
+    if (!q) return activeAgents;
+    return activeAgents.filter((a) => a.name.toLowerCase().includes(q));
+  }, [activeAgents, query]);
+
+  // Confirm before archiving — it stops the agent and moves it out of the
+  // main list. The default agent never reaches here (its row is unswipeable),
+  // matching the server guard that refuses to archive it.
+  const confirmArchive = useCallback(
+    (agent: AgentRecord) => {
+      Alert.alert(
+        `Archive ${agent.name}?`,
+        `${agent.name} will move to your Archived section and stop running.`,
+        [
+          { text: "Cancel", style: "cancel" },
+          {
+            text: "Archive",
+            style: "destructive",
+            onPress: () =>
+              archiveMutation.mutate(agent.id, {
+                onError: (err) =>
+                  Alert.alert("Couldn't archive", err.message || "Please try again.")
+              })
+          }
+        ]
+      );
+    },
+    [archiveMutation]
+  );
+
+  const restoreAgent = useCallback(
+    (agent: AgentRecord) => {
+      unarchiveMutation.mutate(agent.id, {
+        onError: (err) =>
+          Alert.alert("Couldn't restore", err.message || "Please try again.")
+      });
+    },
+    [unarchiveMutation]
+  );
 
   // Open an agent's single chat. The resolver is idempotent server-side;
   // we fetch the session id directly here (rather than via the cached
@@ -198,24 +253,37 @@ export default function ChannelsScreen() {
             />
           }
         >
-          {/* Agents section */}
+          {/* Agents section — active agents only; archived ones render below. */}
           <View style={styles.sectionHeader}>
             <Text style={styles.sectionLabel}>Agents</Text>
-            <Text style={styles.sectionCount}>{agentList.length}</Text>
+            <Text style={styles.sectionCount}>{filteredAgents.length}</Text>
           </View>
           {filteredAgents.length === 0 ? (
             <Text style={styles.emptySub}>
               {query.trim() ? `No agents match “${query}”` : "No agents yet"}
             </Text>
           ) : (
-            filteredAgents.map((agent) => (
-              <AgentRow
-                key={agent.id}
-                agent={agent}
-                opening={openingAgentId === agent.id}
-                onPress={() => void openAgent(agent)}
-              />
-            ))
+            filteredAgents.map((agent) =>
+              // The default agent can't be archived server-side, so it renders
+              // as a plain row — offering a guaranteed-fail swipe would be a
+              // dead affordance.
+              agent.id === defaultAgentId ? (
+                <AgentRow
+                  key={agent.id}
+                  agent={agent}
+                  opening={openingAgentId === agent.id}
+                  onPress={() => void openAgent(agent)}
+                />
+              ) : (
+                <SwipeableAgentRow
+                  key={agent.id}
+                  agent={agent}
+                  opening={openingAgentId === agent.id}
+                  onPress={() => void openAgent(agent)}
+                  onArchive={confirmArchive}
+                />
+              )
+            )
           )}
 
           {/* Recurring Jobs section — channels */}
@@ -233,6 +301,28 @@ export default function ChannelsScreen() {
                   channel={channel}
                   job={jobBySessionId.get(channel.id)}
                   unreadCount={unreadCounts[channel.id] ?? 0}
+                />
+              ))}
+            </>
+          ) : null}
+
+          {/* Archived section — soft-deleted agents, dimmed, with one-tap
+              restore. Rendered only when at least one agent is archived. */}
+          {archivedAgents.length > 0 ? (
+            <>
+              <View style={[styles.sectionHeader, styles.jobsHeader]}>
+                <Text style={styles.sectionLabel}>Archived</Text>
+                <Text style={styles.sectionCount}>{archivedAgents.length}</Text>
+              </View>
+              {archivedAgents.map((agent) => (
+                <ArchivedAgentRow
+                  key={agent.id}
+                  agent={agent}
+                  restoring={
+                    unarchiveMutation.isPending &&
+                    unarchiveMutation.variables === agent.id
+                  }
+                  onRestore={() => restoreAgent(agent)}
                 />
               ))}
             </>
@@ -290,6 +380,89 @@ function AgentRow({
         </Text>
       </View>
     </TouchableOpacity>
+  );
+}
+
+// AgentRow wrapped in a left-swipe-to-archive gesture. A left swipe reveals
+// a red Archive action (renderRightActions); tapping it closes the swipeable
+// and hands off to the confirm dialog. The default agent skips this wrapper
+// (see the list render) since it can't be archived.
+function SwipeableAgentRow({
+  agent,
+  opening,
+  onPress,
+  onArchive
+}: {
+  agent: AgentRecord;
+  opening: boolean;
+  onPress: () => void;
+  onArchive: (agent: AgentRecord) => void;
+}) {
+  const swipeRef = useRef<SwipeableMethods>(null);
+  return (
+    <ReanimatedSwipeable
+      ref={swipeRef}
+      friction={2}
+      rightThreshold={40}
+      renderRightActions={() => (
+        <TouchableOpacity
+          onPress={() => {
+            swipeRef.current?.close();
+            onArchive(agent);
+          }}
+          activeOpacity={0.8}
+          style={styles.archiveAction}
+          accessibilityRole="button"
+          accessibilityLabel={`Archive ${agent.name}`}
+        >
+          <Feather name="archive" size={20} color="#FFFFFF" />
+          <Text style={styles.archiveActionLabel}>Archive</Text>
+        </TouchableOpacity>
+      )}
+    >
+      <AgentRow agent={agent} opening={opening} onPress={onPress} />
+    </ReanimatedSwipeable>
+  );
+}
+
+// Dimmed archived-agent row: avatar + name + a one-tap Restore control.
+// Restore is a direct, no-confirm action (mirrors the web's one-click
+// restore); the row stays tappable so the chat history is still reachable.
+function ArchivedAgentRow({
+  agent,
+  restoring,
+  onRestore
+}: {
+  agent: AgentRecord;
+  restoring: boolean;
+  onRestore: () => void;
+}) {
+  return (
+    <View style={[styles.agentRow, styles.archivedRow]}>
+      <AgentAvatar name={agent.name} size={48} online={false} />
+      <View style={styles.agentBody}>
+        <Text style={styles.agentName} numberOfLines={1}>
+          {agent.name}
+        </Text>
+        <Text style={styles.agentPreview} numberOfLines={1}>
+          Archived
+        </Text>
+      </View>
+      <TouchableOpacity
+        onPress={onRestore}
+        disabled={restoring}
+        hitSlop={8}
+        style={styles.restoreButton}
+        accessibilityRole="button"
+        accessibilityLabel={`Restore ${agent.name}`}
+      >
+        {restoring ? (
+          <ActivityIndicator size="small" color={theme.accent} />
+        ) : (
+          <Feather name="rotate-ccw" size={18} color={theme.accent} />
+        )}
+      </TouchableOpacity>
+    </View>
   );
 }
 
@@ -510,6 +683,24 @@ const styles = StyleSheet.create({
     fontSize: 14,
     lineHeight: 18
   },
+
+  // Left-swipe Archive action revealed behind an active agent row.
+  archiveAction: {
+    backgroundColor: theme.danger,
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 4,
+    paddingHorizontal: 20
+  },
+  archiveActionLabel: {
+    color: "#FFFFFF",
+    fontFamily: family("HankenGrotesk", 600),
+    fontSize: 12
+  },
+
+  // Archived agent row — dimmed, with a Restore control on the right.
+  archivedRow: { opacity: 0.6 },
+  restoreButton: { padding: 8 },
 
   // Channel row — timer tile + name/schedule + next-run.
   channelRow: {
