@@ -162,6 +162,36 @@ describe("chat message queue", () => {
     expect(readState(config.instance).tasks.length).toBe(tasksBefore);
   });
 
+  test("bypassQueue runs immediately even while a turn is in flight, never enqueuing", async () => {
+    // The messaging bridge passes { bypassQueue: true } so every inbound
+    // message gets its own taskId — the poller's reply-mirror waits on that
+    // task and sends the assistant reply back out. A queued submit would
+    // land without a taskId and the reply would be silently dropped. Pin
+    // that bypassQueue runs now (new task, returned taskId) and does NOT
+    // enqueue, even with a turn already in flight.
+    const config = buildConfig(workspaceRoot, "queue-bypass");
+    stubTurn(config);
+    const chat = await createChat(config, { title: "bypass" });
+    await seedInFlightTask(config, chat.id);
+    const tasksBefore = readState(config.instance).tasks.length;
+
+    const result = await submitChatMessage(
+      config,
+      chat.id,
+      { content: "from messaging" },
+      { bypassQueue: true }
+    );
+
+    // Run-now shape: a real taskId, no queued flag.
+    expect("queued" in result).toBe(false);
+    expect(result.taskId).toBeString();
+    // A new task was created and the queue stayed empty.
+    expect(readState(config.instance).tasks.length).toBe(tasksBefore + 1);
+    expect(session(config, chat.id)?.pendingMessages ?? []).toHaveLength(0);
+
+    await waitForStatus(config, result.taskId, (t) => t.status === "completed");
+  });
+
   test("enqueues behind an existing queue even when no task is running, preserving order", async () => {
     const config = buildConfig(workspaceRoot, "queue-nonempty-no-task");
     const chat = await createChat(config, { title: "ordered" });

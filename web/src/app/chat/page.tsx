@@ -448,7 +448,6 @@ function ChatSurface({
             <div className="px-6 pb-5 pt-2">
               <div className="mx-auto w-full max-w-3xl">
                 <QueuedMessages
-                  sessionId={sessionId}
                   pending={pendingMessages}
                   onRemove={(pendingId) =>
                     removePending.mutate(pendingId, {

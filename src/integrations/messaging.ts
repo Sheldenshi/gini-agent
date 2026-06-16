@@ -372,9 +372,11 @@ export async function receiveMessagingInput(config: RuntimeConfig, idOrName: str
   // runtime can mirror assistant replies back out to the originating
   // chat. demo / generic bridges keep the standalone-task path for
   // tests and CLI parity.
-  // Undefined when the submit was queued behind an in-flight turn (ADR
-  // chat-message-queue.md) — the task is created later at auto-dispatch, so
-  // the inbound record lands without a task linkage in that case.
+  // Messaging bypasses the interactive-client queue (ADR
+  // chat-message-queue.md): each inbound message runs immediately and gets
+  // its own taskId, which the poller's reply-mirror needs to wait on and
+  // send the assistant reply back out. A queued submit would land without a
+  // taskId and silently drop the reply.
   let taskId: string | undefined;
   let target: string;
   if (bridge.kind === "telegram") {
@@ -405,8 +407,8 @@ export async function receiveMessagingInput(config: RuntimeConfig, idOrName: str
       }
       return sess;
     });
-    const result = await submitChatMessage(config, session.id, { content: text });
-    taskId = "queued" in result ? undefined : result.taskId;
+    const result = await submitChatMessage(config, session.id, { content: text }, { bypassQueue: true });
+    taskId = result.taskId;
   } else if (bridge.kind === "discord") {
     const channelId = rawTarget.trim();
     if (!channelId) {
@@ -425,8 +427,8 @@ export async function receiveMessagingInput(config: RuntimeConfig, idOrName: str
       }
       return sess;
     });
-    const result = await submitChatMessage(config, session.id, { content: text });
-    taskId = "queued" in result ? undefined : result.taskId;
+    const result = await submitChatMessage(config, session.id, { content: text }, { bypassQueue: true });
+    taskId = result.taskId;
   } else {
     target = rawTarget || "local";
     const task = await submitTask(config, text);

@@ -15,7 +15,6 @@ export function QueuedMessages({
   pending,
   onRemove
 }: {
-  sessionId: string;
   pending: PendingChatMessage[];
   onRemove: (pendingId: string) => void;
 }) {

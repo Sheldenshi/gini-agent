@@ -487,8 +487,39 @@ async function runChatSubmission(
   return { sessionId, runId: run.id, taskId: task.id, status: task.status };
 }
 
-export async function submitChatMessage(config: RuntimeConfig, sessionId: string, input: Record<string, unknown>) {
+// bypassQueue guarantees the run-now shape, so the messaging bridge gets a
+// taskId without narrowing on a `queued` discriminant. The default (and the
+// explicit { bypassQueue: false }) keeps the discriminated union for
+// interactive clients that must handle the queued case.
+type RunNowResult = Awaited<ReturnType<typeof runChatSubmission>>;
+type QueuedResult = { sessionId: string; queued: true; pendingId: string };
+export function submitChatMessage(
+  config: RuntimeConfig,
+  sessionId: string,
+  input: Record<string, unknown>,
+  options: { bypassQueue: true }
+): Promise<RunNowResult>;
+export function submitChatMessage(
+  config: RuntimeConfig,
+  sessionId: string,
+  input: Record<string, unknown>,
+  options?: { bypassQueue?: boolean }
+): Promise<RunNowResult | QueuedResult>;
+export async function submitChatMessage(
+  config: RuntimeConfig,
+  sessionId: string,
+  input: Record<string, unknown>,
+  options?: { bypassQueue?: boolean }
+): Promise<RunNowResult | QueuedResult> {
   const prepared = await prepareChatSubmission(config, sessionId, input);
+  // The queue is for interactive clients (web/mobile/CLI composer), where a
+  // human queues follow-ups while watching a turn. The messaging bridge is a
+  // different ingestion path whose reply-mirror contract depends on a
+  // per-inbound-message taskId, so it passes bypassQueue to always run now.
+  // See ADR chat-message-queue.md.
+  if (options?.bypassQueue) {
+    return runChatSubmission(config, sessionId, prepared);
+  }
   // Enqueue instead of running when a turn is already in flight for this
   // session, or when the queue is already non-empty (so a later submit can't
   // jump ahead of earlier queued messages while the current turn runs). The
