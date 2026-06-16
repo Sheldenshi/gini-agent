@@ -128,7 +128,14 @@ export function JobsTab() {
       {view === "list" && selectedJob ? (
         <ScrollArea className="min-h-0 flex-1">
           <div className="px-8 pb-8 pt-6">
-            <JobDetailPanel job={selectedJob} onBack={() => setSelectedId(null)} />
+            <JobDetailPanel
+              job={selectedJob}
+              deliveryLabel={deliveryLabel(selectedJob, sessionsById)}
+              actionPending={action.isPending}
+              onBack={() => setSelectedId(null)}
+              onAction={(op) => action.mutate({ id: selectedJob.id, op })}
+              onRequestDelete={() => setDeletingJob(selectedJob)}
+            />
           </div>
         </ScrollArea>
       ) : view === "list" ? (
@@ -295,7 +302,7 @@ function deliveryLabel(job: JobRecord, sessionsById: Map<string, ChatSession>): 
 }
 
 // Job card — design `y6aU9` (Job List Item). The header is a click target that
-// opens the job detail (fan-out) view; the action buttons stop propagation so
+// opens the job details view; the action buttons stop propagation so
 // Run/Pause/Resume don't also select.
 function JobCard({
   job,
@@ -378,10 +385,26 @@ function JobCard({
   );
 }
 
-// Job detail (fan-out) view shown when a JobCard is selected. Renders a back
-// control + the job summary + the fan-out concern list. JobFanout owns the
-// generic-vs-email branch; this panel stays domain-agnostic.
-function JobDetailPanel({ job, onBack }: { job: JobRecord; onBack: () => void }) {
+// Job details view shown when a JobCard is selected. A header card (name,
+// schedule, status, and the same Run/Pause/Resume/Delete actions as the list
+// card) over the job's full details — schedule stats, prompt/script, optional
+// chip sections — with the fan-out concern list as one final section. JobFanout
+// owns the generic-vs-email branch; this panel stays domain-agnostic.
+function JobDetailPanel({
+  job,
+  deliveryLabel,
+  actionPending,
+  onBack,
+  onAction,
+  onRequestDelete
+}: {
+  job: JobRecord;
+  deliveryLabel: string | null;
+  actionPending: boolean;
+  onBack: () => void;
+  onAction: (op: "run" | "pause" | "resume") => void;
+  onRequestDelete: () => void;
+}) {
   return (
     <div className="flex max-w-[680px] flex-col gap-5">
       <button
@@ -400,19 +423,144 @@ function JobDetailPanel({ job, onBack }: { job: JobRecord; onBack: () => void })
             <p className="truncate font-mono text-[11.5px] text-muted-foreground" title={job.cronExpression ?? undefined}>
               {job.id} · {scheduleLabel(job)}
             </p>
+            {job.cronExpression ? (
+              <p className="truncate font-mono text-[11px] text-muted-foreground" title="Raw cron expression">
+                {job.cronExpression}
+              </p>
+            ) : null}
           </div>
           <JobStatusBadge status={job.status} />
         </div>
-        <div className="flex flex-col gap-[5px] text-[12.5px] text-muted-foreground">
-          <span>last run {job.lastRunAt ? new Date(job.lastRunAt).toLocaleString() : "—"}</span>
-          <span>next {job.nextRunAt ? new Date(job.nextRunAt).toLocaleString() : "—"}</span>
-          <span className="font-medium text-muted-foreground">
-            {job.runCount} runs · {job.missedRuns} missed
-          </span>
+        <div className="flex gap-2.5">
+          <button
+            type="button"
+            disabled={actionPending}
+            onClick={() => onAction("run")}
+            className="rounded-lg bg-primary px-4 py-2 text-[13px] font-semibold text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-50"
+          >
+            Run
+          </button>
+          {job.status === "active" ? (
+            <button
+              type="button"
+              disabled={actionPending}
+              onClick={() => onAction("pause")}
+              className="rounded-lg border border-border bg-card px-4 py-2 text-[13px] font-semibold text-foreground transition-colors hover:bg-muted disabled:opacity-50"
+            >
+              Pause
+            </button>
+          ) : (
+            <button
+              type="button"
+              disabled={actionPending}
+              onClick={() => onAction("resume")}
+              className="rounded-lg border border-border bg-card px-4 py-2 text-[13px] font-semibold text-foreground transition-colors hover:bg-muted disabled:opacity-50"
+            >
+              Resume
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={onRequestDelete}
+            aria-label={`Delete ${job.name}`}
+            title="Delete job"
+            className="ml-auto flex items-center gap-1.5 rounded-lg border border-border bg-card px-3 py-2 text-[13px] font-semibold text-muted-foreground transition-colors hover:border-destructive/40 hover:bg-destructive/10 hover:text-destructive"
+          >
+            <Trash2 className="size-[15px]" />
+            Delete
+          </button>
         </div>
       </div>
 
+      <DetailSection title="Details">
+        <div className="grid grid-cols-2 gap-x-6 gap-y-3">
+          <DetailKV label="Last run" value={job.lastRunAt ? new Date(job.lastRunAt).toLocaleString() : "—"} />
+          <DetailKV label="Next run" value={job.nextRunAt ? new Date(job.nextRunAt).toLocaleString() : "—"} />
+          <DetailKV label="Last success" value={job.lastSuccessAt ? new Date(job.lastSuccessAt).toLocaleString() : "—"} />
+          <DetailKV label="Last failure" value={job.lastFailureAt ? new Date(job.lastFailureAt).toLocaleString() : "—"} />
+          <DetailKV label="Runs" value={String(job.runCount)} />
+          <DetailKV label="Missed" value={String(job.missedRuns)} />
+          <DetailKV label="Retry limit" value={String(job.retryLimit ?? "—")} />
+          <DetailKV label="Timeout" value={`${job.timeoutSeconds ?? "—"}s`} />
+          {deliveryLabel ? <DetailKV label="Delivers to" value={deliveryLabel} /> : null}
+          {typeof job.costBudget === "number" ? (
+            <DetailKV label="Cost budget" value={`$${job.costBudget.toFixed(2)}`} />
+          ) : null}
+        </div>
+      </DetailSection>
+
+      {(job.skillNames?.length ?? 0) > 0 ? (
+        <DetailSection title="Skill attachments">
+          <div className="flex flex-wrap gap-1.5">
+            {job.skillNames?.map((name) => (
+              <span
+                key={name}
+                className="rounded-md border border-border bg-card/50 px-2 py-0.5 font-mono text-[11px] text-muted-foreground"
+              >
+                {name}
+              </span>
+            ))}
+          </div>
+        </DetailSection>
+      ) : null}
+
+      {(job.context?.length ?? 0) > 0 ? (
+        <DetailSection title="Context">
+          <div className="flex flex-wrap gap-1.5">
+            {job.context.map((item) => (
+              <span
+                key={item}
+                className="rounded-md border border-border bg-card/50 px-2 py-0.5 font-mono text-[11px] text-muted-foreground"
+              >
+                {item}
+              </span>
+            ))}
+          </div>
+        </DetailSection>
+      ) : null}
+
+      <DetailSection title={job.script ? "Prompt & script" : "Prompt"}>
+        <pre className="whitespace-pre-wrap break-words rounded-md border border-border bg-card/50 p-3 font-mono text-[12px] text-foreground">
+          {job.prompt}
+        </pre>
+        {job.script ? (
+          <div className="flex flex-col gap-1.5">
+            <span className="text-[11px] uppercase tracking-[0.5px] text-muted-foreground">Script</span>
+            <pre className="whitespace-pre-wrap break-words rounded-md border border-border bg-card/50 p-3 font-mono text-[12px] text-foreground">
+              {job.script}
+            </pre>
+          </div>
+        ) : null}
+      </DetailSection>
+
+      {job.lastError ? (
+        <DetailSection title="Last error">
+          <pre className="whitespace-pre-wrap break-words text-[12px] text-red-400">{job.lastError}</pre>
+        </DetailSection>
+      ) : null}
+
+      {/* Fan-out concerns — self-hides (renders null) for non-fan-out jobs. */}
       <JobFanout job={job} />
+    </div>
+  );
+}
+
+// Titled card used to group a section of the job details view.
+function DetailSection({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <div className="flex flex-col gap-3 rounded-[10px] border border-border bg-card p-4">
+      <span className="text-[11px] font-bold uppercase tracking-[0.6px] text-muted-foreground">{title}</span>
+      {children}
+    </div>
+  );
+}
+
+// Stacked label-over-value pair for the details grid.
+function DetailKV({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex flex-col gap-1">
+      <span className="text-[11px] uppercase tracking-[0.5px] text-muted-foreground">{label}</span>
+      <span className="truncate text-[13px] text-foreground">{value}</span>
     </div>
   );
 }
