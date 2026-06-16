@@ -104,7 +104,8 @@ describe("maybeAskAboutCrashes", () => {
     await maybeAskAboutCrashes(configFor("default"), {
       createJobImpl,
       supervisorImpl: () => "launchd",
-      clock: () => FIXED_NOW
+      clock: () => FIXED_NOW,
+      resolveDeliverySessionImpl: async () => "chat_main"
     });
 
     // Exactly one job, batching both distinct fingerprints.
@@ -114,7 +115,11 @@ describe("maybeAskAboutCrashes", () => {
     expect(input.oneShot).toBe(true);
     expect(input.intervalSeconds).toBe(2);
     expect(input.timeoutSeconds).toBe(120);
-    expect(input.createDedicatedSession).toEqual({ title: "Crash report" });
+    // The consent question is delivered into the active agent's canonical chat
+    // (the conversation the user reads), NOT a dedicated job channel that the
+    // sidebar would hide.
+    expect(input.chatSessionId).toBe("chat_main");
+    expect(input.createDedicatedSession).toBeUndefined();
     const prompt = String(input.prompt);
     // 2 distinct fingerprints -> count of 2 in the prompt.
     expect(prompt).toContain("2 crashes");
@@ -141,7 +146,8 @@ describe("maybeAskAboutCrashes", () => {
     await maybeAskAboutCrashes(configFor("default"), {
       createJobImpl: first.impl,
       supervisorImpl: () => "launchd",
-      clock: () => FIXED_NOW
+      clock: () => FIXED_NOW,
+      resolveDeliverySessionImpl: async () => "chat_main"
     });
     expect(first.calls.length).toBe(1);
 
@@ -155,6 +161,24 @@ describe("maybeAskAboutCrashes", () => {
       clock: () => later
     });
     expect(second.calls.length).toBe(0);
+  });
+
+  test("no agent chat to deliver into -> no ask AND no stamp (a later boot can still ask)", async () => {
+    seedPending("default", "boom");
+    const fp = listPendingReports()[0]!.report.fingerprint;
+
+    const { impl: createJobImpl, calls } = makeRecorder();
+    await maybeAskAboutCrashes(configFor("default"), {
+      createJobImpl,
+      supervisorImpl: () => "launchd",
+      clock: () => FIXED_NOW,
+      resolveDeliverySessionImpl: async () => undefined
+    });
+
+    // No job created, and crucially lastAskedAt is NOT stamped — otherwise the
+    // ask would be swallowed for the 24h window before any agent could see it.
+    expect(calls.length).toBe(0);
+    expect(readRateLimitState(fp).lastAskedAt).toBeNull();
   });
 
   test("non-default instance -> no ask", async () => {
