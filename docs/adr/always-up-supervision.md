@@ -163,14 +163,24 @@ respawn. The watchdog binds nothing, so it skips the wait.
 
 Auto-update no longer orphans the runtime. Both restart paths — the web-update
 self-restart (`scheduleRuntimeRestart`, `src/runtime/update.ts`) and the
-`gini update` CLI restart (`src/cli/commands/admin.ts`) — route on the
-**instance's** launchd state (`isLaunchdManaged`: any service loaded or any
-plist on disk), not solely the gateway's own `GINI_SUPERVISOR` env. The common
-case is a launchd-spawned gateway, but a foreground gateway running on an
-instance that also has launchd plists (dual supervision — a pre-existing state
-or a manual `gini run` on a launchd instance) restarts through launchd too,
-rather than the foreground stop+start helper that could spawn a competing
-daemon and walk the canonical port to an offset.
+`gini update` CLI restart (`src/cli/commands/admin.ts`) — route on whether the
+**gateway is actively loaded** under launchd (`isLoaded(instance, "gateway")`),
+not solely the gateway's own `GINI_SUPERVISOR` env. This is narrower than the
+`isLaunchdManaged` predicate that `gini stop`/`gini start` use, and
+deliberately so: the launchd restart branch relies on a *loaded* gateway job —
+the self-restart self-SIGTERMs and counts on KeepAlive to respawn it, and the
+CLI restart `launchctl bootout`s it, both of which only apply to a loaded job.
+The common case is a launchd-spawned gateway, but a foreground gateway running
+on an instance whose launchd gateway is also loaded (dual supervision — a
+pre-existing state or a manual `gini run` on a launchd instance) restarts
+through launchd too, rather than the foreground stop+start helper that could
+spawn a competing daemon and walk the canonical port to an offset. An instance
+whose gateway plist is on disk but booted out (not loaded) has no job for
+KeepAlive to respawn or for bootout to stop, so it takes the foreground branch,
+where the launchd-aware `gini start` bootstraps the gateway back from its plist.
+By contrast, `gini stop`/`gini start` route on the broader `isLaunchdManaged`
+(any service loaded OR any plist on disk) because `gini start` can bootstrap a
+not-loaded plist and `gini stop` can boot out a registered-but-stopped one.
 
 For a launchd instance, `scheduleRuntimeRestart` self-SIGTERMs after the
 update has already run `git reset --hard` + `bun install` synchronously;
@@ -245,11 +255,15 @@ launchd instances so foreground/conductor/tmux runs are unaffected.
 - True foreground / `gini run` / conductor / tmux instances (no
   `GINI_SUPERVISOR` env AND no launchd plists) keep their existing behavior end
   to end: no KeepAlive, PID-kill stop, and the detached stop+start update
-  helper. An instance with launchd plists is launchd-managed regardless of the
-  calling process's env, so its restart paths route through launchd (see the
-  auto-update acceptance check below) — the env marker drives the gateway's own
-  runtime behavior, while `isLaunchdManaged` (any service loaded or any plist on
-  disk) drives how the CLI/web-update paths stop and start the instance.
+  helper. An instance with a loaded launchd gateway routes its restart paths
+  through launchd regardless of the calling process's env (see the auto-update
+  acceptance check below) — the env marker drives the gateway's own runtime
+  behavior; the two restart paths route on `isLoaded(instance, "gateway")`
+  because their launchd branch needs a loaded job (KeepAlive respawn /
+  bootout), while `gini stop`/`gini start` route on the broader
+  `isLaunchdManaged` (any service loaded or any plist on disk) because start can
+  bootstrap a not-loaded plist and stop can boot out a registered-but-stopped
+  one.
 - A crash-looping service is bounded by `ThrottleInterval` (10s) rather
   than respawning as fast as it dies. A crash also leaves a redacted report
   in a local queue, which the user is asked to file as a GitHub issue on the
@@ -278,20 +292,25 @@ launchd instances so foreground/conductor/tmux runs are unaffected.
   yields a `webError` banner rather than throwing or hanging. On a
   non-launchd instance, start takes the existing detached-daemon path
   unchanged.
-- Both restart paths route on the instance's launchd state (`isLaunchdManaged`:
-  any service loaded or any plist on disk), not solely the gateway's
-  `GINI_SUPERVISOR` env, so a dual-supervisor anomaly (no env but plists exist)
-  restarts cleanly through launchd rather than the foreground helper. An
-  auto-update (`scheduleRuntimeRestart`) on a launchd-managed instance
-  self-SIGTERMs and is respawned by KeepAlive with the new code, and dispatches
-  detached `gini autostart kick` children for web AND the watchdog — the
-  long-lived watchdog loop never exits on its own and a code-only update leaves
-  its plist stamp unchanged, so the explicit kick is the only thing that
-  replaces its process with the new code. The `gini update` CLI restart on a
-  launchd-managed instance boots out the gateway (a plain SIGTERM would be
-  respawned by KeepAlive), sweeps the pid/port files, waits for it to stop
-  answering, then re-ensures via launchd. On a true foreground / no-plist
-  instance both paths use the detached SIGTERM-based stop+start helper.
+- Both restart paths route on whether the gateway is actively loaded under
+  launchd (`isLoaded(instance, "gateway")`), not solely the gateway's
+  `GINI_SUPERVISOR` env and not the broader `isLaunchdManaged` predicate that
+  `gini stop`/`gini start` use — the launchd restart branch needs a loaded job
+  (KeepAlive respawn / bootout of a loaded service). A dual-supervisor anomaly
+  (no env but the launchd gateway is loaded) restarts cleanly through launchd
+  rather than the foreground helper; an instance whose gateway plist is on disk
+  but booted out (not loaded) takes the foreground branch, where the
+  launchd-aware `gini start` bootstraps the gateway from its plist. An
+  auto-update (`scheduleRuntimeRestart`) on an instance with a loaded launchd
+  gateway self-SIGTERMs and is respawned by KeepAlive with the new code, and
+  dispatches detached `gini autostart kick` children for web AND the watchdog —
+  the long-lived watchdog loop never exits on its own and a code-only update
+  leaves its plist stamp unchanged, so the explicit kick is the only thing that
+  replaces its process with the new code. The `gini update` CLI restart on an
+  instance with a loaded launchd gateway boots out the gateway (a plain SIGTERM
+  would be respawned by KeepAlive), sweeps the pid/port files, waits for it to
+  stop answering, then re-ensures via launchd. On an instance with no loaded
+  launchd gateway both paths use the detached SIGTERM-based stop+start helper.
 - A `gini watchdog` tick against a healthy instance takes no action; with
   the gateway down for two consecutive ticks it `kickstart -k`s the
   gateway; with web down for two consecutive ticks it `kickstart -k`s web

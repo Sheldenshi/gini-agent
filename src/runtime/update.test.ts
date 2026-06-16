@@ -329,10 +329,11 @@ function makeSpawnRecorder(): { calls: SpawnCall[]; spawn: (cmd: string, args?: 
   return { calls, spawn };
 }
 
-// scheduleRuntimeRestart dispatches its restart strategy on supervisor():
-// under launchd it kicks the web service and self-SIGTERMs so KeepAlive
-// respawns the gateway with fresh code; in the foreground it falls back to
-// the detached stop+start bash helper.
+// scheduleRuntimeRestart dispatches its restart strategy on supervisor() OR
+// whether the launchd gateway is loaded: under launchd it kicks the web service
+// and self-SIGTERMs so KeepAlive respawns the gateway with fresh code; when no
+// loaded launchd gateway exists it falls back to the detached stop+start bash
+// helper.
 describe("scheduleRuntimeRestart", () => {
   let scratch: string;
   let priorState: string | undefined;
@@ -394,10 +395,10 @@ describe("scheduleRuntimeRestart", () => {
     expect(kills[0]!.signal).toBe("SIGTERM");
   });
 
-  test("dual supervision (no GINI_SUPERVISOR but launchd manages the instance): takes the launchd branch", async () => {
-    // A foreground gateway running on an instance that ALSO has launchd plists.
-    // supervisor() is null (env unset) but the instance is launchd-managed, so
-    // the restart must route through launchd — kick web+watchdog and
+  test("dual supervision (no GINI_SUPERVISOR but the launchd gateway is loaded): takes the launchd branch", async () => {
+    // A foreground gateway running on an instance whose launchd gateway is ALSO
+    // loaded. supervisor() is null (env unset) but the launchd gateway is
+    // loaded, so the restart must route through launchd — kick web+watchdog and
     // self-SIGTERM — NOT the foreground stop+start bash helper that could spawn
     // a competing daemon and walk the port to an offset.
     delete process.env.GINI_SUPERVISOR;
@@ -407,7 +408,7 @@ describe("scheduleRuntimeRestart", () => {
     const result = scheduleRuntimeRestart("restart-dual", {
       spawnImpl: spawn as never,
       killImpl: (pid, signal) => { kills.push({ pid, signal }); },
-      isLaunchdManagedImpl: () => true
+      gatewayLoadedImpl: () => true
     });
     expect(result).toBe(true);
 
@@ -431,14 +432,17 @@ describe("scheduleRuntimeRestart", () => {
     expect(kills[0]!.signal).toBe("SIGTERM");
   });
 
-  test("foreground (no supervisor): uses the detached bash stop+start helper", async () => {
+  test("foreground (no supervisor, gateway not loaded): uses the detached bash stop+start helper", async () => {
     delete process.env.GINI_SUPERVISOR;
     const { calls, spawn } = makeSpawnRecorder();
     const kills: Array<{ pid: number; signal: NodeJS.Signals | number }> = [];
 
     const result = scheduleRuntimeRestart("restart-fg", {
       spawnImpl: spawn as never,
-      killImpl: (pid, signal) => { kills.push({ pid, signal }); }
+      killImpl: (pid, signal) => { kills.push({ pid, signal }); },
+      // Pin the gateway-not-loaded state so this case doesn't depend on the
+      // absence of a real plist in ~/Library/LaunchAgents.
+      gatewayLoadedImpl: () => false
     });
     expect(result).toBe(true);
 

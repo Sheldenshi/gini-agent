@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { logDir, projectRoot, updateInProgressMarkerPath } from "../paths";
-import { isLaunchdManaged, supervisor } from "../integrations/launchd";
+import { isLoaded, supervisor } from "../integrations/launchd";
 import type { Instance } from "../types";
 
 const EXPECTED_ORIGIN = "https://github.com/Lilac-Labs/gini-agent";
@@ -255,7 +255,7 @@ async function performUpdate(runtimeDir: string, options: UpdateRuntimeOptions):
 export interface ScheduleRestartOptions {
   spawnImpl?: typeof spawn;
   killImpl?: (pid: number, signal: NodeJS.Signals | number) => void;
-  isLaunchdManagedImpl?: (instance: Instance) => boolean;
+  gatewayLoadedImpl?: (instance: Instance) => boolean;
 }
 
 export function scheduleRuntimeRestart(instance: Instance, options: ScheduleRestartOptions = {}): boolean {
@@ -264,7 +264,7 @@ export function scheduleRuntimeRestart(instance: Instance, options: ScheduleRest
   const logFile = join(logDir(instance), "update-restart.log");
   const spawnFn = options.spawnImpl ?? spawn;
   const killFn = options.killImpl ?? ((pid: number, signal: NodeJS.Signals | number) => { process.kill(pid, signal); });
-  const launchdManaged = options.isLaunchdManagedImpl ?? isLaunchdManaged;
+  const gatewayLoaded = options.gatewayLoadedImpl ?? ((i: Instance) => isLoaded(i, "gateway"));
   try {
     mkdirSync(dirname(logFile), { recursive: true });
     appendFileSync(logFile, `[${new Date().toISOString()}] restart requested cwd=${root} supervisor=${supervisor() ?? "none"}\n`);
@@ -281,17 +281,19 @@ export function scheduleRuntimeRestart(instance: Instance, options: ScheduleRest
     // Fall back to ignored stdio.
   }
 
-  // Route on the INSTANCE's launchd state, not solely the gateway's own
-  // GINI_SUPERVISOR env. The common case is a launchd-spawned gateway
+  // Route on whether the GATEWAY is actively LOADED under launchd, not solely
+  // the gateway's own GINI_SUPERVISOR env. This branch's restart relies on
+  // KeepAlive respawning the self-SIGTERM, which only happens for a loaded
+  // launchd gateway. The common case is a launchd-spawned gateway
   // (supervisor()==="launchd"); but a foreground gateway running on an
-  // instance that ALSO has launchd plists (dual supervision — a pre-existing
-  // state or a manual `gini run` on a launchd instance) must take this same
-  // path: its self-SIGTERM frees the canonical port, the launchd gateway
-  // service binds it, and web/watchdog are kicked. Falling through to the
-  // foreground stop+start helper there could spawn a competing detached
-  // daemon and walk the canonical port to an offset. NORMAL launchd
-  // (env set) is unchanged; a true foreground / no-plist instance
-  // (launchdManaged false) is unchanged — only the dual anomaly flips here.
+  // instance whose launchd gateway is ALSO loaded (dual supervision) must take
+  // this same path: its self-SIGTERM frees the canonical port, the launchd
+  // gateway service binds it, and web/watchdog are kicked. Falling through to
+  // the foreground stop+start helper there could spawn a competing detached
+  // daemon and walk the canonical port to an offset. A booted-out-plist or
+  // pure-foreground instance (gatewayLoaded false) takes the foreground branch
+  // instead, where the launchd-aware `gini start` bootstraps the gateway from
+  // its plist — there is no loaded job for KeepAlive to respawn here.
   //
   // updateRuntime has already been awaited to completion (`git reset --hard`
   // + `bun install` + the web build) by the time we get here, so the working
@@ -310,7 +312,7 @@ export function scheduleRuntimeRestart(instance: Instance, options: ScheduleRest
   // This keeps the gateway under launchd supervision (no detached
   // stop+start helper that would reparent the respawn to PID 1 and orphan
   // it outside KeepAlive).
-  if (supervisor() === "launchd" || launchdManaged(instance)) {
+  if (supervisor() === "launchd" || gatewayLoaded(instance)) {
     try {
       for (const kind of ["web", "watchdog"] as const) {
         const child = spawnFn(process.execPath, [
@@ -347,10 +349,11 @@ export function scheduleRuntimeRestart(instance: Instance, options: ScheduleRest
     return true;
   }
 
-  // True foreground / `gini run` (no GINI_SUPERVISOR AND no launchd plists):
-  // no launchd KeepAlive to respawn us, so keep the detached bash helper that
-  // waits for our exit
-  // then stop+starts the instance itself.
+  // No loaded launchd gateway (true foreground / `gini run`, or a booted-out
+  // plist): no launchd KeepAlive to respawn us, so keep the detached bash
+  // helper that waits for our exit then stop+starts the instance itself. Its
+  // `gini start` is launchd-aware, so a booted-out plist is bootstrapped back
+  // up from disk there.
   const script = `
 cd ${shellQuote(root)}
 old_pid=${oldPid}

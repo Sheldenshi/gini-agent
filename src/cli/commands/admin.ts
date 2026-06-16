@@ -322,7 +322,7 @@ export async function update(ctx: CliContext): Promise<void> {
 // restart branch is unit-testable without real launchctl, SIGTERM, or
 // wall-clock waits. Defaults are the real impls.
 export interface RestartUpdatedInstanceDeps {
-  isLaunchdManaged: (instance: string) => boolean;
+  isGatewayLoaded: (instance: string) => boolean;
   stopViaBootout: typeof stopViaBootout;
   cleanupRuntimeFiles: (config: RuntimeConfig) => void;
   stopRuntime: typeof stopRuntime;
@@ -331,7 +331,7 @@ export interface RestartUpdatedInstanceDeps {
 }
 
 const DEFAULT_RESTART_UPDATED_INSTANCE_DEPS: RestartUpdatedInstanceDeps = {
-  isLaunchdManaged,
+  isGatewayLoaded: (instance) => isLoaded(instance, "gateway"),
   stopViaBootout,
   cleanupRuntimeFiles,
   stopRuntime,
@@ -339,20 +339,22 @@ const DEFAULT_RESTART_UPDATED_INSTANCE_DEPS: RestartUpdatedInstanceDeps = {
   startInstance
 };
 
-// Stop the running instance and start it on the fresh code, routing on the
-// instance's launchd state. On a launchd-managed instance KeepAlive respawns a
-// plain SIGTERM, so stopRuntime + waitForRuntimeStopped would time out; bootout
-// unloads the service (KeepAlive no longer applies), then we sweep the pid/port
-// files the launchctl-killed runtime never wrote and wait until the booted-out
-// gateway stops answering. The non-launchd path keeps the SIGTERM-based stop.
-// startInstance (already launchd-aware) brings it back up either way.
+// Stop the running instance and start it on the fresh code, routing on whether
+// the gateway is actively LOADED under launchd. Bootout only stops a loaded
+// launchd job, so a not-loaded/foreground gateway takes the SIGTERM path. On a
+// loaded launchd gateway KeepAlive respawns a plain SIGTERM, so stopRuntime +
+// waitForRuntimeStopped would time out; bootout unloads the service (KeepAlive
+// no longer applies), then we sweep the pid/port files the launchctl-killed
+// runtime never wrote and wait until the booted-out gateway stops answering.
+// The non-launchd path keeps the SIGTERM-based stop. startInstance (already
+// launchd-aware) brings it back up either way.
 export async function restartUpdatedInstance(
   config: RuntimeConfig,
   web: WebOptions,
   deps: RestartUpdatedInstanceDeps = DEFAULT_RESTART_UPDATED_INSTANCE_DEPS
 ): Promise<void> {
   const instance = config.instance;
-  if (deps.isLaunchdManaged(instance)) {
+  if (deps.isGatewayLoaded(instance)) {
     deps.stopViaBootout(instance);
     deps.cleanupRuntimeFiles(config);
     const stopped = await deps.waitForRuntimeStopped(config);
