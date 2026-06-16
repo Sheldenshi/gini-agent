@@ -25,6 +25,7 @@ import {
   providerAuthNote,
   providerCatalog,
   providerCatalogWithStatus,
+  resolveDispatchProvider,
   ProviderAuthError,
   providerDisplayLabel,
   providerHealth,
@@ -3523,6 +3524,89 @@ function config(provider: RuntimeConfig["provider"]): RuntimeConfig {
     logRoot: "/tmp/gini-provider-test-logs"
   };
 }
+
+describe("resolveDispatchProvider (transient fallback)", () => {
+  // Scrub every real provider's credential env so each test starts from a known
+  // "nothing configured" baseline; tests opt specific providers in.
+  const PROVIDER_ENV_VARS = [
+    "OPENAI_API_KEY",
+    "OPENROUTER_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "GINI_LOCAL_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "AZURE_OPENAI_API_KEY",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY"
+  ];
+  let restores: Array<() => void> = [];
+  beforeEach(() => {
+    restores = PROVIDER_ENV_VARS.map((name) => setEnv(name, undefined));
+    // Point codex at a nonexistent auth.json so an ambient ~/.codex/auth.json
+    // on the dev machine doesn't make codex read as configured.
+    restores.push(setEnv("CODEX_AUTH_JSON", "/nonexistent/gini-fallback-test/auth.json"));
+    // Stop the AWS resolver finding ambient shared-credentials/profile creds.
+    restores.push(setEnv("AWS_SHARED_CREDENTIALS_FILE", "/nonexistent/gini-fallback-test/credentials"));
+    restores.push(setEnv("AWS_PROFILE", undefined));
+  });
+  afterEach(() => {
+    for (const restore of restores) restore();
+  });
+
+  test("active provider configured → dispatches it, no fallback", () => {
+    process.env.OPENAI_API_KEY = "sk-active";
+    const result = resolveDispatchProvider(config({ name: "openai", model: "gpt-5.4-mini" }));
+    expect(result.usingFallback).toBe(false);
+    expect(result.provider.name).toBe("openai");
+  });
+
+  test("active provider unconfigured + a configured provider → falls back to it", () => {
+    // bedrock is the selected provider with no AWS creds; deepseek is configured.
+    process.env.DEEPSEEK_API_KEY = "ds-key";
+    const result = resolveDispatchProvider(config({ name: "bedrock", model: "us.amazon.nova-pro-v1:0" }));
+    expect(result.usingFallback).toBe(true);
+    if (result.usingFallback) {
+      expect(result.selected).toBe("bedrock");
+      expect(result.using).toBe("deepseek");
+      expect(result.provider.name).toBe("deepseek");
+      // Fallback model is the deepseek catalog default (models[0]).
+      expect(result.provider.model).toBe("deepseek-v4-flash");
+    }
+  });
+
+  test("never falls back to echo (echo always reports unconfigured)", () => {
+    // No real provider configured: an unconfigured active provider must NOT be
+    // rescued by echo — it returns unchanged so /setup still applies.
+    const result = resolveDispatchProvider(config({ name: "bedrock", model: "us.amazon.nova-pro-v1:0" }));
+    expect(result.usingFallback).toBe(false);
+    expect(result.provider.name).toBe("bedrock");
+  });
+
+  test("none configured → active provider unchanged, no fallback", () => {
+    const result = resolveDispatchProvider(config({ name: "openai", model: "gpt-5.4-mini" }));
+    expect(result.usingFallback).toBe(false);
+    expect(result.provider.name).toBe("openai");
+  });
+
+  test("does not pick the active provider as its own fallback", () => {
+    // openai selected + only OPENROUTER_API_KEY set → falls back to openrouter,
+    // never re-selects the (unconfigured) openai.
+    process.env.OPENROUTER_API_KEY = "or-key";
+    const result = resolveDispatchProvider(config({ name: "openai", model: "gpt-5.4-mini" }));
+    expect(result.usingFallback).toBe(true);
+    if (result.usingFallback) {
+      expect(result.using).toBe("openrouter");
+      expect(result.provider.name).toBe("openrouter");
+    }
+  });
+
+  test("echo active (configured) → dispatches echo, no fallback", () => {
+    // echo reports configured via providerHealth, so it dispatches verbatim
+    // even though it's not pickable AS a fallback.
+    const result = resolveDispatchProvider(config({ name: "echo", model: "gini-echo-v0" }));
+    expect(result.usingFallback).toBe(false);
+    expect(result.provider.name).toBe("echo");
+  });
+});
 
 describe("auth-error classification", () => {
   test("isAuthExpiredError flags expired/invalid/401/sign-in-again messages", () => {

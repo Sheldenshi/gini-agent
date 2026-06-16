@@ -67,6 +67,11 @@ export function status(config: RuntimeConfig) {
     memoryUnits,
     version: currentVersionInfo(),
     provider: providerHealth(config),
+    // Surfaced for the web fallback banner: set when the selected provider is
+    // unconfigured but a configured fallback is transiently serving turns
+    // (computed per turn in resolveEffectiveContext; config.provider is never
+    // mutated). Omitted when the selected provider dispatches directly.
+    ...(effective.providerFallback ? { providerFallback: effective.providerFallback } : {}),
     activeAgent
   };
 }

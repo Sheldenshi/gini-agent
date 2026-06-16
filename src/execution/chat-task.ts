@@ -1806,6 +1806,15 @@ async function runLoop(
   // entry runChatTask hands us the already-resolved EffectiveContext;
   // resumeChatTask omits it so the resume picks up any agent change.
   const effective = inheritedEffective ?? resolveEffectiveContext(state0, config);
+  // Provider override passed into generateToolCallingResponse / generateAuxText
+  // below. We must pass the RESOLVED provider whenever it differs from
+  // config.provider — an agent override OR a transient dispatch fallback (the
+  // instance provider is unconfigured but another configured provider serves
+  // the turn). Passing undefined would late-bind config.provider and defeat the
+  // fallback. Undefined only when the instance provider serves verbatim, so the
+  // legacy single-provider path stays byte-identical.
+  const providerOverride =
+    effective.providerSource === "agent" || effective.providerFallback ? effective.provider : undefined;
   // Full (gated) catalog, including deferred tools. `loadedToolNames` is the
   // set of deferred tools the model has pulled live via load_tools; it is
   // seeded from the task row so it survives the runLoop rebuild on every
@@ -2339,7 +2348,7 @@ async function runLoop(
                 user: renderMessagesForCompaction(workingMessages.slice(span.start, span.end)),
                 maxTokens: COMPACTION_SUMMARY_MAX_TOKENS
               },
-              effective.providerSource === "agent" ? effective.provider : undefined
+              providerOverride
             );
             accumulatedCost = addCost(accumulatedCost, aux.cost);
             summaryText = aux.text.trim();
@@ -2411,7 +2420,7 @@ async function runLoop(
           workingMessages,
           providerTools,
           onDelta,
-          effective.providerSource === "agent" ? effective.provider : undefined
+          providerOverride
         );
       } catch (error) {
         // Tag a provider auth failure with the provider that actually served
@@ -3362,7 +3371,7 @@ async function runLoop(
         summaryMessages,
         [],
         undefined,
-        effective.providerSource === "agent" ? effective.provider : undefined
+        providerOverride
       );
     } catch (error) {
       // Same provider-auth tagging as the main loop call, so an expired token

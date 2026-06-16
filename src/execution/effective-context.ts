@@ -18,8 +18,8 @@
 // now: per-agent memory isolation will introduce its own helper that
 // composes with the bundle returned here.
 
-import type { ProviderConfig, RuntimeConfig, RuntimeState } from "../types";
-import { normalizeProvider } from "../provider";
+import type { ProviderConfig, ProviderName, RuntimeConfig, RuntimeState } from "../types";
+import { normalizeProvider, providerHealth, resolveDispatchProvider } from "../provider";
 import { readState } from "../state";
 
 export interface EffectiveContext {
@@ -32,17 +32,48 @@ export interface EffectiveContext {
   memoryNamespace?: string;
   provider: ProviderConfig;
   providerSource: "agent" | "instance";
+  // Set when `provider` was transiently swapped to a configured fallback
+  // because the resolved provider (instance or agent-pinned) had no usable
+  // credentials but another real provider did. `selected` is the user's
+  // unconfigured choice; `using` is the fallback actually serving the turn.
+  // Surfaced so the web can show a "finish setup" banner. NEVER persisted —
+  // config.provider keeps the user's selection.
+  providerFallback?: { selected: ProviderName; using: ProviderName };
   toolsetFilter?: Set<string>;
   messagingTargetFilter?: Set<string>;
   warnings: string[];
 }
 
+// Swap an unconfigured resolved provider for a configured fallback (transient,
+// per-turn). Returns the provider to dispatch with plus the fallback marker
+// when a swap happened; otherwise the provider unchanged. Applied to BOTH the
+// instance-sourced provider and an agent-pinned provider so an agent pinned to
+// an unconfigured provider falls back too.
+function applyDispatchFallback(provider: ProviderConfig, config: RuntimeConfig): {
+  provider: ProviderConfig;
+  providerFallback?: { selected: ProviderName; using: ProviderName };
+} {
+  if (providerHealth({ ...config, provider }).configured) {
+    return { provider };
+  }
+  const resolution = resolveDispatchProvider({ ...config, provider });
+  if (!resolution.usingFallback) {
+    return { provider };
+  }
+  return {
+    provider: resolution.provider,
+    providerFallback: { selected: resolution.selected, using: resolution.using }
+  };
+}
+
 export function resolveEffectiveContext(state: RuntimeState, config: RuntimeConfig): EffectiveContext {
   const agent = state.agents.find((candidate) => candidate.id === state.activeAgentId);
   if (!agent) {
+    const dispatch = applyDispatchFallback(config.provider, config);
     return {
-      provider: config.provider,
+      provider: dispatch.provider,
       providerSource: "instance",
+      ...(dispatch.providerFallback ? { providerFallback: dispatch.providerFallback } : {}),
       warnings: []
     };
   }
@@ -84,6 +115,14 @@ export function resolveEffectiveContext(state: RuntimeState, config: RuntimeConf
     provider = config.provider;
     providerSource = "instance";
   }
+
+  // Transient dispatch fallback: if the resolved provider (instance OR
+  // agent-pinned) has no usable credentials but another real provider does,
+  // dispatch with the configured fallback so the turn completes. config.provider
+  // is never mutated — the fallback is recomputed per turn and the banner
+  // persists until the user finishes setup.
+  const dispatch = applyDispatchFallback(provider, config);
+  provider = dispatch.provider;
 
   // Toolset intersection. The agent stores toolset names (e.g. "file"),
   // which match ToolsetRecord.name. Validate against state and surface
@@ -127,16 +166,20 @@ export function resolveEffectiveContext(state: RuntimeState, config: RuntimeConf
     memoryNamespace: agent.id,
     provider,
     providerSource,
+    ...(dispatch.providerFallback ? { providerFallback: dispatch.providerFallback } : {}),
     toolsetFilter,
     messagingTargetFilter,
     warnings
   };
 }
 
-// Convenience: read the current state and return the agent's provider override
-// (only when sourced from the agent). Used by memory pipelines (retain,
-// reflect, reinforce) so a single LLM call follows the agent's provider
-// without those modules each rebuilding the resolve/source check.
+// Convenience: read the current state and return the provider override these
+// callers should dispatch with. Used by memory pipelines (retain, reflect,
+// reinforce) so a single LLM call follows the agent's provider — or the
+// transient dispatch fallback when the instance provider is unconfigured —
+// without those modules each rebuilding the resolve/source check. Returns
+// undefined only when the instance provider is configured and no agent
+// override applies, so the generators read config.provider verbatim.
 //
 // Embeddings and the reranker do NOT use this — they continue to read
 // config.provider directly so semantic recall stays stable across agent
@@ -144,5 +187,8 @@ export function resolveEffectiveContext(state: RuntimeState, config: RuntimeConf
 export function providerOverrideForRuntime(config: RuntimeConfig): ProviderConfig | undefined {
   const state = readState(config.instance);
   const effective = resolveEffectiveContext(state, config);
-  return effective.providerSource === "agent" ? effective.provider : undefined;
+  if (effective.providerSource === "agent" || effective.providerFallback) {
+    return effective.provider;
+  }
+  return undefined;
 }
