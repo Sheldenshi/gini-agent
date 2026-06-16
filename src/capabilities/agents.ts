@@ -16,7 +16,7 @@ import { DEFAULT_AGENT_TOOLSETS } from "../state/defaults";
 
 export function listAgents(config: RuntimeConfig) {
   const state = readState(config.instance);
-  return { activeAgentId: state.activeAgentId, agents: state.agents };
+  return { activeAgentId: state.activeAgentId, defaultAgentId: "agent_default", agents: state.agents };
 }
 
 export async function createAgent(config: RuntimeConfig, input: Record<string, unknown>) {
@@ -312,4 +312,83 @@ export async function deleteAgent(
     unitsDeleted,
     bankDeleted
   };
+}
+
+// Soft-deletes an agent by stamping `archivedAt`. The agent stays in
+// `state.agents` (its memory pool and history are preserved) but moves to
+// the UI's Archived section, can't be activated until restored, and has its
+// scheduled jobs suppressed by runDueJobs.
+// Guards:
+//   - The default agent (`agent_default`) cannot be archived — it's the
+//     always-present fallback selection.
+//   - Unknown agent id/name throws (mapped to 404 by the HTTP layer).
+// The active agent CAN be archived: archiving the current selection hands
+// "active" back to the default agent (via activateAgent) so the active
+// pointer, per-agent statuses, and the agent.activated audit stay consistent.
+// A no-op (already archived) returns the record without bumping updatedAt or
+// writing a second audit row.
+export async function archiveAgent(
+  config: RuntimeConfig,
+  idOrName: string
+): Promise<AgentRecord> {
+  return mutateState(config.instance, (state) => {
+    const agent = state.agents.find((item) => item.id === idOrName || item.name === idOrName);
+    if (!agent) throw new Error(`Agent not found: ${idOrName}`);
+    if (agent.id === "agent_default") {
+      throw new Error("Cannot archive the default agent.");
+    }
+    if (agent.archivedAt) return agent;
+    const wasActive = state.activeAgentId === agent.id;
+    agent.archivedAt = now();
+    agent.updatedAt = now();
+    // The archived agent is the subject — attribute the audit to it so the
+    // event lands in that agent's own historical inbox.
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: "agent.archived",
+        target: agent.id,
+        risk: "low",
+        evidence: { name: agent.name, agentId: agent.id }
+      },
+      { agentId: agent.id }
+    );
+    // Archiving the active selection leaves the instance without an active
+    // agent; hand "active" back to the always-present default so statuses,
+    // `activeAgentId`, and the agent.activated audit are set consistently.
+    if (wasActive) {
+      activateAgent(state, "agent_default");
+    }
+    return agent;
+  });
+}
+
+// Restores an archived agent by clearing `archivedAt`. The agent returns to
+// the active list but stays inactive — restoration never auto-activates it.
+// Unknown agent id/name throws; a no-op (not archived) returns the record
+// without bumping updatedAt or writing an audit row.
+export async function unarchiveAgent(
+  config: RuntimeConfig,
+  idOrName: string
+): Promise<AgentRecord> {
+  return mutateState(config.instance, (state) => {
+    const agent = state.agents.find((item) => item.id === idOrName || item.name === idOrName);
+    if (!agent) throw new Error(`Agent not found: ${idOrName}`);
+    if (!agent.archivedAt) return agent;
+    delete agent.archivedAt;
+    agent.updatedAt = now();
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: "agent.unarchived",
+        target: agent.id,
+        risk: "low",
+        evidence: { name: agent.name, agentId: agent.id }
+      },
+      { agentId: agent.id }
+    );
+    return agent;
+  });
 }

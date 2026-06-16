@@ -5,10 +5,12 @@ import Link from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { cn } from "@/lib/utils";
 import {
+  ArchiveRestore,
   ChevronDown,
   Menu,
   MessagesSquare,
   Moon,
+  MoreVertical,
   Plus,
   RefreshCw,
   ScrollText,
@@ -26,8 +28,15 @@ import { toast } from "sonner";
 import { api } from "@/lib/api";
 import { useAllChatSessions, useInvalidate, useStatus, useThreadsInbox } from "@/lib/queries";
 import { useChatReadState, useThreadReadState } from "@/lib/use-chat-read-state";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger
+} from "@/components/ui/dropdown-menu";
 import { AgentAvatar } from "@/components/chat/AgentAvatar";
 import { CreateAgentDialog } from "@/components/CreateAgentDialog";
+import { ArchiveAgentDialog } from "@/components/ArchiveAgentDialog";
 import { TunnelMenu } from "@/components/tunnel/TunnelMenu";
 import { useUpdateGate } from "@/components/UpdateGate";
 import type { AgentRow, ChatSession } from "@/lib/view-types";
@@ -41,16 +50,24 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
   const mounted = useMounted();
   const invalidate = useInvalidate();
   const [createOpen, setCreateOpen] = useState(false);
+  const [archiveTarget, setArchiveTarget] = useState<AgentRow | null>(null);
   const [agentsCollapsed, toggleAgents] = useSectionCollapsed("agents");
+  const [archivedCollapsed, toggleArchived] = useSectionCollapsed("agents-archived");
   const [jobsCollapsed, toggleJobs] = useSectionCollapsed("jobs");
 
   const status = useStatus();
   const activeAgentId = status.data?.activeAgent?.id;
   const agentsQuery = useQuery({
     queryKey: ["agents"],
-    queryFn: () => api<{ agents: AgentRow[]; activeAgentId?: string }>("/agents")
+    queryFn: () => api<{ agents: AgentRow[]; activeAgentId?: string; defaultAgentId?: string }>("/agents")
   });
-  const agents = agentsQuery.data?.agents ?? [];
+  const allAgents = agentsQuery.data?.agents ?? [];
+  const defaultAgentId = agentsQuery.data?.defaultAgentId;
+  // `archivedAt` is a soft-delete marker, orthogonal to `status`. Split the
+  // roster so archived agents render in their own collapsible group instead
+  // of the active list.
+  const agents = useMemo(() => allAgents.filter((a) => !a.archivedAt), [allAgents]);
+  const archivedAgents = useMemo(() => allAgents.filter((a) => a.archivedAt), [allAgents]);
 
   // Recurring jobs and channel read-state are a constant union across all
   // agents, so both source from unscoped fetches rather than the
@@ -63,16 +80,27 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
   const allSessions = useAllChatSessions();
 
   // A job is recurring when it isn't a one-shot reminder and carries an active
-  // schedule (cron or interval). Stable-sorted by createdAt (then name) so the
-  // list doesn't reorder as jobs fire.
+  // schedule (cron or interval). Only channel-bound jobs get a sidebar row: a
+  // deliverTo:"chat" job delivers into — and is managed from — its bound
+  // conversation (Jobs tab), so a rail row would just be a confusing alias for
+  // that chat. A missing/unresolved bound session is treated as not-channel
+  // and hidden, as is an archived channel (archived sessions keep history and
+  // stay addressable by URL but leave the lists). Stable-sorted by createdAt
+  // (then name) so the list doesn't reorder as jobs fire.
   const recurringJobs = useMemo<JobRecord[]>(() => {
+    const sessionsById = new Map((allSessions.data ?? []).map((s) => [s.id, s]));
     return (allJobs.data ?? [])
       .filter((j) => !j.oneShot && (j.cronExpression != null || (j.intervalSeconds ?? 0) > 0))
+      .filter((j) => {
+        if (j.chatSessionId == null) return false;
+        const session = sessionsById.get(j.chatSessionId);
+        return session?.kind === "channel" && !session.archivedAt;
+      })
       .sort(
         (a, b) =>
           (a.createdAt ?? "").localeCompare(b.createdAt ?? "") || a.name.localeCompare(b.name)
       );
-  }, [allJobs.data]);
+  }, [allJobs.data, allSessions.data]);
 
   const { isUnread } = useChatReadState(allSessions.data);
 
@@ -102,6 +130,14 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
   const useAgentMutation = useMutation({
     mutationFn: (id: string) => api(`/agents/${encodeURIComponent(id)}/use`, { method: "POST" }),
     onSuccess: () => invalidate(["agents", "state", "status", "memory", "agent-chat"]),
+    onError: (error: Error) => toast.error(error.message)
+  });
+
+  // Restore is a direct, no-confirm action: the restored agent rejoins the
+  // active list but stays inactive (the server never auto-activates it).
+  const unarchiveMutation = useMutation({
+    mutationFn: (id: string) => api(`/agents/${encodeURIComponent(id)}/unarchive`, { method: "POST" }),
+    onSuccess: () => invalidate(["agents", "state", "status"]),
     onError: (error: Error) => toast.error(error.message)
   });
 
@@ -177,13 +213,18 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
                 agents.map((agent) => {
                   const active = onChat && !selectedSession && agent.id === activeAgentId;
                   const unread = !active && agentUnread.get(agent.id) === true;
+                  // The default agent has no kebab: it's the always-present
+                  // fallback selection and can't be archived server-side, so
+                  // don't offer a guaranteed error. Every other agent — the
+                  // active one included — gets it.
+                  const canArchive = agent.id !== defaultAgentId;
                   return (
-                    <li key={agent.id}>
+                    <li key={agent.id} className="group relative">
                       <button
                         type="button"
                         onClick={() => selectAgent(agent.id)}
                         className={cn(
-                          "group flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors",
+                          "flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors",
                           active ? "bg-sidebar-accent" : "hover:bg-sidebar-accent/50"
                         )}
                       >
@@ -197,14 +238,69 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
                           {agent.name}
                         </span>
                         {unread ? (
-                          <span aria-hidden className="size-[7px] shrink-0 rounded-full bg-sidebar-primary" />
+                          <span aria-hidden className="mr-1 size-[7px] shrink-0 rounded-full bg-sidebar-primary" />
                         ) : null}
                       </button>
+                      {canArchive ? (
+                        <DropdownMenu>
+                          <DropdownMenuTrigger
+                            aria-label={`Agent options for ${agent.name}`}
+                            className="absolute top-1/2 right-1.5 flex size-6 -translate-y-1/2 items-center justify-center rounded-md text-sidebar-foreground/60 opacity-0 transition-opacity hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:opacity-100 group-hover:opacity-100 data-[state=open]:opacity-100"
+                          >
+                            <MoreVertical className="size-4" />
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent align="end" className="w-32">
+                            <DropdownMenuItem variant="destructive" onSelect={() => setArchiveTarget(agent)}>
+                              Archive
+                            </DropdownMenuItem>
+                          </DropdownMenuContent>
+                        </DropdownMenu>
+                      ) : null}
                     </li>
                   );
                 })
               )}
             </ul>
+
+            {/* Archived agents — collapsible, dimmed, indented. Rendered only
+                when at least one agent is archived. */}
+            {archivedAgents.length > 0 ? (
+              <div className="mt-1 flex flex-col gap-0.5">
+                <button
+                  type="button"
+                  onClick={toggleArchived}
+                  aria-expanded={!archivedCollapsed}
+                  className="flex items-center gap-1.5 px-2 text-sidebar-foreground/55 hover:text-sidebar-foreground/80"
+                >
+                  <ChevronDown
+                    className={cn("size-3 transition-transform", archivedCollapsed && "-rotate-90")}
+                  />
+                  <span className="text-[11px] font-semibold tracking-[0.5px]">Archived</span>
+                  <span className="rounded-full bg-sidebar-accent px-[7px] py-px text-[10px] font-semibold text-sidebar-foreground/70">
+                    {archivedAgents.length}
+                  </span>
+                </button>
+                <ul className={cn("flex flex-col gap-0.5 pl-[18px]", archivedCollapsed && "hidden")}>
+                  {archivedAgents.map((agent) => (
+                    <li key={agent.id} className="group flex items-center gap-1.5 rounded-lg px-2.5 py-2 opacity-70 hover:bg-sidebar-accent/50">
+                      <AgentAvatar name={agent.name} seed={agent.id} size={20} initialColor="#0A0A0C" />
+                      <span className="min-w-0 flex-1 truncate text-[13px] font-medium text-sidebar-foreground/70">
+                        {agent.name}
+                      </span>
+                      <button
+                        type="button"
+                        aria-label={`Restore ${agent.name}`}
+                        disabled={unarchiveMutation.isPending}
+                        onClick={() => unarchiveMutation.mutate(agent.id)}
+                        className="flex size-6 shrink-0 items-center justify-center rounded-md text-sidebar-foreground/60 opacity-0 transition-opacity hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:opacity-100 group-hover:opacity-100 disabled:opacity-50"
+                      >
+                        <ArchiveRestore className="size-3.5" />
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
           </div>
 
           {/* Recurring jobs */}
@@ -329,6 +425,13 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
       <div className="h-px bg-sidebar-border" />
       <UpdateReminder />
       <CreateAgentDialog open={createOpen} onOpenChange={setCreateOpen} />
+      <ArchiveAgentDialog
+        agent={archiveTarget}
+        open={archiveTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) setArchiveTarget(null);
+        }}
+      />
     </div>
   );
 }

@@ -164,6 +164,73 @@ describe("deriveActivation: service skill defers to the setup skill", () => {
   });
 });
 
+describe("deriveActivation: externally satisfied credential (registry-only machine)", () => {
+  // Mirrors the runtime's absent-record fallthrough: the provider's live
+  // `externallySatisfied` bit (registered machine-global Google accounts)
+  // satisfies the credential ONLY when no connector record with that name
+  // exists at all. A disabled record is an explicit operator off and keeps
+  // the record-based gate.
+  const extProvider: ProviderDescriptor = { ...gwsProvider, externallySatisfied: true };
+  const extProvidersById = new Map([[extProvider.id, extProvider]]);
+  const extProviderByCredentialName = new Map([["google-workspace-oauth", extProvider]]);
+  const extSetupSkillProviders = new Map([["google-workspace-setup", extProvider]]);
+
+  function extActivationFor(s: SkillRecord, connectors: ConnectorRecord[]) {
+    return deriveActivation(
+      s,
+      byNameOf(connectors),
+      extProvidersById,
+      extProviderByCredentialName,
+      extSetupSkillProviders
+    );
+  }
+
+  const setupSkill = skill({ name: "google-workspace-setup", requiredCredentials: [] });
+  const serviceSkill = skill({ name: "google-calendar", requiredCredentials: ["google-workspace-oauth"] });
+
+  test("setup card with no connector record → active (runtime gate is satisfied)", () => {
+    expect(extActivationFor(setupSkill, [])).toEqual({ label: "active", tone: "ok" });
+  });
+
+  test("service skill with no connector record → green deferral", () => {
+    expect(extActivationFor(serviceSkill, [])).toEqual({
+      label: "via Google Workspace setup",
+      tone: "ok"
+    });
+  });
+
+  test("a disabled record blocks the fallthrough: setup card needs setup, service deferral muted", () => {
+    const disabled = connector({ status: "disabled" });
+    expect(extActivationFor(setupSkill, [disabled])).toEqual({ label: "needs setup", tone: "warn" });
+    expect(extActivationFor(serviceSkill, [disabled])).toEqual({
+      label: "via Google Workspace setup",
+      tone: "neutral"
+    });
+  });
+
+  test("a credential with no setup skill is satisfied generically when no record exists", () => {
+    const plainProvider: ProviderDescriptor = {
+      id: "plain",
+      label: "Plain",
+      description: "",
+      fields: [],
+      hasProbe: false,
+      hasDetect: false,
+      externallySatisfied: true,
+      credentialTemplate: { type: "api-key", name: "PLAIN_KEY" }
+    };
+    const s = skill({ name: "plain-skill", requiredCredentials: ["PLAIN_KEY"] });
+    const activation = deriveActivation(
+      s,
+      byNameOf([]),
+      new Map([[plainProvider.id, plainProvider]]),
+      new Map([["PLAIN_KEY", plainProvider]]),
+      new Map()
+    );
+    expect(activation).toEqual({ label: "active", tone: "ok" });
+  });
+});
+
 describe("deriveActivation: non-gws skills are unaffected", () => {
   test("a skill with no required credentials stays active", () => {
     const plain = skill({ name: "some-skill", requiredCredentials: [] });

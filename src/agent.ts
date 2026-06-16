@@ -13,6 +13,7 @@ import { dirname, join } from "node:path";
 import { spawn } from "bun";
 import type {
   Authorization,
+  ChatClientSurface,
   ImageAttachment,
   RuntimeConfig,
   RuntimeState,
@@ -148,6 +149,10 @@ export interface SubmitTaskOptions {
   // Threaded through to Task.images so the chat-task loop can dispatch
   // vision content without re-reading the chat message.
   images?: ImageAttachment[];
+  // Client surface of the user message that spawned this task. Threaded
+  // through to Task.clientSurface so the per-turn prompt can name the
+  // surface of the CURRENT message. See ADR client-surface-context.md.
+  clientSurface?: ChatClientSurface;
   // Set when the task replies inside a thread. Stamped on the task so
   // resolveEmitContext threads the whole response (every emit* block lands
   // tagged with the same thread_id/parent_block_id), not just the user turn.
@@ -181,6 +186,7 @@ export async function submitTask(
   );
   if (options.mode) created.mode = options.mode;
   if (options.images && options.images.length > 0) created.images = options.images;
+  if (options.clientSurface) created.clientSurface = options.clientSurface;
   if (options.threadId) created.threadId = options.threadId;
   if (options.parentBlockId) created.parentBlockId = options.parentBlockId;
   // When a parentTaskId is set, the upsert + the parent-status
@@ -920,6 +926,77 @@ export async function failTask(config: RuntimeConfig, taskId: string, error: unk
   if (task.status === "failed") {
     await cancelDescendantTasks(config, taskId);
   }
+}
+
+// Cap on how many times one task may be re-dispatched after a gateway
+// restart. A poison task that crashes the process on every resume would
+// otherwise brick the gateway in a restart loop; over the cap we fail it
+// instead of resuming. See ADR task-resume-on-restart.md.
+const MAX_BOOT_RESUMES = 3;
+
+// Reconcile tasks left in-flight by a previous process when the gateway
+// boots. An "orphan" is a task whose status is `running` or `queued` and
+// whose `updatedAt` predates this process's boot time (`cutoffIso`) — the
+// cutoff race-guard excludes anything created/updated by THIS process, so a
+// client POSTing a new message in the window between the HTTP bind and this
+// pass is never claimed. `waiting_approval` and terminal statuses are never
+// touched. Top-level chat orphans are RESUMED by re-running the interrupted
+// turn from durable chat state (runChatTask rebuilds context from the user
+// message); everything else orphaned — subagent children, imperative tasks,
+// and chat tasks over the crash-loop cap — is FAILED so nothing hangs and the
+// UI spinner clears. See ADR task-resume-on-restart.md.
+export async function reconcileInFlightTasks(
+  config: RuntimeConfig,
+  opts: {
+    cutoffIso: string;
+    dispatch?: (config: RuntimeConfig, taskId: string) => Promise<unknown>;
+  }
+): Promise<{ resumed: string[]; failed: string[] }> {
+  const { resumeIds, failIds } = await mutateState(config.instance, (state) => {
+    const resumeIds: string[] = [];
+    const failIds: string[] = [];
+    for (const task of state.tasks) {
+      const orphaned =
+        (task.status === "running" || task.status === "queued") && task.updatedAt < opts.cutoffIso;
+      if (!orphaned) continue;
+      const resumable =
+        task.mode === "chat" &&
+        !task.parentTaskId &&
+        (task.bootResumeCount ?? 0) + 1 <= MAX_BOOT_RESUMES;
+      if (resumable) {
+        task.bootResumeCount = (task.bootResumeCount ?? 0) + 1;
+        // appendTaskPartial APPENDS, so a stale partial from the interrupted
+        // turn would concatenate onto the resumed turn's streamed text.
+        task.partialSummary = "";
+        task.currentStep = "Thinking";
+        task.updatedAt = now();
+        resumeIds.push(task.id);
+      } else {
+        // Don't flip status here; failTask does it outside the lock.
+        failIds.push(task.id);
+      }
+    }
+    return { resumeIds, failIds };
+  });
+  for (const id of failIds) {
+    // Isolate per task: a failTask throw for one orphan must not abort the
+    // loop and leave the remaining orphans stuck running/queued forever.
+    try {
+      await failTask(
+        config,
+        id,
+        new Error("Interrupted by a gateway restart before it could finish; not resumed automatically.")
+      );
+    } catch (err) {
+      appendLog(config.instance, "tasks.reconcile.fail_error", { taskId: id, error: String(err) });
+    }
+  }
+  for (const id of resumeIds) {
+    appendTrace(config.instance, id, { type: "task", message: "Task resumed after gateway restart", data: {} });
+    (opts.dispatch ?? runTask)(config, id).catch((err) => failTask(config, id, err));
+  }
+  appendLog(config.instance, "tasks.reconciled", { resumed: resumeIds.length, failed: failIds.length });
+  return { resumed: resumeIds, failed: failIds };
 }
 
 // Shared between agent and tool modules. Tools that complete immediately

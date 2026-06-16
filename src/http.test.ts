@@ -286,6 +286,65 @@ describe("runtime api", () => {
     expect(body.error).toContain("Cannot delete the active agent");
   });
 
+  test("POST /api/agents/:id/archive then /unarchive round-trips archivedAt", async () => {
+    const config = testConfig("agents-archive-roundtrip");
+    const handler = createHandler(config);
+
+    const created = await call(handler, config, "/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "scratch" })
+    });
+    const archived = await call(handler, config, `/api/agents/${created.id}/archive`, { method: "POST" });
+    expect(typeof archived.archivedAt).toBe("string");
+
+    const restored = await call(handler, config, `/api/agents/${created.id}/unarchive`, { method: "POST" });
+    expect(restored.archivedAt).toBeUndefined();
+  });
+
+  test("POST /api/agents/:id/archive rejects the default agent with 400", async () => {
+    const config = testConfig("agents-archive-default");
+    const handler = createHandler(config);
+    const response = await rawCall(handler, config, "/api/agents/agent_default/archive", { method: "POST" }, config.token);
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body.error).toContain("Cannot archive the default agent");
+  });
+
+  test("POST /api/agents/:id/archive archives the active agent and hands active to the default", async () => {
+    const config = testConfig("agents-archive-active");
+    const handler = createHandler(config);
+
+    const created = await call(handler, config, "/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "active" })
+    });
+    await call(handler, config, `/api/agents/${created.id}/use`, { method: "POST" });
+
+    const archived = await call(handler, config, `/api/agents/${created.id}/archive`, { method: "POST" });
+    expect(typeof archived.archivedAt).toBe("string");
+
+    // Active selection reassigns to the always-present default agent.
+    const agents = await call(handler, config, "/api/agents");
+    expect(agents.activeAgentId).toBe("agent_default");
+    expect(agents.defaultAgentId).toBe("agent_default");
+  });
+
+  test("POST /api/agents/:id/use rejects an archived agent with 400", async () => {
+    const config = testConfig("agents-use-archived");
+    const handler = createHandler(config);
+
+    const created = await call(handler, config, "/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "scratch" })
+    });
+    await call(handler, config, `/api/agents/${created.id}/archive`, { method: "POST" });
+
+    const response = await rawCall(handler, config, `/api/agents/${created.id}/use`, { method: "POST" }, config.token);
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body.error).toContain("Cannot use an archived agent");
+  });
+
   test("PATCH /api/agents/:id renames the agent", async () => {
     const config = testConfig("agents-rename");
     const handler = createHandler(config);
@@ -829,6 +888,30 @@ describe("runtime api", () => {
     expect(retry.input).toContain("remember chat history works");
     expect(detail.messages).toHaveLength(2);
     expect(detail.taskIds).toContain(submitted.taskId);
+  });
+
+  test("chat message POST accepts an optional client surface field", async () => {
+    const config = testConfig("chat-client-surface");
+    const handler = createHandler(config);
+
+    const session = await call(handler, config, "/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ title: "surface chat" })
+    });
+    // A valid `client` value lands on the spawned task; an unrecognized one
+    // resolves to unknown without rejecting the message (older clients must
+    // keep working). See ADR client-surface-context.md.
+    const tagged = await call(handler, config, `/api/chat/${session.id}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ content: "hello from my phone", client: "mobile" })
+    });
+    const untagged = await call(handler, config, `/api/chat/${session.id}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ content: "hello from somewhere", client: "fridge" })
+    });
+    const tasks = readState(config.instance).tasks;
+    expect(tasks.find((t) => t.id === tagged.taskId)?.clientSurface).toBe("mobile");
+    expect(tasks.find((t) => t.id === untagged.taskId)?.clientSurface).toBeUndefined();
   });
 
   test("approval-gated file patch produces a diff approval", async () => {

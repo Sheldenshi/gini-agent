@@ -13,7 +13,7 @@ A user-attached **non-image file** (PDF, CSV, log, code, docx, xlsx, …) is del
 
 This replaces an earlier design where a non-image upload was only *named* in the user message and the model had to invoke the `attachments` skill's `materialize` script to read it. That coupled a core product capability (attach a file, agent uses it) to a skill that can be disabled or change, and to a non-deterministic multi-step tool dance. The new path is core and deterministic: in the common case the agent answers from the content with **zero tool calls**.
 
-The image path (`image_url` / vision) and `vision_query` are unchanged and remain image-only.
+The **image path** is gated on the same capability record: on a non-vision provider an image attachment degrades to a text note instead of an `image_url` part — on the arrival turn the note carries a steering directive so the agent refuses in-band, and on prior turns it stays terse (see [Image attachments and `vision`](#image-attachments-and-vision)). `vision_query` is unchanged and remains image-only.
 
 ## How a file reaches the model
 
@@ -25,6 +25,15 @@ For each non-image attachment, on the turn it arrives (`buildAttachmentContent` 
 - **Path reference** (unsupported format, or extraction failed): a note naming the file and its workspace path.
 
 **Context discipline:** inline content and native document bytes are emitted only on the turn the file arrives. Prior-turn rebuilds (`priorChatMessages`) carry only the workspace path, so a large attachment doesn't compound the context window across a conversation. The 256 KB inline cap is independent of the 50 MB upload cap.
+
+## Image attachments and `vision`
+
+An image is delivered as a base64 `image_url` content part — but only when the resolved provider is vision-capable. A text-only provider's request schema has no image variant, so an `image_url` part **400s the entire turn** (e.g. DeepSeek rejects it with `unknown variant 'image_url', expected 'text'`), taking the user's text question down with it. There is no fallback: `vision_query` runs against `config.provider` too, so a wholly text-only provider has no image path at all. The capability record therefore gates images in one place — `buildAttachmentContent` — and never aborts the turn:
+
+- `buildAttachmentContent` emits an `image_url` part only when `vision` is true; otherwise it degrades the image to a text note, so a non-vision provider never receives an `image_url` part it would 400 on. This covers both the **current turn** and **prior-turn** images replayed from history, so a single image can't 400 any text turn and brick the conversation.
+- On the **arrival turn** (`isCurrentTurn`), a non-vision image also appends a short steering directive inside the user turn's content parts — telling the agent it cannot see the image, not to guess its contents, and to ask the user to switch to a vision-capable model or describe it. The turn then runs normally and the agent refuses **in-band**, as an ordinary assistant turn. The directive is omitted on prior-turn replay to bound replay context.
+
+The turn is **not** hard-rejected on a non-vision provider. An earlier design threw before any model call and surfaced the refusal as a chat `system_note`; but a `system_note` is UI-only and is never replayed into the model's context, so the model couldn't see its own prior-turn refusal and a follow-up "try again" would resolve against the wrong antecedent. Letting the agent refuse in-band makes the refusal a normal, replayable assistant turn the model can reason about on the next turn. The directive deliberately lives in the user turn's content parts, not in the system message, to preserve the byte-stable system prefix (see [Stable system prefix](./stable-system-prefix.md)). The gate keys on image MIME, so non-image attachments on a text-only provider are unaffected.
 
 ## Provider capability record
 
@@ -40,7 +49,7 @@ For each non-image attachment, on the turn it arrives (`buildAttachmentContent` 
 | local | no (unless a vision model is loaded) | no | OpenAI-compatible text by default |
 | echo | no | no | test provider |
 
-The record is a living table — extend it as providers/models are added. Only `nativeDocs` is enforced today; `vision` is recorded for future use but is **not** newly gated on images (gating on a conservative/UNKNOWN flag could disable currently-working image attachments). OpenRouter per-model discovery via `GET /models` `architecture.input_modalities` is a planned refinement.
+The record is a living table — extend it as providers/models are added. Both `nativeDocs` and `vision` are enforced (see [Image attachments and `vision`](#image-attachments-and-vision) for the image gate). The conservative default has a known cost: a `local` vision model is flagged `vision: false` until per-model detection lands, so its image attachments are rejected rather than sent — the safe direction, since the alternative is a 400 on every text-only provider. OpenRouter per-model discovery via `GET /models` `architecture.input_modalities` is a planned refinement.
 
 ## Consequences
 
@@ -54,4 +63,5 @@ The record is a living table — extend it as providers/models are added. Only `
 - A non-image upload is materialized to `<workspace>/uploads/<id>/…` and the agent answers from its content; on a text-only provider this happens with **no** `read_skill`/`materialize`/`file_read` calls.
 - A PDF on a `nativeDocs` provider is delivered as a `document` part; on a text-only provider it is inlined as extracted text. A `document` part never reaches a non-`nativeDocs` provider.
 - Inlined text is wrapped in boundary markers and capped at 256 KB, with the full file on disk by path.
+- A current-turn image attachment on a non-vision provider sends no `image_url` part: it degrades to a text note plus an in-band steering directive, the turn runs to completion, and the agent refuses as a normal assistant turn. A prior-turn image in history degrades to a terse text note (no directive) so it can't 400 a later text turn. On a vision-capable provider the image is delivered as an `image_url` part unchanged.
 - The upload gate (any plausible MIME), 50 MB cap, served-upload security (`Content-Disposition: attachment` + `nosniff`), and filename sanitization remain in force. `vision_query` still rejects non-image MIME.

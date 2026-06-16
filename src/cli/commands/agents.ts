@@ -37,5 +37,17 @@ export async function agent(ctx: CliContext): Promise<void> {
     print(await api(config, `/api/agents/${encodeURIComponent(id)}`, { method: "DELETE" }));
     return;
   }
+  if (sub === "archive") {
+    const id = restAfter(cliArgs, sub)[0];
+    if (!id) throw new Error("Usage: gini agent archive <agent-id-or-name>");
+    print(await api(config, `/api/agents/${encodeURIComponent(id)}/archive`, { method: "POST" }));
+    return;
+  }
+  if (sub === "unarchive") {
+    const id = restAfter(cliArgs, sub)[0];
+    if (!id) throw new Error("Usage: gini agent unarchive <agent-id-or-name>");
+    print(await api(config, `/api/agents/${encodeURIComponent(id)}/unarchive`, { method: "POST" }));
+    return;
+  }
   print(await api(config, "/api/agents"));
 }

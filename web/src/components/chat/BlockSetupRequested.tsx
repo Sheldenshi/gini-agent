@@ -12,6 +12,7 @@ import { api } from "@/lib/api";
 import { useSetupRequests, useInvalidate, useProviders } from "@/lib/queries";
 import type { SetupRequest, SetupRequestedBlock } from "@runtime/types";
 import { parseFillSecretSlots, type FillSecretSlot } from "@/lib/fill-secrets-types";
+import { browserConnectButtonLabel } from "./browser-connect-card";
 
 // User-actor gate: the user performs a setup step (sign in, enter
 // credentials, fill a form, stand up a messaging bridge, approve an
@@ -805,7 +806,7 @@ export function BlockSetupRequested({ block }: { block: SetupRequestedBlock }) {
               disabled={browserConnect.isPending || !isPending}
               onClick={() => browserConnect.mutate()}
             >
-              {signInStarted ? "I've signed in" : "Connect"}
+              {browserConnectButtonLabel(setup?.payload, signInStarted)}
             </Button>
             <Button
               size="sm"

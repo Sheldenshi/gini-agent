@@ -194,6 +194,16 @@ silently bypassing the filter.
   Hindsight bank plus all of its units. The default agent
   (`agent_default`) and the currently active agent are protected and
   return 400 with a typed error.
+- Agents can be archived via `POST /api/agents/:id/archive` and restored
+  via `POST /api/agents/:id/unarchive` (also `gini agent archive` /
+  `gini agent unarchive`). Archive sets `AgentRecord.archivedAt`; the
+  agent is retained (memory and history preserved) but suppressed.
+  Restore clears `archivedAt` and leaves the agent inactive. Only the
+  default agent (`agent_default`) cannot be archived; archiving the active
+  agent is allowed and hands "active" back to the default. An archived
+  agent cannot be activated — both guards return 400 with a typed error. A
+  due, active scheduled job whose owning agent is archived is skipped by
+  `runDueJobs`.
 - `bun run typecheck`, `bun test`, and `bun run gini smoke` are
   green.
 
@@ -245,3 +255,40 @@ The plumbing helper is
 effective context, and returns the agent's provider when
 `providerSource === "agent"` (else `undefined`). Each memory pipeline
 resolves the override once at function entry and threads it through.
+
+## Amendment 2026-06-15: Archive / unarchive agent lifecycle
+
+Agents support a soft-delete lifecycle alongside the hard `deleteAgent`
+cascade. `AgentRecord.archivedAt` is an optional ISO timestamp,
+orthogonal to `status`: archiving an agent stamps `archivedAt` and leaves
+the agent in `state.agents` with its memory pool and history intact;
+restoring clears the field. `archivedAt` lives in its own field rather
+than as an `AgentStatus` value because `activateAgent` rewrites every
+agent's `status` on each switch and would clobber an "archived" status.
+
+`archiveAgent` and `unarchiveAgent` in `src/capabilities/agents.ts`
+mirror `deleteAgent`'s structure (load state, mutate, persist, audit,
+return the updated record) and emit `agent.archived` / `agent.unarchived`
+audit events attributed to the subject agent (see ADR
+agent-attribution-invariant.md). Only the default agent (`agent_default`)
+is non-archivable — it's the always-present fallback selection. The active
+agent can be archived: archiving the current selection hands "active" back
+to the default via `activateAgent`, so the active pointer, per-agent
+statuses, and the `agent.activated` audit stay consistent. A restored
+agent stays inactive — restoration never auto-activates. `activateAgent`
+(and the `/use` path) refuse an archived agent so reactivation is an
+explicit restore. `listAgents` returns `defaultAgentId` alongside
+`activeAgentId` so the web can tell which agent is non-archivable.
+
+Two consequences:
+
+- **Job suppression.** Scheduled jobs are the only per-agent background
+  execution. `runDueJobs` skips a due, active job whose owning agent has
+  `archivedAt` set (the job stays `active`, so restoring the agent
+  resumes it). This is the "stop running" half of archiving.
+- **Client surface.** `POST /api/agents/:id/archive` and `/unarchive`,
+  the `gini agent archive` / `unarchive` CLI subcommands, and the web
+  sidebar's per-agent Archive control plus a collapsible "Archived"
+  group with a Restore action all drive the same two capability
+  functions. The trimmed `AgentRow` view-type carries `archivedAt` so
+  the web can split active from archived agents.

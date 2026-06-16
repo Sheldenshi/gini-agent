@@ -57,6 +57,7 @@ import {
   USER_SOFT_CAP_CHARS,
   buildAgentSystemContext,
   buildBoundJobsBlock,
+  buildClientSurfaceBlock,
   buildCurrentDateBlock,
   resolveLocalTimeZone,
   decideIdentityEmission,
@@ -115,6 +116,7 @@ import { getSubagentForTask, syncSubagentFromTask } from "../capabilities/subage
 import { listEnabledSkillScripts } from "../capabilities/skill-scripts";
 import { autoRenameChatAfterTurn } from "./chat";
 import { finalizeJobRunFromTask } from "../jobs/finalize";
+import { peekRefLabel } from "../tools/browser";
 import { isSkillActive } from "../integrations/connectors";
 import { getProvider, providerForCredentialName } from "../integrations/connectors/registry";
 import { resolveEffectiveContext } from "./effective-context";
@@ -240,6 +242,29 @@ const COMPACTION_SUMMARY_SYSTEM =
 // a per-turn artifact. The durable chat transcript keeps the original
 // tool_transcript rows, so next-turn replay is unaffected.
 export const IN_TURN_COMPACTION_NOTE_PREFIX = "[Context compacted]";
+
+// Test-only override for the base (pre-subagent-filter) tool catalog. When
+// set, resolveBaseCatalog returns this fixed catalog instead of the live
+// buildToolCatalog result, so tests that pin token geometry (the in-turn
+// compaction tests) stay decoupled from the always-on tool-catalog size —
+// growing any always-on tool description can otherwise shift toolSchemaTokens
+// and silently move the compaction crossing point. Default (null) = live
+// behavior. Mirrors the repo's other __set…ForTests seams (e.g. the
+// transformers-loader hook in src/embeddings.ts).
+let baseToolCatalogOverride: ToolCatalogTool[] | null = null;
+
+// Resolve the base tool catalog both buildToolCatalog call sites compose from
+// (system-context build + runLoop). Returns the test override when installed,
+// else the live catalog. The caller still applies filterToolsForSubagent on
+// top, so the override only fixes the pre-filter catalog.
+function resolveBaseCatalog(state: RuntimeState, agentToolsetFilter?: Set<string>): ToolCatalogTool[] {
+  return baseToolCatalogOverride ?? buildToolCatalog(state, agentToolsetFilter);
+}
+
+// Test-only: install (or clear with null) the fixed base tool catalog.
+export function __setBaseToolCatalogForTests(catalog: ToolCatalogTool[] | null): void {
+  baseToolCatalogOverride = catalog;
+}
 
 // Extract the provider-reported prompt token count from a model-call usage
 // record. Anthropic reports `input_tokens` (Bedrock Converse usage is
@@ -764,7 +789,7 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
   // deferred tools remain unloaded by name + one-line summary. The full
   // schemas join the provider tools array only after load_tools fires.
   const deferredCatalog = filterToolsForSubagent(
-    buildToolCatalog(state, effectiveForAgent.toolsetFilter),
+    resolveBaseCatalog(state, effectiveForAgent.toolsetFilter),
     subagent
   );
   const alreadyLoaded = new Set<string>(task.loadedTools ?? []);
@@ -792,7 +817,19 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
   // the prior-transcript rebuild and the live user message deliver files the
   // same way (native doc vs extracted-text vs path-only).
   const modality = resolveProviderModality(effectiveForAgent.provider);
-  const ephemeralContext = subagent ? "" : renderEphemeralContext(identityBlock, recalledContext);
+  // A text-only model (no vision) can't ingest image content parts, but
+  // buildAttachmentContent degrades an image to a text note (never an image_url
+  // part), so there's no 400 risk and no need to abort the turn here. We let the
+  // turn proceed so the agent refuses IN-BAND as a normal, replayable assistant
+  // turn: a hard reject would have surfaced only as a UI-only system_note, which
+  // is never replayed into the model's context and so breaks "try again"
+  // resolution on the next turn (see ADR chat-file-attachments.md).
+  // The surface of the message that started THIS turn rides in the
+  // ephemeral tail (not the byte-stable system prefix) because the same
+  // session can alternate between phone and desktop across turns.
+  const ephemeralContext = subagent
+    ? ""
+    : renderEphemeralContext(identityBlock, recalledContext, buildClientSurfaceBlock(task.clientSurface));
   const currentUserMessage = await buildUserMessage(config, task, modality);
   const nonPriorMessages: ToolCallingMessage[] = [
     { role: "system", content: systemContext },
@@ -1248,7 +1285,11 @@ function wrapInlinedFile(
 //
 // Images are inlined as data URLs (the provider can't authenticate against
 // /api/uploads/:id, so we inline base64 bytes); a missing/unreadable image is
-// dropped with a trace. The image path is NOT gated on `modality.vision`.
+// dropped with a trace. The image path IS gated on `modality.vision`: a
+// non-vision model degrades an image attachment to a text note instead of an
+// image_url part, so a text-only provider never receives an image_url part it
+// would 400 on. On the arrival turn, a non-vision image also adds a steering
+// directive so the agent refuses in-band rather than hallucinating contents.
 //
 // Non-image files are delivered deterministically by capability, in core, with
 // no skill dependency: every file is materialized to the workspace, then —
@@ -1271,6 +1312,16 @@ export async function buildAttachmentContent(
   const files = attachments.filter((a) => !a.mimeType.startsWith("image/"));
   const loaded: Array<{ id: string; mimeType: string; size: number }> = [];
   for (const image of images) {
+    if (!modality.vision) {
+      // Non-vision model: degrade the image to a terse note rather than emitting an
+      // image_url part a text-only provider would 400 on. A current-turn steering
+      // directive is appended after this loop (see below).
+      parts.push({
+        type: "text",
+        text: `[Attached image: ${image.id} (${image.mimeType}, ${formatBytes(image.size)}) — not shown: the active model can't view images.]`
+      });
+      continue;
+    }
     const dataUrl = uploadDataUrl(config.instance, image.id);
     if (!dataUrl) {
       appendLog(config.instance, "chat.image.missing", { uploadId: image.id });
@@ -1278,6 +1329,16 @@ export async function buildAttachmentContent(
     }
     parts.push({ type: "image_url", image_url: { url: dataUrl } });
     loaded.push({ id: image.id, mimeType: image.mimeType, size: image.size });
+  }
+  // On the arrival turn, when the active model has no vision, steer the agent to
+  // refuse in-band instead of hallucinating image contents. Prior-turn replay
+  // (isCurrentTurn=false) keeps only the terse per-image note above to bound
+  // replay context.
+  if (isCurrentTurn && !modality.vision && images.length > 0) {
+    parts.push({
+      type: "text",
+      text: "You cannot see the image(s) above — the active model has no vision. Do not guess or infer their contents. Tell the user you can't view images and ask them to switch to a vision-capable model or describe what the image shows."
+    });
   }
   // Surface upload metadata to the model so non-vision tools (e.g.
   // signed_upload, MCP attachment uploads) can plug the right values into
@@ -1748,7 +1809,7 @@ async function runLoop(
   // after a load_tools call so the next provider call sees the new schemas;
   // the hot no-load path never calls recompute and stays byte-identical to
   // the prior frozen-catalog behavior.
-  const fullCatalog = filterToolsForSubagent(buildToolCatalog(state0, effective.toolsetFilter), subagent0);
+  const fullCatalog = filterToolsForSubagent(resolveBaseCatalog(state0, effective.toolsetFilter), subagent0);
   const loadedToolNames = new Set<string>(taskRow?.loadedTools ?? []);
   // Subagent seeding: a subagent whose whitelisted toolsets own deferred
   // tools gets those tools live at entry (no load_tools round-trip), so a
@@ -2924,7 +2985,8 @@ async function runLoop(
       emitToolCallRunning(emitCtx, {
         toolName: call.function.name,
         callId: call.id,
-        args: parsedArgs
+        args: parsedArgs,
+        resolveRefLabel: (ref) => peekRefLabel(taskId, ref)
       });
       // load_tools is handled INLINE (not via dispatchToolCall): it mutates
       // the loaded set, recomputes providerTools so the NEXT iteration ships

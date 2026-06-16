@@ -144,6 +144,11 @@ function defaultGateChannel(): GateChannel | null {
 // Hold the "complete" confirmation on screen this long before the final
 // pre-reload probe and the reload onto the freshly built assets.
 const COMPLETE_RELOAD_DELAY_MS = 1_500;
+// Per-request timeout for the deadline's final verify (the /version +
+// __healthz fetches below). Short and retry-free: the deadline already fired,
+// so this is a last definitive read, not a poll — a slow/dead stack must fall
+// through to the error rather than stretch the blur further.
+const DEADLINE_VERIFY_TIMEOUT_MS = 4_000;
 // Whole-gate deadline: a generous ceiling on the entire update (git + bun
 // install in both roots, the sha-keyed production `next build` of the web
 // app — itself up to ~90s — the restart, and the pre-reload probe). The
@@ -239,18 +244,27 @@ export function UpdateGateProvider({
   // either order, so /status (proxied to the gateway) can't vouch for the web
   // server it transited: a poll can reach the NEW gateway through the
   // still-alive OLD web server. Poll the web-local __healthz route alongside
-  // status while waiting so the web server proves its own identity. `ppid` —
-  // not the worker pid — is that identity: see the route. retry: false keeps
-  // the cadence on the refetch interval while the server is down instead of
+  // status while waiting so the web server proves its own identity. Under
+  // production serving `buildSha` is that identity — the sha of the code the
+  // server is serving, so only the restarted server reports the target;
+  // `ppid` (the supervising next CLI, not the worker pid — see the route) is
+  // the dev/legacy fallback when `buildSha` is absent. retry: false keeps the
+  // cadence on the refetch interval while the server is down instead of
   // stretching each cycle through exponential retry backoff.
   const healthz = useQuery({
     queryKey: ["web", "healthz"],
-    queryFn: () => api<{ ppid?: number }>("/__healthz"),
+    queryFn: () => api<{ ppid?: number; buildSha?: string }>("/__healthz"),
     enabled: waiting,
     refetchInterval: 1_500,
     retry: false
   });
   const healthzPpid = typeof healthz.data?.ppid === "number" ? healthz.data.ppid : null;
+  // buildSha is contractually the `--short=12` HEAD sha (>=12 hex). Reject an
+  // empty/too-short value so a degenerate string can't false-match the target
+  // via startsWith ("" or a 1-char prefix would spuriously complete the gate);
+  // a malformed signal falls back to the ppid leg below.
+  const healthzBuildSha =
+    typeof healthz.data?.buildSha === "string" && healthz.data.buildSha.length >= 12 ? healthz.data.buildSha : null;
 
   // Progress poll: while waiting, ask the gateway whether its single-flight
   // update is still running. Only an affirmative answer feeds the deadline
@@ -508,11 +522,19 @@ export function UpdateGateProvider({
   //   - Gateway leg: /status reports a pid different from beforePid. Cached
   //     query data still carries the old pid, so a differing pid is
   //     intrinsically a fresh post-restart response.
-  //   - Web leg: the local __healthz route reports a ppid different from
-  //     beforeWebPpid — proof the web server TREE was replaced. The worker
-  //     pid would lie here: the next CLI respawns its worker (new pid, same
-  //     still-old tree) when an update's checkout touches next.config.*, but
-  //     the supervising ppid only changes on a kickstart / stop+start.
+  //   - Web leg: under production serving, __healthz reports a buildSha equal
+  //     to the target revision — the sha of the code the server is serving, so
+  //     the OLD server reports the OLD build and only the restarted server
+  //     reports the target. This is definitive and un-raceable (no transition
+  //     to miss), unlike the ppid proxy below: targetSha is the full sha and
+  //     buildSha the --short form, so the prefix match is the robust compare.
+  //     When buildSha is absent (dev serving, an older server, a build that
+  //     fell back to dev), the leg drops to the legacy signal — __healthz
+  //     reports a ppid different from beforeWebPpid, proof the web server TREE
+  //     was replaced. The worker pid would lie there: the next CLI respawns
+  //     its worker (new pid, same still-old tree) when an update's checkout
+  //     touches next.config.*, but the supervising ppid only changes on a
+  //     kickstart / stop+start.
   // Each leg falls back when its starting identity is unknown (a gate
   // persisted by an older page, or the probe failing/omitting the field): the
   // first poll on that query that succeeds after entering this phase —
@@ -540,15 +562,18 @@ export function UpdateGateProvider({
       beforePid != null
         ? statusPid != null && statusPid !== beforePid
         : !progressHoldsFallback && restartingSince != null && statusUpdatedAt > restartingSince;
+    const webBuildMatchesTarget =
+      targetSha != null && healthzBuildSha != null && targetSha.startsWith(healthzBuildSha);
     const webRestarted =
-      beforeWebPpid != null
+      webBuildMatchesTarget ||
+      (beforeWebPpid != null
         ? healthzPpid != null && healthzPpid !== beforeWebPpid
-        : !progressHoldsFallback && restartingSince != null && healthzUpdatedAt > restartingSince;
+        : !progressHoldsFallback && restartingSince != null && healthzUpdatedAt > restartingSince);
     if (gatewayRestarted && webRestarted) {
       setPhase("complete");
       writePersistedGate({ phase: "complete", verified: true, startedAt: startedAtRef.current ?? undefined });
     }
-  }, [phase, beforePid, statusPid, beforeWebPpid, healthzPpid, restartingSince, statusUpdatedAt, healthzUpdatedAt, progressHoldsFallback]);
+  }, [phase, targetSha, healthzBuildSha, beforePid, statusPid, beforeWebPpid, healthzPpid, restartingSince, statusUpdatedAt, healthzUpdatedAt, progressHoldsFallback]);
 
   // Once complete, reload onto the fresh assets — after one last __healthz
   // probe. The identity proofs above are point-in-time: the web server can
@@ -592,11 +617,47 @@ export function UpdateGateProvider({
     };
   }, [phase, beforePid, beforeWebPpid]);
 
-  // Safety net spanning every non-idle phase: release if the update never
-  // reloads (a hung POST, a failed restart, a reload that lost the target
-  // revision, or a stack that proved its restart and then died — the latter
-  // cycles complete ↔ restarting on pre-reload probe failures because the
-  // latched identity legs re-complete the gate instantly). The deadline is
+  // The deadline's final verify: read the live stack directly and report
+  // whether the update actually completed on the target revision. Both fetches
+  // are awaited with a short timeout and no retries — the deadline already
+  // fired, so this is a definitive last read, not a poll. Success requires the
+  // FULL stack on the target: the gateway reachable, no update still in flight
+  // (updateInProgress not true), and HEAD landed on the target — matched
+  // explicitly when a targetSha was recorded, else inferred from the gateway
+  // reporting nothing newer to pull (updateAvailable false); plus the web
+  // server reachable and, under production serving, serving the target build
+  // (targetSha startsWith buildSha). When buildSha is absent (dev/legacy)
+  // reachability alone stands for the web leg, mirroring the completion
+  // detector's fallback. Any rejection (a down server, a timeout) resolves
+  // false so the caller surfaces the stall notice.
+  const deadlineVerify = useCallback(async (): Promise<boolean> => {
+    try {
+      const signal = AbortSignal.timeout(DEADLINE_VERIFY_TIMEOUT_MS);
+      const [ver, health] = await Promise.all([
+        api<GiniVersionInfo & { updateInProgress?: boolean }>("/version", { signal }),
+        api<{ buildSha?: string }>("/__healthz", { signal })
+      ]);
+      if (ver.updateInProgress === true) return false;
+      const headOnTarget = targetSha != null ? ver.git.sha === targetSha : ver.git.updateAvailable === false;
+      if (!headOnTarget) return false;
+      // Same >=12 guard as healthzBuildSha: an empty/too-short buildSha can't
+      // stand in for the target, so treat it as absent (web leg falls back to
+      // reachability) rather than letting a degenerate prefix match.
+      const webOnTarget =
+        typeof health.buildSha === "string" && health.buildSha.length >= 12 && targetSha != null
+          ? targetSha.startsWith(health.buildSha)
+          : true;
+      return webOnTarget;
+    } catch {
+      return false;
+    }
+  }, [targetSha]);
+
+  // Safety net spanning every non-idle phase: the deadline catches an update
+  // that never reloaded (a hung POST, a failed restart, a reload that lost the
+  // target revision, or a stack that proved its restart and then died — the
+  // latter cycles complete ↔ restarting on pre-reload probe failures because
+  // the latched identity legs re-complete the gate instantly). The deadline is
   // set when the gate leaves idle: phase changes re-run this effect, but
   // each run schedules the remaining time against the one shared deadline,
   // so transitions and drop-backs cannot extend the blur. Only the progress
@@ -605,6 +666,19 @@ export function UpdateGateProvider({
   // the deadline) bounds the whole gate absolutely. Releasing from
   // "complete" also tears down the pending probe/reload via that effect's
   // cancelled-flag cleanup.
+  //
+  // The deadline firing does NOT mean the update failed — only that the
+  // completion detectors never latched (a missed identity transition, a
+  // poll that never landed on the brief restart window). So before crying
+  // wolf, do ONE final definitive read of the stack: /version (the gateway)
+  // and __healthz (the web server), awaited, short timeout, no retries. If
+  // the gateway is up and idle on the target revision AND the web server is
+  // serving the target build, the update DID complete — reload onto it with
+  // no error toast, exactly as a normal completion would. Only when the stack
+  // is genuinely not up on the target does the original release fire: reset
+  // the blur and surface the "taking longer than expected" notice. This
+  // guarantees the false error can't show on any detection-miss path, not
+  // just the ppid race Change 1 targets.
   useEffect(() => {
     if (phase === "idle") {
       stallDeadlineRef.current = null;
@@ -616,14 +690,30 @@ export function UpdateGateProvider({
     // the hard cap from "now".
     stallDeadlineRef.current ??= (startedAtRef.current ?? Date.now()) + stallTimeoutMs;
     hardCapRef.current ??= (startedAtRef.current ?? Date.now()) + gateHardCapMs;
+    let cancelled = false;
     const timer = setTimeout(() => {
-      reset();
-      toast.error("Update is taking longer than expected. Reload to check on it.");
-      qc.invalidateQueries({ queryKey: ["status"] });
-      qc.invalidateQueries({ queryKey: ["version", "check"] });
+      void deadlineVerify().then((up) => {
+        if (cancelled) return;
+        if (up) {
+          // The update completed; a detector just never observed it. Land on
+          // the new app instead of erroring. Clear the persisted gate first
+          // so the reloaded page comes up clean (mirrors the complete path).
+          if (ownerRef.current) channelRef.current?.postMessage({ type: "done" });
+          writePersistedGate(null);
+          window.location.reload();
+          return;
+        }
+        reset();
+        toast.error("Update is taking longer than expected. Reload to check on it.");
+        qc.invalidateQueries({ queryKey: ["status"] });
+        qc.invalidateQueries({ queryKey: ["version", "check"] });
+      });
     }, stallDeadlineRef.current - Date.now());
-    return () => clearTimeout(timer);
-  }, [phase, reset, qc, stallTimeoutMs, gateHardCapMs, deadlineExtensions]);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [phase, deadlineVerify, reset, qc, stallTimeoutMs, gateHardCapMs, deadlineExtensions]);
 
   const value = useMemo<UpdateGateValue>(
     () => ({ version, updateSupported, updateAvailable, phase, start }),

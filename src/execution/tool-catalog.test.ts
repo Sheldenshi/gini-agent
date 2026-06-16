@@ -20,6 +20,7 @@ import { describe, expect, test } from "bun:test";
 import {
   applyDeferralFilter,
   buildToolCatalog,
+  chatBlockArgsPreviewFor,
   deferredToolIndex,
   firstSentence,
   handleLoadTools,
@@ -296,6 +297,36 @@ describe("buildToolCatalog", () => {
     expect(tool?.function.parameters.required).toEqual(["jobId"]);
   });
 
+  test("create_job and update_job offer skillNames with the attach-the-recipe steering", () => {
+    // The skillNames descriptions carry the in-prompt steering that makes
+    // the agent attach integration skills when scheduling (ADR
+    // job-skill-attachments.md). Pin the key clauses so a rewrite that
+    // drops them surfaces as a test failure.
+    const state = stateWithToolsets([]);
+    const catalog = buildToolCatalog(state);
+    const createTool = catalog.find((t) => t.function.name === "create_job");
+    // The top-level description carries the attach-by-default demand — the
+    // param description alone was not enough to make the model reach for it.
+    expect(createTool?.function.description).toContain("ALWAYS set `skillNames`");
+    const createProps = createTool?.function.parameters.properties as Record<string, { description?: string }>;
+    expect(createProps.skillNames).toBeDefined();
+    expect(createProps.skillNames?.description).toContain("loaded into every run");
+    expect(createProps.skillNames?.description).toContain("google-calendar + google-gmail");
+    // Operating recipes only — without this clause the model attaches
+    // one-time setup/install/sign-in skills to recurring jobs.
+    expect(createProps.skillNames?.description).toContain("Never attach one-time setup/installation skills");
+    const updateTool = catalog.find((t) => t.function.name === "update_job");
+    expect(updateTool?.function.description).toContain("skill attachments");
+    const updateProps = updateTool?.function.parameters.properties as Record<string, { type?: unknown; description?: string }>;
+    expect(updateProps.skillNames).toBeDefined();
+    // update is full-replacement; [] or null clears (updateJob treats null
+    // as clear), so the schema must admit null alongside array.
+    expect(updateProps.skillNames?.type).toEqual(["array", "null"]);
+    expect(updateProps.skillNames?.description).toContain("FULL replacement");
+    expect(updateProps.skillNames?.description).toContain("[] (or null) to clear");
+    expect(updateProps.skillNames?.description).toContain("Never attach one-time setup/installation skills");
+  });
+
   test("set_provider's model-facing schema offers bedrock + awsRegion + azure routing; baseUrl is documented as ignored for anthropic/bedrock", () => {
     // This is the schema the MODEL actually sees (the SELF_OPERATIONS schema is
     // documentation-only). It offers bedrock + awsRegion and azure transport
@@ -400,6 +431,51 @@ describe("buildToolCatalog", () => {
       // assignment, not on USER preferences about communication.
       expect(desc).toContain("persona");
       expect(desc).toContain("You are");
+    });
+  });
+
+  describe("sensitive-boundary tool descriptions", () => {
+    // browser_connect and browser_fill_secrets carry the steering for the
+    // payment / PII boundary: the agent drives a sensitive flow as far as
+    // it can, then escalates to the user instead of refusing. Pin the key
+    // clauses so a rewrite that drops a sanctioned use surfaces as a test
+    // failure. browser_fill_secrets is always-on; browser_connect rides the
+    // browser toolset, so enable it.
+    const state = stateWithToolsets([ts("browser")]);
+    const catalog = buildToolCatalog(state);
+
+    test("browser_connect description sanctions both sign-in unblock and sensitive-step handoff", () => {
+      const tool = catalog.find((t) => t.function.name === "browser_connect");
+      expect(tool).toBeDefined();
+      const desc = tool?.function.description ?? "";
+      // Use (1): the sign-in unblock keeps its strong steers.
+      expect(desc).toContain("Sign-in unblock");
+      expect(desc).toContain("NEVER a first step");
+      expect(desc).toContain("I've signed in");
+      // Use (2): the handoff for a user-must-act step.
+      expect(desc).toContain("Sensitive-step handoff");
+      expect(desc).toContain("payment");
+      expect(desc).toContain("I'm done");
+      // Handoff is only useful when the user is at the gateway machine.
+      expect(desc).toContain("gateway machine");
+      // The mode parameter selects the completion-card wording.
+      const props = tool!.function.parameters.properties as Record<string, { enum?: string[]; default?: string }>;
+      expect(props.mode?.enum).toEqual(["sign-in", "handoff"]);
+      expect(props.mode?.default).toBe("sign-in");
+    });
+
+    test("browser_fill_secrets description names payment and checkout PII alongside credentials", () => {
+      const tool = catalog.find((t) => t.function.name === "browser_fill_secrets");
+      expect(tool).toBeDefined();
+      const desc = tool?.function.description ?? "";
+      // Credentials remain first-class.
+      expect(desc).toContain("passwords, OTPs");
+      // Payment / sensitive personal info at checkout is now first-class too.
+      expect(desc).toContain("payment-card");
+      expect(desc).toContain("checkout");
+      // Existing constraints survive the broadening.
+      expect(desc).toContain("NEVER for ordinary text");
+      expect(desc).toContain("you never see the values");
     });
   });
 
@@ -641,5 +717,52 @@ describe("deferred tools", () => {
     expect(firstSentence("Open a page. Then do more.")).toBe("Open a page.");
     const long = "a".repeat(200);
     expect(firstSentence(long, 50).length).toBeLessThanOrEqual(50);
+  });
+});
+
+describe("chatBlockArgsPreviewFor browser ref labels", () => {
+  test("browser_click renders role + name when the resolver names the ref", () => {
+    const preview = chatBlockArgsPreviewFor(
+      "browser_click",
+      { ref: "@e38" },
+      (ref) => (ref === "@e38" ? { role: "button", name: "Buy a License" } : undefined)
+    );
+    expect(preview).toBe('button "Buy a License"');
+  });
+
+  test("browser_click falls back to the bare ref with no resolver", () => {
+    expect(chatBlockArgsPreviewFor("browser_click", { ref: "@e38" })).toBe("@e38");
+  });
+
+  test('browser_click drops the synthetic "clickable" role and shows the name alone', () => {
+    const preview = chatBlockArgsPreviewFor(
+      "browser_click",
+      { ref: "@e38" },
+      () => ({ role: "clickable", name: "Buy a License" })
+    );
+    expect(preview).toBe('"Buy a License"');
+  });
+
+  test("browser_click falls back to the bare ref when the named element has no name", () => {
+    const preview = chatBlockArgsPreviewFor(
+      "browser_click",
+      { ref: "@e38" },
+      () => ({ role: "button", name: "" })
+    );
+    expect(preview).toBe("@e38");
+  });
+
+  test("browser_fill_form joins each field's resolved label", () => {
+    const preview = chatBlockArgsPreviewFor(
+      "browser_fill_form",
+      { fields: [{ ref: "@e1" }, { ref: "@e2" }] },
+      (ref) =>
+        ref === "@e1"
+          ? { role: "textbox", name: "Email" }
+          : ref === "@e2"
+            ? { role: "textbox", name: "Password" }
+            : undefined
+    );
+    expect(preview).toBe('textbox "Email", textbox "Password"');
   });
 });

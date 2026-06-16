@@ -12,14 +12,39 @@ export type ChatRenderItem =
 
 export function groupExchanges(blocks: ChatBlock[]): ChatRenderItem[] {
   const items: ChatRenderItem[] = [];
-  let i = 0;
-  while (i < blocks.length) {
-    let end = i + 1;
-    while (end < blocks.length && blocks[end]!.kind !== "user_text") end++;
-    const exchange = blocks.slice(i, end);
-    appendExchange(items, exchange);
-    i = end;
+  // Partition blocks into exchanges, then collapse each. An exchange is the
+  // set of blocks sharing one taskId — a single agent turn or job cycle. A
+  // turn's user_text, assistant_text, and tool calls all carry that turn's
+  // taskId, so grouping by taskId keeps them together. This is what splits a
+  // recurring-job channel — which has no user_text — into one group per cron
+  // cycle; treating the whole channel as one exchange would collapse every
+  // cycle's tool calls into a single group anchored to the first message.
+  //
+  // Grouping by taskId rather than by contiguous run also survives
+  // interleaving: a manual or replay job run may execute alongside an
+  // in-flight scheduled run (see src/jobs/index.ts), so two tasks can write
+  // blocks into one session's ordinal stream out of order. Keying on taskId
+  // reunites each task's blocks regardless of insertion order, and exchange
+  // order follows each task's first appearance.
+  //
+  // A block with no taskId forms its own single-block exchange in place, so
+  // it passes through untouched rather than merging into an unrelated turn.
+  const exchanges: ChatBlock[][] = [];
+  const indexByTask = new Map<string, number>();
+  for (const b of blocks) {
+    if (b.taskId === undefined) {
+      exchanges.push([b]);
+      continue;
+    }
+    const existing = indexByTask.get(b.taskId);
+    if (existing === undefined) {
+      indexByTask.set(b.taskId, exchanges.length);
+      exchanges.push([b]);
+    } else {
+      exchanges[existing]!.push(b);
+    }
   }
+  for (const exchange of exchanges) appendExchange(items, exchange);
   return items;
 }
 

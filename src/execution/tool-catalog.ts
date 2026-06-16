@@ -721,17 +721,18 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   },
   {
     toolset: "browser",
-    displayLabel: "Connect browser to sign in",
+    displayLabel: "Hand browser to user",
     type: "function",
     function: {
       name: "browser_connect",
-      description: "Surface a Connect button in chat so the user can sign in to a third-party service in a visible Chrome window. ONLY call this when a navigation you ALREADY made hit a sign-in roadblock — a login screen, OAuth / identity-provider redirect, 401/403, or \"please sign in\" interstitial that actually blocks the page you need. It is NEVER a first step and must NOT be called proactively or before navigating: always navigate with browser_navigate first, and reach for this only if that page genuinely requires sign-in. For ordinary browsing that does not hit a sign-in wall, keep using browser_navigate (headless) — no connection or approval is needed, so do not ask the user to connect. When you DO hit a sign-in wall, don't report it as a blocker — call this tool. The user clicks Connect, signs in once, clicks \"I've signed in\", then the browser switches to headless and the agent continues with the persisted session. Pass `url` = the page you ALREADY navigated to and were blocked at by the sign-in wall, so the visible Chrome reopens that exact page for sign-in and the agent retries it afterward. This tool does NOT reach a page you haven't navigated to — use browser_navigate for that.",
+      description: "Surface a Connect button in chat that hands the user a visible Chrome window on the agent's own browser profile, for a step only the user can perform; when they finish, the browser returns to headless and the agent continues with the persisted session. Two sanctioned uses — it is NEVER a first step and must NOT be called before navigating: always navigate with browser_navigate first. (1) Sign-in unblock (default, mode \"sign-in\"): ONLY when a navigation you ALREADY made hit a sign-in roadblock — a login screen, OAuth / identity-provider redirect, 401/403, or \"please sign in\" interstitial that actually blocks the page you need. Never call it proactively for sign-in; for ordinary browsing that does not hit a sign-in wall, keep using browser_navigate (headless) — no connection or approval is needed, so do not ask the user to connect. When you DO hit a sign-in wall, don't report it as a blocker — call this tool. The user clicks Connect, signs in once, clicks \"I've signed in\", then the agent continues. (2) Sensitive-step handoff (mode \"handoff\"): the task has reached a step the USER must perform themselves in the visible window — entering payment details, a final purchase confirmation — or the user chose via ask_user to finish manually. Only at such a genuine user-must-act step or on the user's explicit choice, never as a shortcut for steps you can drive yourself, and only when the user is at the gateway machine (the per-turn surface note tells you). The user clicks Connect, completes the step in the visible window, clicks \"I'm done\", then the agent continues — re-snapshot the page, confirm the outcome from it, and report. In both uses pass `url` = the page you ALREADY navigated to (the sign-in wall, or the page the user must act on), so the visible Chrome reopens that exact page and the agent retries it afterward. This tool does NOT reach a page you haven't navigated to — use browser_navigate for that.",
       parameters: {
         type: "object",
         properties: {
-          reason: { type: "string", description: "One short user-facing sentence shown in the approval card (e.g. 'Sign in to Amazon to manage your Audible subscription')." },
-          url: { type: "string", description: "Absolute http(s) URL of the page you already navigated to and were blocked at by a sign-in wall. The visible Chrome reopens this exact page for sign-in, and the agent retries it afterward. Not a way to open a page you haven't navigated to — use browser_navigate for that." },
-          headless: { type: "boolean", description: "Reserved for the legacy auto-approve path. Leave unset in normal use — the two-stage Connect / \"I've signed in\" flow handles the headed→headless transition automatically.", default: false }
+          reason: { type: "string", description: "One short user-facing sentence shown in the approval card (e.g. 'Sign in to Amazon to manage your Audible subscription', 'Enter your payment details to finish the booking')." },
+          url: { type: "string", description: "Absolute http(s) URL of the page you already navigated to — the sign-in wall, or the page the user must act on. The visible Chrome reopens this exact page, and the agent retries it afterward. Not a way to open a page you haven't navigated to — use browser_navigate for that." },
+          mode: { type: "string", enum: ["sign-in", "handoff"], default: "sign-in", description: "Which sanctioned use this is. \"sign-in\" (default): clear a sign-in wall — the completion card reads \"I've signed in\". \"handoff\": the user performs a sensitive step themselves (payment entry, final confirmation) — the completion card reads \"I'm done\"." },
+          headless: { type: "boolean", description: "Reserved for the legacy auto-approve path. Leave unset in normal use — the two-stage Connect / completion flow handles the headed→headless transition automatically.", default: false }
         },
         required: ["reason"]
       }
@@ -823,20 +824,21 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   },
   {
     // Browser-fill-secrets affordance. When the agent's browser tool
-    // reaches a login or other input form whose values must come from
-    // the user (passwords, OTPs, account ids, MFA codes), the agent
-    // calls this tool. The user sees a card in chat with one input
+    // reaches a login, checkout, or other input form whose values must
+    // come from the user (passwords, OTPs, MFA codes, payment-card
+    // fields, sensitive personal info), the agent calls this tool. The
+    // user sees a card in chat with one input
     // field per slot, types the value(s), and the gateway pipes them
     // straight into page.locator(...).fill(...) via the same /connect
     // endpoint connector.request uses. Submitted values are never
     // persisted, never enter the LLM context, never reach the
     // transcript or audit payload — see ADR browser-fill-secret.md.
     toolset: "browser",
-    displayLabel: "Ask user for credentials",
+    displayLabel: "Ask user for sensitive values",
     type: "function",
     function: {
       name: "browser_fill_secrets",
-      description: "Ask the user to fill one or more input fields on the active browser page. ONLY for credentials and other secret values the user must supply (passwords, OTPs, account ids, MFA codes) — NEVER for ordinary text like search queries or form content you already know; type that yourself with browser_type. Every call here interrupts the user with an approval card, and conversely NEVER attempt to fill credential fields yourself with browser_type. The user sees a single card in chat with one input per slot; once they submit, the gateway fills each locator on the page with the user's value via playwright. Requires an active browser session — call browser_navigate first if needed. Your tool result is a plain-text summary naming which slots filled (by slot.name, never values), which errored, and any abort condition (cancel, origin drift); you never see the values themselves. Re-snapshot the page after this returns to see the post-fill state. If more fields need filling (e.g. an MFA code on the next page), call this tool again.",
+      description: "Ask the user to fill one or more input fields on the active browser page. ONLY for values the user must supply themselves: credentials and other secrets (passwords, OTPs, account ids, MFA codes) AND payment-card or sensitive personal-info fields on a checkout, booking, or registration page (card number, expiry, CVC, SSN, and the like). NEVER for ordinary text like search queries or form content you already know; type that yourself with browser_type. Every call here interrupts the user with an approval card, and conversely NEVER attempt to fill credential fields yourself with browser_type. The user sees a single card in chat with one input per slot; once they submit, the gateway fills each locator on the page with the user's value via playwright. Requires an active browser session — call browser_navigate first if needed. Your tool result is a plain-text summary naming which slots filled (by slot.name, never values), which errored, and any abort condition (cancel, origin drift); you never see the values themselves. Re-snapshot the page after this returns to see the post-fill state. If more fields need filling (e.g. an MFA code on the next page), call this tool again.",
       parameters: {
         type: "object",
         properties: {
@@ -1121,9 +1123,10 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     }
   },
   {
-    // Schedule a real cron/job. The job's output is delivered as an
-    // assistant message back into the originating chat session when it
-    // fires. Low-risk: no approval gate — the user can pause/delete the
+    // Schedule a real cron/job. The job's output is delivered into a
+    // dedicated job channel by default, or into the originating chat
+    // session with deliverTo "chat" (see the dispatcher for the binding
+    // logic). Low-risk: no approval gate — the user can pause/delete the
     // job at any time, and gating reminders behind an approval dialog
     // would defeat the UX (`remind me in 2 minutes` should not pop a
     // modal). Always exposed (like read_skill / spawn_subagent) so a
@@ -1133,7 +1136,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "create_job",
-      description: "Schedule a recurring or one-shot job that runs a prompt. The job's response is delivered as an assistant message back to this chat session when it fires. Provide EITHER `intervalSeconds` OR `cronExpression` (with `cronTimezone`), never both. Use `intervalSeconds` for 'in N minutes' or 'every N hours' (from-now timing). Use `cronExpression` + `cronTimezone` for wall-clock or weekday patterns ('daily at 9am', 'weekdays at 8:30'). Set oneShot=true for single-fire reminders. When a scheduled job needs to run UNATTENDED (e.g. recurring with no human present at fire-time), set `approvalMode: \"yolo\"` for tasks that need broad action, or use `autoApproveCommands` for narrow shell-pattern opt-ins — otherwise the job may stall at a gated approval forever (the instance default is \"auto\", which auto-approves file writes and safe shell commands but still gates dangerous patterns like rm -rf, sudo, pipe-to-sh, chmod 777, and destructive git operations). `dangerouslyAutoApprove: true` is a deprecated alias for `approvalMode: \"yolo\"` kept for back-compat. The default `timeoutSeconds` is 600 (10 min) — drop it lower for trivial reminders, or raise it (e.g. 1800+) when the prompt invokes external CLIs like codex or claude-code that can take several minutes.",
+      description: "Schedule a recurring or one-shot job that runs a prompt. ALWAYS set `skillNames` when the prompt touches an integration covered by an Available skill (e.g. google-calendar + google-gmail for a daily briefing, linear for an issue digest): attached skills' instructions are inlined into every fire, so the job follows the recipe instead of rediscovering CLI usage each run — omitting them makes every fire slower, costlier, and less reliable. By default each fire's output is delivered into a dedicated job channel — a fresh chat thread listed under Recurring jobs — keeping this conversation uncluttered; pass `deliverTo: \"chat\"` to deliver each fire into THIS conversation instead. Choosing the destination: for a RECURRING job created from chat where the user has NOT already said where the output should go, FIRST call `ask_user` with options \"Job channel\" (recommended — keeps this conversation uncluttered; appears under Recurring jobs) and \"This chat\" (each fire posts into this conversation); when you have reason to think a dispatchable messaging bridge is configured, check `list_messaging_bridges` and include up to 4 bridge options (\"Send to <name>\") — `ask_user` allows at most 6 options total — each mapping to `deliveryTargets`. A bridge pick is IN ADDITION to the chat-vs-channel binding, not instead of it: pair the bridge selection with whichever binding the user prefers, defaulting to the job channel. For ONE-SHOT reminders skip the question and pass `deliverTo: \"chat\"` (a reminder belongs in the conversation that set it) unless the user said otherwise. When the user already specified a destination, don't ask. Provide EITHER `intervalSeconds` OR `cronExpression` (with `cronTimezone`), never both. Use `intervalSeconds` for 'in N minutes' or 'every N hours' (from-now timing). Use `cronExpression` + `cronTimezone` for wall-clock or weekday patterns ('daily at 9am', 'weekdays at 8:30'). Set oneShot=true for single-fire reminders. When a scheduled job needs to run UNATTENDED (e.g. recurring with no human present at fire-time), set `approvalMode: \"yolo\"` for tasks that need broad action, or use `autoApproveCommands` for narrow shell-pattern opt-ins — otherwise the job may stall at a gated approval forever (the instance default is \"auto\", which auto-approves file writes and safe shell commands but still gates dangerous patterns like rm -rf, sudo, pipe-to-sh, chmod 777, and destructive git operations). `dangerouslyAutoApprove: true` is a deprecated alias for `approvalMode: \"yolo\"` kept for back-compat. The default `timeoutSeconds` is 600 (10 min) — drop it lower for trivial reminders, or raise it (e.g. 1800+) when the prompt invokes external CLIs like codex or claude-code that can take several minutes.",
       parameters: {
         type: "object",
         properties: {
@@ -1149,6 +1152,11 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
           },
           prompt: { type: "string", description: "The instruction the agent will receive when the job fires. Phrase it from the user's perspective (e.g. 'Remind me to take the cake out of the oven.')." },
           oneShot: { type: "boolean", description: "If true, the job is paused after its first successful run. Defaults to false (recurring)." },
+          skillNames: {
+            type: "array",
+            items: { type: "string" },
+            description: "Names from the Available skills list to attach to this job. Their full instructions are loaded into every run, so each fire follows the skill's recipe instead of rediscovering CLI usage. Pick by each skill's listed description, choosing the OPERATING recipes the fire will follow at run time — e.g. a calendar/email digest needs google-calendar + google-gmail. Never attach one-time setup/installation skills (anything described as 'setup', 'install', or 'sign in'); setup is already done by the time the job fires. Max 8; every name must match an enabled skill."
+          },
           autoApproveCommands: {
             type: "array",
             items: { type: "string" },
@@ -1171,6 +1179,16 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
           timeoutSeconds: {
             type: "number",
             description: "Wall-clock seconds before the spawned task is killed. Default 600 (10 min) — enough for typical git/gh + multi-file scan jobs. Drop lower (e.g. 60-120) for trivial reminders; raise (e.g. 1800-3600) when the prompt invokes external CLIs like codex or claude-code that can run several minutes. The model will be terminated mid-thought if this is too low."
+          },
+          deliverTo: {
+            type: "string",
+            enum: ["channel", "chat"],
+            description: "Where each fire's output is delivered. \"channel\" (default when invoked from chat): a dedicated job channel — a fresh chat thread listed under Recurring jobs; an imperative/CLI invocation gets a session-less job instead. \"chat\": the conversation this tool call was made from (only valid when invoked from a chat conversation). Pass \"chat\" for one-shot reminders; for recurring jobs ask the user first when they haven't said (see tool description)."
+          },
+          deliveryTargets: {
+            type: "array",
+            items: { type: "string" },
+            description: "Optional messaging-bridge names to deliver the job's final output to (in addition to its chat thread, if it has one), e.g. [\"telegram\"]. Use when the user asks for the job's output to reach a messaging app. Each entry must match exactly one configured Telegram or Discord bridge by exact id, or by name or kind (case-insensitive), and is stored as the bridge id; unknown or ambiguous entries are rejected with the dispatchable bridge names so you can relay the fix."
           },
           preRunHook: {
             type: "object",
@@ -1197,7 +1215,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "list_jobs",
-      description: "List scheduled jobs visible to this instance. Cheap, side-effect-free; call this first when the user refers to 'this job', 'my reminder', or any existing scheduled job so you can target the right job id with update_job / delete_job (instead of creating a duplicate). Returns a compact JSON array with each job's id, name, status, schedule shape (cronExpression+cronTimezone OR intervalSeconds), oneShot flag, nextRunAt/lastRunAt timestamps, chatSessionId, and a truncated prompt. Pass `fullPrompt: true` when you intend to edit a prompt (e.g. 'append to this reminder' or 'change wording X to Y') so you get the verbatim prompt without truncation — otherwise prompts are truncated to 200 chars to keep the result compact.",
+      description: "List scheduled jobs visible to this instance. Cheap, side-effect-free; call this first when the user refers to 'this job', 'my reminder', or any existing scheduled job so you can target the right job id with update_job / delete_job (instead of creating a duplicate). Returns a compact JSON array with each job's id, name, status, schedule shape (cronExpression+cronTimezone OR intervalSeconds), oneShot flag, nextRunAt/lastRunAt timestamps, chatSessionId, attached skillNames, and a truncated prompt. Pass `fullPrompt: true` when you intend to edit a prompt (e.g. 'append to this reminder' or 'change wording X to Y') so you get the verbatim prompt without truncation — otherwise prompts are truncated to 200 chars to keep the result compact.",
       parameters: {
         type: "object",
         properties: {
@@ -1218,7 +1236,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "update_job",
-      description: "Patch an existing scheduled job in place. Use this — NOT delete+create — when the user wants to change a job's schedule, prompt, name, status, or auto-approve envelope; this preserves the job id, its dedicated chat thread, and run history. Supply only the fields you want to change. Schedule transitions follow the same mutual-exclusion rule as create_job: a single patch may not set BOTH a positive intervalSeconds AND a cronExpression. To switch a job between cron-driven and interval-driven, pass the new driver and set the other to null (e.g. `{cronExpression: '0 9 * * *', cronTimezone: 'America/Los_Angeles', intervalSeconds: null}`). Call list_jobs first if you don't already know the jobId.",
+      description: "Patch an existing scheduled job in place. Use this — NOT delete+create — when the user wants to change a job's schedule, prompt, name, status, skill attachments, auto-approve envelope, or delivery binding (`deliverTo`); this preserves the job id, its bound chat session, and run history. Supply only the fields you want to change. Schedule transitions follow the same mutual-exclusion rule as create_job: a single patch may not set BOTH a positive intervalSeconds AND a cronExpression. To switch a job between cron-driven and interval-driven, pass the new driver and set the other to null (e.g. `{cronExpression: '0 9 * * *', cronTimezone: 'America/Los_Angeles', intervalSeconds: null}`). Call list_jobs first if you don't already know the jobId.",
       parameters: {
         type: "object",
         properties: {
@@ -1229,10 +1247,21 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
           cronExpression: { type: ["string", "null"], description: "Optional new 5-field Unix cron expression. Pass a string to make the job cron-driven; pass null to clear it when switching to intervalSeconds." },
           cronTimezone: { type: ["string", "null"], description: "Optional new IANA timezone identifier (only valid with cronExpression). Pass null to clear (only legal when also clearing cronExpression)." },
           oneShot: { type: "boolean", description: "Optional. If true the job is auto-paused after its first run." },
+          skillNames: {
+            type: ["array", "null"],
+            items: { type: "string" },
+            description: "Optional new skill attachments (FULL replacement — supply every skill the job should keep; pass [] (or null) to clear). Attached skills' full instructions are loaded into every run, so each fire follows the skill's recipe instead of rediscovering CLI usage. Pick by each skill's listed description, choosing the OPERATING recipes the fire will follow at run time. Never attach one-time setup/installation skills (anything described as 'setup', 'install', or 'sign in'); setup is already done by the time the job fires. Call list_jobs first to see the job's current skillNames. Max 8; every name must match an enabled skill."
+          },
           status: { type: "string", enum: ["active", "paused"], description: "Optional pause/resume. 'paused' stops the scheduler from firing the job; 'active' resumes it." },
           autoApproveCommands: { type: "array", items: { type: "string" }, description: "Optional new list of auto-approve shell patterns for unattended fires." },
           dangerouslyAutoApprove: { type: "boolean", description: "Optional. If true the scheduled task bypasses ALL approval gates at fire-time." },
-          timeoutSeconds: { type: "number", description: "Optional. Wall-clock seconds before the spawned task is killed." }
+          timeoutSeconds: { type: "number", description: "Optional. Wall-clock seconds before the spawned task is killed." },
+          deliveryTargets: { type: "array", items: { type: "string" }, description: "Optional new list of messaging-bridge names that receive the job's final output in addition to its chat thread, e.g. [\"telegram\"]. Pass [] to clear. Each entry must match exactly one configured Telegram or Discord bridge by exact id, or by name or kind (case-insensitive), and is stored as the bridge id; unknown or ambiguous entries are rejected." },
+          deliverTo: {
+            type: "string",
+            enum: ["channel", "chat"],
+            description: "Optional rebind of where future fires deliver. \"channel\": creates a NEW dedicated job channel and delivers future fires there (a previously archived channel is never unarchived); no-op when the job already delivers to a channel. \"chat\": delivers future fires into THIS conversation (only valid when invoked from a chat conversation) and ARCHIVES the job's previous dedicated channel — its history is preserved and the channel stays directly addressable, but it disappears from session lists; no-op when the job is already bound to this conversation. Not available for watcher jobs (preRunHook or fan-out routes) — their sessions carry routing state."
+          }
         },
         required: ["jobId"]
       }
@@ -2469,6 +2498,28 @@ function previewValue(value: unknown): string {
   }
 }
 
+// Render a browser ref as a human-readable element label when a resolver
+// can name it, falling back to the bare ref otherwise. The resolver is
+// supplied by the caller (chat-task wires it to the live browser session)
+// so tool-catalog stays free of browser internals.
+function formatRefPreview(
+  ref: unknown,
+  resolve?: (ref: string) => { role: string; name: string } | undefined
+): string {
+  const refStr = previewValue(ref);
+  if (!refStr) return "";
+  const label = resolve?.(refStr);
+  if (label?.name) {
+    // Synthetic "clickable" role (cursor-detected, not a real ARIA role) reads
+    // poorly as a label — show the name alone in that one case.
+    return label.role && label.role !== "clickable"
+      ? `${label.role} "${label.name}"`
+      : `"${label.name}"`;
+  }
+  // No accessible name (icon button) or no live session → bare ref.
+  return refStr;
+}
+
 // Per-tool argsPreview override — returns the most useful 1-line
 // representation of the call's headline argument. Falls back to a
 // generic "key=value, ..." dump of all top-level args when no specific
@@ -2479,7 +2530,8 @@ function previewValue(value: unknown): string {
 // inline preview without each one rebuilding the per-tool mapping.
 export function chatBlockArgsPreviewFor(
   toolName: string,
-  args: Record<string, unknown> | null | undefined
+  args: Record<string, unknown> | null | undefined,
+  resolveRefLabel?: (ref: string) => { role: string; name: string } | undefined
 ): string {
   const safe = args ?? {};
   // Headline-arg mapping per tool. Order matters within an entry only
@@ -2518,7 +2570,7 @@ export function chatBlockArgsPreviewFor(
     case "browser_select_option":
     case "browser_upload_file":
     case "browser_download":
-      return truncatePreview(previewValue(safe.ref));
+      return truncatePreview(formatRefPreview(safe.ref, resolveRefLabel));
     case "browser_press":
       return truncatePreview(previewValue(safe.key));
     case "browser_resize":
@@ -2526,14 +2578,14 @@ export function chatBlockArgsPreviewFor(
     case "browser_scroll":
       return truncatePreview(previewValue(safe.direction));
     case "browser_wait_for":
-      return truncatePreview(previewValue(safe.ref) || previewValue(safe.text));
+      return truncatePreview(formatRefPreview(safe.ref, resolveRefLabel) || previewValue(safe.text));
     case "browser_fill_form":
       // Preview the refs only — field text is page content the card
       // doesn't need, and the ref list tells the user what's touched.
       return truncatePreview(
         Array.isArray(safe.fields)
           ? safe.fields
-              .map((f) => (f !== null && typeof f === "object" ? previewValue((f as Record<string, unknown>).ref) : ""))
+              .map((f) => (f !== null && typeof f === "object" ? formatRefPreview((f as Record<string, unknown>).ref, resolveRefLabel) : ""))
               .filter(Boolean)
               .join(", ")
           : ""
@@ -2545,7 +2597,7 @@ export function chatBlockArgsPreviewFor(
       return truncatePreview(previewValue(safe.question));
     case "browser_drag":
       return truncatePreview(
-        `${previewValue(safe.fromRef)} → ${previewValue(safe.toRef)}`
+        `${formatRefPreview(safe.fromRef, resolveRefLabel)} → ${formatRefPreview(safe.toRef, resolveRefLabel)}`
       );
     case "browser_requests":
       return truncatePreview(previewValue(safe.filter));

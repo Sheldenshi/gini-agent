@@ -161,6 +161,10 @@ export default function ChatDetailScreen() {
   const [voiceBusy, setVoiceBusy] = useState(false);
   const scrollRef = useRef<ScrollView | null>(null);
   const pinnedToBottomRef = useRef<boolean>(true);
+  // Mirrors pinnedToBottomRef as state so the "jump to latest" button can show
+  // when the user has scrolled up. The ref drives auto-scroll (no re-render);
+  // this drives the button's visibility (needs a re-render).
+  const [atBottom, setAtBottom] = useState(true);
 
   const unauthorized =
     stream.error instanceof ApiError && stream.error.status === 401;
@@ -276,7 +280,22 @@ export default function ChatDetailScreen() {
 
   useEffect(() => {
     pinnedToBottomRef.current = true;
+    setAtBottom(true);
   }, [sessionId]);
+
+  // When the keyboard opens, the composer rises above it and the message
+  // viewport shrinks from the bottom, covering the latest messages. Follow the
+  // user down only if they were already reading at the bottom; if they'd
+  // scrolled up, leave their position so they stay on what they're looking at.
+  // keyboardDidShow (not willShow) fires after KeyboardAvoidingView's padding
+  // animation settles, so scrollToEnd lands on the true, shrunk-viewport bottom.
+  useEffect(() => {
+    const sub = Keyboard.addListener("keyboardDidShow", () => {
+      if (!pinnedToBottomRef.current) return;
+      scrollRef.current?.scrollToEnd({ animated: true });
+    });
+    return () => sub.remove();
+  }, []);
 
   const trimmed = text.trim();
   const readyImages = useMemo(
@@ -292,6 +311,7 @@ export default function ChatDetailScreen() {
   const submit = () => {
     if (sendDisabled) return;
     pinnedToBottomRef.current = true;
+    setAtBottom(true);
     send.mutate(
       { content: trimmed, images: readyImages },
       {
@@ -306,6 +326,7 @@ export default function ChatDetailScreen() {
   const sendVoice = (audio: VoiceRef): void => {
     if (!sessionId) return;
     pinnedToBottomRef.current = true;
+    setAtBottom(true);
     setVoicePending(true);
     send.mutate(
       { content: "", audio },
@@ -462,6 +483,12 @@ export default function ChatDetailScreen() {
     setImages((prev) => prev.filter((image) => image.localId !== localId));
   };
 
+  const scrollToBottom = (): void => {
+    pinnedToBottomRef.current = true;
+    setAtBottom(true);
+    scrollRef.current?.scrollToEnd({ animated: true });
+  };
+
   if (unauthorized) return null;
 
   return (
@@ -524,7 +551,8 @@ export default function ChatDetailScreen() {
         style={styles.flex}
       >
         {tab === "messages" ? (
-          stream.isPending && !stream.blocks ? (
+          <View style={styles.messagesArea}>
+          {stream.isPending && !stream.blocks ? (
             <View style={styles.center}>
               <ActivityIndicator color={theme.muted} />
             </View>
@@ -541,7 +569,9 @@ export default function ChatDetailScreen() {
                 const distanceFromBottom =
                   contentSize.height -
                   (contentOffset.y + layoutMeasurement.height);
-                pinnedToBottomRef.current = distanceFromBottom < 40;
+                const pinned = distanceFromBottom < 40;
+                pinnedToBottomRef.current = pinned;
+                setAtBottom(pinned);
               }}
             >
               {visible.length > 0 ? (
@@ -624,7 +654,23 @@ export default function ChatDetailScreen() {
                 </View>
               ) : null}
             </ScrollView>
-          )
+          )}
+          {/* Floating "jump to latest" button — shown once the user scrolls
+              up off the bottom. It lives inside the message area (a flex child
+              that shrinks with the keyboard), so it floats just above the
+              composer whether the keyboard is up or down. */}
+          {!atBottom && visible.length > 0 ? (
+            <TouchableOpacity
+              onPress={scrollToBottom}
+              activeOpacity={0.85}
+              style={styles.jumpToBottom}
+              accessibilityRole="button"
+              accessibilityLabel="Scroll to latest messages"
+            >
+              <Feather name="chevron-down" size={24} color={theme.text} />
+            </TouchableOpacity>
+          ) : null}
+          </View>
         ) : tab === "threads" ? (
           <ThreadsTab
             sessionId={sessionId ?? null}
@@ -1106,6 +1152,32 @@ const styles = StyleSheet.create({
     color: "#B6B6BC",
     fontFamily: family("HankenGrotesk", 500),
     fontSize: 12
+  },
+
+  // Message area — wraps the transcript ScrollView so the floating jump
+  // button can be absolutely positioned relative to it. As a flex child it
+  // shrinks when the keyboard opens, keeping the button above the composer.
+  messagesArea: { flex: 1 },
+
+  // Floating "jump to latest" button, anchored to the bottom-right of the
+  // message area (just above the composer).
+  jumpToBottom: {
+    position: "absolute",
+    right: 16,
+    bottom: 12,
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: theme.bg,
+    borderWidth: 1,
+    borderColor: theme.inputBorder,
+    alignItems: "center",
+    justifyContent: "center",
+    shadowColor: "#000",
+    shadowOpacity: 0.12,
+    shadowRadius: 6,
+    shadowOffset: { width: 0, height: 2 },
+    elevation: 3
   },
 
   // Composer (unchanged geometry from the prior chat detail).

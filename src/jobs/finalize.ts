@@ -11,25 +11,40 @@
 //
 // Idempotent: if the run is already terminal, this is a no-op.
 
-import type { RuntimeConfig, Task } from "../types";
-import { addAudit, appendEvent, appendLog, isTerminalTaskStatus, mutateState, now, readState } from "../state";
+import type { RuntimeConfig, RuntimeState, Task } from "../types";
+import { addAudit, appendEvent, appendLog, insertChatBlock, isTerminalTaskStatus, mutateState, now, readState } from "../state";
 import { syncChatTaskResult } from "../execution/chat";
-// `sendMessagingOutput` is imported lazily inside dispatchJobReplyToBridge
-// to avoid closing a static import cycle. The runtime graph would be:
+import { providerAuthFailureText, providerDisplayLabel, providerReauth } from "../provider";
+// `sendMessagingOutput` is imported lazily inside the bridge-dispatch
+// helpers to avoid closing a static import cycle. The runtime graph would be:
 //   agent.ts -> jobs/finalize.ts -> integrations/messaging.ts -> agent.ts
 // (messaging.ts imports submitTask from agent.ts). A static cycle here
 // would defeat the deliberate split between agent.ts and jobs/finalize.ts —
 // see the leaf-module comment at src/agent.ts:51-55 — so we defer the
 // messaging import until call time. Module-init cost is unchanged; the
 // dynamic import resolves to the already-loaded module the first time
-// dispatchJobReplyToBridge runs.
+// a dispatch helper runs.
+
+// Human-readable degradation note naming the skipped recipe(s) + the remedy.
+// Shared by the chat system_note and the bridge mirror so both surfaces carry
+// the same wording.
+function skillSkipNote(skips: Array<{ name: string; reason: string }>): string {
+  const named = skips.map((s) => `${s.name} (${s.reason})`).join(", ");
+  return `Heads up: this run could not use ${skips.length} attached skill recipe(s) — ${named}. Re-enable the skill or re-attach it via update_job to restore full behavior.`;
+}
 
 export async function finalizeJobRunFromTask(config: RuntimeConfig, task: Task): Promise<void> {
   if (!task.jobId) return;
   if (!isTerminalTaskStatus(task.status)) return;
   // Capture session/oneShot context inside the mutateState write so the
   // post-write chat sync uses the same view we used to flip the run.
+  // `runFinalized` gates the dispatch tail: a repeat call (run already
+  // terminal) must not re-deliver the reply to bridges. The run's fire-time
+  // skill skips ride along so the post-write delivery can name the missing
+  // recipe(s) on the chat + bridge surfaces.
   let chatSessionIdToSync: string | undefined;
+  let runFinalized = false;
+  let skillSkips: Array<{ name: string; reason: string }> | undefined;
   await mutateState(config.instance, (state) => {
     // Match the run by taskId first (most reliable), fall back to the
     // most recent running run for the job (covers older runs whose
@@ -43,6 +58,10 @@ export async function finalizeJobRunFromTask(config: RuntimeConfig, task: Task):
       );
     }
     if (!run) return; // already finalized or never tracked
+    runFinalized = true;
+    // Capture the run's fire-time skill skips before we flip it terminal so
+    // the post-write delivery can name the missing recipe(s).
+    if (run.skillSkips && run.skillSkips.length > 0) skillSkips = run.skillSkips;
     const job = state.jobs.find((candidate) => candidate.id === task.jobId);
     const completedAt = now();
     if (task.status === "completed") {
@@ -107,6 +126,8 @@ export async function finalizeJobRunFromTask(config: RuntimeConfig, task: Task):
     );
   });
 
+  if (!runFinalized) return;
+
   // Materialize the assistant chat message for jobs created via the
   // agent tool with a chat session. syncChatTaskResult is idempotent
   // (no-ops if the message already exists) and only writes for terminal
@@ -114,6 +135,10 @@ export async function finalizeJobRunFromTask(config: RuntimeConfig, task: Task):
   // a deletion mid-flight doesn't land an orphan ChatMessageRecord
   // (createChatMessage silently skips session linkage when the session
   // is missing — that path is exactly what we don't want here).
+  // `liveSessionId` is the session the origin mirror may dispatch to;
+  // it stays undefined for session-less jobs (POST /api/jobs, create_job
+  // from a non-chat task) and for sessions deleted mid-flight.
+  let liveSessionId: string | undefined;
   if (chatSessionIdToSync) {
     const sessionExists = readState(config.instance).chatSessions.some((s) => s.id === chatSessionIdToSync);
     if (!sessionExists) {
@@ -122,53 +147,72 @@ export async function finalizeJobRunFromTask(config: RuntimeConfig, task: Task):
         taskId: task.id,
         sessionId: chatSessionIdToSync
       });
-      return;
+    } else {
+      liveSessionId = chatSessionIdToSync;
+      try {
+        await syncChatTaskResult(config, chatSessionIdToSync, task.id);
+      } catch (error) {
+        appendLog(config.instance, "job.chat.sync.error", {
+          jobId: task.jobId,
+          taskId: task.id,
+          sessionId: chatSessionIdToSync,
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
+      // Surface fire-time skill skips as ONE deterministic system_note in the
+      // job thread, after the synced answer. This is the guaranteed (not
+      // model-reliant) user-facing degradation signal for the web surface. Only
+      // for a completed run — a failed run's own error already carries the
+      // signal. Keyed to land in-thread after the answer; idempotent because
+      // finalize early-returns once the run is terminal (so we run once).
+      if (skillSkips && task.status === "completed") {
+        try {
+          insertChatBlock(config.instance, {
+            kind: "system_note",
+            sessionId: chatSessionIdToSync,
+            text: skillSkipNote(skillSkips),
+            taskId: task.id,
+            runId: task.runId,
+            ...(task.threadId != null ? { threadId: task.threadId } : {}),
+            ...(task.parentBlockId != null ? { parentBlockId: task.parentBlockId } : {})
+          });
+        } catch (error) {
+          appendLog(config.instance, "job.skill.skip.note.error", {
+            jobId: task.jobId,
+            taskId: task.id,
+            sessionId: chatSessionIdToSync,
+            error: error instanceof Error ? error.message : String(error)
+          });
+        }
+      }
     }
-    try {
-      await syncChatTaskResult(config, chatSessionIdToSync, task.id);
-    } catch (error) {
-      appendLog(config.instance, "job.chat.sync.error", {
-        jobId: task.jobId,
-        taskId: task.id,
-        sessionId: chatSessionIdToSync,
-        error: error instanceof Error ? error.message : String(error)
-      });
-    }
-    // Mirror back to the originating bridge on every terminal status —
-    // a failed scheduled "remind me in 20s" should still surface SOME
-    // signal to the chat the user started in (the agent's error
-    // summary is the best we have), otherwise the user just hears
-    // silence and assumes the bot dropped the ball. The dispatch
-    // helper itself filters out empty / `[SILENT]` content, so the
-    // case where the synced assistant message is genuinely empty
-    // (failed task with no error summary) still mirrors nothing.
-    await dispatchJobReplyToBridge(config, chatSessionIdToSync, task);
   }
+  // Mirror back to the originating bridge on every terminal status —
+  // a failed scheduled "remind me in 20s" should still surface SOME
+  // signal to the chat the user started in (the agent's error
+  // summary is the best we have), otherwise the user just hears
+  // silence and assumes the bot dropped the ball. The dispatch
+  // helper itself filters out empty / `[SILENT]` content, so the
+  // case where the synced assistant message is genuinely empty
+  // (failed task with no error summary) still mirrors nothing.
+  let mirroredBridgeId: string | undefined;
+  if (liveSessionId) {
+    mirroredBridgeId = await dispatchJobReplyToBridge(config, liveSessionId, task, skillSkips);
+  }
+  // Independently of the origin mirror, deliver the same reply to any
+  // bridges the job names on its own deliveryTargets — the "send my
+  // morning briefing to telegram" surface. This runs on EVERY terminal
+  // finalize, including jobs with no chat session at all (the dispatcher
+  // falls back to the task summary when no synced assistant message
+  // exists).
+  await dispatchJobReplyToDeliveryTargets(config, liveSessionId, task, mirroredBridgeId, skillSkips);
 }
 
-async function dispatchJobReplyToBridge(
-  config: RuntimeConfig,
-  chatSessionId: string,
-  task: Task
-): Promise<void> {
-  const state = readState(config.instance);
-  const session = state.chatSessions.find((candidate) => candidate.id === chatSessionId);
-  if (!session) return;
-  // Prefer outboundMirror (set on dedicated job sessions to keep
-  // inbound routing keyed off the live channel session) and fall back
-  // to source (set on live channel sessions where the two are the
-  // same).
-  const dispatchTo = session.outboundMirror ?? session.source;
-  if (!dispatchTo) return;
-  // Bridge-dispatch only applies to telegram / discord sources. The
-  // openclaw provenance source carries no live channel routing
-  // (it's just a migration breadcrumb), so a job that landed on a
-  // migrated chat has nowhere to mirror its assistant reply.
-  if (dispatchTo.kind !== "telegram" && dispatchTo.kind !== "discord") return;
-  // The synced assistant message is the most recent one on the
-  // session keyed to this task; pick it up from chatMessages so we
-  // never accidentally re-dispatch an older turn.
-  const assistantMessage = state.chatMessages
+// The synced assistant message is the most recent one on the session
+// keyed to this task; pick it up from chatMessages so we never
+// accidentally re-dispatch an older turn.
+function findSyncedAssistantMessage(state: RuntimeState, chatSessionId: string, task: Task) {
+  return state.chatMessages
     .filter(
       (m) =>
         m.sessionId === chatSessionId &&
@@ -178,25 +222,118 @@ async function dispatchJobReplyToBridge(
         m.kind !== "approval_reason"
     )
     .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))[0];
-  const replyText = assistantMessage?.content?.trim();
-  // `[SILENT]` summaries explicitly suppress the bridge mirror. The
-  // canonical match is EXACT (trimmed), not prefix — matching the
-  // suppression contract in src/execution/chat.ts and the system-
-  // prompt instruction at src/jobs/index.ts that tells the LLM to
-  // "respond with exactly [SILENT] and nothing else". A prefix match
-  // here would silently drop a legitimate reply like
-  // `"[SILENT] but here's an update"`, which is the exact failure
-  // mode the chat-side test pins against.
-  if (!replyText || replyText.length === 0) return;
-  if (replyText === "[SILENT]") return;
+}
+
+// `[SILENT]` replies explicitly suppress bridge dispatch. The
+// canonical match is EXACT (trimmed), not prefix — matching the
+// suppression contract in src/execution/chat.ts and the system-
+// prompt instruction at src/jobs/index.ts that tells the LLM to
+// "respond with exactly [SILENT] and nothing else". A prefix match
+// here would silently drop a legitimate reply like
+// `"[SILENT] but here's an update"`, which is the exact failure
+// mode the chat-side test pins against.
+function suppressSilentReply(raw: string | undefined): string | undefined {
+  const text = raw?.trim();
+  if (!text || text.length === 0) return undefined;
+  if (text === "[SILENT]") return undefined;
+  return text;
+}
+
+// Resolve the assistant reply text the origin mirror should dispatch,
+// or undefined when nothing should be sent.
+function resolveJobReplyText(state: RuntimeState, chatSessionId: string, task: Task): string | undefined {
+  return suppressSilentReply(findSyncedAssistantMessage(state, chatSessionId, task)?.content);
+}
+
+// Reply text for deliveryTargets dispatch. Prefer the synced assistant
+// chat message; when none exists — session-less jobs never sync one,
+// and a vanished session or sync error leaves a sessionful job without
+// one — mirror the content selection syncChatTaskResult
+// (src/execution/chat.ts) applies. Completed runs deliver the task
+// summary under exact-[SILENT] suppression; failed/cancelled runs are
+// never suppressed (the chat-side contract honors [SILENT] only for
+// successfully completed tasks) and fall through summary → error →
+// currentStep, because failed tasks carry task.error rather than
+// task.summary (src/agent.ts failTask) and would otherwise deliver
+// nothing at all. Provider auth failures render the same actionable,
+// provider-named line the chat surface shows.
+function resolveJobDeliveryText(
+  state: RuntimeState,
+  chatSessionId: string | undefined,
+  task: Task
+): string | undefined {
+  if (chatSessionId !== undefined) {
+    const message = findSyncedAssistantMessage(state, chatSessionId, task);
+    if (message) return suppressSilentReply(message.content);
+  }
+  if (task.status === "completed") return suppressSilentReply(task.summary);
+  const text = task.authErrorProvider
+    ? providerAuthFailureText(
+        providerDisplayLabel(task.authErrorProvider),
+        providerReauth(task.authErrorProvider)
+      )
+    : task.summary ?? task.error ?? task.currentStep ?? `Task is ${task.status}.`;
+  const trimmed = text.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+// Returns the bridge id when the mirror send actually landed, undefined
+// when the mirror was suppressed or failed — the deliveryTargets
+// dispatcher seeds its dedupe set from this, so an explicitly-listed
+// target still gets its own attempt when the mirror failed.
+async function dispatchJobReplyToBridge(
+  config: RuntimeConfig,
+  chatSessionId: string,
+  task: Task,
+  skillSkips?: Array<{ name: string; reason: string }>
+): Promise<string | undefined> {
+  const state = readState(config.instance);
+  const session = state.chatSessions.find((candidate) => candidate.id === chatSessionId);
+  if (!session) return undefined;
+  // Prefer outboundMirror (set on dedicated job sessions to keep
+  // inbound routing keyed off the live channel session) and fall back
+  // to source (set on live channel sessions where the two are the
+  // same).
+  const dispatchTo = session.outboundMirror ?? session.source;
+  if (!dispatchTo) return undefined;
+  // Bridge-dispatch only applies to telegram / discord sources. The
+  // openclaw provenance source carries no live channel routing
+  // (it's just a migration breadcrumb), so a job that landed on a
+  // migrated chat has nowhere to mirror its assistant reply.
+  if (dispatchTo.kind !== "telegram" && dispatchTo.kind !== "discord") return undefined;
+  const replyText = resolveJobReplyText(state, chatSessionId, task);
+  if (replyText === undefined) return undefined;
+  // Append the one-line degradation note for bridge/CLI users when the run
+  // skipped attachments — so the chat system_note isn't the only surface that
+  // reports it. Only on a real (non-empty, non-[SILENT]) reply, which
+  // resolveJobReplyText already guarantees.
+  const bridgeText = skillSkips && skillSkips.length > 0
+    ? `${replyText}\n\n${skillSkipNote(skillSkips)}`
+    : replyText;
   try {
     const replyToMessageId = dispatchTo.lastInboundMessageId;
     const { sendMessagingOutput } = await import("../integrations/messaging");
-    await sendMessagingOutput(config, dispatchTo.bridgeId, {
-      text: replyText,
+    const record = await sendMessagingOutput(config, dispatchTo.bridgeId, {
+      text: bridgeText,
       target: dispatchTo.target,
       ...(replyToMessageId !== undefined ? { replyToMessageId } : {})
     });
+    // sendMessagingOutput swallows Telegram/Discord API errors into the
+    // outbound record (status "failed") instead of throwing — surface
+    // those at the job level too, or a revoked token / deleted channel
+    // would leave no trace beyond the outbound row.
+    if (record.status === "failed") {
+      appendLog(config.instance, "job.messaging.dispatch.error", {
+        jobId: task.jobId,
+        taskId: task.id,
+        sessionId: chatSessionId,
+        bridgeId: dispatchTo.bridgeId,
+        kind: dispatchTo.kind,
+        error: record.error ?? "messaging send returned status=failed"
+      });
+      return undefined;
+    }
+    return dispatchTo.bridgeId;
   } catch (error) {
     appendLog(config.instance, "job.messaging.dispatch.error", {
       jobId: task.jobId,
@@ -206,5 +343,135 @@ async function dispatchJobReplyToBridge(
       kind: dispatchTo.kind,
       error: error instanceof Error ? error.message : String(error)
     });
+    return undefined;
+  }
+}
+
+// A delivery failure gets both a structured log line and an audit row —
+// the audit trail is how the activity feed surfaces that a scheduled
+// job's output never reached its named bridge (the same visibility
+// contract as job.oneshot.completed). One row per failed target.
+async function recordDeliveryFailure(
+  config: RuntimeConfig,
+  details: { jobId: string; taskId: string; target: string; bridgeId?: string; reason: string }
+): Promise<void> {
+  appendLog(config.instance, "job.delivery.target.error", {
+    jobId: details.jobId,
+    taskId: details.taskId,
+    target: details.target,
+    ...(details.bridgeId !== undefined ? { bridgeId: details.bridgeId } : {}),
+    error: details.reason
+  });
+  await mutateState(config.instance, (state) => {
+    addAudit(
+      state,
+      {
+        actor: "runtime",
+        action: "job.delivery.failed",
+        target: details.jobId,
+        risk: "low",
+        taskId: details.taskId,
+        evidence: {
+          target: details.target,
+          ...(details.bridgeId !== undefined ? { bridgeId: details.bridgeId } : {}),
+          reason: details.reason
+        }
+      },
+      { jobId: details.jobId }
+    );
+  });
+}
+
+// Deliver the job's final reply to each bridge named on the job's own
+// `deliveryTargets`. Runs on every terminal finalize: a job with a live
+// chat session delivers the synced assistant reply; otherwise the task
+// summary is delivered instead (see resolveJobDeliveryText). Entries
+// are persisted as bridge ids by create_job/update_job, so the id tier
+// matches first; the name/kind tiers remain for jobs saved before
+// entries were normalized to ids, and for raw entries written through
+// POST /api/jobs, which persists the strings unvalidated by design
+// (src/jobs/index.ts keeps that path permissive). A fire-time miss
+// therefore means the bridge was removed after the job was saved, or
+// the entry never matched a bridge in the first place. Only telegram /
+// discord bridges are dispatchable today; sendMessagingOutput picks the
+// target itself (first agent-filter-permitted entry of
+// bridge.deliveryTargets, else bridge.deliveryTargets[0], else the
+// literal "local"). The bridge
+// the origin mirror confirmed delivering to (`mirroredBridgeId`) is
+// skipped, as are duplicate entries resolving to the same bridge.
+// Resolution failures and send failures — thrown OR recorded as a
+// status:"failed" outbound row, which is how sendMessagingOutput
+// reports Telegram/Discord API errors — are logged and audited; a
+// delivery problem must never fail the run.
+async function dispatchJobReplyToDeliveryTargets(
+  config: RuntimeConfig,
+  chatSessionId: string | undefined,
+  task: Task,
+  mirroredBridgeId: string | undefined,
+  skillSkips?: Array<{ name: string; reason: string }>
+): Promise<void> {
+  const state = readState(config.instance);
+  const job = state.jobs.find((candidate) => candidate.id === task.jobId);
+  if (!job || job.deliveryTargets.length === 0) return;
+  const resolvedReply = resolveJobDeliveryText(state, chatSessionId, task);
+  if (resolvedReply === undefined) return;
+  // Append the same one-line degradation note bridge/CLI users get on the
+  // origin mirror, so deliveryTargets recipients also see the skipped
+  // recipe(s). resolveJobDeliveryText already suppressed empty / [SILENT].
+  const replyText = skillSkips && skillSkips.length > 0
+    ? `${resolvedReply}\n\n${skillSkipNote(skillSkips)}`
+    : resolvedReply;
+  // Seed the dedupe set with the bridge the origin mirror actually
+  // delivered to. Seeding on confirmed success (not attempt) means an
+  // explicitly-listed target still gets its own attempt when the
+  // mirror failed.
+  const dispatchedBridgeIds = new Set<string>();
+  if (mirroredBridgeId !== undefined) dispatchedBridgeIds.add(mirroredBridgeId);
+  // Restrict resolution to dispatchable kinds BEFORE the id → name →
+  // kind tier chain — the same pre-filter parseDeliveryTargets
+  // (src/execution/tool-dispatch.ts) applies at create/update — so a
+  // legacy name entry can't first-match a non-dispatchable (e.g. demo)
+  // bridge while a dispatchable bridge of the same name exists.
+  const dispatchable = state.messagingBridges.filter(
+    (candidate) => candidate.kind === "telegram" || candidate.kind === "discord"
+  );
+  for (const entry of job.deliveryTargets) {
+    const lower = entry.toLowerCase();
+    const bridge =
+      dispatchable.find((candidate) => candidate.id === entry) ??
+      dispatchable.find((candidate) => candidate.name.toLowerCase() === lower) ??
+      dispatchable.find((candidate) => candidate.kind.toLowerCase() === lower);
+    if (!bridge) {
+      await recordDeliveryFailure(config, {
+        jobId: job.id,
+        taskId: task.id,
+        target: entry,
+        reason: "no dispatchable messaging bridge matches"
+      });
+      continue;
+    }
+    if (dispatchedBridgeIds.has(bridge.id)) continue;
+    dispatchedBridgeIds.add(bridge.id);
+    try {
+      const { sendMessagingOutput } = await import("../integrations/messaging");
+      const record = await sendMessagingOutput(config, bridge.id, { text: replyText });
+      if (record.status === "failed") {
+        await recordDeliveryFailure(config, {
+          jobId: job.id,
+          taskId: task.id,
+          target: entry,
+          bridgeId: bridge.id,
+          reason: record.error ?? "messaging send returned status=failed"
+        });
+      }
+    } catch (error) {
+      await recordDeliveryFailure(config, {
+        jobId: job.id,
+        taskId: task.id,
+        target: entry,
+        bridgeId: bridge.id,
+        reason: error instanceof Error ? error.message : String(error)
+      });
+    }
   }
 }

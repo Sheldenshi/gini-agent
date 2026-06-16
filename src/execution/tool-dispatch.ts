@@ -33,7 +33,7 @@ import { codeExecutionCommand } from "../tools/code";
 import { MAX_SUBAGENT_DEPTH, spawnSubagent, subagentDepth } from "../capabilities/subagents";
 import { matchAutoApprove } from "./auto-approve";
 import { resolveApprovalPolicy, type PolicyAction } from "./policy";
-import { createScheduledJob, listJobs, removeJob, runJobNow, updateJob, updateJobStatus } from "../jobs";
+import { createScheduledJob, listJobs, rebindJobDelivery, removeJob, runJobNow, updateJob, updateJobStatus } from "../jobs";
 import { findSelfOperation } from "./self-registry";
 import { isDeferredToolName } from "./tool-catalog";
 import { buildCurrentTimeResult, resolveLocalTimeZone } from "../system-prompt";
@@ -385,17 +385,20 @@ async function dispatchToolCallInner(
       return await dispatchSelfOp(config, taskId, toolCallId, toolName, args);
     case "browser_connect": {
       // browser.connect is a SetupRequest (user-actor): the user opens the
-      // visible browser, signs in, then clicks Connect. There is no
+      // visible browser, performs their step (sign-in, or a handoff step
+      // like payment entry), then signals done. There is no
       // "auto-approve" path — the user has to perform the action — so
       // bypass pendingOrAuto and always return the pending approval id.
       //
       // Navigate-first precondition (same contract as browser_fill_secrets):
-      // browser_connect's only job is to clear a sign-in / auth wall the agent
-      // ALREADY hit by navigating. Calling it cold — before any browser_navigate
+      // both sanctioned uses act on a page the agent ALREADY reached by
+      // navigating — a sign-in / auth wall to clear, or a sensitive step the
+      // user must perform themselves (ADR browser-connect-handoff.md).
+      // Calling it cold — before any browser_navigate
       // — is a misuse that would pop a spurious "Connect" card at the user for
       // what is really an ordinary browse-the-web request. Refuse the cold call
       // and steer the agent to browse headless first; it then only escalates to
-      // a Connect prompt when a navigation genuinely lands on a sign-in wall.
+      // a Connect prompt when a navigation genuinely reaches such a step.
       // Validate the reason first so a missing reason fails identically
       // regardless of browser state.
       requireString(args, "reason");
@@ -415,7 +418,7 @@ async function dispatchToolCallInner(
           result: JSON.stringify({
             ok: false,
             error:
-              "browser_connect only clears a sign-in or auth wall you have already hit. No browser page is open yet — call browser_navigate (headless) to open the page first, and call browser_connect only if that navigation lands on a login, OAuth, or 401/403 wall."
+              "browser_connect only acts on a page you have already reached — a sign-in wall to clear, or a step the user must perform themselves. No browser page is open yet — call browser_navigate (headless) to open the page first, and call browser_connect only when that page genuinely needs the user (a login, OAuth, or 401/403 wall, or a handoff step like payment entry)."
           })
         };
       }
@@ -443,7 +446,7 @@ async function dispatchToolCallInner(
           result: JSON.stringify({
             ok: false,
             error:
-              "You've already surfaced a Connect card for this site twice in this task and the sign-in wall hasn't cleared. Do NOT call browser_connect again for this site. If you can finish without signing in, continue; otherwise stop and tell the user you're blocked on signing in to this site."
+              "You've already surfaced a Connect card for this site twice in this task and the step it was for (sign-in or a user handoff) hasn't been completed. Do NOT call browser_connect again for this site. If you can finish without the user acting in the browser, continue; otherwise stop and tell the user you're blocked waiting on them to complete that step on this site."
           })
         };
       }
@@ -1346,6 +1349,56 @@ async function spawnSubagentTool(
   return JSON.stringify(payload);
 }
 
+// Validate a create_job / update_job `deliveryTargets` payload against
+// the dispatchable messaging bridges — telegram / discord, the only
+// kinds the job finalizer (src/jobs/finalize.ts) can send to. A demo
+// (or other non-dispatchable) bridge would validate and then fail on
+// every fire, so it is rejected here. Entries resolve by bridge id,
+// then case-insensitive name, then kind; an entry whose winning tier
+// matches more than one bridge is rejected as ambiguous (bridge names
+// and kinds are not unique, and bridge ordering shifts as records are
+// added — first-match would silently re-route). The resolved entry is
+// persisted as the bridge id, which is stable across renames and
+// reordering (the same way ChatSessionRecord.outboundMirror pins
+// bridgeId). Unknown entries are rejected with the dispatchable bridge
+// names so the agent can relay a fixable error to the user.
+// Returns undefined when the field was omitted; an empty array is the
+// documented "clear" signal for update_job and passes through.
+function parseDeliveryTargets(config: RuntimeConfig, raw: unknown): string[] | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (!Array.isArray(raw)) {
+    throw new Error("Invalid input: deliveryTargets must be an array of strings.");
+  }
+  const dispatchable = readState(config.instance).messagingBridges.filter(
+    (bridge) => bridge.kind === "telegram" || bridge.kind === "discord"
+  );
+  const resolved: string[] = [];
+  for (const entry of raw) {
+    if (typeof entry !== "string" || entry.trim().length === 0) {
+      throw new Error("Invalid input: deliveryTargets entries must be non-empty strings.");
+    }
+    const value = entry.trim();
+    const lower = value.toLowerCase();
+    let matches = dispatchable.filter((bridge) => bridge.id === value);
+    if (matches.length === 0) matches = dispatchable.filter((bridge) => bridge.name.toLowerCase() === lower);
+    if (matches.length === 0) matches = dispatchable.filter((bridge) => bridge.kind.toLowerCase() === lower);
+    if (matches.length === 0) {
+      const names = dispatchable.map((bridge) => bridge.name).join(", ");
+      throw new Error(
+        `Invalid input: no dispatchable messaging bridge matches '${value}'. Dispatchable bridges: ${names.length > 0 ? names : "<none>"}.`
+      );
+    }
+    if (matches.length > 1) {
+      const candidates = matches.map((bridge) => `${bridge.name} (${bridge.id})`).join(", ");
+      throw new Error(
+        `Invalid input: deliveryTargets entry '${value}' is ambiguous — matches ${candidates}. Use the bridge name or id.`
+      );
+    }
+    resolved.push(matches[0]!.id);
+  }
+  return resolved;
+}
+
 // Schedule a real job (cron-style) and link it to the originating chat
 // session so the job's output is delivered back as an assistant message
 // when it fires. Low-risk: no approval gate, since reminders should not
@@ -1468,6 +1521,18 @@ async function createJobTool(
     }
     timeoutSeconds = args.timeoutSeconds;
   }
+  // Delivery binding: "channel" (default) mints a dedicated job channel
+  // for chat-bound invocations; "chat" binds the job's fires to the
+  // originating conversation instead (validated against the resolved
+  // session below).
+  let deliverTo: "channel" | "chat" | undefined;
+  if (args.deliverTo !== undefined && args.deliverTo !== null) {
+    if (args.deliverTo !== "channel" && args.deliverTo !== "chat") {
+      throw new Error("Invalid input: deliverTo must be one of \"channel\" | \"chat\".");
+    }
+    deliverTo = args.deliverTo;
+  }
+  const deliveryTargets = parseDeliveryTargets(config, args.deliveryTargets);
   // `preRunHook` passes through UNVALIDATED on purpose: the authoritative
   // shape + known-handler (isKnownHook) validation lives in
   // `createScheduledJob` — the same seam the HTTP /api/jobs route uses — and
@@ -1495,14 +1560,22 @@ async function createJobTool(
   }
   // The agent's caller is "chat-bound" when its task is attached to a run
   // whose conversation still exists. That's the trigger to mint a fresh
-  // chat thread for the job to deliver into.
-  let invokedFromChat = false;
+  // chat thread for the job to deliver into — or, with deliverTo "chat",
+  // the session the job binds to directly.
+  let originatingSessionId: string | undefined;
   if (task?.runId) {
     const run = state.runs.find((item) => item.id === task.runId);
     if (run?.conversationId) {
       const session = state.chatSessions.find((item) => item.id === run.conversationId);
-      if (session) invokedFromChat = true;
+      if (session) originatingSessionId = session.id;
     }
+  }
+  const invokedFromChat = originatingSessionId !== undefined;
+  // deliverTo "chat" is only meaningful when there IS an originating
+  // conversation to deliver into. Imperative/CLI tasks have none, so
+  // surface a tool error instead of silently creating a session-less job.
+  if (deliverTo === "chat" && !invokedFromChat) {
+    return `Error: create_job deliverTo "chat" requires invocation from a chat conversation, and this task has no originating chat session. Omit deliverTo (or pass "channel") instead.`;
   }
 
   // Pass `parentTaskId` so `createScheduledJob`'s own `mutateState`
@@ -1528,31 +1601,48 @@ async function createJobTool(
       // Dedicated chat thread for chat-driven jobs. Title defaults to
       // the job name — the chat IS bound to that job's delivery, so the
       // job name is the natural label in the session list. (createChatSession
-      // truncates to 80 chars.)
-      createDedicatedSession: invokedFromChat ? { title: name } : undefined,
+      // truncates to 80 chars.) With deliverTo "chat" we skip the dedicated
+      // thread and bind the job to the originating conversation instead;
+      // the session itself stays a normal chat (no kind/title mutation).
+      createDedicatedSession: invokedFromChat && deliverTo !== "chat" ? { title: name } : undefined,
+      chatSessionId: deliverTo === "chat" ? originatingSessionId : undefined,
       oneShot,
+      // Skill attachments pass through verbatim — createScheduledJob is the
+      // single validation choke point (shape + enabled-skill resolution),
+      // and its typed `Invalid input: …` surfaces back as a tool error.
+      skillNames: args.skillNames,
       parentTaskId: taskId,
       dangerouslyAutoApprove,
       approvalMode,
       autoApproveCommands,
       dangerousTerminalPatterns,
       timeoutSeconds,
+      deliveryTargets,
       preRunHook
     }, {
       // Inherit the originating task's owning agent so a scheduler tick
       // doesn't reattribute the job to whichever agent happens to be
       // active at fire time. Threaded through the trusted options bag
       // so a malicious HTTP client can't spoof it via the request body.
-      originatingAgentId: task?.agentId
+      originatingAgentId: task?.agentId,
+      // originatingSessionId came from a lock-free readState above; ask
+      // createScheduledJob to re-verify the session inside its mutateState
+      // callback so a deletion racing this call can't persist a job bound
+      // to a dead conversation.
+      requireChatSession: deliverTo === "chat"
     });
   } catch (err) {
     if (err instanceof Error && err.message.startsWith("Cannot create scheduled job: parent task ")) {
       return `Error: create_job skipped because parent task was cancelled between pre-check and job creation.`;
     }
+    if (err instanceof Error && err.message.startsWith("Cannot create scheduled job: chat session ")) {
+      return `Error: create_job skipped because the originating chat session was deleted between pre-check and job creation.`;
+    }
     throw err;
   }
   // The job's chatSessionId is the freshly-minted dedicated thread when
-  // invokedFromChat, or undefined for imperative/CLI invocations.
+  // invokedFromChat (the originating conversation with deliverTo "chat"),
+  // or undefined for imperative/CLI invocations.
   const chatSessionId = job.chatSessionId;
 
   await mutateState(config.instance, (current) => {
@@ -1572,6 +1662,7 @@ async function createJobTool(
           cronExpression,
           cronTimezone,
           oneShot,
+          skillNames: job.skillNames,
           chatSessionId,
           jobId: job.id,
           dangerouslyAutoApprove,
@@ -1579,6 +1670,7 @@ async function createJobTool(
           autoApproveCommands,
           dangerousTerminalPatterns,
           timeoutSeconds,
+          deliveryTargets,
           // Handler id only — the hook's declarative config can carry bulky
           // per-script data the audit row doesn't need.
           preRunHookHandlerId: job.preRunHook?.handlerId
@@ -1598,13 +1690,15 @@ async function createJobTool(
       cronExpression,
       cronTimezone,
       oneShot,
+      skillNames: job.skillNames,
       chatSessionId,
       preRunHookHandlerId: job.preRunHook?.handlerId,
       dangerouslyAutoApprove,
       approvalMode,
       autoApproveCommands,
       dangerousTerminalPatterns,
-      timeoutSeconds
+      timeoutSeconds,
+      deliveryTargets
     }
   });
 
@@ -1671,6 +1765,9 @@ async function listJobsTool(
     nextRunAt: job.nextRunAt,
     lastRunAt: job.lastRunAt,
     chatSessionId: job.chatSessionId,
+    // Surfaced so update_job's REPLACE-only skillNames patch can preserve
+    // attachments the user isn't changing.
+    skillNames: job.skillNames,
     prompt: fullPrompt
       ? job.prompt
       : job.prompt.length > 200
@@ -1740,11 +1837,19 @@ async function updateJobTool(
     "cronTimezone",
     "timeoutSeconds",
     "autoApproveCommands",
-    "dangerouslyAutoApprove"
+    "dangerouslyAutoApprove",
+    "skillNames"
   ] as const;
   for (const key of passthrough) {
     if (key in args) patch[key] = args[key];
   }
+  // `deliveryTargets` is validated against dispatchable bridges and
+  // normalized to bridge ids instead of passed through raw — an unknown
+  // or ambiguous entry must fail here with the dispatchable bridge
+  // names so the agent can relay a fixable error.
+  // `[]` is the documented "clear" signal and passes through.
+  const deliveryTargetsPatch = parseDeliveryTargets(config, args.deliveryTargets);
+  if (deliveryTargetsPatch !== undefined) patch.deliveryTargets = deliveryTargetsPatch;
   // oneShot lives on the JobRecord but isn't part of `updateJob`'s patch
   // contract — apply it directly inside the same mutateState so the audit
   // row reflects every field the agent touched. We forward it via
@@ -1757,10 +1862,20 @@ async function updateJobTool(
     }
     oneShotPatch = args.oneShot;
   }
+  // Delivery rebind. Same enum as create_job's deliverTo; applied via
+  // `rebindJobDelivery` (one mutateState write) after the field patch so a
+  // same-call name change titles the freshly minted channel.
+  let deliverTo: "channel" | "chat" | undefined;
+  if (args.deliverTo !== undefined && args.deliverTo !== null) {
+    if (args.deliverTo !== "channel" && args.deliverTo !== "chat") {
+      throw new Error("Invalid input: deliverTo must be one of \"channel\" | \"chat\".");
+    }
+    deliverTo = args.deliverTo;
+  }
 
   const hasFieldPatch =
     Object.keys(patch).length > 0 || oneShotPatch !== undefined;
-  if (!hasFieldPatch && statusPatch === undefined) {
+  if (!hasFieldPatch && statusPatch === undefined && deliverTo === undefined) {
     throw new Error("Invalid input: update_job requires at least one field to change.");
   }
 
@@ -1769,6 +1884,34 @@ async function updateJobTool(
   // reconstructable from the log alone.
   const before = listJobs(config).find((candidate) => candidate.id === jobId);
   if (!before) throw new Error(`Job not found: ${jobId}`);
+  // Delivery-rebind pre-checks, before ANY mutation so a rejected rebind
+  // leaves the job untouched even when other patch fields were supplied.
+  // The authoritative guards are re-run inside rebindJobDelivery's
+  // mutateState; these lock-free checks give the agent a typed tool error
+  // without touching the per-instance lock.
+  let originatingSessionId: string | undefined;
+  if (deliverTo !== undefined) {
+    // Watcher / fan-out jobs (email-watch etc.) bind routing state to their
+    // sessions — a rebind would orphan dedupe anchors and concern channels.
+    if (before.preRunHook || (before.routes && Object.keys(before.routes).length > 0)) {
+      return `Error: update_job deliverTo is not supported for jobs with a preRunHook or fan-out routes — their sessions carry routing state.`;
+    }
+    if (deliverTo === "chat") {
+      // Same task → run → conversation derivation as create_job: "chat"
+      // means THIS conversation, so the call must originate from one.
+      const state = readState(config.instance);
+      const task = state.tasks.find((item) => item.id === taskId);
+      if (task?.runId) {
+        const run = state.runs.find((item) => item.id === task.runId);
+        if (run?.conversationId && state.chatSessions.some((s) => s.id === run.conversationId)) {
+          originatingSessionId = run.conversationId;
+        }
+      }
+      if (originatingSessionId === undefined) {
+        return `Error: update_job deliverTo "chat" requires invocation from a chat conversation, and this task has no originating chat session.`;
+      }
+    }
+  }
   const previousSchedule = {
     cronExpression: before.cronExpression,
     cronTimezone: before.cronTimezone,
@@ -1810,17 +1953,70 @@ async function updateJobTool(
   if (statusPatch !== undefined) {
     await updateJobStatus(config, jobId, statusPatch, taskId);
   }
+  // Delivery rebind, applied last so a same-call `name` patch titles the
+  // freshly minted channel. rebindJobDelivery writes its own audit rows
+  // (job.delivery.rebound, chat.session.archived); the clause below feeds
+  // the result text so the model can describe the new binding.
+  let deliveryClause: string | undefined;
+  let deliverToApplied = false;
+  if (deliverTo !== undefined) {
+    let rebind: Awaited<ReturnType<typeof rebindJobDelivery>> | undefined;
+    try {
+      rebind = await rebindJobDelivery(config, jobId, deliverTo, { originatingSessionId, parentTaskId: taskId });
+    } catch (err) {
+      // The rebind can race a session deletion or a parent-task
+      // cancellation landing between the lock-free pre-checks above and
+      // rebindJobDelivery's serialized re-checks. By this point the
+      // sibling patches (name/schedule/oneShot/status) have already
+      // committed, so returning a bare `Error:` would tell the model the
+      // whole call failed while most of it persisted: when other fields
+      // were applied, fall through to the normal success return with a
+      // skip clause and leave `deliverTo` out of appliedFields. Only a
+      // deliverTo-only call (nothing applied) keeps the error surface.
+      const sessionVanished =
+        err instanceof Error && err.message.startsWith("Cannot rebind job delivery: chat session ");
+      const parentTerminal =
+        err instanceof Error && err.message.startsWith("Cannot rebind job delivery: parent task ");
+      if (!sessionVanished && !parentTerminal) throw err;
+      const otherFieldsApplied = hasFieldPatch || statusPatch !== undefined;
+      if (!otherFieldsApplied) {
+        if (sessionVanished) {
+          return `Error: update_job skipped the delivery rebind because the originating chat session was deleted mid-call.`;
+        }
+        throw err;
+      }
+      deliveryClause = sessionVanished
+        ? "Delivery rebind skipped: the originating chat session was deleted mid-call."
+        : "Delivery rebind skipped: the parent task went terminal mid-call.";
+    }
+    if (rebind) {
+      deliverToApplied = true;
+      if (rebind.outcome === "noop") {
+        deliveryClause = deliverTo === "chat"
+          ? "Delivery already bound to this conversation — no change."
+          : "Delivery already bound to a dedicated channel — no change.";
+      } else if (deliverTo === "channel") {
+        deliveryClause = `Delivery rebound to a new dedicated channel ${rebind.job.chatSessionId}.`;
+      } else {
+        deliveryClause = `Delivery rebound to this conversation (${originatingSessionId})${rebind.archivedSessionId ? `; the previous channel ${rebind.archivedSessionId} was archived (history preserved, removed from lists)` : ""}.`;
+      }
+    }
+  }
 
   const after = listJobs(config).find((candidate) => candidate.id === jobId);
   if (!after) throw new Error(`Job not found after update: ${jobId}`);
 
   // Compose evidence describing exactly which fields were touched. We
-  // record only the patch keys the caller supplied (plus `status` and
-  // `oneShot` if present) so the audit row mirrors the agent's intent.
+  // record only the patch keys the caller supplied (plus `status`,
+  // `oneShot`, and `deliverTo` if it actually applied — a rebind skipped
+  // by a mid-call race is excluded so appliedFields reflects persisted
+  // state; the supplied value still appears in the `patch` evidence as
+  // intent).
   const appliedFields = [
     ...Object.keys(patch),
     ...(oneShotPatch !== undefined ? ["oneShot"] : []),
-    ...(statusPatch !== undefined ? ["status"] : [])
+    ...(statusPatch !== undefined ? ["status"] : []),
+    ...(deliverToApplied ? ["deliverTo"] : [])
   ];
   await mutateState(config.instance, (state) => {
     const item = findTask(state, taskId);
@@ -1836,7 +2032,7 @@ async function updateJobTool(
         evidence: {
           jobId,
           appliedFields,
-          patch: { ...patch, ...(oneShotPatch !== undefined ? { oneShot: oneShotPatch } : {}), ...(statusPatch !== undefined ? { status: statusPatch } : {}) },
+          patch: { ...patch, ...(oneShotPatch !== undefined ? { oneShot: oneShotPatch } : {}), ...(statusPatch !== undefined ? { status: statusPatch } : {}), ...(deliverTo !== undefined ? { deliverTo } : {}) },
           previousSchedule
         }
       },
@@ -1866,7 +2062,7 @@ async function updateJobTool(
       : after.nextRunAt
         ? `next fires at ${after.nextRunAt}`
         : "next-fire moment pending";
-  return `Updated job ${after.id} (\"${after.name}\"): ${appliedFields.join(", ")}. Now ${after.status}, ${cadence}, ${firingClause}.`;
+  return `Updated job ${after.id} (\"${after.name}\"): ${appliedFields.join(", ")}. Now ${after.status}, ${cadence}, ${firingClause}.${deliveryClause ? ` ${deliveryClause}` : ""}`;
 }
 
 // Delete a job and cascade-remove its run history. Low-risk for symmetry
@@ -3357,6 +3553,11 @@ async function requestBrowserConnect(
   // Validated minimally; safetyCheck runs server-side in the open-browser
   // endpoint before navigation.
   const url = resolveConnectUrl(args, taskId);
+  // Handoff mode is opt-in: only an explicit mode:"handoff" rides the payload
+  // (it flips the web card's completion button from "I've signed in" to
+  // "I'm done" — ADR browser-connect-handoff.md). Anything else, including
+  // the unset default, keeps the payload byte-identical to the sign-in flow.
+  const handoff = args.mode === "handoff";
   return mutateState(config.instance, (state: RuntimeState) => {
     const item = findTask(state, taskId);
     if (isTerminalTaskStatus(item.status)) {
@@ -3370,14 +3571,14 @@ async function requestBrowserConnect(
       // the body when rendering a browser.connect card.
       target: reason,
       reason: reasonOverride ?? "Opening a managed browser window requires explicit approval.",
-      payload: { reason, toolCallId, headless, url }
+      payload: { reason, toolCallId, headless, url, ...(handoff ? { mode: "handoff" } : {}) }
     });
     item.approvalIds.push(approval.id);
     item.updatedAt = now();
     appendTrace(config.instance, item.id, {
       type: "approval",
       message: "Approval requested for browser connect (chat-task)",
-      data: { approvalId: approval.id, reason, toolCallId, headless, url }
+      data: { approvalId: approval.id, reason, toolCallId, headless, url, ...(handoff ? { mode: "handoff" } : {}) }
     });
     return approval.id;
   });

@@ -66,6 +66,9 @@ export interface ChatSession {
   // `"job"` marks a session spawned by a scheduled job — channels carry
   // both this and `kind: "channel"`.
   origin?: "job";
+  // Archived marker (absent = active). Archived sessions keep their history
+  // and stay directly addressable, but are excluded from session lists.
+  archivedAt?: string;
 }
 
 export type ChatRole = "user" | "assistant" | "system" | "tool";

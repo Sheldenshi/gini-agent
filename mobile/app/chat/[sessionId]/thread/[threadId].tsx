@@ -7,6 +7,7 @@ import {
   ActivityIndicator,
   Alert,
   Image,
+  Keyboard,
   KeyboardAvoidingView,
   Platform,
   Pressable,
@@ -97,6 +98,9 @@ export default function ThreadViewScreen() {
   const [attachMenuVisible, setAttachMenuVisible] = useState(false);
   const scrollRef = useRef<ScrollView | null>(null);
   const pinnedToBottomRef = useRef<boolean>(true);
+  // State mirror of pinnedToBottomRef for the "jump to latest" button (the ref
+  // drives auto-scroll without a re-render; the button's visibility needs one).
+  const [atBottom, setAtBottom] = useState(true);
 
   const unauthorized =
     stream.error instanceof ApiError && stream.error.status === 401;
@@ -172,6 +176,20 @@ export default function ThreadViewScreen() {
     return () => clearTimeout(id);
   }, [list.length, lastUpdatedAt]);
 
+  // When the keyboard opens, the composer rises above it and the reply
+  // viewport shrinks from the bottom, covering the latest replies. Follow the
+  // user down only if they were already reading at the bottom; if they'd
+  // scrolled up, leave their position so they stay on what they're looking at.
+  // keyboardDidShow (not willShow) fires after KeyboardAvoidingView's padding
+  // animation settles, so scrollToEnd lands on the true, shrunk-viewport bottom.
+  useEffect(() => {
+    const sub = Keyboard.addListener("keyboardDidShow", () => {
+      if (!pinnedToBottomRef.current) return;
+      scrollRef.current?.scrollToEnd({ animated: true });
+    });
+    return () => sub.remove();
+  }, []);
+
   const trimmed = text.trim();
   const readyImages = useMemo(
     () => images.filter((i) => i.status === "ready" && i.ref).map((i) => i.ref!),
@@ -188,6 +206,7 @@ export default function ThreadViewScreen() {
   const submit = () => {
     if (sendDisabled) return;
     pinnedToBottomRef.current = true;
+    setAtBottom(true);
     reply.mutate(
       {
         content: trimmed,
@@ -288,6 +307,12 @@ export default function ThreadViewScreen() {
     setImages((prev) => prev.filter((i) => i.localId !== localId));
   };
 
+  const scrollToBottom = (): void => {
+    pinnedToBottomRef.current = true;
+    setAtBottom(true);
+    scrollRef.current?.scrollToEnd({ animated: true });
+  };
+
   if (unauthorized) return null;
 
   return (
@@ -320,6 +345,7 @@ export default function ThreadViewScreen() {
         keyboardVerticalOffset={0}
         style={styles.flex}
       >
+        <View style={styles.messagesArea}>
         {stream.isPending && !stream.blocks ? (
           <View style={styles.center}>
             <ActivityIndicator color={theme.muted} />
@@ -335,7 +361,9 @@ export default function ThreadViewScreen() {
               const { contentOffset, contentSize, layoutMeasurement } = e.nativeEvent;
               const distanceFromBottom =
                 contentSize.height - (contentOffset.y + layoutMeasurement.height);
-              pinnedToBottomRef.current = distanceFromBottom < 40;
+              const pinned = distanceFromBottom < 40;
+              pinnedToBottomRef.current = pinned;
+              setAtBottom(pinned);
             }}
           >
             {/* Pinned parent message — the main-chat block the thread
@@ -404,6 +432,22 @@ export default function ThreadViewScreen() {
             </View>
           </ScrollView>
         )}
+        {/* Floating "jump to latest" button — shown once the user scrolls up
+            off the bottom. It lives inside the message area (a flex child that
+            shrinks with the keyboard), so it floats just above the composer
+            whether the keyboard is up or down. */}
+        {!atBottom ? (
+          <TouchableOpacity
+            onPress={scrollToBottom}
+            activeOpacity={0.85}
+            style={styles.jumpToBottom}
+            accessibilityRole="button"
+            accessibilityLabel="Scroll to latest replies"
+          >
+            <Feather name="chevron-down" size={24} color={theme.text} />
+          </TouchableOpacity>
+        ) : null}
+        </View>
 
         {/* Composer — "Also send to main chat" toggle + reply pill. */}
         <View style={styles.composer}>
@@ -608,6 +652,32 @@ const styles = StyleSheet.create({
     fontSize: 14,
     textAlign: "center",
     paddingVertical: 24
+  },
+
+  // Message area — wraps the transcript ScrollView so the floating jump
+  // button can be absolutely positioned relative to it. As a flex child it
+  // shrinks when the keyboard opens, keeping the button above the composer.
+  messagesArea: { flex: 1 },
+
+  // Floating "jump to latest" button, anchored to the bottom-right of the
+  // message area (just above the composer).
+  jumpToBottom: {
+    position: "absolute",
+    right: 16,
+    bottom: 12,
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: theme.bg,
+    borderWidth: 1,
+    borderColor: theme.inputBorder,
+    alignItems: "center",
+    justifyContent: "center",
+    shadowColor: "#000",
+    shadowOpacity: 0.12,
+    shadowRadius: 6,
+    shadowOffset: { width: 0, height: 2 },
+    elevation: 3
   },
 
   // Composer.

@@ -859,6 +859,12 @@ export interface Task {
   // under ~/.gini/instances/<inst>/uploads/<id>.<ext>; this array only
   // carries the refs.
   images?: ImageAttachment[];
+  // Client surface of the user message that spawned this task. Stamped on
+  // submission (same rationale as `images`: the agent loop reads a single
+  // record instead of racing the chat-message write) so the per-turn prompt
+  // can tell the model which surface the CURRENT message came from. Absent
+  // when the surface is unknown. See ADR client-surface-context.md.
+  clientSurface?: ChatClientSurface;
   // Thread membership for the task's emitted chat blocks. Set when a task is
   // spawned to reply inside a thread (Phase 0c thread-reply endpoint), in
   // which case the whole response threads with no routing directive needed.
@@ -868,6 +874,9 @@ export interface Task {
   // main-chat tasks.
   threadId?: string;
   parentBlockId?: string;
+  // Times this task has been re-dispatched after a gateway restart; capped to
+  // break crash loops — see ADR task-resume-on-restart.md.
+  bootResumeCount?: number;
 }
 
 export interface RuntimeEvent {
@@ -988,6 +997,13 @@ export interface ChatSessionRecord {
   // sessions may leave this undefined; the new UI treats undefined as
   // hidden.
   kind?: "agent" | "channel";
+  // Archived marker. Absent = active. An archived session keeps its full
+  // history and stays directly addressable (GET /api/chat/<id>, deep links),
+  // but is excluded from session/channel lists. Set when a job's delivery
+  // is rebound away from its dedicated channel (update_job deliverTo
+  // "chat") so the orphaned channel stops cluttering the rails. Optional,
+  // so legacy sessions just lack it — no normalizeState backfill.
+  archivedAt?: string;
   // Stable marker identifying a channel as belonging to the email-watch
   // feature, used for PRECISE identity-based cleanup of orphan email-watch
   // channels — NOT title-based matching (which could catch an unrelated
@@ -1018,6 +1034,16 @@ export type ChatSessionSource =
   // structured field instead of string-matching the title (which the
   // operator can rename via `gini chat rename`).
   | { kind: "openclaw"; openclawSessionId: string; openclawAgentId: string };
+
+// Client surface an inbound chat message was sent from. Per-MESSAGE, not
+// per-session — the same session can be used from phone and desktop
+// alternately, so the surface is resolved on every submit. UI clients tag
+// each POST with a `client` body field ("web" | "mobile" | "cli"); messaging
+// bridges don't send the field — their surface derives from the session's
+// `source.kind`. An absent/unrecognized value resolves to undefined
+// (unknown), never an error, so older clients keep working. See ADR
+// client-surface-context.md.
+export type ChatClientSurface = "web" | "mobile" | "cli" | "telegram" | "discord" | "openclaw";
 
 export interface ChatMessageRecord {
   id: string;
@@ -1335,6 +1361,12 @@ export interface AgentRecord {
   // beyond the always-on SSRF gate. User-managed by editing the agent
   // record (no CLI/UI surface yet — see ADR browser-domain-policy.md).
   browserDomainPolicy?: BrowserDomainPolicy;
+  // ISO timestamp set when the agent is archived (soft delete). Orthogonal
+  // to `status` — `activateAgent` flips `status`, so archive state lives in
+  // its own field. Absent ⇒ not archived. An archived agent cannot be
+  // activated (explicit unarchive required) and its scheduled jobs are
+  // suppressed. See ADR agents-replace-profiles.md.
+  archivedAt?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -1775,6 +1807,14 @@ export interface JobRecord {
   status: JobStatus;
   deliveryTargets: string[];
   context: string[];
+  // Skill attachments: names of enabled skills whose full bodies are inlined
+  // into every fire's dispatched prompt, so each run follows the skill's
+  // recipe deterministically instead of relying on the model calling
+  // read_skill. Validated at create/update time (every name must resolve to
+  // an enabled skill); a skill that has gone missing/disabled/inactive by
+  // fire time is skipped with a trace event — never fails the fire. See ADR
+  // job-skill-attachments.md.
+  skillNames?: string[];
   retryLimit: number;
   timeoutSeconds: number;
   costBudget?: number;
@@ -1856,6 +1896,14 @@ export interface JobRunRecord {
   summary?: string;
   error?: string;
   cost?: CostRecord;
+  // Skill attachments that were SKIPPED at fire time (a name that resolved at
+  // create time but had gone missing/disabled/inactive by the time the run
+  // dispatched). Durable + structured so /api/job-runs surfaces the
+  // degradation, the model is told (in-prompt directive) not to fabricate
+  // results that need the missing recipe, and the delivery surfaces (chat
+  // system_note + bridge note) name it. Absent when nothing was skipped. See
+  // ADR job-skill-attachments.md ("Surfacing skips").
+  skillSkips?: Array<{ name: string; reason: string }>;
 }
 
 export interface CostRecord {

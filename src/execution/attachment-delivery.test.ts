@@ -246,7 +246,7 @@ describe("attachment delivery", () => {
     expect(documentParts(parts).length).toBe(0);
   });
 
-  test("image attachments stay image_url and are not gated on vision", async () => {
+  test("current-turn image on a non-vision provider degrades to a note plus a steering directive", async () => {
     // A real-ish PNG header is enough; uploadDataUrl just base64s the bytes.
     const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01]);
     const upload = storeUpload(config.instance, png, "image/png", "pic.png");
@@ -255,7 +255,48 @@ describe("attachment delivery", () => {
       config,
       "see this",
       [{ id: upload.id, mimeType: "image/png", size: upload.size }],
-      TEXT_ONLY, // vision:false must NOT drop the image
+      TEXT_ONLY, // vision:false must NOT emit an image_url part a text-only provider would 400 on
+      true
+    );
+
+    expect(parts.every((p) => p.type !== "image_url")).toBe(true);
+    const joined = textParts(parts).join("\n");
+    // Terse per-image note is still present.
+    expect(joined).toContain("not shown: the active model can't view images");
+    // The arrival turn carries the directive so the agent refuses in-band
+    // instead of hallucinating the image contents.
+    expect(joined).toContain("You cannot see the image(s) above");
+    expect(joined).toContain("Do not guess or infer their contents");
+    expect(joined).toContain("switch to a vision-capable model");
+  });
+
+  test("prior-turn image on a non-vision provider degrades to a terse note with no steering directive", async () => {
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01]);
+    const upload = storeUpload(config.instance, png, "image/png", "pic.png");
+
+    const parts = await buildAttachmentContent(
+      config,
+      "earlier turn",
+      [{ id: upload.id, mimeType: "image/png", size: upload.size }],
+      TEXT_ONLY,
+      false // replay turn — terse note only, no directive, to bound replay context
+    );
+
+    expect(parts.every((p) => p.type !== "image_url")).toBe(true);
+    const joined = textParts(parts).join("\n");
+    expect(joined).toContain("not shown: the active model can't view images");
+    expect(joined).not.toContain("You cannot see the image(s) above");
+  });
+
+  test("image attachment on a vision provider stays an image_url part", async () => {
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01]);
+    const upload = storeUpload(config.instance, png, "image/png", "pic.png");
+
+    const parts = await buildAttachmentContent(
+      config,
+      "see this",
+      [{ id: upload.id, mimeType: "image/png", size: upload.size }],
+      NATIVE, // vision:true keeps the inlined image bytes
       true
     );
 

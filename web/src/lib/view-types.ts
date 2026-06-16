@@ -49,7 +49,7 @@ export interface ThreadSummary extends RuntimeThreadSummary {
 // is the per-agent override (ADR per-agent-provider-settings.md) — the
 // Settings default-model control reads agent_default's pair, which is what
 // new chats start with.
-export type AgentRow = Pick<AgentRecord, "id" | "name" | "status" | "providerName" | "model">;
+export type AgentRow = Pick<AgentRecord, "id" | "name" | "status" | "providerName" | "model" | "archivedAt">;
 
 // UI-narrowed snapshot returned by GET /state. The runtime sends the full
 // RuntimeState; the UI only consumes a subset of fields and treats some

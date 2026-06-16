@@ -11,7 +11,7 @@ Each chat turn the agent loop sends to the provider is shaped as:
 ```
 [ system: instructions + soul + user-profile + skills + inactive-skills + mcp + bound-jobs + current-date ]   ← byte-stable WITHIN A LOCAL DAY, cacheable
 [ ...packed prior transcript tail (durable history stays complete) ]
-[ user: «emitted identity (if any)» + «Long-term memory… block (if any)» ]                     ← ephemeral tail
+[ user: «client surface (if known)» + «emitted identity (if any)» + «Long-term memory… block (if any)» ] ← ephemeral tail
 [ user: the actual user message ]
 ```
 
@@ -19,7 +19,7 @@ Four decisions hold this shape:
 
 1. **Message 0 (the system message) is a byte-stable prefix.** It contains only content that is stable across turns for a fixed instance configuration: the instructions preamble, `SOUL.md`, `USER.md`, the enabled-skills index, the inactive-skills block, the configured-MCP block, the bound-jobs block, and today's date (the only intra-day-stable element — see decision 4). Those change only when the underlying entity set changes (a real configuration event, where a cache break is correct), never per turn, and the date line rolls at most once per local calendar day. The prior transcript tail that follows message 0 is deterministic for a given stored history and context budget, but it is bounded by ADR chat-context-window.md rather than unbounded forever.
 
-2. **Per-turn-varying content rides in an ephemeral `role:"user"` tail.** The two blocks that used to be baked into message 0 — recalled Hindsight memory (keyed on the turn's user input, so different every turn) and the emitted runtime-identity block (present on emit turns, absent on quiet turns) — now render through `renderEphemeralContext(emittedIdentity, recalledContext)` into a single `role:"user"` message placed after the packed prior transcript and immediately before the real user message. The two pieces are joined by a blank line in the order identity-then-memory (mirroring their old system-prompt order); each is elided when empty, and when both are empty no tail message is injected at all. The tail is built live every turn and is never written to durable `chatMessages`, so the next turn's prior transcript never replays a stale tail (see Boundary for its in-memory lifecycle across an approval pause).
+2. **Per-turn-varying content rides in an ephemeral `role:"user"` tail.** Three blocks render through `renderEphemeralContext(emittedIdentity, recalledContext, clientSurfaceNote)` into a single `role:"user"` message placed after the packed prior transcript and immediately before the real user message: the client-surface note for the CURRENT inbound message (per-message by design — see ADR [client-surface-context.md](./client-surface-context.md)), the emitted runtime-identity block (present on emit turns, absent on quiet turns), and recalled Hindsight memory (keyed on the turn's user input, so different every turn). The pieces are joined by blank lines in the order surface-then-identity-then-memory (the surface note frames the turn, and identity-then-memory mirrors their old system-prompt order); each is elided when empty, and when all are empty no tail message is injected at all. The tail is built live every turn and is never written to durable `chatMessages`, so the next turn's prior transcript never replays a stale tail (see Boundary for its in-memory lifecycle across an approval pause).
 
 3. **Automatic provider prefix caching only — no `cache_control` markers.** The OpenAI-shaped providers Gini targets (openai, openrouter, deepseek, local, azure) get the pinned OpenAI-style `in_memory` retention field in `src/provider.ts` rather than any explicit cache markers (see ADR prompt-cache-in-memory-tier.md for which backends actually cache on it). Codex uses its own server-side prefix caching of `instructions` + `input`. Prefix byte-stability alone is what makes both warm. The anthropic provider (see ADR anthropic-messages-provider.md) speaks the Anthropic Messages API, whose prompt caching is opt-in via explicit `cache_control` breakpoints rather than automatic prefix caching; the current implementation sends no `cache_control` markers, so the anthropic path's stable prefix is sent uncached. Wiring Messages-shaped `cache_control` onto the stable prefix is a future follow-up.
 
@@ -63,7 +63,7 @@ The legacy `generateTaskSummary` path in `src/provider.ts` is one system + one u
 - The emitted identity block and the recalled-memory block both appear in a single `role:"user"` message located immediately before the real user message, identity before memory.
 - A turn that injected a tail does not cause the next turn's prior transcript (or `chatMessages`) to contain that tail's identity/memory text.
 - Subagent turns inject no tail; their system prompt is the subagent override.
-- `renderEphemeralContext` returns `""` when both pieces are empty and the caller injects no tail message in that case.
+- `renderEphemeralContext` returns `""` when all pieces are empty and the caller injects no tail message in that case.
 - `bun run typecheck`, `bun test`, and `bun run gini smoke` are green.
 
 ## Critical Files

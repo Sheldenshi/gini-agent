@@ -3,11 +3,13 @@
 // real on-disk paths without polluting a developer's actual instance.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { buildAgentSystemContext } from "../system-prompt";
 import {
   HISTORY_MAX_SNAPSHOTS,
+  __testing,
   approveSoul,
   approveUserProfile,
   dedupeAppendLines,
@@ -22,6 +24,7 @@ import {
   removeSoulSection,
   removeUserProfileSection,
   renameSeededSoulName,
+  reseedDefaultInstructions,
   restoreSoulFromHistory,
   restoreUserProfileFromHistory,
   seedAgentSoulFile,
@@ -627,6 +630,83 @@ describe("identity-files", () => {
 
     test("no-op when INSTRUCTIONS.md is absent", () => {
       expect(migrateInstructionsIdentityLine(INSTANCE)).toBe(false);
+    });
+  });
+
+  describe("reseedDefaultInstructions", () => {
+    // Verbatim historical bundled defaults, checked in as fixtures so the
+    // tests exercise the real shipped hash list (not an injected one).
+    // `instructions-default-earliest.md` is the first default main ever
+    // shipped; `instructions-default-legacy-identity-line.md` is a later
+    // default whose first line ("You are Gini, a personal agent.") is in
+    // the identity-line migration's legacy set.
+    const FIXTURES = join(import.meta.dir, "__fixtures__");
+    const earliestDefault = readFileSync(join(FIXTURES, "instructions-default-earliest.md"), "utf8");
+    const legacyLineDefault = readFileSync(join(FIXTURES, "instructions-default-legacy-identity-line.md"), "utf8");
+
+    function writeInstructions(content: string): string {
+      const path = instructionsPath(INSTANCE);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, content);
+      return path;
+    }
+
+    test("a prior shipped default is reseeded to the current bundled default", () => {
+      const path = writeInstructions(earliestDefault);
+      expect(reseedDefaultInstructions(INSTANCE)).toBe(true);
+      expect(readFileSync(path, "utf8")).toBe(expectedDefaultInstructions);
+    });
+
+    test("a prior default whose first line was rewritten by the identity-line migration still reseeds", () => {
+      const path = writeInstructions(legacyLineDefault);
+      // Boot order in install(): identity-line migration first, then the
+      // reseed sees the migrated bytes — which no longer match any
+      // committed default verbatim. The hash list carries the migrated
+      // variant, so the reseed still recognizes the file as unedited.
+      expect(migrateInstructionsIdentityLine(INSTANCE)).toBe(true);
+      expect(readFileSync(path, "utf8")).not.toBe(legacyLineDefault);
+      expect(reseedDefaultInstructions(INSTANCE)).toBe(true);
+      expect(readFileSync(path, "utf8")).toBe(expectedDefaultInstructions);
+    });
+
+    test("a user-edited file is never touched, even one character off a shipped default", () => {
+      const edited = `${earliestDefault}!`;
+      const path = writeInstructions(edited);
+      expect(reseedDefaultInstructions(INSTANCE)).toBe(false);
+      expect(readFileSync(path, "utf8")).toBe(edited);
+    });
+
+    test("a file already matching the current bundled default is a no-op (no rewrite churn)", () => {
+      const path = writeInstructions(expectedDefaultInstructions);
+      const past = new Date(Date.now() - 60_000);
+      utimesSync(path, past, past);
+      const before = statSync(path).mtimeMs;
+      expect(reseedDefaultInstructions(INSTANCE)).toBe(false);
+      expect(statSync(path).mtimeMs).toBe(before);
+      expect(readFileSync(path, "utf8")).toBe(expectedDefaultInstructions);
+    });
+
+    test("no-op when INSTRUCTIONS.md is absent", () => {
+      expect(reseedDefaultInstructions(INSTANCE)).toBe(false);
+      expect(existsSync(instructionsPath(INSTANCE))).toBe(false);
+    });
+
+    test("the bundled default's hash is pinned so edits also update the historical hash list", () => {
+      // Reseed only recognizes a file as an unedited prior default if its
+      // hash is in HISTORICAL_DEFAULT_INSTRUCTIONS_HASHES. If the bundled
+      // default changes without the OLD default's hash joining that list,
+      // every instance still carrying the old default silently stops
+      // receiving updates.
+      const pinned = "91bff143c82fe59725801aca89b9058df69e2b2754615d1b55af3edc4bb0441d";
+      const current = createHash("sha256").update(readFileSync(DEFAULT_INSTRUCTIONS_FILE)).digest("hex");
+      expect(
+        current,
+        "src/runtime/defaults/INSTRUCTIONS.md changed. Add the OLD default's sha256 (the pinned hash below) to HISTORICAL_DEFAULT_INSTRUCTIONS_HASHES in src/runtime/identity-files.ts, then update this test's pinned hash to the new file's sha256 (`shasum -a 256 src/runtime/defaults/INSTRUCTIONS.md`)."
+      ).toBe(pinned);
+      expect(
+        __testing.HISTORICAL_DEFAULT_INSTRUCTIONS_HASHES.has(pinned),
+        "The current bundled default's hash must NOT be in HISTORICAL_DEFAULT_INSTRUCTIONS_HASHES — the list holds only previously shipped defaults (a file matching the current default needs no rewrite)."
+      ).toBe(false);
     });
   });
 

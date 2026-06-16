@@ -220,6 +220,71 @@ an agent chat; the difference is purely the `kind`/`origin` tags that
 drive the rail grouping and the unread-until-opened behavior job
 sessions already had.
 
+Session-level unread is computed client-side
+(`web/src/lib/use-chat-read-state.ts`) and keys on **delivered replies
+only** — the activity timestamp is the newest `updatedAt` among the
+session's runs that carry an `assistantMessageId` (set when a final
+answer is persisted as a durable chat message, with `run.updatedAt`
+stamped to that message's `createdAt`), floored at `session.createdAt`.
+It deliberately ignores `session.updatedAt` and runs without a delivered
+reply, which advance on dispatch, run creation, and subagent attach: a
+job run emits tool calls and finishes subagent runs throughout its
+execution, and counting those would re-flag a channel the user already
+opened while the job is still working. This mirrors the thread rule
+above, where `lastReplyAt` keys on message blocks rather than the
+trailing auxiliary blocks a run appends.
+
+The delivery binding is user-chosen at creation. The `create_job` tool
+takes `deliverTo: "channel" | "chat"` — `"channel"` (the default) mints
+the dedicated channel session above; `"chat"` binds
+`JobRecord.chatSessionId` to the originating conversation instead, so
+each fire posts into the chat that created the job (the session stays a
+normal agent chat — no kind/title mutation). `"chat"` is only valid for
+chat-bound invocations; an imperative/CLI task gets a tool error. The
+default is `"channel"`; one-shot reminders default to `"chat"`. A
+chat-bound job gets no Recurring jobs rail row — the rail lists only
+channel-bound jobs; each fire delivers into the bound conversation,
+and the job is managed from that conversation's Jobs tab. Its fires
+also run with that conversation's prior-turn context (token-budgeted,
+like any chat turn), whereas a channel-bound job's fires see only
+prior fires.
+
+The binding stays modifiable after creation: `update_job` accepts the
+same `deliverTo` enum (`rebindJobDelivery` in `src/jobs/index.ts`,
+audited as `job.delivery.rebound`). Switching to `"channel"` always
+mints a **new** dedicated channel and leaves the previously bound
+conversation untouched — it's the user's chat. Switching to `"chat"`
+binds future fires to the conversation the `update_job` call came from
+(tool error when the invocation isn't chat-bound) and, when the job's
+current session is a dedicated channel, stamps the channel's
+`archivedAt` (audited as `chat.session.archived`). An archived session
+keeps its full history and stays directly addressable by id/URL; it is
+only excluded from session/channel lists (web sidebar rail, mobile
+channels). Rebinding when already bound the requested way is a no-op.
+Watcher jobs (a `preRunHook` or fan-out `routes`) reject `deliverTo` —
+their sessions carry routing state a rebind would orphan. The raw
+`PATCH /api/jobs` path stays permissive and has no `deliverTo`
+semantics.
+
+Beyond the channel itself, a finished job run's reply can reach
+messaging bridges two ways (`src/jobs/finalize.ts`): the session's
+origin mirror (`outboundMirror`/`source`, set when the job was created
+from a Telegram/Discord conversation) mirrors the reply back to that
+bridge, and `JobRecord.deliveryTargets` names additional bridges to
+deliver to — the surface for "send my morning briefing to telegram"
+when the job was created from web/CLI. The `create_job`/`update_job`
+tools accept `deliveryTargets` entries that must resolve to exactly
+one dispatchable (Telegram/Discord) bridge — by id, case-insensitive
+name, or kind; unknown and ambiguous entries are rejected — and
+persist the resolved bridge id (`[]` clears). Delivery runs on every
+terminal finalize: a job with no chat session (created via `POST
+/api/jobs` or from a non-chat task) or whose session vanished delivers
+the task summary instead of the synced chat reply, and both paths
+honor the exact-`[SILENT]` suppression contract. A bridge the origin
+mirror already delivered to is skipped. Fire-time resolution failures
+and send failures are logged (`job.delivery.target.error`) and audited
+(`job.delivery.failed`) without failing the run.
+
 ## Agent-Decided Routing
 
 Routing is resolved per turn, before the user sees any text, by three
@@ -415,6 +480,11 @@ Con:
 - `bun test src/state/chat-blocks.test.ts` covers thread tagging on
   insert, `listThreadBlocks` / `listMainChatBlocks`, and the
   `summarizeThreads` / `summarizeThreadsForInstance` aggregates.
+- `bun test src/jobs.test.ts` covers job-output bridge delivery: the
+  origin-mirror `[SILENT]` contract, and the `deliveryTargets` path
+  (resolution by name/id/kind, dedupe against the origin mirror,
+  fire-time resolution failure logged without failing the run, and
+  `create_job`/`update_job` validation against configured bridges).
 - `bun test src/http.test.ts` smoke-tests the new routes — the
   agent-chat resolver, the three per-session thread routes (including
   create-or-append from a new thread id + `parentBlockId`, the

@@ -1409,6 +1409,12 @@ export function createNotificationRecord(
 export function activateAgent(state: RuntimeState, idOrName: string): AgentRecord {
   const agent = state.agents.find((item) => item.id === idOrName || item.name === idOrName);
   if (!agent) throw new Error(`Agent not found: ${idOrName}`);
+  // An archived agent is soft-deleted: it can't be the active selection
+  // until it's explicitly restored. Block activation outright rather than
+  // silently un-archiving it as a side effect.
+  if (agent.archivedAt) {
+    throw new Error("Cannot use an archived agent; restore it first.");
+  }
   for (const item of state.agents) item.status = item.id === agent.id ? "active" : "inactive";
   agent.updatedAt = now();
   state.activeAgentId = agent.id;

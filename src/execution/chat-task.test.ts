@@ -5,6 +5,13 @@
 //   - one tool call → result fed back → final answer
 //   - approval-gated tool call → task pauses with toolCallState
 //   - resume after approval → task completes
+//
+// HOME is pointed at a unique mkdtemp dir per test (same pattern as
+// src/state/google-accounts.test.ts): the loop reads the machine-global
+// Google account registry (buildConnectedAccountsBlock(readGoogleAccounts())
+// in the system prompt; isSkillActive via credentialExternallySatisfied), so
+// a developer machine with registered accounts would otherwise shift the
+// system-prompt size and skill activity these tests depend on.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -21,6 +28,7 @@ import {
   setEchoToolCallingFailure,
   setEchoToolCallingResponse,
   normalizeProvider,
+  type MessageContentPart,
   type ToolCallingMessage
 } from "../provider";
 import { submitTask, decideApproval, resolveSetupRequest } from "../agent";
@@ -42,10 +50,12 @@ import {
   recordProviderAuthFailure
 } from "../state";
 import { echoEmbed } from "../embeddings";
+import { storeUpload } from "../state/uploads";
 import { resolveDefaultPriorContextTokenBudget } from "../provider-capabilities";
 import type { AgentIdentity, GoogleAccount, JobRecord, RuntimeConfig, RuntimeState, SkillRecord, Task, ToolsetRecord } from "../types";
 import { createSkillFromInput, setSkillStatus } from "../capabilities/skills";
 import {
+  __setBaseToolCatalogForTests,
   buildAgentIdentity,
   buildConnectedAccountsBlock,
   buildEnabledSkillsBlock,
@@ -60,7 +70,33 @@ import {
   promptTokensFromUsage,
   renderMessagesForCompaction
 } from "./chat-task";
+import type { ToolCatalogTool } from "./tool-catalog";
 import type { EffectiveContext } from "./effective-context";
+
+let scratchHome: string;
+let prevHome: string | undefined;
+let prevEmbedding: string | undefined;
+
+beforeEach(() => {
+  scratchHome = mkdtempSync(join(tmpdir(), "gini-chat-task-home-"));
+  prevHome = process.env.HOME;
+  process.env.HOME = scratchHome;
+  // Pin embeddings to echo: the local provider is unavailable under bun
+  // test, and the fallback chain otherwise picks the openai provider on
+  // machines with ~/.codex/auth.json (resolved via os.homedir(), which
+  // ignores the HOME override above) — turning every memory embed in the
+  // loop into a real network call.
+  prevEmbedding = process.env.GINI_EMBEDDING_PROVIDER;
+  process.env.GINI_EMBEDDING_PROVIDER = "echo";
+});
+
+afterEach(() => {
+  if (prevHome === undefined) delete process.env.HOME;
+  else process.env.HOME = prevHome;
+  if (prevEmbedding === undefined) delete process.env.GINI_EMBEDDING_PROVIDER;
+  else process.env.GINI_EMBEDDING_PROVIDER = prevEmbedding;
+  rmSync(scratchHome, { recursive: true, force: true });
+});
 
 function buildConfig(workspaceRoot: string, instance: string, opts: Partial<RuntimeConfig> = {}): RuntimeConfig {
   return {
@@ -91,6 +127,51 @@ async function seedBulkSkill(config: RuntimeConfig, name: string, body: string):
   });
   await setSkillStatus(config, skill.id, "enabled");
 }
+
+// Fixed, test-owned tool catalog for the in-turn-compaction geometry tests.
+// Those tests size skill bodies against the always-on `toolSchemaTokens`
+// floor; growing any always-on tool description (as create_job's did) would
+// otherwise shift that floor and move the compaction crossing point opaquely.
+// Installing this constant via __setBaseToolCatalogForTests pins the floor so
+// no live-catalog change can perturb the geometry.
+//
+// Shape: `read_skill` (the only tool the compaction scripts dispatch — the
+// loop must run to completion with it) plus uniform filler tools whose count
+// is chosen so the serialized provider catalog tokenizes to a known floor.
+// Measured floor: toolSchemaTokens = ceil(JSON.stringify(toProviderTools)/4)
+// = 12,207 tokens (read_skill ≈ 90 tokens + 47 filler tools ≈ 258 tokens
+// each). The high-water mark is floor(32,000 × 0.85) = 27,200 under the echo
+// provider (no usage → promptTokenEstimateGap 0), so the message budget
+// before the mark is 27,200 − 12,207 ≈ 14,993 tokens. Each in-turn exchange
+// is one ~8,600-char read_skill result (≈ 2,150 tokens) plus its assistant
+// tool_call row; with the protected head + system prompt, six accumulated
+// results cross the mark before the 7th call. The filler count is the ONE
+// knob that sets the floor; bodies below are derived from it.
+const FIXED_COMPACTION_CATALOG_FILLER = 47;
+const FIXED_COMPACTION_CATALOG: ToolCatalogTool[] = [
+  {
+    toolset: "skills",
+    type: "function",
+    function: {
+      name: "read_skill",
+      description: "Return the full body of an enabled skill by name.",
+      parameters: {
+        type: "object",
+        properties: { name: { type: "string", description: "Skill name." } },
+        required: ["name"]
+      }
+    }
+  },
+  ...Array.from({ length: FIXED_COMPACTION_CATALOG_FILLER }, (_unused, i) => ({
+    toolset: "core",
+    type: "function" as const,
+    function: {
+      name: `fixed_floor_tool_${i}`,
+      description: "X".repeat(900),
+      parameters: { type: "object", properties: {}, required: [] as string[] }
+    }
+  }))
+];
 
 async function waitForTerminal(config: RuntimeConfig, taskId: string, timeoutMs = 5000): Promise<Task> {
   const deadline = Date.now() + timeoutMs;
@@ -125,6 +206,9 @@ describe("chat-task loop", () => {
     else process.env.GINI_STATE_ROOT = prevState;
     if (prevLog === undefined) delete process.env.GINI_LOG_ROOT;
     else process.env.GINI_LOG_ROOT = prevLog;
+    // Clear any fixed-catalog override a compaction test installed so the
+    // rest of the suite sees the live buildToolCatalog.
+    __setBaseToolCatalogForTests(null);
     rmSync(root, { recursive: true, force: true });
     clearEchoToolCallingResponses();
     clearEchoAuxTextResponses();
@@ -461,6 +545,41 @@ describe("chat-task loop", () => {
     expect(after.status).toBe("failed");
     expect(after.toolCallState).toBeUndefined();
     expect(existsSync(join(workspaceRoot, "x.txt"))).toBe(false);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("image attachment on a non-vision model proceeds and steers an in-band refusal", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-image-no-vision");
+
+    // The echo provider resolves to vision:false. A PNG header is enough since
+    // buildAttachmentContent degrades the image to a text note without reading
+    // the bytes — it gates on mime alone, never emitting an image_url part.
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01]);
+    const upload = storeUpload(config.instance, png, "image/png", "pic.png");
+
+    const task = await submitTask(config, "see this", {
+      mode: "chat",
+      images: [{ id: upload.id, mimeType: "image/png", size: upload.size }]
+    });
+    const finished = await waitForTerminal(config, task.id);
+
+    // The turn is no longer hard-rejected: it runs to completion so the refusal
+    // is a normal, replayable assistant turn.
+    expect(finished.status).toBe("completed");
+
+    // The model saw the image degraded to a text note plus the steering
+    // directive, and never received an image_url part it would 400 on.
+    const turn = getEchoToolCallingCalls()[0]!;
+    const userMessage = turn.find((m) => m.role === "user" && Array.isArray(m.content))!;
+    const userParts = userMessage.content as MessageContentPart[];
+    expect(userParts.every((p) => p.type !== "image_url")).toBe(true);
+    const userText = userParts
+      .filter((p): p is { type: "text"; text: string } => p.type === "text")
+      .map((p) => p.text)
+      .join("\n");
+    expect(userText).toContain("You cannot see the image(s) above");
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
@@ -1722,6 +1841,102 @@ describe("chat-task loop", () => {
       const text = String(m.content ?? "");
       expect(text).not.toContain("Your runtime identity:");
       expect(text).not.toContain("Runtime identity changes since last turn:");
+    }
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // Client-surface injection: the surface of the message that started THIS
+  // turn rides in the ephemeral role:"user" tail (never the byte-stable
+  // system prefix), and is omitted entirely when unknown. See ADR
+  // client-surface-context.md.
+  test("injects the current message's client-surface line into the ephemeral tail, per turn", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-surface");
+    const provider = normalizeProvider(config.provider);
+    const { submitChatMessage, createChat } = await import("./chat");
+    const session = await createChat(config, { title: "Surface probe" });
+
+    // Turn 1 from the web, turn 2 from the phone — the same session can
+    // alternate surfaces, so each turn must carry only its OWN surface.
+    setEchoToolCallingResponse({ provider, text: "ok", toolCalls: [], finishReason: "stop" });
+    const first = await submitChatMessage(config, session.id, { content: "desktop turn", client: "web" });
+    expect((await waitForTerminal(config, first.taskId)).status).toBe("completed");
+
+    setEchoToolCallingResponse({ provider, text: "ok", toolCalls: [], finishReason: "stop" });
+    const second = await submitChatMessage(config, session.id, { content: "phone turn", client: "mobile" });
+    expect((await waitForTerminal(config, second.taskId)).status).toBe("completed");
+
+    const calls = getEchoToolCallingCalls();
+    const turn1 = calls[0]!;
+    const turn2 = calls[calls.length - 1]!;
+
+    // Turn 1: the web line rides in the tail immediately before the user
+    // message, and the system prefix stays surface-free.
+    const userIdx1 = turn1.findIndex((m) => m.role === "user" && m.content === "desktop turn");
+    expect(userIdx1).toBeGreaterThan(0);
+    const tail1 = String(turn1[userIdx1 - 1]!.content ?? "");
+    expect(tail1).toContain("The user is messaging from the web app");
+    expect(String(turn1.find((m) => m.role === "system")?.content ?? "")).not.toContain("The user is messaging");
+
+    // Turn 2: only the mobile line — the prior turn's web line must not
+    // replay into this turn's context.
+    const userIdx2 = turn2.findIndex((m) => m.role === "user" && m.content === "phone turn");
+    expect(userIdx2).toBeGreaterThan(0);
+    const tail2 = String(turn2[userIdx2 - 1]!.content ?? "");
+    expect(tail2).toContain("The user is messaging from the mobile app");
+    expect(tail2).toContain("NOT at the gateway machine");
+    for (const m of turn2) {
+      expect(String(m.content ?? "")).not.toContain("The user is messaging from the web app");
+    }
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("derives the surface line from a bridge session without a client field", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-surface-bridge");
+    const provider = normalizeProvider(config.provider);
+    const sessionId = await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "Telegram probe", {
+        kind: "telegram",
+        bridgeId: "bridge_1",
+        chatId: 42,
+        target: "42"
+      });
+      return session.id;
+    });
+
+    setEchoToolCallingResponse({ provider, text: "ok", toolCalls: [], finishReason: "stop" });
+    const { submitChatMessage } = await import("./chat");
+    const submitted = await submitChatMessage(config, sessionId, { content: "bridge turn" });
+    expect((await waitForTerminal(config, submitted.taskId)).status).toBe("completed");
+
+    const turn = getEchoToolCallingCalls()[0]!;
+    const userIdx = turn.findIndex((m) => m.role === "user" && m.content === "bridge turn");
+    expect(userIdx).toBeGreaterThan(0);
+    const tail = String(turn[userIdx - 1]!.content ?? "");
+    expect(tail).toContain("The user is messaging from Telegram");
+    expect(tail).toContain("NOT at the gateway machine");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("omits the surface line entirely when the surface is unknown", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-surface-unknown");
+    const provider = normalizeProvider(config.provider);
+    const { submitChatMessage, createChat } = await import("./chat");
+    const session = await createChat(config, { title: "Unknown surface probe" });
+
+    setEchoToolCallingResponse({ provider, text: "ok", toolCalls: [], finishReason: "stop" });
+    const submitted = await submitChatMessage(config, session.id, { content: "untagged turn" });
+    expect((await waitForTerminal(config, submitted.taskId)).status).toBe("completed");
+
+    // No claim anywhere in the turn — not a hedged "unknown surface" line.
+    const turn = getEchoToolCallingCalls()[0]!;
+    for (const m of turn) {
+      expect(String(m.content ?? "")).not.toContain("The user is messaging");
     }
 
     rmSync(workspaceRoot, { recursive: true, force: true });
@@ -4018,7 +4233,7 @@ describe("chat-task loop", () => {
     // reports usage; the resulting calibration gap forces the pre-call trim
     // ahead of the 13th call.
     for (let i = 0; i < 12; i++) {
-      writeFileSync(join(workspaceRoot, `chunk${i}.md`), `chunk-${i} `.repeat(420));
+      writeFileSync(join(workspaceRoot, `chunk${i}.md`), `chunk-${i} `.repeat(411));
       setEchoToolCallingResponse({
         provider,
         text: "",
@@ -4075,18 +4290,27 @@ describe("chat-task loop", () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
     const config = buildConfig(workspaceRoot, "chat-task-overflow-retry");
     const provider = normalizeProvider(config.provider);
+    await mutateState(config.instance, (state) => {
+      for (const toolset of state.toolsets) toolset.status = "disabled";
+    });
+    // Pin the tool-catalog floor so the crossing geometry is decoupled from
+    // live always-on catalog size (cleared in afterEach).
+    __setBaseToolCatalogForTests(FIXED_COMPACTION_CATALOG);
 
-    // Seven mid-size tool results (distinct files so no loop-breaker trips)
+    // Seven mid-size tool results (distinct skills so no loop-breaker trips)
     // give the overflow compaction passes something to shrink, while the
-    // estimated total stays under every proactive threshold — the overflow
-    // is driven purely by the stubbed provider failures.
+    // estimated total stays under the proactive high-water mark (27,200
+    // tokens against the ~12,487-token floor: the 12,207 pinned catalog plus
+    // the system-prompt slice) — the proactive
+    // compaction path never fires, so the overflow is driven purely by the
+    // stubbed provider failures.
     for (let i = 0; i < 7; i++) {
-      writeFileSync(join(workspaceRoot, `bulk${i}.md`), `bulk-${i} ${"x".repeat(4_800)}`);
+      await seedBulkSkill(config, `bulk-skill-${i}`, `BODY-${i} ${"x".repeat(4_800)}`);
       setEchoToolCallingResponse({
         provider,
         text: "",
         toolCalls: [
-          { id: `call_o${i}`, type: "function", function: { name: "file_read", arguments: JSON.stringify({ path: `bulk${i}.md` }) } }
+          { id: `call_o${i}`, type: "function", function: { name: "read_skill", arguments: JSON.stringify({ name: `bulk-skill-${i}` }) } }
         ],
         finishReason: "tool_calls"
       });
@@ -4475,18 +4699,15 @@ describe("chat-task loop", () => {
 
   // In-turn compaction happy path. Token geometry under the echo provider
   // (32k window, high-water 27,200): the always-on tool schemas + system
-  // prompt occupy ~15.3k tokens (slightly less on Linux, where the
-  // macOS-only apple skills stay out of the system prompt), so six
-  // ~2.1k-token read_skill results cross the high-water mark before the 7th
-  // call — and pruning can't help (all six results sit inside the elision
-  // layer's protected-recent window). The loop must summarize the middle
-  // exchanges via ONE aux call, splice in the marked summary message,
-  // protect the head and the recent tail, and keep going to completion.
-  // Toolsets are disabled to pin the schema to the always-on floor —
-  // read_skill is always-on, so the calls still dispatch. The body size
-  // balances two erosion modes: growing the always-on floor pushes the
-  // trigger a call earlier (5 results must stay under the mark), shrinking
-  // it pushes the trigger a call later (6 results must stay over).
+  // prompt occupy ~15.4k tokens, so six ~2.2k-token read_skill results cross
+  // the high-water mark before the 7th call — and pruning can't help (all
+  // six results sit inside the elision layer's protected-recent window). The
+  // loop must summarize the middle exchanges via ONE aux call, splice in the
+  // marked summary message, protect the head and the recent tail, and keep
+  // going to completion. The schema floor is pinned to FIXED_COMPACTION_CATALOG
+  // (installed below) so the crossing geometry is decoupled from live
+  // always-on catalog growth; toolsets are also disabled, and read_skill is in
+  // the fixed catalog so the calls still dispatch.
   test("in-turn compaction summarizes the middle, protects head and tail, and continues", async () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
     const config = buildConfig(workspaceRoot, "chat-task-compaction");
@@ -4494,9 +4715,12 @@ describe("chat-task loop", () => {
     await mutateState(config.instance, (state) => {
       for (const toolset of state.toolsets) toolset.status = "disabled";
     });
+    // Pin the tool-catalog floor so the crossing geometry is decoupled from
+    // live always-on catalog size (cleared in afterEach).
+    __setBaseToolCatalogForTests(FIXED_COMPACTION_CATALOG);
 
     for (let i = 0; i < 7; i++) {
-      await seedBulkSkill(config, `bulk-skill-${i}`, `BODY-${i} ${"x".repeat(8_400)}`);
+      await seedBulkSkill(config, `bulk-skill-${i}`, `BODY-${i} ${"x".repeat(8_600)}`);
       setEchoToolCallingResponse({
         provider,
         text: "",
@@ -4578,6 +4802,9 @@ describe("chat-task loop", () => {
     await mutateState(config.instance, (state) => {
       for (const toolset of state.toolsets) toolset.status = "disabled";
     });
+    // Pin the tool-catalog floor so the crossing geometry is decoupled from
+    // live always-on catalog size (cleared in afterEach).
+    __setBaseToolCatalogForTests(FIXED_COMPACTION_CATALOG);
 
     // Exchange sizes: big, tiny, big, big. The middle span (everything
     // between the protected first exchange and the protected last two) is
@@ -4621,6 +4848,9 @@ describe("chat-task loop", () => {
     await mutateState(config.instance, (state) => {
       for (const toolset of state.toolsets) toolset.status = "disabled";
     });
+    // Pin the tool-catalog floor so the crossing geometry is decoupled from
+    // live always-on catalog size (cleared in afterEach).
+    __setBaseToolCatalogForTests(FIXED_COMPACTION_CATALOG);
 
     // Geometry: the projection crosses the high-water mark (27,200 tokens
     // under the echo provider's 32k window) with a small middle span — so
@@ -4631,11 +4861,11 @@ describe("chat-task loop", () => {
     // post-compaction headroom under the mark; the always-on tool schemas
     // count toward the projection, so growing them erodes this headroom.
     const bodies = [
-      `BODY-0 ${"x".repeat(9_600)}`,
+      `BODY-0 ${"x".repeat(8_000)}`,
       `BODY-1 ${"x".repeat(4_000)}`,
       `BODY-2 ${"x".repeat(4_000)}`,
       `BODY-3 ${"x".repeat(19_000)}`,
-      `BODY-4 ${"x".repeat(16_000)}`
+      `BODY-4 ${"x".repeat(14_000)}`
     ];
     for (let i = 0; i < bodies.length; i++) {
       await seedBulkSkill(config, `bulk-skill-${i}`, bodies[i]!);
@@ -4678,11 +4908,14 @@ describe("chat-task loop", () => {
     await mutateState(config.instance, (state) => {
       for (const toolset of state.toolsets) toolset.status = "disabled";
     });
+    // Pin the tool-catalog floor so the crossing geometry is decoupled from
+    // live always-on catalog size (cleared in afterEach).
+    __setBaseToolCatalogForTests(FIXED_COMPACTION_CATALOG);
 
     // Same geometry as the happy path (compaction fires before call 7) plus
     // a 7th huge read that immediately refills the reclaimed space.
     for (let i = 0; i < 7; i++) {
-      const chars = i === 6 ? 36_000 : 8_400;
+      const chars = i === 6 ? 36_000 : 8_600;
       await seedBulkSkill(config, `bulk-skill-${i}`, `BODY-${i} ${"x".repeat(chars)}`);
       setEchoToolCallingResponse({
         provider,
@@ -4719,6 +4952,9 @@ describe("chat-task loop", () => {
     await mutateState(config.instance, (state) => {
       for (const toolset of state.toolsets) toolset.status = "disabled";
     });
+    // Pin the tool-catalog floor so the crossing geometry is decoupled from
+    // live always-on catalog size (cleared in afterEach).
+    __setBaseToolCatalogForTests(FIXED_COMPACTION_CATALOG);
 
     const queueRead = (i: number): void => {
       setEchoToolCallingResponse({
@@ -4730,12 +4966,12 @@ describe("chat-task loop", () => {
         finishReason: "tool_calls"
       });
     };
-    // Twelve ~2.1k-token reads. The high-water mark trips after every sixth
+    // Twelve ~2.2k-token reads. The high-water mark trips after every sixth
     // accumulated full result, so compactions land at iterations 7 and 10 —
     // three iterations apart, wide enough that the refill guard stays quiet
     // — and the third trigger at iteration 13 hits the cap.
     for (let i = 0; i < 12; i++) {
-      await seedBulkSkill(config, `bulk-skill-${i}`, `BODY-${i} ${"x".repeat(8_400)}`);
+      await seedBulkSkill(config, `bulk-skill-${i}`, `BODY-${i} ${"x".repeat(8_600)}`);
       queueRead(i);
     }
     setEchoAuxTextResponse({ text: "SUMMARY-ONE" });
@@ -4777,9 +5013,12 @@ describe("chat-task loop", () => {
     await mutateState(config.instance, (state) => {
       for (const toolset of state.toolsets) toolset.status = "disabled";
     });
+    // Pin the tool-catalog floor so the crossing geometry is decoupled from
+    // live always-on catalog size (cleared in afterEach).
+    __setBaseToolCatalogForTests(FIXED_COMPACTION_CATALOG);
 
     for (let i = 0; i < 7; i++) {
-      await seedBulkSkill(config, `bulk-skill-${i}`, `BODY-${i} ${"x".repeat(8_400)}`);
+      await seedBulkSkill(config, `bulk-skill-${i}`, `BODY-${i} ${"x".repeat(8_600)}`);
       setEchoToolCallingResponse({
         provider,
         text: "",
@@ -4835,14 +5074,23 @@ describe("chat-task loop", () => {
     await mutateState(config.instance, (state) => {
       for (const toolset of state.toolsets) toolset.status = "disabled";
     });
+    // Pin the tool-catalog floor so the no-trim geometry is decoupled from
+    // live always-on catalog size (cleared in afterEach).
+    __setBaseToolCatalogForTests(FIXED_COMPACTION_CATALOG);
 
+    // Twelve modest reads (~910 tokens each). With echo reporting no usage the
+    // calibration gap stays 0, so the only trim trigger is the chars/4 live
+    // budget — and the accumulated transcript stays well under it (the budget
+    // is 32,000 − 1,600 reserve − ~12,487 floor [12,207 pinned catalog + the
+    // system-prompt slice] = ~17,913 tokens), so no
+    // elision and no proactive compaction ever engages.
     for (let i = 0; i < 12; i++) {
-      writeFileSync(join(workspaceRoot, `chunk${i}.md`), `chunk-${i} `.repeat(420));
+      await seedBulkSkill(config, `chunk-skill-${i}`, `chunk-${i} ${"x".repeat(3_630)}`);
       setEchoToolCallingResponse({
         provider,
         text: "",
         toolCalls: [
-          { id: `call_n${i}`, type: "function", function: { name: "file_read", arguments: JSON.stringify({ path: `chunk${i}.md` }) } }
+          { id: `call_n${i}`, type: "function", function: { name: "read_skill", arguments: JSON.stringify({ name: `chunk-skill-${i}` }) } }
         ],
         finishReason: "tool_calls"
       });
