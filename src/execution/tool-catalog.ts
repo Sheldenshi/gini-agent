@@ -2531,7 +2531,8 @@ function formatRefPreview(
 export function chatBlockArgsPreviewFor(
   toolName: string,
   args: Record<string, unknown> | null | undefined,
-  resolveRefLabel?: (ref: string) => { role: string; name: string } | undefined
+  resolveRefLabel?: (ref: string) => { role: string; name: string } | undefined,
+  resolveJobName?: (jobId: string) => string | undefined
 ): string {
   const safe = args ?? {};
   // Headline-arg mapping per tool. Order matters within an entry only
@@ -2633,8 +2634,14 @@ export function chatBlockArgsPreviewFor(
     case "create_job":
     case "run_job":
     case "delete_job":
-    case "update_job":
-      return truncatePreview(previewValue(safe.name) || previewValue(safe.jobId));
+    case "update_job": {
+      // Prefer a model-supplied `name` (create_job, or update_job rename),
+      // then resolve the job's stored name from its id so jobId-only calls
+      // (run_job / delete_job) read as the job's name, not "job_6e0fd00b".
+      const jobIdStr = previewValue(safe.jobId);
+      const resolved = jobIdStr ? resolveJobName?.(jobIdStr) : undefined;
+      return truncatePreview(previewValue(safe.name) || previewValue(resolved) || jobIdStr);
+    }
     case "list_jobs":
       return truncatePreview(previewValue(safe.nameContains) || "");
     case "cancel_task":

@@ -766,3 +766,35 @@ describe("chatBlockArgsPreviewFor browser ref labels", () => {
     expect(preview).toBe('textbox "Email", textbox "Password"');
   });
 });
+
+describe("chatBlockArgsPreviewFor job names", () => {
+  test("run_job resolves the job's name from its id", () => {
+    const preview = chatBlockArgsPreviewFor(
+      "run_job",
+      { jobId: "job_6e0fd00b" },
+      undefined,
+      (jobId) => (jobId === "job_6e0fd00b" ? "Send daily report" : undefined)
+    );
+    expect(preview).toBe("Send daily report");
+  });
+
+  test("run_job falls back to the bare id when the job can't be resolved", () => {
+    expect(
+      chatBlockArgsPreviewFor("run_job", { jobId: "job_6e0fd00b" }, undefined, () => undefined)
+    ).toBe("job_6e0fd00b");
+  });
+
+  test("run_job falls back to the bare id with no resolver", () => {
+    expect(chatBlockArgsPreviewFor("run_job", { jobId: "job_6e0fd00b" })).toBe("job_6e0fd00b");
+  });
+
+  test("create_job prefers the model-supplied name over the resolver", () => {
+    const preview = chatBlockArgsPreviewFor(
+      "create_job",
+      { name: "New job" },
+      undefined,
+      () => "should-not-be-used"
+    );
+    expect(preview).toBe("New job");
+  });
+});

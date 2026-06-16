@@ -116,6 +116,7 @@ import { getSubagentForTask, syncSubagentFromTask } from "../capabilities/subage
 import { listEnabledSkillScripts } from "../capabilities/skill-scripts";
 import { autoRenameChatAfterTurn } from "./chat";
 import { finalizeJobRunFromTask } from "../jobs/finalize";
+import { listJobs } from "../jobs";
 import { peekRefLabel } from "../tools/browser";
 import { isSkillActive } from "../integrations/connectors";
 import { getProvider, providerForCredentialName } from "../integrations/connectors/registry";
@@ -2986,7 +2987,8 @@ async function runLoop(
         toolName: call.function.name,
         callId: call.id,
         args: parsedArgs,
-        resolveRefLabel: (ref) => peekRefLabel(taskId, ref)
+        resolveRefLabel: (ref) => peekRefLabel(taskId, ref),
+        resolveJobName: (jobId) => listJobs(config).find((job) => job.id === jobId)?.name
       });
       // load_tools is handled INLINE (not via dispatchToolCall): it mutates
       // the loaded set, recomputes providerTools so the NEXT iteration ships
