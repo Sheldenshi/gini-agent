@@ -16,6 +16,7 @@ import type {
   PairedDevice,
   PairingCode,
   PairingRequest,
+  PendingChatMessage,
   AgentRecord,
   PromotionProposal,
   RelayRecord,
@@ -34,7 +35,7 @@ import { addAudit, appendEvent, type AgentContext } from "./audit";
 import { deleteChatBlocksForSession } from "./chat-blocks";
 import { tracePath } from "./trace";
 import { hashSecret, randomPairingCode } from "./security";
-import { expirePairingCodes, expirePairingRequests } from "./store";
+import { expirePairingCodes, expirePairingRequests, isTerminalTaskStatus } from "./store";
 
 export function taskCounts(tasks: Task[]): Record<Task["status"], number> {
   return {
@@ -345,6 +346,61 @@ export function renameChatSession(state: RuntimeState, id: string, title: string
     { sessionId: session.id }
   );
   return session;
+}
+
+// Append a message to the session's FIFO pending-message queue (ADR
+// chat-message-queue.md). Called inside mutateState while a turn is already in
+// flight for the session; the returned record carries the allocated id +
+// createdAt so the caller can publish it and return the pendingId.
+export function enqueuePendingChatMessage(
+  state: RuntimeState,
+  sessionId: string,
+  msg: Omit<PendingChatMessage, "id" | "createdAt">
+): PendingChatMessage {
+  const session = state.chatSessions.find((item) => item.id === sessionId);
+  if (!session) throw new Error(`Chat session not found: ${sessionId}`);
+  const pending: PendingChatMessage = {
+    id: id("pending"),
+    createdAt: now(),
+    ...msg
+  };
+  if (!session.pendingMessages) session.pendingMessages = [];
+  session.pendingMessages.push(pending);
+  return pending;
+}
+
+// Remove a queued message by id. Returns whether anything was removed so the
+// caller can decide whether to publish the updated session.
+export function removePendingChatMessage(
+  state: RuntimeState,
+  sessionId: string,
+  pendingId: string
+): boolean {
+  const session = state.chatSessions.find((item) => item.id === sessionId);
+  if (!session?.pendingMessages) return false;
+  const index = session.pendingMessages.findIndex((item) => item.id === pendingId);
+  if (index < 0) return false;
+  session.pendingMessages.splice(index, 1);
+  return true;
+}
+
+// Pop the first queued message (FIFO) for auto-dispatch when a turn ends.
+// Returns undefined if the queue is empty or the session is gone.
+export function shiftPendingChatMessage(
+  state: RuntimeState,
+  sessionId: string
+): PendingChatMessage | undefined {
+  const session = state.chatSessions.find((item) => item.id === sessionId);
+  if (!session?.pendingMessages || session.pendingMessages.length === 0) return undefined;
+  return session.pendingMessages.shift();
+}
+
+// True when a non-terminal chat task is already running for the session.
+// Queued/running/waiting_approval all count as in-flight; the enqueue policy
+// treats this as "a turn is busy" so a new message queues instead of starting
+// a concurrent task.
+export function sessionHasInFlightChatTask(state: RuntimeState, sessionId: string): boolean {
+  return state.tasks.some((t) => t.chatSessionId === sessionId && !isTerminalTaskStatus(t.status));
 }
 
 // Monotonic counter stamped onto every chat message as `seq`. Several

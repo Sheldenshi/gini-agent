@@ -1012,6 +1012,23 @@ export interface ChatSessionRecord {
   // self-heal migration. DISTINCT from `source` (messaging-bridge routing).
   // Optional, so legacy sessions just lack it — no normalizeState backfill.
   feature?: "email-watch";
+  // FIFO queue of messages submitted while a chat turn is already in flight
+  // for this session. The gateway is the source of truth: a new POST while a
+  // task runs is enqueued here instead of starting a concurrent task, and the
+  // next entry auto-dispatches when the current turn ends (ADR
+  // chat-message-queue.md). Optional, so existing persisted state stays valid.
+  pendingMessages?: PendingChatMessage[];
+}
+
+// A chat message held in the per-session queue while a turn is in flight.
+// Audio is intentionally absent: a voice message is transcribed to `content`
+// at prepare time, so only the resulting text + image refs are queued.
+export interface PendingChatMessage {
+  id: string;
+  content: string;
+  images?: ImageAttachment[];
+  clientSurface?: ChatClientSurface;
+  createdAt: string;
 }
 
 // `lastInboundMessageId` is the most recent originating-message id the
