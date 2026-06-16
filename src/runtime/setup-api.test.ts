@@ -298,9 +298,49 @@ describe("setup-api", () => {
     }
   });
 
-  test("bedrock: configures with no apiKey when AWS creds resolve, persisting model + region", async () => {
-    // Like codex, bedrock needs no gini-held key — it signs with AWS creds. When
-    // they resolve, set succeeds and persists the (model-agnostic) model + region.
+  test("bedrock: writes the entered AWS keys to secrets.env + process.env and persists model + region", async () => {
+    // The user enters the access key + secret on add; gini stores them under the
+    // standard AWS_* names (so future shells + the running gateway both sign with
+    // them) and persists only model + region in config — never the secret values.
+    const prevAk = process.env.AWS_ACCESS_KEY_ID;
+    const prevSk = process.env.AWS_SECRET_ACCESS_KEY;
+    delete process.env.AWS_ACCESS_KEY_ID;
+    delete process.env.AWS_SECRET_ACCESS_KEY;
+    try {
+      const result = await setSetupProvider(config, {
+        provider: "bedrock",
+        model: "us.amazon.nova-pro-v1:0",
+        awsRegion: "us-west-2",
+        awsAccessKeyId: "AKIAIOSFODNN7EXAMPLE",
+        awsSecretAccessKey: "wJalrXUtnFEMIsecret"
+      });
+      expect(result.ok).toBe(true);
+      expect(config.provider.name).toBe("bedrock");
+      expect(config.provider.model).toBe("us.amazon.nova-pro-v1:0");
+      expect(config.provider.awsRegion).toBe("us-west-2");
+      expect(config.provider.baseUrl).toBe("https://bedrock-runtime.us-west-2.amazonaws.com");
+      expect(result.provider.message).toContain("AWS SigV4");
+      // Keys landed in process.env so the running gateway signs on the next call.
+      // Read through a fresh alias so the earlier `delete` doesn't narrow the
+      // type to `undefined` for the type checker.
+      const liveEnv = process.env as Record<string, string | undefined>;
+      expect(liveEnv.AWS_ACCESS_KEY_ID).toBe("AKIAIOSFODNN7EXAMPLE");
+      expect(liveEnv.AWS_SECRET_ACCESS_KEY).toBe("wJalrXUtnFEMIsecret");
+      // …and into the shell-sourced secrets.env (HOME points at the scratch dir).
+      const secretsBody = readFileSync(join(s.stateRoot, "secrets.env"), "utf8");
+      expect(secretsBody).toContain("AWS_ACCESS_KEY_ID=");
+      expect(secretsBody).toContain("AWS_SECRET_ACCESS_KEY=");
+      // The secret values themselves are NOT persisted into the runtime config.
+      expect(JSON.stringify(config.provider)).not.toContain("wJalrXUtnFEMIsecret");
+    } finally {
+      if (prevAk === undefined) delete process.env.AWS_ACCESS_KEY_ID; else process.env.AWS_ACCESS_KEY_ID = prevAk;
+      if (prevSk === undefined) delete process.env.AWS_SECRET_ACCESS_KEY; else process.env.AWS_SECRET_ACCESS_KEY = prevSk;
+    }
+  });
+
+  test("bedrock: a keyless save succeeds when keys already resolve, preserving model + region", async () => {
+    // When usable AWS keys already resolve from the env (a prior add, or ambient
+    // AWS_* vars), a model/region-only save must go through without re-typing them.
     const prevAk = process.env.AWS_ACCESS_KEY_ID;
     const prevSk = process.env.AWS_SECRET_ACCESS_KEY;
     process.env.AWS_ACCESS_KEY_ID = "AKIAIOSFODNN7EXAMPLE";
@@ -308,18 +348,15 @@ describe("setup-api", () => {
     try {
       const result = await setSetupProvider(config, { provider: "bedrock", model: "us.amazon.nova-pro-v1:0", awsRegion: "us-west-2" });
       expect(result.ok).toBe(true);
-      expect(config.provider.name).toBe("bedrock");
       expect(config.provider.model).toBe("us.amazon.nova-pro-v1:0");
       expect(config.provider.awsRegion).toBe("us-west-2");
-      expect(config.provider.baseUrl).toBe("https://bedrock-runtime.us-west-2.amazonaws.com");
-      expect(result.provider.message).toContain("AWS SigV4");
     } finally {
       if (prevAk === undefined) delete process.env.AWS_ACCESS_KEY_ID; else process.env.AWS_ACCESS_KEY_ID = prevAk;
       if (prevSk === undefined) delete process.env.AWS_SECRET_ACCESS_KEY; else process.env.AWS_SECRET_ACCESS_KEY = prevSk;
     }
   });
 
-  test("bedrock: rejects when no AWS credentials resolve", async () => {
+  test("bedrock: rejects a fresh add with no keys entered and none resolving", async () => {
     const prevAk = process.env.AWS_ACCESS_KEY_ID;
     const prevSk = process.env.AWS_SECRET_ACCESS_KEY;
     const prevFile = process.env.AWS_SHARED_CREDENTIALS_FILE;
@@ -331,12 +368,31 @@ describe("setup-api", () => {
     try {
       const result = await setSetupProvider(config, { provider: "bedrock", model: "us.amazon.nova-pro-v1:0" });
       expect(result.ok).toBe(false);
-      expect(result.error).toMatch(/No AWS credentials/);
+      expect(result.error).toMatch(/Enter your AWS Access Key ID and Secret Access Key/);
     } finally {
       if (prevAk === undefined) delete process.env.AWS_ACCESS_KEY_ID; else process.env.AWS_ACCESS_KEY_ID = prevAk;
       if (prevSk === undefined) delete process.env.AWS_SECRET_ACCESS_KEY; else process.env.AWS_SECRET_ACCESS_KEY = prevSk;
       if (prevFile === undefined) delete process.env.AWS_SHARED_CREDENTIALS_FILE; else process.env.AWS_SHARED_CREDENTIALS_FILE = prevFile;
       if (prevProfile === undefined) delete process.env.AWS_PROFILE; else process.env.AWS_PROFILE = prevProfile;
+    }
+  });
+
+  test("bedrock: rejects a half-entered key pair (one field blank)", async () => {
+    const prevAk = process.env.AWS_ACCESS_KEY_ID;
+    const prevSk = process.env.AWS_SECRET_ACCESS_KEY;
+    delete process.env.AWS_ACCESS_KEY_ID;
+    delete process.env.AWS_SECRET_ACCESS_KEY;
+    try {
+      const result = await setSetupProvider(config, {
+        provider: "bedrock",
+        model: "us.amazon.nova-pro-v1:0",
+        awsAccessKeyId: "AKIAIOSFODNN7EXAMPLE"
+      });
+      expect(result.ok).toBe(false);
+      expect(result.error).toMatch(/BOTH the AWS Access Key ID and the Secret Access Key/);
+    } finally {
+      if (prevAk === undefined) delete process.env.AWS_ACCESS_KEY_ID; else process.env.AWS_ACCESS_KEY_ID = prevAk;
+      if (prevSk === undefined) delete process.env.AWS_SECRET_ACCESS_KEY; else process.env.AWS_SECRET_ACCESS_KEY = prevSk;
     }
   });
 
@@ -441,6 +497,39 @@ describe("setup-api", () => {
     } finally {
       if (prevKey === undefined) delete process.env.OPENAI_API_KEY;
       else process.env.OPENAI_API_KEY = prevKey;
+    }
+  });
+
+  test("remove bedrock scrubs BOTH AWS keys from secrets.env + env and switches off when active", async () => {
+    // Gini stores the AWS access key + secret for bedrock, so disconnect must
+    // delete both from the env and the shell-sourced secrets.env, and fall back
+    // when bedrock was the active provider.
+    const prevAk = process.env.AWS_ACCESS_KEY_ID;
+    const prevSk = process.env.AWS_SECRET_ACCESS_KEY;
+    // Seed both stores as if a prior add had written them.
+    writeKeyToSecretsEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    writeKeyToSecretsEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    process.env.AWS_ACCESS_KEY_ID = "AKIAIOSFODNN7EXAMPLE";
+    process.env.AWS_SECRET_ACCESS_KEY = "secret";
+    config.provider = { name: "bedrock", model: "us.amazon.nova-pro-v1:0" };
+    try {
+      const result = await removeSetupProvider(config, "bedrock");
+      expect(result.ok).toBe(true);
+      expect(result.switched).toBe(true);
+      expect(config.provider.name).toBe("echo");
+      // Both keys gone from process.env …
+      const liveEnv = process.env as Record<string, string | undefined>;
+      expect(liveEnv.AWS_ACCESS_KEY_ID).toBeUndefined();
+      expect(liveEnv.AWS_SECRET_ACCESS_KEY).toBeUndefined();
+      // … and from secrets.env.
+      const secretsBody = existsSync(join(s.stateRoot, "secrets.env"))
+        ? readFileSync(join(s.stateRoot, "secrets.env"), "utf8")
+        : "";
+      expect(secretsBody).not.toContain("AWS_ACCESS_KEY_ID=");
+      expect(secretsBody).not.toContain("AWS_SECRET_ACCESS_KEY=");
+    } finally {
+      if (prevAk === undefined) delete process.env.AWS_ACCESS_KEY_ID; else process.env.AWS_ACCESS_KEY_ID = prevAk;
+      if (prevSk === undefined) delete process.env.AWS_SECRET_ACCESS_KEY; else process.env.AWS_SECRET_ACCESS_KEY = prevSk;
     }
   });
 
@@ -752,21 +841,47 @@ describe("setup-api", () => {
     expect(state.audit.some((a) => a.action === "provider.auth.cleared" && a.target === "openai")).toBe(false);
   });
 
-  test("POST bedrock clears the needs-reauth record on a successful config write", async () => {
-    // Bedrock has no key form — re-saving the provider with working AWS
-    // credentials IS the recovery seam for that provider class.
+  test("POST bedrock clears the needs-reauth record when a NEW key pair is entered", async () => {
+    // Re-entering the access key + secret IS the recovery seam for bedrock —
+    // that's what clears the amber row.
     await seedAuthFailure("bedrock");
     const prevAk = process.env.AWS_ACCESS_KEY_ID;
     const prevSk = process.env.AWS_SECRET_ACCESS_KEY;
-    process.env.AWS_ACCESS_KEY_ID = "AKIAIOSFODNN7EXAMPLE";
-    process.env.AWS_SECRET_ACCESS_KEY = "secret";
+    delete process.env.AWS_ACCESS_KEY_ID;
+    delete process.env.AWS_SECRET_ACCESS_KEY;
     try {
-      const result = await setSetupProvider(config, { provider: "bedrock", model: "us.amazon.nova-pro-v1:0", awsRegion: "us-west-2" });
+      const result = await setSetupProvider(config, {
+        provider: "bedrock",
+        model: "us.amazon.nova-pro-v1:0",
+        awsRegion: "us-west-2",
+        awsAccessKeyId: "AKIAIOSFODNN7EXAMPLE",
+        awsSecretAccessKey: "secret"
+      });
       expect(result.ok).toBe(true);
       const state = readState(config.instance);
       expect(state.providerAuthFailures?.bedrock).toBeUndefined();
       const cleared = state.audit.find((a) => a.action === "provider.auth.cleared" && a.target === "bedrock");
       expect(cleared?.evidence).toMatchObject({ reason: "provider configuration updated" });
+    } finally {
+      if (prevAk === undefined) delete process.env.AWS_ACCESS_KEY_ID; else process.env.AWS_ACCESS_KEY_ID = prevAk;
+      if (prevSk === undefined) delete process.env.AWS_SECRET_ACCESS_KEY; else process.env.AWS_SECRET_ACCESS_KEY = prevSk;
+    }
+  });
+
+  test("POST bedrock keyless model/region edit does NOT clear needs-reauth (presence != validity)", async () => {
+    // Dead-but-present AWS keys make hasUsableAwsCredentials() true, so a keyless
+    // model/region edit succeeds — but it proves nothing about the credential and
+    // must NOT flip the amber row back to a stale "Connected".
+    await seedAuthFailure("bedrock");
+    const prevAk = process.env.AWS_ACCESS_KEY_ID;
+    const prevSk = process.env.AWS_SECRET_ACCESS_KEY;
+    process.env.AWS_ACCESS_KEY_ID = "AKIADEADBUTPRESENT";
+    process.env.AWS_SECRET_ACCESS_KEY = "stale-secret";
+    try {
+      const result = await setSetupProvider(config, { provider: "bedrock", model: "us.amazon.nova-lite-v1:0", awsRegion: "us-west-2" });
+      expect(result.ok).toBe(true);
+      // The record survives — no new credential was supplied.
+      expect(readState(config.instance).providerAuthFailures?.bedrock).toBeDefined();
     } finally {
       if (prevAk === undefined) delete process.env.AWS_ACCESS_KEY_ID; else process.env.AWS_ACCESS_KEY_ID = prevAk;
       if (prevSk === undefined) delete process.env.AWS_SECRET_ACCESS_KEY; else process.env.AWS_SECRET_ACCESS_KEY = prevSk;

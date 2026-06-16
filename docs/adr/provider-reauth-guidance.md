@@ -11,7 +11,7 @@ in code or duplicated across surfaces:
 | Provider class | `auth` | CTA destination | Where instructions live |
 |---|---|---|---|
 | OAuth / CLI (codex) | `codex-oauth` | The `#re-authentication` section of `https://gini.lilaclabs.ai/docs/providers/<id>`, rendered **inline** in a slide-over (with an Open full docs ↗ escape hatch) | A docs page per such provider |
-| AWS-signed (bedrock) | `aws` | In-app **Settings → Providers** (`/settings`), CTA worded "Open … settings" — there's no key to paste; the text says check AWS credentials (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` or `~/.aws/credentials`) | The provider's own 401/403 message (shown as the note's detail) — no doc |
+| AWS-signed (bedrock) | `aws` | In-app **Settings → Providers** (`/settings`), CTA worded "Update Amazon Bedrock credentials" — opens the Edit dialog to re-enter the AWS access key + secret (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`) | The provider's own 401/403 message (shown as the note's detail) — no doc |
 | API-key (openai, anthropic, openrouter, deepseek, azure, local) | `env` | In-app **Settings → Providers** key form (`/settings`) | The provider's own 401/403 message (shown as the note's detail) — no doc |
 
 The runtime classifies the failure, tags it with the provider that served the
@@ -89,9 +89,11 @@ therefore also persists a per-provider auth-failure record:
   2. a credential-carrying provider-config write through the setup API
      (`setSetupProvider`) for that provider — this covers the Add Provider
      key form, key rotation via the Settings Edit dialog, `set_provider`
-     self-tool writes that carry an `apiKey`, the bedrock re-save (its AWS
-     credential gate is the signal — bedrock has no key form), and the codex
-     setup **Verify**, which requires credentials to be present AND not
+     self-tool writes that carry an `apiKey`, the bedrock re-save ONLY when a new
+     access key + secret pair is entered (gated on `hasNewPair`, mirroring the
+     env-keyed `&& apiKey`: a keyless model/region edit proves nothing about the
+     credential, since `hasUsableAwsCredentials` checks presence not validity),
+     and the codex setup **Verify**, which requires credentials to be present AND not
      provably expired (the locally-decoded JWT `exp`; api_key-shaped and
      exp-unknown credentials stay presence-only). Writes that carry no
      credential evidence never clear: for env-keyed providers a keyless
@@ -110,7 +112,8 @@ therefore also persists a per-provider auth-failure record:
   carries, derived at read time. Settings → Providers renders needs-reauth
   rows with an amber "Needs re-authentication" status, the redacted detail,
   and a kind-routed CTA (docs slide-over for `docs`, the row's key-edit
-  dialog for `settings`, AWS-credentials guidance for `aws`); the
+  dialog for `settings`, an "Update credentials" button that opens the same
+  Edit dialog for `aws`); the
   `provider.auth.*` events invalidate the web `providers` query through the
   runtime stream so an open Settings page updates live.
 - **Connector-probe honesty.** The codex connector probe

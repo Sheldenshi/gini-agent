@@ -105,7 +105,8 @@ export interface CredentialStatus {
 // How a provider authenticates, which drives the credential prompt in setup:
 //   api-key     — a key the user pastes; saved to secrets.env under `apiKeyEnv`
 //   codex-oauth — codex CLI owns the token (~/.codex/auth.json); no key to save
-//   aws         — bedrock signs with ~/.aws / AWS_* creds; no gini-held key
+//   aws         — bedrock signs with the AWS access key + secret the user enters,
+//                 saved to secrets.env under AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY
 //   local       — OpenAI-compatible local server; key optional (most are no-auth)
 export type ProviderKind = "api-key" | "codex-oauth" | "aws" | "local";
 
@@ -359,15 +360,16 @@ function runCodexLogin(io: SetupIO, spawn: typeof spawnSync = spawnSync): boolea
   return true;
 }
 
-// Bedrock signs every Converse request with AWS SigV4 from the standard AWS
-// credential chain (AWS_* env or ~/.aws). There's no gini-held key, so
-// "configured" means the chain resolves — mirroring codex. An optional region
-// refines the endpoint (defaults resolve at request time).
+// Bedrock signs every Converse request with AWS SigV4 over the AWS access key +
+// secret the user enters here (written to secrets.env under the standard AWS_*
+// names). gini does NOT read ~/.aws. "Configured" means those keys resolve from
+// the env. An optional region refines the endpoint (defaults resolve at request
+// time).
 const bedrockProvider: ProviderModule = {
   id: "bedrock",
   kind: "aws",
   label: "Amazon Bedrock",
-  description: "AWS SigV4 — Claude, Nova, Llama… (no API key)",
+  description: "AWS access key — Claude, Nova, Llama…",
   defaultModel: "us.anthropic.claude-opus-4-8",
   suggestedModels: [
     "us.anthropic.claude-opus-4-8",
@@ -377,19 +379,45 @@ const bedrockProvider: ProviderModule = {
   ],
   checkCredentials(): CredentialStatus {
     if (hasUsableAwsCredentials()) {
-      return { available: true, source: "env", display: "✓ AWS credentials resolved" };
+      return { available: true, source: "env", display: "✓ AWS keys set" };
     }
-    return { available: false, source: "missing", display: "✗ no AWS credentials (set AWS_* or ~/.aws/credentials)" };
+    return { available: false, source: "missing", display: "✗ no AWS keys (enter your access key + secret)" };
   },
   async ensureCredentials(io: SetupIO, extra: ProviderExtraConfig): Promise<boolean> {
+    // When the keys aren't already in the env (a prior add or the user's shell),
+    // prompt for them and persist to secrets.env so future shells + the gateway
+    // both sign with them. gini never reads ~/.aws.
     if (!hasUsableAwsCredentials()) {
-      io.error(
-        "No AWS credentials found. Set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (and AWS_SESSION_TOKEN " +
-        "for temporary sessions), or run `aws configure` to write ~/.aws/credentials, then re-run setup."
-      );
-      return false;
+      const accessKeyId = (await io.prompt("AWS Access Key ID (AKIA…):")).trim();
+      if (!accessKeyId) {
+        io.error("No AWS Access Key ID entered. Aborting.");
+        return false;
+      }
+      const secretAccessKey = (await io.secret("AWS Secret Access Key:")).trim();
+      if (!secretAccessKey) {
+        io.error("No AWS Secret Access Key entered. Aborting.");
+        return false;
+      }
+      writeKeyToSecretsFile("AWS_ACCESS_KEY_ID", accessKeyId);
+      writeKeyToSecretsFile("AWS_SECRET_ACCESS_KEY", secretAccessKey);
+      process.env.AWS_ACCESS_KEY_ID = accessKeyId;
+      process.env.AWS_SECRET_ACCESS_KEY = secretAccessKey;
+      io.success("Saved AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY to ~/.gini/secrets.env (mode 0600).");
+    } else {
+      // Keys already resolve. If they're only in the live shell env (not yet in
+      // secrets.env), persist them — the autostart plist refresh reads secrets.env,
+      // so an env-only pair would be lost on the next launchd respawn. Mirrors the
+      // api-key providers' env-source persistence.
+      const ak = checkApiKeyStatus("AWS_ACCESS_KEY_ID");
+      const sk = checkApiKeyStatus("AWS_SECRET_ACCESS_KEY");
+      if (ak.source === "env" && ak.value && sk.source === "env" && sk.value) {
+        writeKeyToSecretsFile("AWS_ACCESS_KEY_ID", ak.value);
+        writeKeyToSecretsFile("AWS_SECRET_ACCESS_KEY", sk.value);
+        io.info("Saved the AWS keys from your environment to ~/.gini/secrets.env (mode 0600).");
+      } else {
+        io.info("Using the AWS keys already set in your environment.");
+      }
     }
-    io.info("Using AWS credentials from your environment / ~/.aws.");
     const region = (await io.prompt("AWS region [blank → AWS_REGION / us-east-1]:", "")).trim();
     if (region) extra.awsRegion = region;
     return true;
@@ -519,6 +547,16 @@ async function runNonInteractive(config: RuntimeConfig, io: SetupIO): Promise<vo
       const key = checkApiKeyStatus(provider.apiKeyEnv);
       if (key.source === "env" && key.value) writeKeyToSecretsFile(provider.apiKeyEnv, key.value);
     }
+    // Bedrock signs with the AWS access key + secret; persist a live-env pair into
+    // secrets.env the same way so future shells + the gateway keep signing.
+    if (provider.kind === "aws") {
+      const ak = checkApiKeyStatus("AWS_ACCESS_KEY_ID");
+      const sk = checkApiKeyStatus("AWS_SECRET_ACCESS_KEY");
+      if (ak.source === "env" && ak.value && sk.source === "env" && sk.value) {
+        writeKeyToSecretsFile("AWS_ACCESS_KEY_ID", ak.value);
+        writeKeyToSecretsFile("AWS_SECRET_ACCESS_KEY", sk.value);
+      }
+    }
 
     config.provider = normalizeProvider({ name: provider.id, model });
     writeRuntimeConfig(config);
@@ -536,7 +574,7 @@ function describeCredentialSource(provider: ProviderModule, status: CredentialSt
   if (provider.kind === "codex-oauth") {
     return `credentials from ${status.source === "env" ? "CODEX_AUTH_JSON env" : "~/.codex/auth.json"}`;
   }
-  if (provider.kind === "aws") return "AWS credentials from env / ~/.aws";
+  if (provider.kind === "aws") return "AWS keys from env";
   return `key from ${status.source === "env" ? "env" : "secrets.env"}`;
 }
 

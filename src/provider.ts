@@ -26,9 +26,11 @@ const DEFAULT_ANTHROPIC_MODEL = "claude-opus-4-8";
 // NOT Anthropic-specific: Converse (`bedrock-runtime.{region}.amazonaws.com`,
 // SigV4 service "bedrock") speaks one request/response shape across every
 // Bedrock model family — Claude, Amazon Nova, Meta Llama, Mistral, DeepSeek, …
-// It signs with the caller's ~/.aws / AWS_* credentials (the same chain the
-// `aws` CLI uses, no API key). The model id is a cross-region inference-profile
-// id (e.g. "us.amazon.nova-pro-v1:0") sent verbatim in the request path.
+// It signs with the AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (and optional
+// AWS_SESSION_TOKEN) the user enters when adding the provider; those are stored
+// in ~/.gini/secrets.env, not read from ~/.aws. The model id is a cross-region
+// inference-profile id (e.g. "us.amazon.nova-pro-v1:0") sent verbatim in the
+// request path.
 const DEFAULT_BEDROCK_REGION = "us-east-1";
 const DEFAULT_BEDROCK_MODEL = "us.anthropic.claude-opus-4-8";
 function bedrockRuntimeBaseUrl(region: string): string {
@@ -94,7 +96,7 @@ export function providerHealth(config: RuntimeConfig) {
       configured,
       message: configured
         ? "bedrock provider is configured (AWS SigV4)."
-        : "Set AWS credentials (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY or ~/.aws/credentials) to use the bedrock provider."
+        : "Set AWS credentials (enter your AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY when adding the bedrock provider) to use the bedrock provider."
     };
   }
 
@@ -140,10 +142,10 @@ const PROVIDER_API_KEY_ENV: Record<string, string> = {
   azure: "AZURE_OPENAI_API_KEY"
 };
 
-// Whether AWS credentials resolve for the `bedrock` provider — env
-// (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY[/AWS_SESSION_TOKEN]) or the
-// ~/.aws/credentials profile. The bedrock analogue of hasUsableCodexCredentials:
-// there's no gini-held secret, so "configured" means the AWS chain has creds.
+// Whether AWS credentials resolve for the `bedrock` provider from the env
+// (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY[/AWS_SESSION_TOKEN]). The keys are
+// entered on provider add and sourced from ~/.gini/secrets.env into the
+// environment; "configured" means they're present.
 export function hasUsableAwsCredentials(): boolean {
   return Boolean(resolveAwsCredentials());
 }
@@ -163,8 +165,8 @@ export function isProviderConfigured(
 ): boolean {
   if (name === "echo") return false;
   if (name === "codex") return hasUsableCodexCredentials();
-  // bedrock signs with AWS credentials from ~/.aws or AWS_* env (no gini-held
-  // key), mirroring how codex reads ~/.codex/auth.json — configured when they resolve.
+  // bedrock signs with the AWS keys the user entered (stored in secrets.env,
+  // read from the AWS_* env) — configured when they resolve.
   if (name === "bedrock") return hasUsableAwsCredentials();
   // Azure has no default endpoint, so an env key alone is NOT a usable config —
   // it counts as configured only when azure is the ACTIVE provider AND carries a
@@ -282,8 +284,9 @@ export function providerCatalog(): ProviderCatalogItem[] {
     {
       // Amazon Bedrock via the model-agnostic Converse API — Claude, Amazon
       // Nova, Meta Llama, Mistral, DeepSeek, and more behind one transport.
-      // Signed with AWS SigV4 from the caller's ~/.aws / AWS_* credentials (no
-      // API key), so its `auth` is "aws", mirroring how codex is "codex-oauth".
+      // Signed with AWS SigV4 from the AWS access key + secret the user enters
+      // when adding the provider (stored in ~/.gini/secrets.env, not an API
+      // key), so its `auth` is "aws", distinct from the env-key providers.
       // Models are cross-region inference-profile ids sent verbatim to Converse.
       // The list below is what the picker offers, grouped by family in the UI and
       // covering the common us/eu/apac geos; the picker also has a custom-id
@@ -560,7 +563,7 @@ export function providerAuthFailureText(providerLabel: string, reauth?: Provider
   // AWS providers sign with credentials, not an API key — never tell the user to
   // "update a key" they don't have.
   if (reauth?.kind === "aws") {
-    return `${base} Check your AWS credentials (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY or ~/.aws/credentials) to continue.`;
+    return `${base} Re-enter your AWS credentials (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY) in Settings → Providers to continue.`;
   }
   if (!reauth) return `${base} Re-authenticate ${providerLabel} to continue.`;
   return reauth.kind === "docs"
@@ -1976,8 +1979,9 @@ async function callAnthropicStructured<T>(
 // (bedrock-runtime.{region}.amazonaws.com, SigV4 service "bedrock"), so one
 // transport serves every Bedrock family — Claude, Amazon Nova, Meta Llama,
 // Mistral, DeepSeek, … The model id is a cross-region inference-profile id sent
-// verbatim in the request path. Auth is SigV4 over the caller's ~/.aws / AWS_*
-// credentials, never an API key. Converse maps cleanly onto the same
+// verbatim in the request path. Auth is SigV4 over the AWS_ACCESS_KEY_ID /
+// AWS_SECRET_ACCESS_KEY (and optional AWS_SESSION_TOKEN) the user entered,
+// never an API key. Converse maps cleanly onto the same
 // OpenAI-shaped transcript the rest of the runtime uses (translate in,
 // parse out), so dispatch differs only by the transport.
 
@@ -2025,7 +2029,7 @@ function bedrockAuthHeaders(region: string, url: string, body: string): Record<s
     // (providerReauth("bedrock") → kind "aws") instead of a generic failure.
     throw new ProviderAuthError(
       "bedrock",
-      "bedrock provider needs AWS credentials but none resolved (set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY or ~/.aws/credentials)."
+      "bedrock provider needs AWS credentials but none resolved (enter your AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY when adding the bedrock provider)."
     );
   }
   return signAwsRequest({

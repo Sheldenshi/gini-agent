@@ -34,9 +34,9 @@ place to pick a provider/model.
 
 ## Credentials Stay Instance-Level
 
-Provider **credentials** are machine-global: API keys live in
-`~/.gini/secrets.env` and `process.env`, AWS credentials in `~/.aws`, and Codex
-OAuth in `~/.codex/auth.json`. They are not per-agent, and the instance-level
+Provider **credentials** are machine-global: API keys and the AWS access key +
+secret live in `~/.gini/secrets.env` and `process.env`, and Codex OAuth in
+`~/.codex/auth.json`. They are not per-agent, and the instance-level
 `POST /api/setup/provider` flow that writes them (plus the launchd plist
 refresh it triggers) is unchanged. The per-agent Settings tab therefore only
 **selects among already-configured providers** — it never accepts or stores a

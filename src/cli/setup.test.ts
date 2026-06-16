@@ -820,7 +820,7 @@ describe("gini setup interactive picker (scripted IO)", () => {
     });
   });
 
-  test("bedrock: with AWS creds, captures region and sets provider", async () => {
+  test("bedrock: with AWS keys already in env, captures region and persists the env keys to secrets.env", async () => {
     await withScratchHome(async () => {
       const saved = {
         id: process.env.AWS_ACCESS_KEY_ID,
@@ -838,6 +838,10 @@ describe("gini setup interactive picker (scripted IO)", () => {
         await providerStep.run(config, io);
         expect(config.provider?.name).toBe("bedrock");
         expect(config.provider?.awsRegion).toBe("us-west-2");
+        // Keys present only in the live shell env get persisted to secrets.env so
+        // a later launchd respawn (which re-sources secrets.env) keeps signing.
+        expect(readKeyFromSecretsFile("AWS_ACCESS_KEY_ID")).toBe("AKIATESTTESTTEST");
+        expect(readKeyFromSecretsFile("AWS_SECRET_ACCESS_KEY")).toBe("secret/value");
       } finally {
         for (const [k, v] of [["AWS_ACCESS_KEY_ID", saved.id], ["AWS_SECRET_ACCESS_KEY", saved.secret], ["AWS_PROFILE", saved.profile], ["AWS_SHARED_CREDENTIALS_FILE", saved.file]] as const) {
           if (v === undefined) delete process.env[k]; else process.env[k] = v;
@@ -846,7 +850,7 @@ describe("gini setup interactive picker (scripted IO)", () => {
     });
   });
 
-  test("bedrock: without AWS creds, aborts with a guidance message", async () => {
+  test("bedrock: with no env keys, prompts for and saves the AWS access key + secret", async () => {
     await withScratchHome(async () => {
       const saved = {
         id: process.env.AWS_ACCESS_KEY_ID,
@@ -859,11 +863,72 @@ describe("gini setup interactive picker (scripted IO)", () => {
         delete process.env.AWS_SECRET_ACCESS_KEY;
         delete process.env.AWS_PROFILE;
         process.env.AWS_SHARED_CREDENTIALS_FILE = "/nonexistent/aws/credentials";
+        const io = scriptedIo({
+          pickProviderId: "bedrock",
+          answers: { "AWS Access Key ID": "AKIATESTTESTTEST", "AWS region": "us-west-2" },
+          secret: "wJalrXUtnFEMIsecret"
+        });
+        const config = freshConfig();
+        await providerStep.run(config, io);
+        expect(config.provider?.name).toBe("bedrock");
+        expect(config.provider?.awsRegion).toBe("us-west-2");
+        // Keys written to the scratch secrets.env under the standard AWS_* names.
+        expect(readKeyFromSecretsFile("AWS_ACCESS_KEY_ID")).toBe("AKIATESTTESTTEST");
+        expect(readKeyFromSecretsFile("AWS_SECRET_ACCESS_KEY")).toBe("wJalrXUtnFEMIsecret");
+      } finally {
+        for (const [k, v] of [["AWS_ACCESS_KEY_ID", saved.id], ["AWS_SECRET_ACCESS_KEY", saved.secret], ["AWS_PROFILE", saved.profile], ["AWS_SHARED_CREDENTIALS_FILE", saved.file]] as const) {
+          if (v === undefined) delete process.env[k]; else process.env[k] = v;
+        }
+      }
+    });
+  });
+
+  test("bedrock: with no env keys and no access key entered, aborts", async () => {
+    await withScratchHome(async () => {
+      const saved = {
+        id: process.env.AWS_ACCESS_KEY_ID,
+        secret: process.env.AWS_SECRET_ACCESS_KEY,
+        profile: process.env.AWS_PROFILE,
+        file: process.env.AWS_SHARED_CREDENTIALS_FILE
+      };
+      try {
+        delete process.env.AWS_ACCESS_KEY_ID;
+        delete process.env.AWS_SECRET_ACCESS_KEY;
+        delete process.env.AWS_PROFILE;
+        process.env.AWS_SHARED_CREDENTIALS_FILE = "/nonexistent/aws/credentials";
+        // No "AWS Access Key ID" answer → the prompt returns "" → abort.
         const io = scriptedIo({ pickProviderId: "bedrock" });
         const config = freshConfig();
         await providerStep.run(config, io);
         expect(config.provider?.name).not.toBe("bedrock");
-        expect(io.errors.join("\n")).toContain("No AWS credentials found");
+        expect(io.errors.join("\n")).toContain("No AWS Access Key ID entered");
+      } finally {
+        for (const [k, v] of [["AWS_ACCESS_KEY_ID", saved.id], ["AWS_SECRET_ACCESS_KEY", saved.secret], ["AWS_PROFILE", saved.profile], ["AWS_SHARED_CREDENTIALS_FILE", saved.file]] as const) {
+          if (v === undefined) delete process.env[k]; else process.env[k] = v;
+        }
+      }
+    });
+  });
+
+  test("bedrock: access key entered but secret left blank, aborts", async () => {
+    await withScratchHome(async () => {
+      const saved = {
+        id: process.env.AWS_ACCESS_KEY_ID,
+        secret: process.env.AWS_SECRET_ACCESS_KEY,
+        profile: process.env.AWS_PROFILE,
+        file: process.env.AWS_SHARED_CREDENTIALS_FILE
+      };
+      try {
+        delete process.env.AWS_ACCESS_KEY_ID;
+        delete process.env.AWS_SECRET_ACCESS_KEY;
+        delete process.env.AWS_PROFILE;
+        process.env.AWS_SHARED_CREDENTIALS_FILE = "/nonexistent/aws/credentials";
+        // Access key answered, but secret() returns "" (no `secret` opt) → abort.
+        const io = scriptedIo({ pickProviderId: "bedrock", answers: { "AWS Access Key ID": "AKIATESTTESTTEST" } });
+        const config = freshConfig();
+        await providerStep.run(config, io);
+        expect(config.provider?.name).not.toBe("bedrock");
+        expect(io.errors.join("\n")).toContain("No AWS Secret Access Key entered");
       } finally {
         for (const [k, v] of [["AWS_ACCESS_KEY_ID", saved.id], ["AWS_SECRET_ACCESS_KEY", saved.secret], ["AWS_PROFILE", saved.profile], ["AWS_SHARED_CREDENTIALS_FILE", saved.file]] as const) {
           if (v === undefined) delete process.env[k]; else process.env[k] = v;
@@ -1021,13 +1086,13 @@ describe("gini setup non-interactive (in-process)", () => {
     });
   });
 
-  test("only AWS credentials → auto-configures bedrock with AWS source line", async () => {
+  test("only AWS keys → auto-configures bedrock with AWS source line", async () => {
     await withIsolatedEnv({ AWS_ACCESS_KEY_ID: "AKIATESTTESTTEST", AWS_SECRET_ACCESS_KEY: "secret/value" }, async () => {
       const io = nonInteractiveIo();
       const config = { instance: "dev" } as Parameters<typeof providerStep.run>[0];
       await providerStep.run(config, io);
       expect(config.provider?.name).toBe("bedrock");
-      expect(io.successes.join("\n")).toContain("AWS credentials from env / ~/.aws");
+      expect(io.successes.join("\n")).toContain("AWS keys from env");
     });
   });
 

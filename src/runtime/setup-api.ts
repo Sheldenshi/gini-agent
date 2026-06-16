@@ -15,8 +15,9 @@
 //   - POST /api/setup/provider accepts {provider, apiKey?, model?, baseUrl?}
 //     for the env-keyed providers (openai/openrouter/deepseek/local/anthropic/
 //     azure) — plus apiVersion/deployment/authScheme for azure's
-//     deployment-scoped routing; {provider: "bedrock", model?, awsRegion?},
-//     which signs with AWS credentials and holds no gini key; or
+//     deployment-scoped routing; {provider: "bedrock", model?, awsRegion?,
+//     awsAccessKeyId?, awsSecretAccessKey?}, which SigV4-signs with the entered
+//     AWS keys (written to secrets.env under the AWS_* names); or
 //     {provider: "codex"}. An env-keyed flow writes the key to
 //     ~/.gini/secrets.env (under the provider's apiKeyEnv) and updates
 //     process.env so the running gateway picks it up on the very next provider
@@ -65,7 +66,8 @@ type SupportedProvider = (typeof SUPPORTED_PROVIDERS)[number];
 // speaks the native Messages API, not an OpenAI-compatible surface. `azure` is
 // the Azure OpenAI resource key (api-key header by default); it additionally
 // requires a per-resource baseUrl, enforced by the azureNeeds* guards below.
-// (bedrock is NOT here — it signs with AWS credentials, no gini-held key.)
+// (bedrock is NOT here — it stores an AWS access key + secret under two fixed
+// names via its own branch, not the single-envVar shape this map models.)
 const ENV_KEY_PROVIDERS: Record<string, { envVar: string; allowEmptyKey: boolean; defaultModel: string }> = {
   openai: { envVar: "OPENAI_API_KEY", allowEmptyKey: false, defaultModel: "gpt-5.4-mini" },
   openrouter: { envVar: "OPENROUTER_API_KEY", allowEmptyKey: false, defaultModel: "openrouter/auto" },
@@ -292,20 +294,42 @@ export async function setSetupProvider(
     };
   }
   if (providerName === "bedrock") {
-    // Like codex, bedrock holds no gini-managed key: it signs each Converse
-    // request with the caller's AWS credentials (AWS_* env or the
-    // ~/.aws/credentials profile). "Configured" therefore means those
-    // credentials resolve — reject up front with a clear hint when they don't,
-    // mirroring codex's "run codex login" gate. Only model + region are
-    // persisted (never secret values).
+    // Bedrock signs each Converse request with AWS SigV4 over the user's AWS
+    // access key + secret. Gini does NOT read ~/.aws — the keys are entered here
+    // and written to ~/.gini/secrets.env under the standard AWS_* names, exactly
+    // like the env-keyed providers persist their bearer. Config holds only model
+    // + region.
     const existing = config.provider?.name === "bedrock" ? config.provider : undefined;
-    if (!hasUsableAwsCredentials()) {
+    const trimmedSecret = (value: unknown): string => (typeof value === "string" ? value.trim() : "");
+    const awsAccessKeyId = trimmedSecret(payload.awsAccessKeyId);
+    const awsSecretAccessKey = trimmedSecret(payload.awsSecretAccessKey);
+    // Reject a half-entered pair (one field filled, the other blank) before the
+    // "need keys" gate: a user who filled exactly one field clearly meant to
+    // enter credentials and botched it — don't let it silently fall back to a
+    // previously-stored key or to the generic "enter your keys" message.
+    if ((awsAccessKeyId.length > 0) !== (awsSecretAccessKey.length > 0)) {
+      return {
+        ok: false,
+        provider: providerHealth(config),
+        plistRefreshNeeded: false,
+        error: "Enter BOTH the AWS Access Key ID and the Secret Access Key (or leave both blank to keep the saved credentials)."
+      };
+    }
+    // The access key + secret are required unless usable AWS credentials already
+    // resolve from the environment — whether from a prior add (the common case:
+    // a model/region-only edit shouldn't force a re-type) or from ambient AWS_*
+    // vars the user exported in their shell. Mirrors the env-keyed branch's
+    // envAlreadySet check; the gate is purely "are creds present?", not
+    // same-provider status.
+    const credsResolveNow = hasUsableAwsCredentials();
+    const hasNewPair = awsAccessKeyId.length > 0 && awsSecretAccessKey.length > 0;
+    if (!hasNewPair && !credsResolveNow) {
       return {
         ok: false,
         provider: providerHealth(config),
         plistRefreshNeeded: false,
         error:
-          "No AWS credentials found. Set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY or configure ~/.aws/credentials, then retry."
+          "Enter your AWS Access Key ID and Secret Access Key to use the bedrock provider."
       };
     }
     const model = typeof payload.model === "string" && payload.model.length > 0
@@ -329,6 +353,15 @@ export async function setSetupProvider(
         error: `awsRegion is invalid: '${awsRegion}' (must match /^[a-z0-9-]+$/, e.g. us-east-1).`
       };
     }
+    // Persist a freshly-entered key pair to secrets.env (so future shell launches
+    // carry it) and into process.env (so the running gateway signs with it on the
+    // very next call — resolveAwsCredentials reads process.env each time).
+    if (hasNewPair) {
+      writeKeyToSecretsEnv("AWS_ACCESS_KEY_ID", awsAccessKeyId);
+      writeKeyToSecretsEnv("AWS_SECRET_ACCESS_KEY", awsSecretAccessKey);
+      process.env.AWS_ACCESS_KEY_ID = awsAccessKeyId;
+      process.env.AWS_SECRET_ACCESS_KEY = awsSecretAccessKey;
+    }
     config.provider = normalizeProvider({
       name: "bedrock",
       model: model ?? "",
@@ -338,14 +371,23 @@ export async function setSetupProvider(
       ...(existing?.extraBody ? { extraBody: existing.extraBody } : {})
     });
     writeRuntimeConfig(config);
-    // Config write supersedes the needs-reauth record (see the env-keyed
-    // branch above for the rationale).
-    if (options?.clearAuthFailureOnSuccess !== false) {
+    // A key-carrying write supersedes the needs-reauth record — re-entering the
+    // access key + secret is the user re-establishing the credential. Gate on
+    // hasNewPair, mirroring the env-keyed branch's `&& apiKey`: a keyless
+    // model/region edit proves nothing about the credential (hasUsableAwsCredentials
+    // checks presence, not validity), so a dead-but-present key would otherwise
+    // flip the amber row back to a stale "Connected". Cleared BEFORE the plist
+    // refresh so the write can't be lost to the restart.
+    if (options?.clearAuthFailureOnSuccess !== false && hasNewPair) {
       await clearProviderAuthFailureIfPresent(config.instance, "bedrock", {
         reason: "provider configuration updated"
       });
     }
-    return { ok: true, provider: providerHealth(config), plistRefreshNeeded: false };
+    // A key write must survive the next launchd respawn — refresh the plist so
+    // the new AWS_* values land in EnvironmentVariables (same hand-off the
+    // env-keyed branch uses). No refresh on a keyless model/region edit.
+    const refreshed = hasNewPair ? requestAutostartRefresh(config.instance) : false;
+    return { ok: true, provider: providerHealth(config), plistRefreshNeeded: refreshed };
   }
   // providerName === "codex"
   // Pin the provider across the retry: the 50ms wait is a real macrotask, so
@@ -436,12 +478,14 @@ export interface RemoveSetupProviderResult {
   error?: string;
 }
 
-// Disconnect an env-keyed provider: scrub its bearer from process.env +
-// secrets.env, and, when removing the currently-active provider, fall
-// back to codex if codex auth is available so the gateway stays usable.
+// Disconnect a provider that holds a gini-managed secret: scrub it from
+// process.env + secrets.env, and, when removing the currently-active provider,
+// fall back to codex if codex auth is available so the gateway stays usable.
 // Codex itself isn't removable through the UI because ~/.codex/auth.json
 // is owned by the `codex` CLI — the user manages it via codex logout.
-// Local has no key to remove; the gate below mirrors that.
+// Local has no key to remove; the gate below mirrors that. Bedrock is removable
+// because gini now stores its AWS access key + secret — disconnect must be able
+// to scrub them.
 export async function removeSetupProvider(
   config: RuntimeConfig,
   providerName: string
@@ -454,26 +498,33 @@ export async function removeSetupProvider(
       error: "Codex is managed by the codex CLI. Run `codex logout` to sign out."
     };
   }
-  const envKeySpec = ENV_KEY_PROVIDERS[providerName];
-  if (!envKeySpec || providerName === "local") {
-    return {
-      ok: false,
-      provider: providerHealth(config),
-      switched: false,
-      error: `Cannot remove provider '${providerName}'.`
-    };
+  // Set of secrets.env / process.env vars this removal must scrub.
+  const scrubVars = new Set<string>();
+  if (providerName === "bedrock") {
+    // Bedrock holds the AWS access key + secret gini wrote on add — scrub both.
+    scrubVars.add("AWS_ACCESS_KEY_ID");
+    scrubVars.add("AWS_SECRET_ACCESS_KEY");
+  } else {
+    const envKeySpec = ENV_KEY_PROVIDERS[providerName];
+    if (!envKeySpec || providerName === "local") {
+      return {
+        ok: false,
+        provider: providerHealth(config),
+        switched: false,
+        error: `Cannot remove provider '${providerName}'.`
+      };
+    }
+    // Wipe the bearer from both stores so the running process and future shell
+    // launches stop seeing it. Scrub the env var the active config actually used
+    // (a custom apiKeyEnv like AZURE_OPENAI_API_KEY) as well as the provider
+    // default — the write path stores the key under `apiKeyEnv ?? envKeySpec.envVar`,
+    // so disconnect must clear the same target or the secret survives.
+    scrubVars.add(envKeySpec.envVar);
+    if (config.provider?.name === providerName && config.provider.apiKeyEnv && isValidEnvVarName(config.provider.apiKeyEnv)) {
+      scrubVars.add(config.provider.apiKeyEnv);
+    }
   }
-
-  // Wipe the bearer from both stores so the running process and future shell
-  // launches stop seeing it. Scrub the env var the active config actually used
-  // (a custom apiKeyEnv like AZURE_OPENAI_API_KEY) as well as the provider
-  // default — the write path stores the key under `apiKeyEnv ?? envKeySpec.envVar`,
-  // so disconnect must clear the same target or the secret survives.
   // removeKeyFromSecretsEnv / delete are no-ops when the var is already absent.
-  const scrubVars = new Set<string>([envKeySpec.envVar]);
-  if (config.provider?.name === providerName && config.provider.apiKeyEnv && isValidEnvVarName(config.provider.apiKeyEnv)) {
-    scrubVars.add(config.provider.apiKeyEnv);
-  }
   for (const envVar of scrubVars) {
     removeKeyFromSecretsEnv(envVar);
     delete process.env[envVar];

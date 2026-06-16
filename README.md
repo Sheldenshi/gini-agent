@@ -115,19 +115,19 @@ gini provider set openai gpt-5.4-mini      # uses $OPENAI_API_KEY
 gini provider set openrouter <model>       # uses $OPENROUTER_API_KEY
 gini provider set local <model> --base-url http://127.0.0.1:8000/v1
 gini provider set anthropic claude-opus-4-8 # first-party Claude API, uses $ANTHROPIC_API_KEY
-# Amazon Bedrock: model-agnostic Converse signed with your AWS credentials (no API key)
-gini provider set bedrock us.amazon.nova-pro-v1:0 --aws-region us-east-1  # reads ~/.aws or AWS_*
+# Amazon Bedrock: model-agnostic Converse, SigV4-signed with AWS keys you enter via the web form or `gini setup`
+gini provider set bedrock us.amazon.nova-pro-v1:0 --aws-region us-east-1  # sets model + region; enter keys separately
 # Azure OpenAI: a first-class provider targeting a deployment on your resource
 gini provider set azure gpt-4o \
   --base-url https://<resource>.openai.azure.com \
   --deployment <deployment> --api-version 2024-10-21 --auth-scheme api-key  # uses $AZURE_OPENAI_API_KEY
 ```
 
-For step-by-step setup of each provider — getting credentials, installing any prerequisite tooling (AWS CLI, Ollama, …), and configuring it in the CLI or web — see the per-provider guides: [OpenAI](docs/providers/openai.md), [Anthropic](docs/providers/anthropic.md), [Amazon Bedrock](docs/providers/bedrock.md), [Azure OpenAI](docs/providers/azure.md), [OpenRouter](docs/providers/openrouter.md), [DeepSeek](docs/providers/deepseek.md), [Codex](docs/providers/codex.md), and [Local](docs/providers/local.md). The [providers index](docs/providers/README.md) lists them all with their auth model at a glance.
+For step-by-step setup of each provider — getting credentials, installing any prerequisite tooling (Ollama, …), and configuring it in the CLI or web — see the per-provider guides: [OpenAI](docs/providers/openai.md), [Anthropic](docs/providers/anthropic.md), [Amazon Bedrock](docs/providers/bedrock.md), [Azure OpenAI](docs/providers/azure.md), [OpenRouter](docs/providers/openrouter.md), [DeepSeek](docs/providers/deepseek.md), [Codex](docs/providers/codex.md), and [Local](docs/providers/local.md). The [providers index](docs/providers/README.md) lists them all with their auth model at a glance.
 
 The `local` provider works with any OpenAI-compatible server (oMLX, vLLM, LM Studio, llama.cpp). The `azure` provider targets an Azure OpenAI resource: set `--base-url` to `https://<resource>.openai.azure.com` and pick a deployment; `--api-version` defaults to a GA value and `--auth-scheme` defaults to `api-key` (a resource key), with `bearer` available for an Entra token. API keys are read from environment variables, and Codex OAuth is read from `~/.codex/auth.json` (or `CODEX_AUTH_JSON`) — nothing is written to Gini config. Run `gini --help` for the full flag set, or see [provider-extra-body.md](docs/adr/provider-extra-body.md) for the `--extra-body` contract and [Azure OpenAI As A First-Class Provider](docs/adr/azure-provider.md) for the Azure routing contract. When a credential fails mid-chat, see [Codex re-authentication](docs/providers/codex.md#re-authentication) and [Provider Re-Authentication Guidance](docs/adr/provider-reauth-guidance.md).
 
-`gini setup`'s interactive picker covers every provider — OpenAI, Codex, Anthropic, Amazon Bedrock, Azure OpenAI, OpenRouter, DeepSeek, and Local — prompting for whatever each one needs (an API key, the AWS credential check for Bedrock, the resource endpoint and deployment for Azure, the base URL for Local). `gini provider set …` (above) and the web **Settings → Add provider** form remain available for scripted or non-interactive configuration.
+`gini setup`'s interactive picker covers every provider — OpenAI, Codex, Anthropic, Amazon Bedrock, Azure OpenAI, OpenRouter, DeepSeek, and Local — prompting for whatever each one needs (an API key, the AWS access key + secret for Bedrock, the resource endpoint and deployment for Azure, the base URL for Local). `gini provider set …` (above) and the web **Settings → Add provider** form remain available for scripted or non-interactive configuration.
 
 ## Parallel Instances
 

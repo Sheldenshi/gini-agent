@@ -49,8 +49,8 @@ export function EditProviderDialog({
 }) {
   const queryClient = useQueryClient();
   const isAnthropic = row.name === "anthropic";
-  // Bedrock signs with AWS credentials (no gini-held key) and takes any
-  // model id, so its edit surface is a free-text model + optional region.
+  // Bedrock signs with an AWS access key + secret (no bearer API key) and takes
+  // any model id, so its edit surface is the two key fields + a model + region.
   const isBedrock = row.name === "bedrock";
   const isAzure = row.name === "azure";
   const initialModel = currentModel ?? row.models[0] ?? "";
@@ -59,6 +59,10 @@ export function EditProviderDialog({
   const [showKey, setShowKey] = useState(false);
   const [model, setModel] = useState<string>(initialModel);
   const [awsRegion, setAwsRegion] = useState(initialRegion);
+  // Bedrock AWS credentials. Blank keeps the saved keys (model/region-only edit);
+  // entering both rotates them. gini does not read ~/.aws.
+  const [awsAccessKeyId, setAwsAccessKeyId] = useState("");
+  const [awsSecretAccessKey, setAwsSecretAccessKey] = useState("");
   // Endpoint override, shared by anthropic and azure. Anthropic leaves it blank
   // to keep the current endpoint; azure prefills the required resource endpoint
   // from the active config and the remaining transport fields below.
@@ -76,6 +80,8 @@ export function EditProviderDialog({
     setShowKey(false);
     setModel(initialModel);
     setAwsRegion(initialRegion);
+    setAwsAccessKeyId("");
+    setAwsSecretAccessKey("");
     setBaseUrl(activeConfig?.baseUrl ?? "");
     setApiVersion(activeConfig?.apiVersion ?? "");
     setDeployment(activeConfig?.deployment ?? "");
@@ -88,8 +94,9 @@ export function EditProviderDialog({
         method: "POST",
         body: JSON.stringify({
           provider: row.name,
-          // bedrock holds no key; for the others apiKey is optional when the
-          // env var is already set, so model-only edits work without a re-type.
+          // bedrock uses its own AWS key fields below (not this bearer apiKey);
+          // for the others apiKey is optional when the env var is already set, so
+          // model-only edits work without a re-type.
           ...(!isBedrock && apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
           ...(model.trim() ? { model: model.trim() } : {}),
           // baseUrl applies to every OpenAI-compatible provider plus anthropic
@@ -103,6 +110,13 @@ export function EditProviderDialog({
           // clears it so the host resolves from AWS_REGION / the us-east-1
           // default, rather than being silently dropped and preserved.
           ...(isBedrock ? { awsRegion: awsRegion.trim() } : {}),
+          // Bedrock AWS keys: sent when EITHER field is filled (a rotation), so a
+          // half-entered pair reaches the backend's "enter BOTH" guard instead of
+          // being silently dropped. Both blank keeps the saved credentials, so a
+          // model/region-only edit needs no re-type. gini does not read ~/.aws.
+          ...(isBedrock && (awsAccessKeyId.trim() || awsSecretAccessKey.trim())
+            ? { awsAccessKeyId: awsAccessKeyId.trim(), awsSecretAccessKey: awsSecretAccessKey.trim() }
+            : {}),
           // Azure routing — sent as the full transport state (present-clears),
           // so blanking api-version/deployment falls back to the GA default /
           // the model id.
@@ -145,8 +159,13 @@ export function EditProviderDialog({
       (apiVersion.trim() !== (activeConfig?.apiVersion ?? "") ||
         deployment.trim() !== (activeConfig?.deployment ?? "") ||
         authScheme !== (activeConfig?.authScheme ?? "api-key")));
+  // Entering an AWS key counts as a change. A half-entered pair (one field) is
+  // dirty so the user can submit and get the backend's "enter BOTH" error rather
+  // than a silently-disabled button.
+  const bedrockKeyDirty = isBedrock && (awsAccessKeyId.trim().length > 0 || awsSecretAccessKey.trim().length > 0);
   const dirty =
     apiKey.trim().length > 0 ||
+    bedrockKeyDirty ||
     (isBedrock && awsRegion.trim() !== initialRegion.trim()) ||
     (model.trim() !== "" && model.trim() !== initialModel) ||
     transportDirty;
@@ -206,17 +225,58 @@ export function EditProviderDialog({
           ) : null}
 
           {isBedrock ? (
-            <div className="space-y-2">
-              <Label htmlFor="edit-aws-region" className="text-[13px] font-semibold text-foreground">AWS region</Label>
-              <BedrockRegionSelect
-                id="edit-aws-region"
-                value={awsRegion}
-                onChange={setAwsRegion}
-                disabled={save.isPending}
-                triggerClassName="h-11 border-border bg-secondary font-mono text-[13px]"
-              />
-              <p className="text-xs text-muted-foreground">Signs with your AWS credentials (AWS_ACCESS_KEY_ID/SECRET env vars or ~/.aws/credentials). No API key needed.</p>
-            </div>
+            <>
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <Label htmlFor="edit-aws-access-key-id" className="text-[13px] font-semibold text-foreground">AWS Access Key ID</Label>
+                  <span className="text-xs text-muted-foreground">Stored in ~/.gini/secrets.env</span>
+                </div>
+                <Input
+                  id="edit-aws-access-key-id"
+                  type="text"
+                  autoComplete="off"
+                  placeholder="Leave blank to keep the saved key"
+                  value={awsAccessKeyId}
+                  onChange={(e) => setAwsAccessKeyId(e.target.value)}
+                  disabled={save.isPending}
+                  className="h-11 border-border bg-secondary font-mono text-[13px]"
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="edit-aws-secret-access-key" className="text-[13px] font-semibold text-foreground">AWS Secret Access Key</Label>
+                <div className="relative">
+                  <Input
+                    id="edit-aws-secret-access-key"
+                    type={showKey ? "text" : "password"}
+                    autoComplete="off"
+                    placeholder="Leave blank to keep the saved key"
+                    value={awsSecretAccessKey}
+                    onChange={(e) => setAwsSecretAccessKey(e.target.value)}
+                    disabled={save.isPending}
+                    className="h-11 border-border bg-secondary pr-11 font-mono text-[13px]"
+                  />
+                  <button
+                    type="button"
+                    aria-label={showKey ? "Hide secret access key" : "Show secret access key"}
+                    onClick={() => setShowKey((v) => !v)}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                  >
+                    {showKey ? <EyeIcon className="size-4" /> : <EyeOffIcon className="size-4" />}
+                  </button>
+                </div>
+                <p className="text-xs text-muted-foreground">Enter both to rotate your AWS credentials, or leave blank to keep the saved ones. gini does not read ~/.aws.</p>
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="edit-aws-region" className="text-[13px] font-semibold text-foreground">AWS region</Label>
+                <BedrockRegionSelect
+                  id="edit-aws-region"
+                  value={awsRegion}
+                  onChange={setAwsRegion}
+                  disabled={save.isPending}
+                  triggerClassName="h-11 border-border bg-secondary font-mono text-[13px]"
+                />
+              </div>
+            </>
           ) : null}
 
           {isAnthropic ? (

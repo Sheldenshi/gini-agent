@@ -72,6 +72,11 @@ export default function AddProviderPage() {
   // AWS_DEFAULT_REGION / us-east-1 at request time (matching `gini provider set`).
   // The picker shows a "Select a region" placeholder until one is chosen.
   const [awsRegion, setAwsRegion] = useState("");
+  // AWS credentials for the bedrock provider, entered here (gini does not read
+  // ~/.aws). The access key + secret are required on add; the backend writes them
+  // to ~/.gini/secrets.env under the standard AWS_* names.
+  const [awsAccessKeyId, setAwsAccessKeyId] = useState("");
+  const [awsSecretAccessKey, setAwsSecretAccessKey] = useState("");
   // Azure transport fields. The rest default server-side when blank.
   const [apiVersion, setApiVersion] = useState("");
   const [deployment, setDeployment] = useState("");
@@ -93,6 +98,8 @@ export default function AddProviderPage() {
     setApiKey("");
     setBaseUrl("");
     setAwsRegion("");
+    setAwsAccessKeyId("");
+    setAwsSecretAccessKey("");
     setApiVersion("");
     setDeployment("");
     setAuthScheme("api-key");
@@ -131,6 +138,10 @@ export default function AddProviderPage() {
           ...(!isCodex && !isBedrock && baseUrl.trim() ? { baseUrl: baseUrl.trim() } : {}),
           // Bedrock signs with AWS creds; an optional region override travels here.
           ...(isBedrock && awsRegion.trim() ? { awsRegion: awsRegion.trim() } : {}),
+          // Bedrock AWS credentials, entered on add (gini doesn't read ~/.aws).
+          // The backend writes them to secrets.env under the AWS_* names.
+          ...(isBedrock && awsAccessKeyId.trim() ? { awsAccessKeyId: awsAccessKeyId.trim() } : {}),
+          ...(isBedrock && awsSecretAccessKey.trim() ? { awsSecretAccessKey: awsSecretAccessKey.trim() } : {}),
           // Azure routing fields default server-side when blank.
           ...(isAzure
             ? {
@@ -174,7 +185,10 @@ export default function AddProviderPage() {
       : selectedModel.trim() !== "" &&
         (!requiresApiKey || apiKey.trim().length > 0) &&
         // Azure has no default endpoint — require a base URL before saving.
-        (!isAzure || baseUrl.trim().length > 0));
+        (!isAzure || baseUrl.trim().length > 0) &&
+        // Bedrock requires the AWS access key + secret entered here (gini does
+        // not read ~/.aws).
+        (!isBedrock || (awsAccessKeyId.trim().length > 0 && awsSecretAccessKey.trim().length > 0)));
 
   return (
     <>
@@ -242,7 +256,7 @@ export default function AddProviderPage() {
               {isCodex
                 ? "Codex authenticates through your existing ChatGPT account — no API key needed."
                 : isBedrock
-                  ? "Bedrock signs each request with your AWS credentials — no API key needed."
+                  ? "Enter your AWS access key — saved to ~/.gini/secrets.env (mode 0600), used to sign each request."
                   : isLocal
                     ? "Local providers accept no-auth requests; leave the key blank if your gateway is open."
                     : "Saved to ~/.gini/secrets.env (mode 0600). Not sent anywhere except the provider."}
@@ -280,11 +294,32 @@ export default function AddProviderPage() {
             ) : isBedrock ? (
               <>
                 <p className="text-xs text-muted-foreground">
-                  Gini signs each Converse request with the AWS credentials it finds in
-                  <code className="mx-1 rounded bg-muted px-1 py-0.5 font-mono text-[11px]">AWS_ACCESS_KEY_ID</code>/<code className="rounded bg-muted px-1 py-0.5 font-mono text-[11px]">AWS_SECRET_ACCESS_KEY</code>
-                  (plus <code className="mx-1 rounded bg-muted px-1 py-0.5 font-mono text-[11px]">AWS_SESSION_TOKEN</code> for temporary sessions)
-                  or your <code className="mx-1 rounded bg-muted px-1 py-0.5 font-mono text-[11px]">~/.aws/credentials</code> profile. No API key. SSO or assumed-role users: export the session first with <code className="mx-1 rounded bg-muted px-1 py-0.5 font-mono text-[11px]">aws configure export-credentials</code>.
+                  Create an IAM user access key in the AWS console (IAM → Users → Security credentials → Create access key) and paste both parts below. Gini signs each Converse request with them using AWS SigV4 — it never reads <code className="mx-1 rounded bg-muted px-1 py-0.5 font-mono text-[11px]">~/.aws</code>.
                 </p>
+                <div className="grid gap-2">
+                  <Label htmlFor="bedrock-access-key-id">AWS Access Key ID</Label>
+                  <Input
+                    id="bedrock-access-key-id"
+                    type="text"
+                    autoComplete="off"
+                    placeholder="AKIA…"
+                    value={awsAccessKeyId}
+                    onChange={(e) => setAwsAccessKeyId(e.target.value)}
+                    disabled={save.isPending}
+                  />
+                </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="bedrock-secret-access-key">AWS Secret Access Key</Label>
+                  <Input
+                    id="bedrock-secret-access-key"
+                    type="password"
+                    autoComplete="off"
+                    placeholder="Secret access key"
+                    value={awsSecretAccessKey}
+                    onChange={(e) => setAwsSecretAccessKey(e.target.value)}
+                    disabled={save.isPending}
+                  />
+                </div>
                 <div className="grid gap-2">
                   <Label htmlFor="bedrock-model">Model (cross-region inference profile)</Label>
                   <BedrockModelSelect

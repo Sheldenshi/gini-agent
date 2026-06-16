@@ -1060,12 +1060,12 @@ export const SELF_OPERATIONS: SelfOperation[] = [
   },
   {
     name: "remove_provider",
-    summary: "Disconnect an env-keyed LLM provider: scrub its API key from process.env + secrets.env. If it was active, falls back to codex (or echo). Codex/local aren't removable this way.",
+    summary: "Disconnect an LLM provider whose credentials gini stores: scrub its key(s) from process.env + secrets.env (the API-key providers, plus bedrock's AWS key pair). If it was active, falls back to codex (or echo). Codex/local aren't removable this way.",
     tag: "mutate",
     schema: {
       type: "object",
       properties: {
-        provider: { type: "string", description: "Provider id to remove (e.g. 'openai', 'openrouter', 'deepseek', 'azure'). Codex and local cannot be removed here." }
+        provider: { type: "string", description: "Provider id to remove (e.g. 'openai', 'openrouter', 'deepseek', 'anthropic', 'bedrock'). Codex and local cannot be removed here." }
       },
       required: ["provider"]
     },

@@ -3720,9 +3720,9 @@ describe("auth-error classification", () => {
     expect(providerAuthFailureText("OpenAI", providerReauth("openai"))).toBe(
       "OpenAI authentication failed. Update your OpenAI API key in Settings → Providers."
     );
-    // AWS target — credentials, never an API key.
+    // AWS target — re-enter the access key + secret in Settings, not an API key.
     expect(providerAuthFailureText("Amazon Bedrock", providerReauth("bedrock"))).toBe(
-      "Amazon Bedrock authentication failed. Check your AWS credentials (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY or ~/.aws/credentials) to continue."
+      "Amazon Bedrock authentication failed. Re-enter your AWS credentials (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY) in Settings → Providers to continue."
     );
   });
 

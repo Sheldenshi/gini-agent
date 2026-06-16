@@ -1908,15 +1908,15 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     toolset: "self",
     displayLabel: "Remove provider",
     deferred: true,
-    indexSummary: "Disconnect an env-keyed LLM provider: scrub its API key. Falls back to codex/echo if it was active.",
+    indexSummary: "Disconnect a credential-storing LLM provider: scrub its stored key(s). Falls back to codex/echo if it was active.",
     type: "function",
     function: {
       name: "remove_provider",
-      description: "Disconnect an env-keyed LLM provider: scrub its API key from process.env + secrets.env. If it was active, falls back to codex (or echo). Codex and local cannot be removed this way. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      description: "Disconnect an LLM provider whose credentials gini stores: scrub its key(s) from process.env + secrets.env. Covers the API-key providers (openai/openrouter/deepseek/anthropic) and bedrock (scrubs its AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY). If it was active, falls back to codex (or echo). Codex and local cannot be removed this way. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
       parameters: {
         type: "object",
         properties: {
-          provider: { type: "string", description: "Provider id to remove (e.g. 'openai', 'openrouter', 'deepseek', 'azure')." }
+          provider: { type: "string", description: "Provider id to remove (e.g. 'openai', 'openrouter', 'deepseek', 'anthropic', 'bedrock')." }
         },
         required: ["provider"]
       }

@@ -6,8 +6,8 @@
 // "Needs re-authentication", shows the redacted failure detail, and routes
 // the CTA by reauthKind the same way the chat re-auth note does: "docs"
 // wraps the CTA in the DocReference slide-over trigger, "settings" opens the
-// row's own key-edit dialog, "aws" renders credentials guidance with no key
-// form. A payload missing the routing fields falls back to the settings CTA
+// row's own key-edit dialog, "aws" opens that same edit dialog to re-enter the
+// AWS access key + secret. A payload missing the routing fields falls back to the settings CTA
 // so it never renders broken. Around that: codex hides Edit/Remove in every
 // auth state, rows render in the fixed display order, the trash is gated off
 // the instance/default-model provider, and the remove confirmation drives
@@ -179,7 +179,7 @@ describe("ProviderCard needs-reauth state", () => {
     await waitFor(() => expect(screen.queryByText("Edit provider")).toBeNull());
   });
 
-  test("aws kind: credentials guidance instead of a key CTA, and no key form opens", () => {
+  test("aws kind: an Update credentials CTA (not a doc link), and bedrock is removable (gini stores its keys)", () => {
     renderCard([
       row("bedrock", {
         authStatus: "needs_reauth",
@@ -189,13 +189,15 @@ describe("ProviderCard needs-reauth state", () => {
 
     expect(screen.getByText("Needs re-authentication")).not.toBeNull();
     expect(screen.getByText("credential chain exhausted")).not.toBeNull();
-    expect(screen.getByText(/Check your AWS credentials/)).not.toBeNull();
+    // The aws kind now offers an actionable CTA that opens the edit dialog (gini
+    // holds the keys), not a doc link and not the old "key" wording.
+    expect(screen.getByRole("button", { name: "Update Amazon Bedrock credentials" })).not.toBeNull();
     expect(screen.queryByTestId("doc-reference")).toBeNull();
     expect(screen.queryByRole("button", { name: "Update Amazon Bedrock key" })).toBeNull();
-    expect(screen.queryByText("Edit provider")).toBeNull();
-    // Bedrock keeps its Edit pencil but is never removable from this UI.
+    // Bedrock keeps its Edit pencil AND, now that gini stores its AWS keys, a
+    // Remove button to scrub them (this row isn't the instance/default provider).
     expect(screen.getByRole("button", { name: "Edit Amazon Bedrock" })).not.toBeNull();
-    expect(screen.queryByRole("button", { name: "Remove Amazon Bedrock" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Remove Amazon Bedrock" })).not.toBeNull();
   });
 
   test("a payload missing the routing fields falls back to the settings CTA with no detail line", () => {
@@ -266,9 +268,9 @@ describe("ProviderCard rows", () => {
 
   test("an unconfigured row with a needs_reauth record still renders the amber guidance", () => {
     // bedrock/anthropic flip configured to false the moment their credentials
-    // VANISH (env scrubbed, ~/.aws/credentials deleted) — exactly a needs-
-    // re-auth state. The row must survive the configured filter or the amber
-    // guidance is unreachable for the failure it explains.
+    // VANISH (env scrubbed) — exactly a needs-re-auth state. The row must survive
+    // the configured filter or the amber guidance is unreachable for the failure
+    // it explains.
     renderCard([
       row("bedrock", {
         configured: false,
@@ -283,7 +285,7 @@ describe("ProviderCard rows", () => {
     ]);
     const bedrock = rowItem("Amazon Bedrock");
     expect(within(bedrock).getByText("Needs re-authentication")).not.toBeNull();
-    expect(within(bedrock).getByText(/AWS credentials/)).not.toBeNull();
+    expect(within(bedrock).getByRole("button", { name: "Update Amazon Bedrock credentials" })).not.toBeNull();
     const anthropic = rowItem("Anthropic");
     expect(within(anthropic).getByText("Needs re-authentication")).not.toBeNull();
     expect(within(anthropic).getByRole("button", { name: "Update Anthropic key" })).not.toBeNull();

@@ -9,14 +9,11 @@
 // This module implements exactly what that path needs with `node:crypto` (no
 // AWS SDK dependency): the SigV4 canonical-request → string-to-sign → signing-
 // key HMAC chain → signature, plus credential/region resolution from the
-// standard env vars and `~/.aws/credentials`. The SigV4 service name for the
-// Converse endpoint is `bedrock`. The model id carries a ':' (e.g.
-// `us.amazon.nova-pro-v1:0`) that lands in the request path, so canonicalUri
-// double-encodes it to match how AWS recomputes the signed path.
+// standard AWS_* env vars. The SigV4 service name for the Converse endpoint is
+// `bedrock`. The model id carries a ':' (e.g. `us.amazon.nova-pro-v1:0`) that
+// lands in the request path, so canonicalUri double-encodes it to match how AWS
+// recomputes the signed path.
 import { createHash, createHmac } from "node:crypto";
-import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
 
 export interface AwsCredentials {
   accessKeyId: string;
@@ -125,15 +122,15 @@ export function signAwsRequest(opts: {
   return headers;
 }
 
-// Resolve AWS credentials for signing. Precedence: the standard
-// AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN env vars, then
-// the `~/.aws/credentials` profile (AWS_PROFILE, else "default"). Returns null
-// when no usable credentials are found. Secrets never enter config — these are
-// read from the environment / ~/.aws at call time, the same static sources the
-// `aws` CLI reads. NOT the full AWS CLI provider chain: SSO, `assume-role`
-// profiles in ~/.aws/config, process/web-identity, and IMDS/container roles are
-// out of scope — those users export a session into the AWS_* env vars first
-// (e.g. `aws configure export-credentials`).
+// Resolve AWS credentials for signing from the standard AWS_ACCESS_KEY_ID /
+// AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN env vars. Returns null when the
+// access key or secret is absent. Gini does NOT read `~/.aws/credentials`, SSO
+// session caches, `~/.aws/config` role chains, process/web-identity, or
+// IMDS/container roles: the keys are entered explicitly when the bedrock
+// provider is added (web Add Provider, `gini setup`, or `gini provider set`)
+// and persisted to ~/.gini/secrets.env, which the gateway sources into the
+// environment on launch. A user holding only a temporary session passes its
+// access key + secret + session token through that same entry point.
 export function resolveAwsCredentials(): AwsCredentials | null {
   const accessKeyId = process.env.AWS_ACCESS_KEY_ID;
   const secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY;
@@ -141,41 +138,5 @@ export function resolveAwsCredentials(): AwsCredentials | null {
     const sessionToken = process.env.AWS_SESSION_TOKEN;
     return { accessKeyId, secretAccessKey, sessionToken: sessionToken || undefined };
   }
-  return readAwsProfileCredentials(process.env.AWS_PROFILE ?? "default");
-}
-
-// Parse ~/.aws/credentials (INI) for one profile. No `ini` dependency: the
-// credentials file is a flat list of `[profile]` sections with `key = value`
-// lines. Honors AWS_SHARED_CREDENTIALS_FILE.
-export function readAwsProfileCredentials(profile: string): AwsCredentials | null {
-  const path = process.env.AWS_SHARED_CREDENTIALS_FILE ?? join(homedir(), ".aws", "credentials");
-  let text: string;
-  try {
-    text = readFileSync(path, "utf8");
-  } catch {
-    return null;
-  }
-  let inProfile = false;
-  let accessKeyId: string | undefined;
-  let secretAccessKey: string | undefined;
-  let sessionToken: string | undefined;
-  for (const raw of text.split(/\r?\n/)) {
-    const line = raw.trim();
-    if (!line || line.startsWith("#") || line.startsWith(";")) continue;
-    const section = line.match(/^\[(.+)\]$/);
-    if (section) {
-      inProfile = section[1]!.trim() === profile;
-      continue;
-    }
-    if (!inProfile) continue;
-    const eq = line.indexOf("=");
-    if (eq < 0) continue;
-    const key = line.slice(0, eq).trim().toLowerCase();
-    const value = line.slice(eq + 1).trim();
-    if (key === "aws_access_key_id") accessKeyId = value;
-    else if (key === "aws_secret_access_key") secretAccessKey = value;
-    else if (key === "aws_session_token") sessionToken = value;
-  }
-  if (accessKeyId && secretAccessKey) return { accessKeyId, secretAccessKey, sessionToken };
   return null;
 }

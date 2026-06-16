@@ -19,17 +19,17 @@ import { api } from "@/lib/api";
 import { displayProviderName, type ProviderCatalogItem } from "@/lib/providers";
 import { EditProviderDialog } from "./EditProviderDialog";
 
-// Providers whose credentials are env-keyed and therefore safe to remove
-// from this UI: scrubbing the env var + secrets.env line is reversible
-// (the user can add it back). Codex is owned by the codex CLI and local
-// has no key to clear; bedrock signs with ~/.aws credentials gini doesn't
-// manage — so neither row exposes the trash button. Azure is excluded too:
-// its row only renders while it is the instance provider (it has no default
-// endpoint, so an inactive azure config isn't "configured"), and the trash
-// button is disabled for that row — a permanently-dead affordance. Azure is
-// managed by re-add via Add Provider; key cleanup is the CLI `gini provider`
-// path.
-const REMOVABLE_PROVIDERS = new Set(["openai", "openrouter", "deepseek", "anthropic"]);
+// Providers whose credentials gini stores locally and can therefore scrub from
+// this UI: removal deletes the secrets.env line(s) + env vars, reversibly (the
+// user can add the provider back). Bedrock is included — gini now stores its AWS
+// access key + secret, so disconnect scrubs both. Codex is owned by the codex
+// CLI and local has no key to clear, so neither row exposes the trash button.
+// Azure is excluded too: its row only renders while it is the instance provider
+// (it has no default endpoint, so an inactive azure config isn't "configured"),
+// and the trash button is disabled for that row — a permanently-dead affordance.
+// Azure is managed by re-add via Add Provider; key cleanup is the CLI `gini
+// provider` path.
+const REMOVABLE_PROVIDERS = new Set(["openai", "openrouter", "deepseek", "anthropic", "bedrock"]);
 
 // Provider rows shown on the Settings page, in display order. Echo is
 // dev-only and never configured, so it can't appear.
@@ -86,10 +86,9 @@ export function ProviderCard({
 }) {
   // Keep needs_reauth rows even when unconfigured: bedrock/anthropic flip
   // `configured` to false the moment their credentials VANISH (env scrubbed,
-  // ~/.aws/credentials deleted, launchd restart without the shell env), which
-  // is precisely a needs-re-auth state — dropping the row would hide the
-  // amber guidance for the exact failure it explains. Unconfigured rows
-  // without a failure record stay hidden.
+  // launchd restart without the shell env), which is precisely a needs-re-auth
+  // state — dropping the row would hide the amber guidance for the exact failure
+  // it explains. Unconfigured rows without a failure record stay hidden.
   const rows = SELECTABLE_PROVIDERS
     .map((name) => catalog.find((c) => c.name === name))
     .filter((c): c is ProviderCatalogItem =>
@@ -166,9 +165,9 @@ export function ProviderCard({
           // the redacted provider error and a CTA routed the same way as the
           // chat re-auth note (BlockSystemNote): "docs" opens the in-app doc
           // slide-over, "settings" opens the key-edit dialog that already
-          // lives on this row, "aws" gets text guidance (no key to paste).
-          // The fallbacks mirror BlockSystemNote so a payload missing the
-          // routing fields never renders a broken CTA.
+          // lives on this row, "aws" opens that same edit dialog to re-enter the
+          // AWS access key + secret. The fallbacks mirror BlockSystemNote so a
+          // payload missing the routing fields never renders a broken CTA.
           const needsReauth = row.authStatus === "needs_reauth";
           const reauthKind = row.reauth?.reauthKind ?? "settings";
           const reauthUrl = row.reauth?.reauthUrl ?? "/settings";
@@ -218,10 +217,14 @@ export function ProviderCard({
                       </Button>
                     </DocReference>
                   ) : reauthKind === "aws" ? (
-                    <p className="text-[11px] text-muted-foreground">
-                      Check your AWS credentials (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY or
-                      ~/.aws/credentials), then retry.
-                    </p>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="mt-1.5"
+                      onClick={() => setEditingRow(row)}
+                    >
+                      Update {displayProviderName(row)} credentials
+                    </Button>
                   ) : (
                     <Button
                       size="sm"

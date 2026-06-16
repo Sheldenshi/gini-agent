@@ -174,8 +174,8 @@ export async function renameAgent(
 //   - A lone providerName or model is rejected ("Invalid input" → 400) instead
 //     of being half-applied.
 //
-// Credentials are NOT managed here. API keys, AWS, and Codex auth live at the
-// instance level (secrets.env, ~/.aws, ~/.codex); this helper only selects
+// Credentials are NOT managed here. API keys and AWS access keys live in
+// secrets.env; Codex auth lives in ~/.codex — all instance-level. This helper only selects
 // which provider/model the agent uses. It validates the provider NAME against
 // the catalog but does not require the provider to be configured — the
 // configured-only restriction is a UI affordance (see ADR
