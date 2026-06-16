@@ -13,7 +13,6 @@
 // metadata that a re-encode would otherwise drop) and `.flatten()` onto white
 // to drop any alpha channel, since JPEG has no transparency.
 
-import sharp from "sharp";
 import type { Instance } from "../types";
 import { readUpload, readVisionVariant, writeVisionVariant } from "../state/uploads";
 import { appendLog } from "../state";
@@ -32,6 +31,13 @@ export async function compressImageToFit(
   limitBytes: number
 ): Promise<{ bytes: Uint8Array; mimeType: string } | null> {
   if (bytes.length <= limitBytes) return { bytes, mimeType };
+
+  // Dynamic import: sharp wraps libvips, a heavy native addon only needed on the
+  // rare oversized-image path. A top-level import loads libvips into every Bun
+  // test isolate that transitively imports chat-task, segfaulting the isolate
+  // workers on teardown — and needlessly loads it at cold start even when no
+  // oversized image is ever sent.
+  const sharp = (await import("sharp")).default;
 
   try {
     const meta = await sharp(bytes, { failOn: "none" }).metadata();
