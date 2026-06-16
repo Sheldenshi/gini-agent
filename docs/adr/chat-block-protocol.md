@@ -215,6 +215,12 @@ remote previews, screen readers) would need the same translation code.
   to the live browser session by `peekRefLabel` (`src/tools/browser.ts`).
   The opaque ref stays in `argsFull`, and the preview falls back to the
   bare ref when the element has no recorded name or the session is gone.
+  jobId-only job tools (`run_job`, `delete_job`) use the same shape: a
+  second optional resolver enriches `argsPreview` by resolving the
+  `jobId` to the job's stored name — e.g. `Hydration reminder` instead of
+  `job_6e0fd00b` — wired at emit time to `listJobs` (`src/jobs`). A
+  model-supplied `name` (e.g. `create_job`) still wins, and the preview
+  falls back to the bare id when the job can't be resolved.
 
 - The SSE endpoint is its own handler (`chatBlockStream` in
   `src/http.ts`), not a reuse of the existing global `eventStream`.
