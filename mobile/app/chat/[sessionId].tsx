@@ -805,23 +805,39 @@ export default function ChatDetailScreen() {
               accessibilityLabel="Message input"
             />
             {canStop ? (
-              <Pressable
-                onPress={stopTask}
-                disabled={cancel.isPending}
-                style={[
-                  styles.sendButton,
-                  styles.stopButton,
-                  cancel.isPending && styles.sendButtonDisabled
-                ]}
-                accessibilityRole="button"
-                accessibilityLabel="Stop response"
-              >
-                {cancel.isPending ? (
-                  <ActivityIndicator color={theme.buttonText} />
-                ) : (
-                  <Feather name="square" size={16} color={theme.buttonText} />
-                )}
-              </Pressable>
+              <>
+                {canSubmit ? (
+                  <Pressable
+                    onPress={submit}
+                    style={[styles.sendButton, styles.queueButton]}
+                    accessibilityRole="button"
+                    accessibilityLabel="Queue message"
+                  >
+                    {send.isPending ? (
+                      <ActivityIndicator color={theme.buttonText} />
+                    ) : (
+                      <Feather name="arrow-up" size={22} color={theme.buttonText} />
+                    )}
+                  </Pressable>
+                ) : null}
+                <Pressable
+                  onPress={stopTask}
+                  disabled={cancel.isPending}
+                  style={[
+                    styles.sendButton,
+                    styles.stopButton,
+                    cancel.isPending && styles.sendButtonDisabled
+                  ]}
+                  accessibilityRole="button"
+                  accessibilityLabel="Stop response"
+                >
+                  {cancel.isPending ? (
+                    <ActivityIndicator color={theme.buttonText} />
+                  ) : (
+                    <Feather name="square" size={16} color={theme.buttonText} />
+                  )}
+                </Pressable>
+              </>
             ) : !voiceBusy && (trimmed || readyImages.length > 0 || Platform.OS !== "ios") ? (
               <Pressable
                 onPress={submit}
@@ -1315,6 +1331,7 @@ const styles = StyleSheet.create({
   },
   sendButtonDisabled: { backgroundColor: theme.buttonDisabled },
   stopButton: { backgroundColor: theme.danger },
+  queueButton: { marginRight: 8 },
 
   voicePendingRow: { alignSelf: "flex-end", maxWidth: "80%" },
   voicePendingBubble: {
