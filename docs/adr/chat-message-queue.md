@@ -33,9 +33,18 @@ The state helpers operate on `RuntimeState` inside a `mutateState` callback, mat
 
 ## FIFO one-per-turn auto-dispatch
 
-`dispatchNextPendingChatMessage(config, sessionId)` pops the first pending message (FIFO), publishes the shrunk queue, then runs it via `runChatSubmission`. A run failure is logged (`chat.queue.dispatch_failed`) and swallowed so one bad turn doesn't crash the dispatch chain — the remaining queue stays intact for the next terminal transition.
+`dispatchNextPendingChatMessage(config, sessionId)` is the **single guarded chokepoint** for draining the queue. It is atomic and idempotent: the in-flight check (`sessionHasInFlightChatTask`) AND the FIFO pop (`shiftPendingChatMessage`) run inside ONE `mutateState`, so a queued message is popped only when the session is truly idle. It then publishes the shrunk queue and runs the popped message via `runChatSubmission`. A run failure is logged (`chat.queue.dispatch_failed`) and swallowed so one bad turn doesn't crash the dispatch chain — the remaining queue stays intact for the next terminal transition.
 
-Dispatch is driven from a **single chokepoint** in `submitTask` (`src/agent.ts`): the fire-and-forget `runTask(...)` chain gets a `.finally(...)` that, only for a top-level chat task (`options.mode === "chat" && options.chatSessionId && !options.parentTaskId`), calls `dispatchNextPendingChatMessage`. `.finally` fires on every terminal transition: normal completion, failure (the preceding `.catch(failTask)` runs first), and user cancel (Stop → `cancelTask` makes `runChatTask` return so `runTask` resolves). Each dispatched message becomes the new in-flight task; when IT settles the chain fires again, so the queue drains one message per turn. Subagent and imperative tasks are excluded — they have no session queue.
+Because `sessionHasInFlightChatTask` treats queued/running/**waiting_approval** as in-flight, calling the chokepoint while a turn is still active or paused for approval pops nothing and no-ops. That makes the function safe to call redundantly from several settle points: at most one queued message drains, and only once no live turn remains for the session.
+
+The chokepoint is fired from four owners, each gated to a top-level chat task (`task.mode === "chat" && task.chatSessionId && !task.parentTaskId`) and firing only AFTER the terminal state is committed:
+
+- **`submitTask` (`src/agent.ts`)** — the fire-and-forget `runTask(...)` chain gets a `.finally(...)` that calls the chokepoint. This covers an active run's normal completion, failure (the preceding `.catch(failTask)` runs first), and user cancel of a running turn. It also fires when a turn pauses for approval — `runChatTask` returns the non-terminal `waiting_approval` task, resolving the promise — but the in-flight guard makes that a deliberate no-op rather than a premature second turn.
+- **`resumeChatTask` (`src/execution/chat-task.ts`)** — after the resumed loop settles. An approval resume continues the turn inside this separate call path; its original `runTask` promise already resolved at the pause, so the `.finally` would never drain a queue stranded behind the resumed turn.
+- **`decideApproval` deny branch (`src/agent.ts`)** — the deny path flips the paused task to `failed` INLINE in its own `mutateState` (not via `failTask`), and its `runTask` promise already resolved at the pause, so the `.finally` doesn't fire for it.
+- **`cancelTask` (`src/agent.ts`)** — cancelling a `waiting_approval` task sets it terminal with no active `runTask` promise, so the `.finally` never fires for it.
+
+Each dispatched message becomes the new in-flight task; when IT settles the chain fires again, so the queue drains one message per turn. Subagent and imperative tasks are excluded — they have no session queue.
 
 ### Stop drains the queue (current decision)
 
@@ -59,6 +68,7 @@ Messaging inbound (`src/integrations/messaging.ts`) tolerates the queued result:
 - Idle session: `submitChatMessage` runs immediately (returns `taskId`, no `queued` flag); `pendingMessages` stays empty (`src/execution/chat-queue.test.ts`).
 - Busy session (a non-terminal chat task seeded on the session): `submitChatMessage` enqueues (`queued: true` + `pendingId`, `pendingMessages` grows, no second task) (`src/execution/chat-queue.test.ts`, `src/http.test.ts`).
 - A submit behind a non-empty queue with no running task still enqueues, preserving FIFO order (`src/execution/chat-queue.test.ts`).
-- `dispatchNextPendingChatMessage` pops FIFO and runs the next message (creates a task + user row for the popped content; the queue shrinks); it is a no-op on an empty queue (`src/execution/chat-queue.test.ts`).
+- `dispatchNextPendingChatMessage` pops FIFO and runs the next message once the session is idle (creates a task + user row for the popped content; the queue shrinks); it is a no-op on an empty queue (`src/execution/chat-queue.test.ts`).
+- The guard holds the queue while a turn is paused at `waiting_approval` (calling the chokepoint pops nothing and starts no second task), then drains the queued message once the paused task reaches a terminal status (`src/execution/chat-queue.test.ts`).
 - `removePendingChatMessageById` removes the right item and returns false for an unknown id; the DELETE route maps that to 404 (`src/execution/chat-queue.test.ts`, `src/http.test.ts`).
 - Two inbound bridge messages to the same session serialize through the queue and both land, in order, once it drains (`src/integrations/messaging.test.ts`).
