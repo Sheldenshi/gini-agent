@@ -220,7 +220,11 @@ remote previews, screen readers) would need the same translation code.
   `jobId` to the job's stored name — e.g. `Hydration reminder` instead of
   `job_6e0fd00b` — wired at emit time to `listJobs` (`src/jobs`). A
   model-supplied `name` (e.g. `create_job`) still wins, and the preview
-  falls back to the bare id when the job can't be resolved.
+  falls back to the bare id when the job can't be resolved. `terminal_exec`
+  masks its `argsPreview` (returns `""`) because a raw shell command line is
+  noise — and a path/secret-leak risk — in an end-user inline preview; the
+  full command stays in `argsFull.command` and clients surface it on row
+  expansion.
 
 - The SSE endpoint is its own handler (`chatBlockStream` in
   `src/http.ts`), not a reuse of the existing global `eventStream`.

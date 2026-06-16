@@ -798,3 +798,12 @@ describe("chatBlockArgsPreviewFor job names", () => {
     expect(preview).toBe("New job");
   });
 });
+
+describe("chatBlockArgsPreviewFor masking", () => {
+  test("terminal_exec masks the raw command (empty preview)", () => {
+    const preview = chatBlockArgsPreviewFor("terminal_exec", {
+      command: 'GOOGLE_WORKSPACE_CLI_CONFIG_DIR="/Users/shelden/.gini/google-accounts/gacct" gcloud auth list'
+    });
+    expect(preview).toBe("");
+  });
+});

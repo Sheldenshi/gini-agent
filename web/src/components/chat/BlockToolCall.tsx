@@ -18,7 +18,9 @@ import { iconForTool } from "./tool-icons";
 //   - Default (any tool, any status): the row above. Failed (error/denied)
 //     tool calls surface the error string below the row — red by default,
 //     muted gray when errorSeverity is "info" (a calm needs-setup notice,
-//     e.g. web_search with no connector).
+//     e.g. web_search with no connector). terminal_exec renders no chip
+//     (its argsPreview is masked server-side); the full command lives in
+//     argsFull.command and is revealed on expand, prefixed with `$ `.
 //   - Inline spinner (status === "running" && !result, no runningHint):
 //     a small Loader2 sits after the chip while the dispatch is in flight.
 //     Right for short tools (web_fetch, code_exec).
@@ -43,7 +45,9 @@ export function BlockToolCall({
   const running = block.status === "running" && !result;
   const waitingCard = running && Boolean(block.runningHint);
   const inlineSpinner = running && !waitingCard;
-  const canExpand = Boolean(result);
+  const command =
+    block.toolName === "terminal_exec" ? String(block.argsFull?.command ?? "") : "";
+  const canExpand = Boolean(result) || Boolean(command);
   const Icon = iconForTool(block.toolName);
 
   const row = (
@@ -119,11 +123,21 @@ export function BlockToolCall({
           {block.errorMessage}
         </span>
       ) : null}
-      {expanded && result ? (
-        <pre className="ml-[23px] max-h-48 overflow-auto whitespace-pre-wrap break-words rounded-md bg-muted p-2.5 font-mono text-[12px] text-foreground">
-          {result.preview}
-          {result.truncated ? "\n\n[truncated]" : ""}
-        </pre>
+      {expanded && (command || result) ? (
+        <div className="ml-[23px] flex flex-col gap-1.5">
+          {command ? (
+            <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words rounded-md bg-muted p-2.5 font-mono text-[12px] text-foreground">
+              <span className="select-none text-muted-foreground">$ </span>
+              {command}
+            </pre>
+          ) : null}
+          {result ? (
+            <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words rounded-md bg-muted p-2.5 font-mono text-[12px] text-foreground">
+              {result.preview}
+              {result.truncated ? "\n\n[truncated]" : ""}
+            </pre>
+          ) : null}
+        </div>
       ) : null}
     </div>
   );

@@ -2552,7 +2552,10 @@ export function chatBlockArgsPreviewFor(
     case "load_tools":
       return truncatePreview(Array.isArray(safe.names) ? safe.names.join(", ") : previewValue(safe.names));
     case "terminal_exec":
-      return truncatePreview(previewValue(safe.command));
+      // Masked: a raw shell command line is noise — and a path/secret-leak
+      // risk — in an end-user inline preview. The full command stays in
+      // `argsFull.command`; clients surface it on row expansion.
+      return "";
     case "code_exec":
       return truncatePreview(`${previewValue(safe.language) || "code"}: ${previewValue(safe.code)}`);
     case "read_skill":
