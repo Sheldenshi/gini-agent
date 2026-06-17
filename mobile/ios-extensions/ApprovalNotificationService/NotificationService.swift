@@ -34,6 +34,12 @@ class NotificationService: UNNotificationServiceExtension {
     var contentHandler: ((UNNotificationContent) -> Void)?
     var bestAttemptContent: UNMutableNotificationContent?
     var fetchTask: URLSessionDataTask?
+    // Serializes deliver() so the content handler fires exactly once. The
+    // URLSession completion (a background delegate queue) and
+    // serviceExtensionTimeWillExpire() (the OS timeout thread) can both
+    // reach deliver() concurrently — without a lock the check-then-clear
+    // of contentHandler is a data race that can call the handler twice.
+    private let deliverLock = NSLock()
 
     // Must match plugins/with-approval-notification-service.js (App Group
     // default `group.<hostBundleId>`) and src/shared-credentials.ts.
@@ -141,12 +147,16 @@ class NotificationService: UNNotificationServiceExtension {
     // Invoke the content handler exactly once. Apple requires a NSE to
     // call its content handler precisely one time; both the fetch
     // completion and the timeout path can race to call it (a cancelled
-    // URLSession task still delivers its completion with an error), so we
-    // nil the stored handler after the first call and no-op thereafter.
+    // URLSession task still delivers its completion with an error). The
+    // claim-under-lock makes the check-then-clear atomic so only the first
+    // caller gets the handler; the handler itself is invoked OUTSIDE the
+    // lock so it can never deadlock or hold the lock across UI work.
     private func deliver(_ content: UNNotificationContent) {
-        guard let handler = contentHandler else { return }
+        deliverLock.lock()
+        let handler = contentHandler
         contentHandler = nil
-        handler(content)
+        deliverLock.unlock()
+        handler?(content)
     }
 
     // Credentials the main app wrote into the shared App Group container.
@@ -183,13 +193,25 @@ class NotificationService: UNNotificationServiceExtension {
     // `baseUrl` is the normalized gateway origin (scheme://host[:port], no
     // path), so we set the path and let URLComponents percent-encode the
     // query values.
+    //
+    // Transport guard: we attach the gateway bearer to this request, and
+    // the NSE has ATS disabled, so we mirror the JS side's
+    // isLocalGatewayHost / assertTransportAllowed defense-in-depth — refuse
+    // to build a URL (and therefore never send the bearer) for a public
+    // http:// origin. https is always allowed; http only to a local host.
+    // The app already normalizes baseUrl at write time, so this only fires
+    // on a corrupt/stale/regressed shared-container value.
     static func previewURL(
         baseUrl: String,
         event: String,
         sessionId: String,
         approvalId: String?
     ) -> URL? {
-        guard var components = URLComponents(string: baseUrl) else { return nil }
+        guard var components = URLComponents(string: baseUrl),
+              let scheme = components.scheme?.lowercased(),
+              scheme == "https" || (scheme == "http" && isLocalHost(components.host)) else {
+            return nil
+        }
         components.path = "/api/push/preview"
         var items = [
             URLQueryItem(name: "sessionId", value: sessionId),
@@ -200,5 +222,32 @@ class NotificationService: UNNotificationServiceExtension {
         }
         components.queryItems = items
         return components.url
+    }
+
+    // True when `host` is on the user's own machine or a private network
+    // they control — the set plaintext http:// is allowed to reach. Mirrors
+    // mobile/src/auth.ts isLocalGatewayHost: loopback, *.local, RFC1918
+    // (10/8, 172.16-31/12, 192.168/16), and CGNAT (100.64-127/10, Tailscale).
+    static func isLocalHost(_ host: String?) -> Bool {
+        guard let raw = host, !raw.isEmpty else { return false }
+        // WHATWG/URLComponents may bracket IPv6 ("[::1]"); strip one pair.
+        var h = raw.lowercased()
+        if h.hasPrefix("[") && h.hasSuffix("]") { h = String(h.dropFirst().dropLast()) }
+        if h == "localhost" || h == "127.0.0.1" || h == "::1" { return true }
+        if h.hasSuffix(".local") { return true }
+        let octets = h.split(separator: ".", omittingEmptySubsequences: false)
+        guard octets.count == 4 else { return false }
+        var parsed: [Int] = []
+        for part in octets {
+            guard !part.isEmpty, part.count <= 3, part.allSatisfy({ $0.isNumber }),
+                  let n = Int(part), n >= 0, n <= 255 else { return false }
+            parsed.append(n)
+        }
+        let a = parsed[0], b = parsed[1]
+        if a == 10 { return true }
+        if a == 172 && b >= 16 && b <= 31 { return true }
+        if a == 192 && b == 168 { return true }
+        if a == 100 && b >= 64 && b <= 127 { return true }
+        return false
     }
 }

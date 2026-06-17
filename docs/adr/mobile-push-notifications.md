@@ -26,12 +26,14 @@ the device out-of-band; it never transits Apple. On any failure (no
 shared creds, network error, non-200, timeout) the NSE falls back to the
 generic as-sent banner, so the user always sees a notification.
 
-Lock-screen Approve / Deny action buttons on approval pushes are also
-implemented by the NSE plus a `UNNotificationCategory` registered by the
-main app. The NSE attaches the category id on incoming
-`authorization_requested` / `setup_requested` payloads; the OS renders
-the action buttons; tapping an action posts directly to
-`/api/authorizations/:id/approve` or `/deny` without opening the app.
+Lock-screen Approve / Deny action buttons are also implemented by the NSE
+plus a `UNNotificationCategory` registered by the main app. The category
+is attached only to `authorization_requested` pushes (the dispatcher sets
+it server-side; the NSE re-asserts it); the OS renders the action buttons;
+tapping an action posts directly to `/api/authorizations/:id/approve` or
+`/deny` without opening the app. Setup requests need the app (open a
+browser, fill a form), so they carry no action buttons and deep-link on
+tap instead.
 
 The mobile build moves from purely managed Expo to a **dev client +
 `expo prebuild`** workflow on iOS to host the NSE. The plugin
@@ -172,11 +174,11 @@ lock-screen entry always reflects the newest assistant reply.
   - `APPROVE` — `opensAppToForeground: false`, `isAuthenticationRequired: false`
   - `DENY` — `opensAppToForeground: false`, `isDestructive: true`
 - When the user taps an action, `mobile/src/push-dispatch.ts` extracts
-  `approvalId` from the payload and POSTs to the existing
-  `/api/approvals/:id/approve|deny` route. The app never foregrounds.
-  Failures schedule a follow-up local notification ("Failed to approve
-  — open the app to retry") so a network blip doesn't silently lose
-  the action.
+  `approvalId` (the authorization id) from the payload and POSTs to the
+  existing `/api/authorizations/:id/approve|deny` route. The app never
+  foregrounds. Failures schedule a follow-up local notification ("Failed
+  to approve — open the app to retry") so a network blip doesn't silently
+  lose the action.
 - iOS only invokes the response listener if the app is at least
   suspended. If the user has killed the app from the app switcher,
   iOS doesn't run JS — the user must open the app and approve from
@@ -185,10 +187,10 @@ lock-screen entry always reflects the newest assistant reply.
 
 ## Action endpoints
 
-The action handler reuses the **existing** approval routes:
+The action handler reuses the **existing** authorization routes:
 
-- `POST /api/approvals/:id/approve` — pre-dates the push surface.
-- `POST /api/approvals/:id/deny` — pre-dates the push surface.
+- `POST /api/authorizations/:id/approve` — pre-dates the push surface.
+- `POST /api/authorizations/:id/deny` — pre-dates the push surface.
 
 Both already enforce authentication, idempotency, and the audit-trail
 semantics from [Approval And Audit Substrate](./approval-and-audit-substrate.md).
