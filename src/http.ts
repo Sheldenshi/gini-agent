@@ -9,6 +9,7 @@ import {
   assertInsideWorkspace,
   createSetupRequest,
   getDevice,
+  latestAssistantTextForSession,
   listChatBlocks,
   listChatBlocksAfter,
   listThreadBlocks,
@@ -38,6 +39,7 @@ import { runFillSecretConnect } from "./execution/browser-fill-secrets";
 import { runMessagingBridgeConnect } from "./execution/messaging-bridge-connect";
 import { runMessagingPairingConnect } from "./execution/messaging-pairing-connect";
 import { runMessagingRemoveConnect } from "./execution/messaging-remove-connect";
+import { buildNotificationPreview, type PreviewEvent } from "./integrations/apns/preview";
 import { mobileBootstrap, publicState } from "./runtime/views";
 import { checkConnector, createConnector, credentialTemplateForProvider, deleteConnector, firstUngrantedCredential, isSkillActive, updateConnector } from "./integrations/connectors";
 import { gwsSessionStatus } from "./integrations/connectors/gws-session";
@@ -1671,6 +1673,50 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       // either leaks information about other credentials' devices.
       if (!removed) return json({ error: "Device not found" }, 404);
       return json({ ok: true });
+    }],
+    // Notification-preview endpoint for the iOS Notification Service
+    // Extension (NSE). When a `mutable-content: 1` push lands, the NSE
+    // runs on-device and calls this to fetch the real, human-readable
+    // title + body, then rewrites the lock-screen banner before display.
+    // The APNs wire payload carries only ids + a generic string, so this
+    // is the path that surfaces the actual message text WITHOUT it ever
+    // transiting Apple's servers (see ADR mobile-push-notifications.md).
+    // Bearer-gated like every other /api route; the NSE reads the bearer
+    // from the App Group shared container the main app writes on auth.
+    ["GET", /^\/api\/push\/preview$/, async (request) => {
+      const credential = await resolveCredentialFromBearer(config, bearerFromRequest(request));
+      if (!credential) return json({ error: "Unauthorized" }, 401);
+      const params = new URL(request.url).searchParams;
+      const sessionId = (params.get("sessionId") ?? "").trim();
+      const event = (params.get("event") ?? "").trim();
+      const approvalId = (params.get("approvalId") ?? "").trim() || undefined;
+      if (!sessionId) return json({ error: "sessionId is required" }, 400);
+      if (event !== "message_completed" && event !== "authorization_requested" && event !== "setup_requested") {
+        return json({ error: "event must be message_completed, authorization_requested, or setup_requested" }, 400);
+      }
+      // Validate the session belongs to this instance so a stale or
+      // foreign sessionId 404s rather than leaking a generic empty preview.
+      const state = readState(config.instance);
+      const session = state.chatSessions.find((s) => s.id === sessionId);
+      if (!session) return json({ error: `Chat session not found: ${sessionId}` }, 404);
+      const preview = buildNotificationPreview(
+        config.instance,
+        { event: event as PreviewEvent, sessionId, approvalId },
+        {
+          latestAssistantText: latestAssistantTextForSession,
+          sessionTitle: (_inst, id) =>
+            readState(config.instance).chatSessions.find((s) => s.id === id)?.title ?? null,
+          authorization: (_inst, id) =>
+            readState(config.instance).authorizations.find((a) => a.id === id && a.status === "pending") ?? null,
+          setupRequest: (_inst, id) =>
+            readState(config.instance).setupRequests.find((s) => s.id === id && s.status === "pending") ?? null
+        }
+      );
+      // No preview ⇒ the underlying content is gone (resolved approval,
+      // not-yet-persisted message). 404 tells the NSE to keep the generic
+      // as-sent banner instead of blanking it.
+      if (!preview) return json({ error: "No preview available" }, 404);
+      return json(preview);
     }],
     // Chat read-state + badge endpoints. The mobile app POSTs to
     // /read every time the user lands on a chat detail so the gateway

@@ -35,6 +35,27 @@ describe("with-approval-notification-service", () => {
     expect(opts.iosDeployment).toBe("16.0");
   });
 
+  test("resolveOptions derives the App Group from the host bundle id", () => {
+    const opts = plugin.resolveOptions({}, "ai.lilaclabs.gini.mobile");
+    expect(opts.appGroup).toBe("group.ai.lilaclabs.gini.mobile");
+  });
+
+  test("resolveOptions falls back to the default bundle id when none is passed", () => {
+    const opts = plugin.resolveOptions({});
+    expect(opts.appGroup).toBe("group.ai.lilaclabs.gini.mobile");
+  });
+
+  test("resolveOptions respects an explicit appGroup override", () => {
+    const opts = plugin.resolveOptions({ appGroup: "group.custom.id" }, "ai.lilaclabs.gini.mobile");
+    expect(opts.appGroup).toBe("group.custom.id");
+  });
+
+  test("buildExtensionEntitlements carries the App Group membership", () => {
+    const opts = plugin.resolveOptions({}, "ai.lilaclabs.gini.mobile");
+    const ent = plugin.buildExtensionEntitlements(opts);
+    expect(ent[plugin.APP_GROUPS_ENTITLEMENT]).toEqual(["group.ai.lilaclabs.gini.mobile"]);
+  });
+
   test("buildExtensionInfoPlist sets the two required NSE keys", () => {
     const info = plugin.buildExtensionInfoPlist(plugin.resolveOptions({}));
     expect(info.NSExtension.NSExtensionPointIdentifier).toBe(
@@ -69,9 +90,11 @@ describe("with-approval-notification-service", () => {
 
       const swiftPath = path.join(tempRoot, "ios", opts.targetName, "NotificationService.swift");
       const plistPath = path.join(tempRoot, "ios", opts.targetName, `${opts.targetName}-Info.plist`);
+      const entitlementsPath = path.join(tempRoot, "ios", opts.targetName, `${opts.targetName}.entitlements`);
 
       expect(fs.existsSync(swiftPath)).toBe(true);
       expect(fs.existsSync(plistPath)).toBe(true);
+      expect(fs.existsSync(entitlementsPath)).toBe(true);
 
       // The written Swift must match the canonical source byte-for-byte —
       // no munging during the copy, so an Xcode-side debug session
@@ -84,6 +107,13 @@ describe("with-approval-notification-service", () => {
       expect(parsed.NSExtension.NSExtensionPointIdentifier).toBe(
         "com.apple.usernotifications.service"
       );
+
+      // The NSE entitlements carry the shared App Group so the extension
+      // can reach the container the app writes credentials into.
+      const entitlements = plist.parse(fs.readFileSync(entitlementsPath, "utf8"));
+      expect(entitlements[plugin.APP_GROUPS_ENTITLEMENT]).toEqual([
+        "group.ai.lilaclabs.gini.mobile"
+      ]);
     } finally {
       fs.rmSync(tempRoot, { recursive: true, force: true });
     }

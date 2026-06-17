@@ -4963,6 +4963,151 @@ describe("runtime api", () => {
     });
   });
 
+  describe("push preview endpoint", () => {
+    test("GET /api/push/preview returns the latest assistant reply for a completed message", async () => {
+      const config = testConfig("push-preview-message");
+      const handler = createHandler(config);
+      const session = await call(handler, config, "/api/chat", {
+        method: "POST",
+        body: JSON.stringify({ title: "Morning briefing" })
+      });
+      const submitted = await call(handler, config, `/api/chat/${session.id}/messages`, {
+        method: "POST",
+        body: JSON.stringify({ content: "what's up" })
+      });
+      await waitForTask(handler, config, submitted.taskId);
+
+      const preview = await call(
+        handler,
+        config,
+        `/api/push/preview?sessionId=${session.id}&event=message_completed`
+      );
+      expect(preview.title).toBe("Morning briefing");
+      // The echo provider replies with the user's text; the body must be
+      // the actual reply, NOT a generic "Tap to read" string.
+      expect(typeof preview.body).toBe("string");
+      expect(preview.body.length).toBeGreaterThan(0);
+      expect(preview.body).not.toBe("Tap to read");
+    });
+
+    test("GET /api/push/preview 404s when the session has no assistant message yet", async () => {
+      const config = testConfig("push-preview-empty");
+      const handler = createHandler(config);
+      const session = await call(handler, config, "/api/chat", {
+        method: "POST",
+        body: JSON.stringify({ title: "Empty chat" })
+      });
+      const res = await rawCall(
+        handler,
+        config,
+        `/api/push/preview?sessionId=${session.id}&event=message_completed`,
+        {},
+        config.token
+      );
+      expect(res.status).toBe(404);
+    });
+
+    test("GET /api/push/preview surfaces a pending authorization's risk + summary", async () => {
+      const config = testConfig("push-preview-approval");
+      const handler = createHandler(config);
+      const session = await call(handler, config, "/api/chat", {
+        method: "POST",
+        body: JSON.stringify({ title: "Deploy bot" })
+      });
+      const { createAuthorization } = await import("./state");
+      const approval = await mutateState(config.instance, (state) =>
+        createAuthorization(state, {
+          action: "terminal.exec",
+          target: "rm -rf build",
+          risk: "high",
+          reason: "Clear the stale build cache",
+          payload: {}
+        })
+      );
+
+      const preview = await call(
+        handler,
+        config,
+        `/api/push/preview?sessionId=${session.id}&event=authorization_requested&approvalId=${approval.id}`
+      );
+      expect(preview.title).toBe("Approve in Deploy bot?");
+      expect(preview.body).toBe("[high] Clear the stale build cache");
+    });
+
+    test("GET /api/push/preview surfaces a pending setup request's ask", async () => {
+      const config = testConfig("push-preview-setup");
+      const handler = createHandler(config);
+      const session = await call(handler, config, "/api/chat", {
+        method: "POST",
+        body: JSON.stringify({ title: "Email watch" })
+      });
+      const { createSetupRequest } = await import("./state");
+      const setup = await mutateState(config.instance, (state) =>
+        createSetupRequest(state, {
+          action: "browser.connect",
+          target: "https://example.com/login",
+          reason: "Sign in to your email provider",
+          payload: {}
+        })
+      );
+
+      const preview = await call(
+        handler,
+        config,
+        `/api/push/preview?sessionId=${session.id}&event=setup_requested&approvalId=${setup.id}`
+      );
+      expect(preview.title).toBe("Finish a step in Email watch");
+      expect(preview.body).toBe("Sign in to your email provider");
+    });
+
+    test("GET /api/push/preview validates inputs and auth", async () => {
+      const config = testConfig("push-preview-validation");
+      const handler = createHandler(config);
+      const session = await call(handler, config, "/api/chat", {
+        method: "POST",
+        body: JSON.stringify({ title: "Validation chat" })
+      });
+
+      // Unauthenticated.
+      const noAuth = await rawCall(
+        handler,
+        config,
+        `/api/push/preview?sessionId=${session.id}&event=message_completed`
+      );
+      expect(noAuth.status).toBe(401);
+
+      // Missing sessionId.
+      const noSession = await rawCall(
+        handler,
+        config,
+        `/api/push/preview?event=message_completed`,
+        {},
+        config.token
+      );
+      expect(noSession.status).toBe(400);
+
+      // Unknown event.
+      const badEvent = await rawCall(
+        handler,
+        config,
+        `/api/push/preview?sessionId=${session.id}&event=bogus`,
+        {},
+        config.token
+      );
+      expect(badEvent.status).toBe(400);
+
+      // Unknown session.
+      const badSession = await rawCall(
+        handler,
+        config,
+        `/api/push/preview?sessionId=chat_nope&event=message_completed`,
+        {},
+        config.token
+      );
+      expect(badSession.status).toBe(404);
+    });
+  });
+
   describe("cors", () => {
     // Save/restore the env override so individual cases don't leak.
     function withEnv(value: string | undefined, fn: () => Promise<void>): Promise<void> {

@@ -111,6 +111,7 @@ export {
   deleteChatBlock,
   findInFlightAssistantTextForTask,
   taskProducedAssistantText,
+  latestAssistantTextForSession,
   getLatestMessagesBySession,
   subscribeChatBlocks,
   subscribeAllChatBlocks

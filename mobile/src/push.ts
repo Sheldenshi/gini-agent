@@ -483,6 +483,31 @@ async function postDevice(token: string, bundleId: string): Promise<void> {
     method: "POST",
     body: JSON.stringify({ token, platform: "ios", bundleId })
   });
+  // Fold the freshly-registered device token into the App Group shared
+  // container alongside the gateway base URL + bearer so the iOS
+  // Notification Service Extension can send X-Device-Token when it fetches
+  // the notification preview. Best-effort — a failure here must not fail
+  // registration, and the NSE's preview endpoint works without the header.
+  mirrorDeviceTokenToSharedContainer(token);
+}
+
+// Rewrite the App Group shared credentials to include the device token.
+// Reads the live gateway base URL + bearer from the auth cache (the same
+// pair the NSE authenticates with) and re-writes the shared file. Lazy
+// requires keep the import graph acyclic (auth → push → api) and let
+// non-RN bundles skip the native file write.
+function mirrorDeviceTokenToSharedContainer(deviceToken: string): void {
+  try {
+    const auth = require("./auth") as { readCachedCredentials?: () => { baseUrl: string; token: string } | null };
+    const creds = auth.readCachedCredentials?.();
+    if (!creds) return;
+    const shared = require("./shared-credentials") as {
+      writeSharedCredentials?: (c: { baseUrl: string; token: string; deviceToken?: string }) => void;
+    };
+    shared.writeSharedCredentials?.({ baseUrl: creds.baseUrl, token: creds.token, deviceToken });
+  } catch {
+    // require can throw in non-RN envs — best effort.
+  }
 }
 
 // Reads the bundle id from expo-constants. Falls back to null when

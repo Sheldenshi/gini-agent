@@ -533,6 +533,41 @@ export function taskProducedAssistantText(
   return false;
 }
 
+// Returns the full text of the most recent non-empty assistant_text block
+// in a session, or null when the session has no such block. The push
+// notification-preview endpoint consults this so the iOS Notification
+// Service Extension can show the latest assistant reply on the lock
+// screen. Because it reads the latest row by ordinal (not by task), a
+// notification collapsed onto a single session entry always reflects the
+// newest message even across multiple agent turns. Thread replies are
+// excluded so the preview tracks the main chat the notification deep-links
+// to. Ordering by ordinal DESC + LIMIT 1 keeps the read O(1) on the
+// session index.
+export function latestAssistantTextForSession(
+  instance: Instance,
+  sessionId: string
+): string | null {
+  const db = getMemoryDb(instance);
+  const rows = db
+    .query<{ payload_json: string }, [string]>(
+      `SELECT payload_json FROM chat_blocks
+       WHERE session_id = ? AND kind = 'assistant_text' AND thread_id IS NULL
+       ORDER BY ordinal DESC`
+    )
+    .all(sessionId);
+  for (const r of rows) {
+    try {
+      const payload = JSON.parse(r.payload_json) as { text?: unknown };
+      if (typeof payload.text === "string" && payload.text.trim().length > 0) {
+        return payload.text;
+      }
+    } catch {
+      // malformed row — skip and keep scanning older blocks
+    }
+  }
+  return null;
+}
+
 // Updates an existing assistant_text block's text + updated_at without
 // allocating a new ordinal. Used by the streaming-delta path: the first
 // delta inserts the block via insertChatBlock; subsequent deltas flow

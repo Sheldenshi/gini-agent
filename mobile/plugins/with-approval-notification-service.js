@@ -27,6 +27,15 @@
  *                      signing can resolve a provisioning profile.
  *                      Without it, Xcode emits the misleading
  *                      "resource bundles are signed by default" error.
+ *   - `appGroup`     — App Group id shared by the main app and the NSE so
+ *                      the extension can read the gateway base URL + bearer
+ *                      the app writes to the shared container. Defaults to
+ *                      "group.<hostBundleId>". Both targets get the
+ *                      `com.apple.security.application-groups` entitlement
+ *                      with this id; the NSE fetch-and-enrich path
+ *                      (NotificationService.swift) reads the creds from the
+ *                      container that id resolves to. See ADR
+ *                      mobile-push-notifications.md.
  *
  * Source of truth for the Swift NSE itself:
  *   mobile/ios-extensions/ApprovalNotificationService/NotificationService.swift
@@ -34,7 +43,11 @@
  *   every prebuild so the on-disk source is the canonical reference.
  */
 
-const { withDangerousMod, withXcodeProject } = require("@expo/config-plugins");
+const {
+  withDangerousMod,
+  withEntitlementsPlist,
+  withXcodeProject
+} = require("@expo/config-plugins");
 const fs = require("fs");
 const path = require("path");
 const plist = require("plist");
@@ -42,6 +55,8 @@ const plist = require("plist");
 const DEFAULT_TARGET_NAME = "ApprovalNotificationService";
 const DEFAULT_BUNDLE_SUFFIX = ".notificationservice";
 const DEFAULT_IOS_DEPLOYMENT = "15.1";
+// The entitlement key both targets need to share an App Group container.
+const APP_GROUPS_ENTITLEMENT = "com.apple.security.application-groups";
 
 // Returns the absolute path to the canonical NSE source bundled in the
 // repo. The plugin reads from here and writes into the prebuild output
@@ -97,6 +112,17 @@ function writeExtensionSources(projectRoot, opts) {
 
   const infoPlistContents = plist.build(buildExtensionInfoPlist(opts));
   fs.writeFileSync(path.join(targetDir, `${opts.targetName}-Info.plist`), infoPlistContents, "utf8");
+
+  // The NSE's own .entitlements carries the App Group membership so the
+  // extension process can resolve the shared container. withEntitlementsPlist
+  // only reaches the MAIN app target, so the extension needs its own file
+  // written here and linked via CODE_SIGN_ENTITLEMENTS below.
+  const entitlementsContents = plist.build(buildExtensionEntitlements(opts));
+  fs.writeFileSync(
+    path.join(targetDir, `${opts.targetName}.entitlements`),
+    entitlementsContents,
+    "utf8"
+  );
 }
 
 // Adds (or no-ops if already present) the NSE target inside the
@@ -209,6 +235,12 @@ function addExtensionTarget(xcodeProject, opts, hostBundleId) {
   //     PBXBuildFile), which is what we want.
   xcodeProject.addFile(`${targetName}-Info.plist`, pbxGroup.uuid);
 
+  // 5b) Register the NSE's .entitlements the same way — a plain file
+  //     reference consumed via the CODE_SIGN_ENTITLEMENTS build setting
+  //     (configured below). Like the Info.plist it must NOT land in a
+  //     resources build phase; addFile creates only the PBXFileReference.
+  xcodeProject.addFile(`${targetName}.entitlements`, pbxGroup.uuid);
+
   // 6) Configure per-build-config settings the NSE needs:
   //    - Info.plist path
   //    - Bundle id
@@ -224,6 +256,9 @@ function addExtensionTarget(xcodeProject, opts, hostBundleId) {
       const buildSettings = config.buildSettings;
       if (buildSettings.PRODUCT_NAME && buildSettings.PRODUCT_NAME.replace(/"/g, "") === targetName) {
         buildSettings.INFOPLIST_FILE = `"${targetName}/${targetName}-Info.plist"`;
+        // Links the NSE's .entitlements (App Group membership) so the
+        // extension is signed with access to the shared container.
+        buildSettings.CODE_SIGN_ENTITLEMENTS = `"${targetName}/${targetName}.entitlements"`;
         buildSettings.PRODUCT_BUNDLE_IDENTIFIER = `"${productBundleId}"`;
         buildSettings.IPHONEOS_DEPLOYMENT_TARGET = opts.iosDeployment;
         buildSettings.SWIFT_VERSION = "5.0";
@@ -248,28 +283,60 @@ function addExtensionTarget(xcodeProject, opts, hostBundleId) {
 
 // Resolves the plugin's options against a partial input. Exported so
 // the unit test can verify defaults without invoking the full plugin
-// chain.
-function resolveOptions(rawOpts) {
+// chain. `hostBundleId` lets the App Group default derive from the app's
+// bundle id when the caller didn't pin one explicitly.
+function resolveOptions(rawOpts, hostBundleId) {
   const opts = rawOpts || {};
+  const bundleId = hostBundleId || "ai.lilaclabs.gini.mobile";
   return {
     targetName: opts.targetName || DEFAULT_TARGET_NAME,
     bundleSuffix: opts.bundleSuffix || DEFAULT_BUNDLE_SUFFIX,
     iosDeployment: opts.iosDeployment || DEFAULT_IOS_DEPLOYMENT,
-    appleTeamId: opts.appleTeamId
+    appleTeamId: opts.appleTeamId,
+    appGroup: opts.appGroup || `group.${bundleId}`
+  };
+}
+
+// Builds the NSE target's .entitlements contents. The only key is the
+// App Group membership so the extension's FileManager can resolve the
+// same shared container the main app writes credentials into. Exported so
+// the unit test can assert the shape.
+function buildExtensionEntitlements(opts) {
+  return {
+    [APP_GROUPS_ENTITLEMENT]: [opts.appGroup]
   };
 }
 
 /**
- * The plugin entry point. Composes two mods:
- *   1. A dangerous mod that writes the NSE source files into the
- *      prebuild output (runs before the Xcode mod so the file
+ * The plugin entry point. Composes three mods:
+ *   1. withEntitlementsPlist — add the App Group to the MAIN app target so
+ *      the JS layer can write credentials into the shared container.
+ *   2. withDangerousMod — write the NSE source + Info.plist + .entitlements
+ *      into the prebuild output (runs before the Xcode mod so the file
  *      references it adds resolve to real on-disk files).
- *   2. An Xcode-project mod that registers the NSE as a target.
+ *   3. withXcodeProject — register the NSE as a target and link its
+ *      .entitlements.
  */
 const withApprovalNotificationService = (config, rawOpts) => {
-  const opts = resolveOptions(rawOpts);
+  const hostBundleId =
+    config.ios && config.ios.bundleIdentifier
+      ? config.ios.bundleIdentifier
+      : "ai.lilaclabs.gini.mobile";
+  const opts = resolveOptions(rawOpts, hostBundleId);
 
-  // Mod 1: write the NSE source + Info.plist to disk.
+  // Mod 1: add the App Group entitlement to the MAIN app target. This is
+  // the half withEntitlementsPlist can reach; the NSE target's entitlements
+  // are written separately in Mod 2 (withEntitlementsPlist edits only the
+  // app). Merge into any existing array so we don't clobber other groups.
+  config = withEntitlementsPlist(config, (cfg) => {
+    const existing = cfg.modResults[APP_GROUPS_ENTITLEMENT];
+    const groups = Array.isArray(existing) ? existing.slice() : [];
+    if (!groups.includes(opts.appGroup)) groups.push(opts.appGroup);
+    cfg.modResults[APP_GROUPS_ENTITLEMENT] = groups;
+    return cfg;
+  });
+
+  // Mod 2: write the NSE source + Info.plist + .entitlements to disk.
   config = withDangerousMod(config, [
     "ios",
     (cfg) => {
@@ -278,12 +345,8 @@ const withApprovalNotificationService = (config, rawOpts) => {
     }
   ]);
 
-  // Mod 2: register the NSE target inside the Xcode project.
+  // Mod 3: register the NSE target inside the Xcode project.
   config = withXcodeProject(config, (cfg) => {
-    const hostBundleId =
-      cfg.ios && cfg.ios.bundleIdentifier
-        ? cfg.ios.bundleIdentifier
-        : "ai.lilaclabs.gini.mobile";
     cfg.modResults = addExtensionTarget(cfg.modResults, opts, hostBundleId);
     return cfg;
   });
@@ -296,6 +359,8 @@ module.exports = withApprovalNotificationService;
 // default export above, not these named ones).
 module.exports.resolveOptions = resolveOptions;
 module.exports.buildExtensionInfoPlist = buildExtensionInfoPlist;
+module.exports.buildExtensionEntitlements = buildExtensionEntitlements;
 module.exports.readCanonicalSwiftSource = readCanonicalSwiftSource;
 module.exports.addExtensionTarget = addExtensionTarget;
 module.exports.writeExtensionSources = writeExtensionSources;
+module.exports.APP_GROUPS_ENTITLEMENT = APP_GROUPS_ENTITLEMENT;

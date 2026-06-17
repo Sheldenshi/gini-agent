@@ -1,4 +1,4 @@
-# ADR: Mobile Push Notifications (APNs + NSE + Inline Actions)
+# ADR: Mobile Push Notifications (APNs + NSE Enrichment + Inline Actions)
 
 - **Status:** Accepted
 - **Date:** 2026-05-26
@@ -13,17 +13,25 @@ intermediate relay — the gateway holds the `.p8` signing key and posts
 straight to `api.push.apple.com`.
 
 Pushes carry **ids only** (sessionId, blockId, approvalId, event tag).
-The notification body is a generic string (`"Tap to review"` for
-approvals; silent payload for completions). The mobile client fetches
-full content via the existing `/api/*` surface on tap, action, or
-foreground refresh.
+The APNs wire body is a generic string (`"Tap to review"` for approvals,
+`"Tap to read"` for completions; silent payload for badge-only
+completions) — Apple's servers never see chat content.
 
-Lock-screen Approve / Deny action buttons on approval pushes are
-implemented as an iOS **Notification Service Extension** (NSE) plus a
-`UNNotificationCategory` registered by the main app. The NSE attaches
-the category id on incoming `approval_requested` payloads; the OS
-renders the action buttons; tapping an action posts directly to
-`/api/approvals/:id/approve` or `/deny` without opening the app.
+The lock-screen banner is then **enriched on-device** by the iOS
+**Notification Service Extension** (NSE). On a `mutable-content: 1` push,
+the NSE fetches the real preview from the gateway's
+`GET /api/push/preview` over the device's own authenticated connection
+and rewrites the title + body before display. The message text reaches
+the device out-of-band; it never transits Apple. On any failure (no
+shared creds, network error, non-200, timeout) the NSE falls back to the
+generic as-sent banner, so the user always sees a notification.
+
+Lock-screen Approve / Deny action buttons on approval pushes are also
+implemented by the NSE plus a `UNNotificationCategory` registered by the
+main app. The NSE attaches the category id on incoming
+`authorization_requested` / `setup_requested` payloads; the OS renders
+the action buttons; tapping an action posts directly to
+`/api/authorizations/:id/approve` or `/deny` without opening the app.
 
 The mobile build moves from purely managed Expo to a **dev client +
 `expo prebuild`** workflow on iOS to host the NSE. The plugin
@@ -64,15 +72,17 @@ The chosen design uses two transports in concert:
   `APNS_KEY_P8_PATH` from env. The key never leaves the gateway
   process. ES256 JWT is cached for 50 minutes and rotated on demand.
 - **Payload scope**: APNs alert payloads contain `{ sessionId, blockId,
-  approvalId, event }` and a fixed `{ title: "Gini needs your
-  approval", body: "Tap to review" }`. No chat text, no tool name, no
-  approval summary. Silent payloads carry the same routing fields and
-  `content-available: 1`. The exhaustive privacy assertion is pinned
-  in `src/integrations/apns/dispatcher.test.ts` — any future regression
-  that adds user content to the wire surface fails the suite.
+  approvalId, event }` and a fixed `{ title, body }` generic string. No
+  chat text, no tool name, no approval summary. Silent payloads carry the
+  same routing fields and `content-available: 1`. The exhaustive privacy
+  assertion is pinned in `src/integrations/apns/dispatcher.test.ts` — any
+  future regression that adds user content to the **wire** surface fails
+  the suite. The rich preview the user sees is fetched on-device by the
+  NSE (see "NSE enrichment" below), never placed on the wire.
 - **Apple sees**: sessionId-shaped opaque strings, app bundle id, and
   the generic title. Apple does not see the chat content, the agent
-  name, or any user-authored text.
+  name, or any user-authored text — even though the user reads a rich
+  preview on their lock screen.
 
 ## Trigger policy
 
@@ -97,6 +107,58 @@ two iOS installs of the same human can be in different app states
 (one watching, one backgrounded). The backgrounded install still gets
 the wake-up (alert or silent) so its badge and visible state stay in
 sync.
+
+## NSE enrichment (rich previews without leaking text to Apple)
+
+The default banner is intentionally content-free on the wire. To let the
+user read a notification without tapping in — while keeping chat text off
+Apple's servers — the NSE fetches the real preview on-device after the
+push arrives:
+
+1. **Server**: `GET /api/push/preview?sessionId=&event=&approvalId=`
+   (`src/http.ts`) returns a notification-ready `{ title, body }` built by
+   `src/integrations/apns/preview.ts`. Three event kinds resolve:
+   - `message_completed` → the **latest** non-empty `assistant_text` in
+     the session (`latestAssistantTextForSession`). Reading the newest
+     block — not a specific one — is what makes a banner collapsed onto a
+     single session entry track the last message across multiple agent
+     turns.
+   - `authorization_requested` → the approval's risk + reason
+     (`[high] <reason>`), titled `Approve in <chat>?`.
+   - `setup_requested` → the setup ask, titled `Finish a step in <chat>`.
+   The route is bearer-gated like every other `/api/*` route; a resolved
+   approval, deleted session, or not-yet-persisted message returns 404 so
+   the NSE keeps the generic banner.
+
+2. **Credential bridge**: the NSE runs in its own process and cannot read
+   the app's AsyncStorage. The main app mirrors `{ baseUrl, token,
+   deviceToken }` into an **App Group** shared container
+   (`group.<bundleId>`) via `expo-file-system`'s
+   `Paths.appleSharedContainers` (`mobile/src/shared-credentials.ts`),
+   written on credential save and after push registration, cleared on
+   sign-out. The NSE reads the same file via
+   `FileManager.containerURL(forSecurityApplicationGroupIdentifier:)` —
+   the two APIs resolve to the same on-disk container. The config plugin
+   grants the App Group entitlement to both the app target
+   (`withEntitlementsPlist`) and the NSE target (a dedicated
+   `.entitlements` linked via `CODE_SIGN_ENTITLEMENTS`).
+
+3. **NSE** (`NotificationService.swift`): reads the shared creds, reads
+   the routing fields from `userInfo["body"]`, calls the preview endpoint
+   (20s budget, under Apple's 30s NSE ceiling), and rewrites `title` /
+   `body`. On any failure it hands back the original generic content via
+   `contentHandler` / `serviceExtensionTimeWillExpire`.
+
+**Privacy invariant preserved**: the enriched text travels gateway →
+device over the device's own authenticated connection. APNs still only
+ever carries ids + the generic string. The credential file holds the
+gateway bearer (never chat content) in the app's own sandboxed App Group
+container.
+
+**Update-across-turns**: completion pushes collapse by `sessionId`
+(`apns-collapse-id`), so a later push **replaces** the earlier banner
+rather than stacking; combined with the latest-message lookup, the single
+lock-screen entry always reflects the newest assistant reply.
 
 ## NSE + category model
 

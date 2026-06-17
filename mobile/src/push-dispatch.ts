@@ -39,10 +39,17 @@ export interface ResponseLike {
 
 /**
  * Routes an incoming `NotificationResponse` to the right side-effect:
- *   - APPROVE button → POST /api/approvals/:id/approve
- *   - DENY button → POST /api/approvals/:id/deny
+ *   - APPROVE button → POST /api/authorizations/:id/approve
+ *   - DENY button → POST /api/authorizations/:id/deny
  *   - any other actionIdentifier (default tap, future actions) →
  *     navigate to /chat/:sessionId if the payload carries one
+ *
+ * The action buttons only ride on `authorization_requested` pushes (the
+ * server-side NSE attaches the APPROVAL_REQUEST category for that event
+ * alone); setup requests need the app and deep-link on tap instead. The
+ * approvalId carried by an authorization push is the authorization id, so
+ * these post to /api/authorizations/:id/{approve,deny} — the canonical
+ * routes in src/http.ts.
  *
  * Action failures (network error, 5xx from the gateway) schedule a
  * follow-up local notification ("Failed to approve — open the app")
@@ -63,7 +70,7 @@ export async function dispatchNotificationResponse(
   if (response.actionIdentifier === APPROVE_ACTION) {
     if (!approvalId) return { kind: "ignored" };
     try {
-      await deps.apiCall(`/approvals/${approvalId}/approve`, { method: "POST" });
+      await deps.apiCall(`/authorizations/${approvalId}/approve`, { method: "POST" });
       return { kind: "approve", approvalId };
     } catch {
       await deps.notifyFailure("approve");
@@ -74,7 +81,7 @@ export async function dispatchNotificationResponse(
   if (response.actionIdentifier === DENY_ACTION) {
     if (!approvalId) return { kind: "ignored" };
     try {
-      await deps.apiCall(`/approvals/${approvalId}/deny`, { method: "POST" });
+      await deps.apiCall(`/authorizations/${approvalId}/deny`, { method: "POST" });
       return { kind: "deny", approvalId };
     } catch {
       await deps.notifyFailure("deny");
