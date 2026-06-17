@@ -8,7 +8,7 @@
 // (idempotent). Hosted by a slow abortable loop in src/server.ts.
 
 import type { ChatSessionRecord, RuntimeConfig, SkillOutcome } from "../types";
-import { createChatMessage, createChatSession, mutateState, now, readState } from "../state";
+import { createChatMessage, createChatSession, insertChatBlock, mutateState, now, readState } from "../state";
 import { reflectOnSkillOutcomes } from "./reflect";
 
 const SKILL_REVIEW_TITLE = "Skill review";
@@ -126,6 +126,16 @@ async function runDailyReviewInner(config: RuntimeConfig): Promise<DailyReviewRe
     });
     // Advance the digest watermark so the next run won't re-post these.
     s.lastSkillReviewDigestAt = now();
+  });
+  // The chat UI renders BLOCKS (the /blocks stream web + mobile read), not the
+  // durable chatMessages transcript — so emit a renderable assistant_text block
+  // too, or the digest persists invisibly. insertChatBlock self-manages its
+  // SQLite savepoint, so it runs cleanly after the JSON-state mutation above.
+  insertChatBlock(config.instance, {
+    sessionId,
+    kind: "assistant_text",
+    text: digest,
+    streaming: false
   });
 
   return {

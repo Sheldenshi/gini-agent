@@ -5,7 +5,7 @@
 
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
-import { addAudit, mutateState, readState } from "../state";
+import { addAudit, listChatBlocks, mutateState, readState } from "../state";
 import { proposeImprovement } from "../governance/improvements";
 import { recordObjectiveOutcomes } from "./outcomes";
 import { ensureSkillReviewSession, runDailyReview } from "./daily-review";
@@ -133,6 +133,14 @@ describe("runDailyReview", () => {
     expect(session.messageIds.length).toBe(1);
     const message = state.chatMessages.find((m) => m.id === session.messageIds[0]);
     expect(message!.content).toContain("Quick questions about recent actions");
+    // The digest must also emit a renderable assistant_text block — the chat UI
+    // reads the /blocks stream, not the durable chatMessages transcript.
+    const blocks = listChatBlocks(instance, session.id);
+    expect(
+      blocks.some(
+        (b) => b.kind === "assistant_text" && b.text.includes("Quick questions about recent actions")
+      )
+    ).toBe(true);
   });
 
   test("a standing proposal is not re-posted on the next run", async () => {
