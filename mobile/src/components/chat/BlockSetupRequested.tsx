@@ -22,7 +22,9 @@ export function BlockSetupRequested({
         ? "Connection setup needed"
         : block.action === "browser.fill_secret"
           ? "Credentials needed"
-          : block.action;
+          : block.action === "confirmation.request"
+            ? "Confirmation needed"
+            : block.action;
   const hint =
     isConnectorRequest
       ? "Finish this setup in Gini on your Mac. This chat is paused until the connection is completed or the turn is stopped."
@@ -30,7 +32,9 @@ export function BlockSetupRequested({
         ? "Finish this step from Gini on your Mac. This chat is paused until setup is completed or the turn is stopped."
         : block.action === "browser.fill_secret"
           ? "Enter the requested value from Gini on your Mac. This chat is paused until the value is submitted or the turn is stopped."
-          : "Open Gini on your Mac to continue, or stop this turn from the composer.";
+          : block.action === "confirmation.request"
+            ? "Confirm or cancel from Gini on your Mac. This chat is paused until you decide or the turn is stopped."
+            : "Open Gini on your Mac to continue, or stop this turn from the composer.";
   return (
     <View style={styles.row}>
       <View style={styles.header}>
