@@ -3928,6 +3928,53 @@ describe("chat-task loop", () => {
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
 
+  // Issue #397: an inline-handled tool (load_tools here; the deferred-not-loaded
+  // nudge and start_thread share the branch) must PERSIST its tool result to
+  // the durable transcript, paired with the assistant tool_use row. Otherwise a
+  // later turn (or any rebuild) replays the assistant tool_use with no result,
+  // and a tool-pairing-strict provider (Bedrock Converse, Anthropic Messages)
+  // 400s the whole request. Pin: after a load_tools turn, the channel's durable
+  // chatMessages carry both the assistant call AND a role:"tool" result for it.
+  test("inline load_tools persists a paired tool_result row in the durable transcript", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-inline-persist");
+    const provider = normalizeProvider(config.provider);
+
+    const sessionId = await mutateState(config.instance, (state) =>
+      createChatSession(state, "Inline persist").id
+    );
+
+    // Turn 1: an inline load_tools call. Turn 2: a tool-less final answer.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_inline_load", type: "function", function: { name: "load_tools", arguments: JSON.stringify({ names: ["browser_snapshot"] }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    setEchoToolCallingResponse({ provider, text: "Ready.", toolCalls: [], finishReason: "stop" });
+
+    const task = await submitTask(config, "load the browser tools", { mode: "chat", chatSessionId: sessionId });
+    const finished = await waitForTerminal(config, task.id, 10000);
+    expect(finished.status).toBe("completed");
+
+    const durable = readState(config.instance).chatMessages.filter(
+      (m) => m.sessionId === sessionId && m.kind === "tool_transcript"
+    );
+    // The assistant tool_use row was persisted...
+    const assistantCall = durable.find(
+      (m) => m.role === "assistant" && (m.toolCalls ?? []).some((c) => c.id === "call_inline_load")
+    );
+    expect(assistantCall).toBeDefined();
+    // ...AND its inline result is now a paired durable row (the fix).
+    const pairedResult = durable.find((m) => m.role === "tool" && m.toolCallId === "call_inline_load");
+    expect(pairedResult).toBeDefined();
+    expect(String(pairedResult?.content)).toContain("callable directly");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
   // Fan-out watch worker history. A session-bound subagent (chatSessionId set,
   // no run.conversationId — exactly how dispatchFanOut spawns a concern-channel
   // worker) must land its turn in the channel's durable chatMessages so a later

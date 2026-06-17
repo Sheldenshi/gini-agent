@@ -2984,6 +2984,13 @@ async function runLoop(
         }
         const content = JSON.stringify(resultPayload);
         toolResultMessages.push({ role: "tool", tool_call_id: call.id, content });
+        // Persist the inline result so the assistant tool_use row stays paired
+        // in the durable transcript (issue #397 — see the load_tools branch).
+        persistTranscriptRow(config, taskId, transcriptSessionId, {
+          role: "tool",
+          toolCallId: call.id,
+          content
+        });
         await mutateState(config.instance, (state) => {
           const item = findTask(state, taskId);
           if (isTerminalTaskStatus(item.status)) return;
@@ -3025,6 +3032,15 @@ async function runLoop(
           item.updatedAt = now();
         });
         toolResultMessages.push({ role: "tool", tool_call_id: call.id, content: result });
+        // Persist the inline result so the durable transcript pairs the
+        // assistant tool_use row above with its result. Without this a later
+        // replay rebuilds a dangling tool_use that tool-pairing-strict
+        // providers (Bedrock Converse, Anthropic Messages) reject (issue #397).
+        persistTranscriptRow(config, taskId, transcriptSessionId, {
+          role: "tool",
+          toolCallId: call.id,
+          content: result
+        });
         emitToolCallStatus(emitCtx, { callId: call.id, status: "ok" });
         emitToolResult(emitCtx, { callId: call.id, result });
         continue;
@@ -3045,6 +3061,13 @@ async function runLoop(
           error: `Tool '${call.function.name}' is available but not loaded yet. Call load_tools({"names":["${call.function.name}"]}) first, then call it on the next turn.`
         });
         toolResultMessages.push({ role: "tool", tool_call_id: call.id, content: nudge });
+        // Persist the nudge result so the assistant tool_use row stays paired
+        // in the durable transcript (issue #397 — see the load_tools branch).
+        persistTranscriptRow(config, taskId, transcriptSessionId, {
+          role: "tool",
+          toolCallId: call.id,
+          content: nudge
+        });
         emitToolCallStatus(emitCtx, { callId: call.id, status: "error", errorMessage: "tool not loaded" });
         emitToolResult(emitCtx, { callId: call.id, result: nudge });
         await mutateState(config.instance, (state) => {

@@ -5904,7 +5904,7 @@ describe("dispatchToolCall(browser_connect)", () => {
     rmSync(ROOT, { recursive: true, force: true });
   });
 
-  test("missing reason rejects without creating an approval row", async () => {
+  test("missing reason returns a recoverable nudge without creating an approval row", async () => {
     rmSync(ROOT, { recursive: true, force: true });
     mkdirSync(WORKSPACE, { recursive: true });
     const config = dispatchConfig("browser-connect-dispatch-missing-reason");
@@ -5914,15 +5914,24 @@ describe("dispatchToolCall(browser_connect)", () => {
       return task.id;
     });
 
-    await expect(
-      dispatchToolCall(
-        config,
-        taskId,
-        "browser_connect",
-        "call_connect_missing_1",
-        JSON.stringify({})
-      )
-    ).rejects.toThrow(/reason/);
+    // Issue #397: a missing `reason` must NOT throw a bare "Missing required
+    // string argument" — that surfaced as a terse tool error and stalled the
+    // flow. Instead it returns a recoverable sync nudge so the model simply
+    // re-calls WITH a reason. The reason guard runs before the navigate-first
+    // guard, so an empty-arg call hits it first.
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "browser_connect",
+      "call_connect_missing_1",
+      JSON.stringify({})
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind !== "sync") throw new Error("unreachable");
+    const parsed = JSON.parse(result.result) as { ok: boolean; error: string };
+    expect(parsed.ok).toBe(false);
+    expect(parsed.error).toContain("requires a `reason`");
+    expect(parsed.error).not.toContain("Missing required string argument");
     // No approval row should exist.
     const state = readState(config.instance);
     expect(state.setupRequests.length).toBe(0);

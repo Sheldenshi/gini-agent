@@ -690,6 +690,58 @@ function stripDocumentPartsIfUnsupported(
   });
 }
 
+// Drop unpaired tool-calling messages so the tool-pairing-strict providers
+// (Anthropic Messages, Bedrock Converse) never 400 on a malformed history.
+// Both APIs require every assistant `tool_use` block to be answered by a
+// `tool_result` in the immediately-following message, and reject an orphan
+// `tool_result` with no preceding `tool_use`. A history can carry an unpaired
+// pair when an inline-handled tool (load_tools, the deferred-not-loaded nudge,
+// start_thread) pushed its result into the live turn but never persisted a
+// transcript row — so a later replay reconstructs the assistant tool_use
+// without its result. chat-task's priorChatMessages does a similar pass, but
+// this is the request-build backstop that catches ANY path (resume snapshots,
+// in-turn compaction, future callers) regardless of how the gap arose.
+//
+// An assistant message is kept only when EVERY id it carries has a matching
+// later `tool` result; otherwise the message and any partial results for its
+// ids are dropped together (a partial tool_use set still 400s). A `tool`
+// message is kept only when a retained assistant message claimed its id. The
+// pass preserves order and never merges turns.
+function pairToolCallingMessages(messages: ToolCallingMessage[]): ToolCallingMessage[] {
+  // First sweep: which tool_call ids does each assistant turn carry, and which
+  // ids are answered by some later tool message? Answered = a `tool` message
+  // with that id appears anywhere after the assistant message (Converse and
+  // Messages both want it in the very next message, which our translators
+  // already guarantee by collapsing consecutive tool messages — so a present
+  // result is always positioned correctly once the unpaired ones are removed).
+  const resultIds = new Set<string>();
+  for (const message of messages) {
+    if (message.role === "tool" && typeof message.tool_call_id === "string") {
+      resultIds.add(message.tool_call_id);
+    }
+  }
+  // Ids on assistant turns we decide to KEEP — only their results survive.
+  const keptCallIds = new Set<string>();
+  const keep: boolean[] = messages.map((message) => {
+    if (message.role === "assistant" && Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
+      const ids = message.tool_calls.map((call) => call.id);
+      const allAnswered = ids.every((id) => resultIds.has(id));
+      if (allAnswered) for (const id of ids) keptCallIds.add(id);
+      return allAnswered;
+    }
+    return true;
+  });
+  return messages.filter((message, index) => {
+    if (!keep[index]) return false;
+    // Orphan tool result: its originating assistant turn was dropped (or never
+    // existed). Drop it so no tool_result leads without a tool_use.
+    if (message.role === "tool") {
+      return typeof message.tool_call_id === "string" && keptCallIds.has(message.tool_call_id);
+    }
+    return true;
+  });
+}
+
 export interface ToolCallingResult {
   provider: ProviderConfig;
   text: string;
@@ -1599,7 +1651,7 @@ async function callAnthropicMessages(
   // including a Bedrock Mantle Messages baseUrl.
   const messagesUrl = `${baseUrl.replace(/\/v1(\/messages)?$/, "")}/v1/messages`;
   const wantStream = Boolean(onDelta);
-  const safeMessages = stripDocumentPartsIfUnsupported(messages, provider);
+  const safeMessages = pairToolCallingMessages(stripDocumentPartsIfUnsupported(messages, provider));
   const { system, messages: anthropicMessages } = translateMessagesToAnthropic(safeMessages);
   const extras = sanitizeExtraBody(provider.extraBody, ANTHROPIC_RESERVED_EXTRA_BODY_KEYS);
   const resolvedMaxTokens =
@@ -2248,7 +2300,7 @@ async function callBedrockConverse(
   const wantStream =
     Boolean(onDelta) && !(toolConfig && !bedrockSupportsStreamingWithTools(provider.model));
   const url = bedrockConverseUrl(region, provider.model, wantStream);
-  const safeMessages = stripDocumentPartsIfUnsupported(messages, provider);
+  const safeMessages = pairToolCallingMessages(stripDocumentPartsIfUnsupported(messages, provider));
   const { system, messages: converseMessages } = translateMessagesToConverse(safeMessages);
   const extraMax =
     isRecord(provider.extraBody) && typeof provider.extraBody.max_tokens === "number" ? provider.extraBody.max_tokens : undefined;
