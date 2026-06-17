@@ -5,18 +5,23 @@
 // `git clone` tripped that dialog and the installer aborted while the dialog
 // was still open. ensure_git_macos detects the missing tools, triggers the
 // install, and tracks the user's choice:
-//   - tools present              -> success
-//   - helper alive, tools absent -> still deciding / downloading -> keep waiting
-//   - helper gone,  tools absent -> Cancel -> abort with a clear error
+//   - tools present (incl. a working non-Apple git) -> success
+//   - helper alive, tools absent                    -> deciding / downloading -> wait
+//   - helper seen then gone, tools absent           -> Cancel -> abort
 //
 // We source install.sh with GINI_INSTALL_SH_NO_MAIN=1 (so main never runs) and
-// call ensure_git_macos directly, with `git`, `xcode-select`, and `pgrep`
-// shadowed by stubs on a temp PATH. State is driven by files in the stub dir:
+// call ensure_git_macos directly, with `git`, `xcode-select`, `pgrep`, and
+// `command` resolution driven by stubs on a temp PATH. State is driven by files
+// in the stub dir:
 //   - poll counter (bumped by `xcode-select -p`); tools "appear" at READY_AFTER
 //   - a `helper_until` ceiling that makes the pgrep stub report the install
-//     helper alive until the poll counter passes it (simulating Cancel = helper
-//     exits before tools land).
-// All sleeps use interval 0 and grace 0 so the suite stays deterministic.
+//     helper alive until the poll counter passes it (so the helper is "seen then
+//     gone" -> the Cancel scenario).
+//
+// The child env is built explicitly (not inherited from process.env): a stray
+// BASH_ENV or exported override on the developer's machine would otherwise be
+// sourced by `bash -c` and could shadow the stubs or override the test's own
+// settings, making the suite non-hermetic.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
@@ -57,8 +62,15 @@ case "$1" in
 esac
 `;
 
+// git --version succeeds once the poll counter reaches STUB_READY_AFTER (CLT
+// landed). STUB_GIT_PATH lets a test present git as a non-/usr/bin path so the
+// preflight's "working non-Apple git" branch can be exercised.
 const GIT_STUB = `#!/usr/bin/env bash
 if [ "$1" = "--version" ]; then
+  if [ -n "\${STUB_GIT_ALWAYS_OK:-}" ]; then
+    echo "git version 2.50.1 (stub)"
+    exit 0
+  fi
   n=$(cat "$STUB_DIR/poll" 2>/dev/null || echo 0)
   if [ "$n" -ge "\${STUB_READY_AFTER:-999999}" ]; then
     echo "git version 2.50.1 (stub)"
@@ -70,12 +82,17 @@ fi
 exit 0
 `;
 
-// The install-helper stub: "alive" (exit 0) while the poll counter is below
-// STUB_HELPER_UNTIL, "gone" (exit 1) afterwards. With HELPER_UNTIL < READY_AFTER
-// the helper disappears before the tools land — the Cancel scenario.
+// The install-helper stub uses its OWN call counter (independent of the
+// xcode-select poll counter) so helper lifetime is deterministic regardless of
+// how many times clt_tools_present probes. It reports the helper "alive" (exit 0)
+// for the first STUB_HELPER_UNTIL pgrep calls, then "gone" (exit 1). With a
+// non-zero HELPER_UNTIL the helper is seen then disappears -> the Cancel scenario;
+// with HELPER_UNTIL 0 the helper is never alive -> the never-spawned scenario.
 const PGREP_STUB = `#!/usr/bin/env bash
-n=$(cat "$STUB_DIR/poll" 2>/dev/null || echo 0)
-if [ "$n" -lt "\${STUB_HELPER_UNTIL:-0}" ]; then
+c=$(cat "$STUB_DIR/pgrep_calls" 2>/dev/null || echo 0)
+c=$((c + 1))
+printf '%s' "$c" > "$STUB_DIR/pgrep_calls"
+if [ "$c" -le "\${STUB_HELPER_UNTIL:-0}" ]; then
   echo 12345
   exit 0
 fi
@@ -94,15 +111,19 @@ function runPreflight(env: Record<string, string>): {
   stderr: string;
   installCalled: boolean;
 } {
+  // Explicit, hermetic child env. We do NOT spread process.env: a developer's
+  // BASH_ENV (sourced by non-interactive `bash -c`) or exported overrides could
+  // otherwise perturb the stubs or the test's own settings. PATH puts stubDir
+  // first so git/xcode-select/pgrep resolve to the stubs, then the standard
+  // system dirs so bash/cat/awk/uname/sleep/printf still resolve.
   const res = spawnSync("bash", ["-c", `source "${SCRIPT}"; ensure_git_macos`], {
     encoding: "utf8",
     env: {
-      ...process.env,
-      PATH: `${stubDir}:${process.env.PATH ?? ""}`,
+      PATH: `${stubDir}:/usr/bin:/bin:/usr/sbin:/sbin`,
+      HOME: stubDir,
       GINI_INSTALL_SH_NO_MAIN: "1",
       STUB_DIR: stubDir,
       GINI_CLT_WAIT_INTERVAL_S: "0",
-      GINI_CLT_HELPER_GRACE_S: "0",
       GINI_CLT_WAIT_TIMEOUT_S: "60",
       ...env
     }
@@ -136,8 +157,22 @@ describe("install.sh ensure_git_macos preflight", () => {
     expect(existsSync(join(stubDir, "poll"))).toBe(false);
   });
 
-  test("fast path: tools already present, no install triggered", () => {
+  test("fast path: CLT active (xcode-select -p ok), no install triggered", () => {
     const res = runPreflight({ OS: "darwin", STUB_READY_AFTER: "1" });
+    expect(res.status).toBe(0);
+    expect(res.stdout).toContain("Git ready");
+    expect(res.installCalled).toBe(false);
+  });
+
+  test("working non-Apple git with no active developer dir: accepted, no install", () => {
+    // xcode-select -p never succeeds (READY_AFTER huge), but a git resolving to
+    // the stubDir (not /usr/bin/git) runs fine — the preflight must accept it
+    // and NOT force a CLT install (regression guard for Homebrew/Nix/conda git).
+    const res = runPreflight({
+      OS: "darwin",
+      STUB_READY_AFTER: "999",
+      STUB_GIT_ALWAYS_OK: "1"
+    });
     expect(res.status).toBe(0);
     expect(res.stdout).toContain("Git ready");
     expect(res.installCalled).toBe(false);
@@ -157,9 +192,9 @@ describe("install.sh ensure_git_macos preflight", () => {
     expect(res.installCalled).toBe(true);
   });
 
-  test("cancel: helper exits before tools land -> aborts with a clear message", () => {
-    // Helper "alive" only through poll 1, tools would need poll 999: the user
-    // dismissed the dialog. With grace 0 the cancel rule fires promptly.
+  test("cancel: helper seen then exits before tools land -> aborts with a clear message", () => {
+    // Helper alive on the first pgrep call (so saw_helper is set), gone after;
+    // tools never land (READY_AFTER 999). That's a mid-flight dismissal.
     const res = runPreflight({
       OS: "darwin",
       STUB_READY_AFTER: "999",
@@ -168,6 +203,22 @@ describe("install.sh ensure_git_macos preflight", () => {
     expect(res.status).toBe(1);
     expect(res.installCalled).toBe(true);
     expect(res.stderr).toContain("cancelled");
+  });
+
+  test("helper never spawns: waits for timeout, not a false cancel", () => {
+    // Helper is never alive (HELPER_UNTIL 0) and tools never land. saw_helper
+    // stays 0, so the cancel rule must NOT fire — it hits the timeout backstop
+    // and reports "still not installed" rather than "cancelled".
+    const res = runPreflight({
+      OS: "darwin",
+      STUB_READY_AFTER: "999",
+      STUB_HELPER_UNTIL: "0",
+      GINI_CLT_WAIT_TIMEOUT_S: "0"
+    });
+    expect(res.status).toBe(1);
+    expect(res.installCalled).toBe(true);
+    expect(res.stderr).toContain("still not installed");
+    expect(res.stderr).not.toContain("cancelled");
   });
 
   test("timeout: helper stays alive but tools never land -> aborts after timeout", () => {

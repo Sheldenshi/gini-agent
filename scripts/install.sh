@@ -181,17 +181,31 @@ ensure_bun() {
 # the tools actually land:
 #   - tools present              -> success (Install clicked, download finished)
 #   - helper alive, tools absent -> user still deciding, or download in progress
-#   - helper gone,  tools absent -> Cancel / dismissed -> abort with a clear error
+#   - helper seen then gone, tools absent -> Cancel -> abort with a clear error
 # This honors "wait until they click Install; terminate cleanly if they Cancel"
-# without trying to introspect a system alert that exposes no AX window.
+# without trying to introspect a system alert that exposes no AX window. The
+# cancel rule only fires once the helper was actually observed (saw_helper), so a
+# helper that never spawns waits for the tools until the timeout rather than being
+# misreported as a cancel.
 #
-# Detection probes `xcode-select -p` first (it never spawns the install dialog),
-# so on a fresh machine the short-circuit skips the git probe and the dialog
-# appears only after our explanatory message — not as a detection side effect.
-# Poll interval, timeout, the helper-match pattern, and the post-trigger grace
-# window are env-injectable for testing.
+# clt_tools_present accepts a working non-Apple git (Homebrew/Nix/conda) even when
+# `xcode-select -p` reports no active developer dir: such a git clones fine without
+# the CLT, and forcing a CLT install there would regress installs that used to just
+# work. Only /usr/bin/git is the stub that needs the CLT, and we never invoke it
+# during detection (we check its path, not run it), so detection can't trip the
+# install dialog — it appears only after our explanatory message.
+#
+# Poll interval, timeout, and the helper-match pattern are env-injectable for tests.
 clt_tools_present() {
-  xcode-select -p >/dev/null 2>&1 && git --version >/dev/null 2>&1
+  # CLT installed and active -> /usr/bin/git works and clones succeed.
+  if xcode-select -p >/dev/null 2>&1; then
+    return 0
+  fi
+  # No active developer dir. A non-Apple git on PATH clones without the CLT; only
+  # /usr/bin/git is the stub. Accept any git that resolves elsewhere and runs.
+  local git_path
+  git_path="$(command -v git 2>/dev/null || true)"
+  [ -n "$git_path" ] && [ "$git_path" != "/usr/bin/git" ] && git --version >/dev/null 2>&1
 }
 
 clt_helper_running() {
@@ -213,12 +227,9 @@ ensure_git_macos() {
   xcode-select --install >/dev/null 2>&1 || true
 
   local waited=0
+  local saw_helper=0
   local timeout="${GINI_CLT_WAIT_TIMEOUT_S:-1800}"
   local interval="${GINI_CLT_WAIT_INTERVAL_S:-5}"
-  # The helper can take a moment to appear after --install; don't treat that
-  # startup gap as a cancel. Wait at least this long for the helper or the tools
-  # before the "helper gone -> cancelled" rule can fire.
-  local grace="${GINI_CLT_HELPER_GRACE_S:-15}"
 
   while ! clt_tools_present; do
     if [ "$waited" -ge "$timeout" ]; then
@@ -226,7 +237,18 @@ ensure_git_macos() {
       err "Finish the install (or run 'xcode-select --install'), then re-run this installer."
       exit 1
     fi
-    if [ "$waited" -ge "$grace" ] && ! clt_helper_running; then
+    if clt_helper_running; then
+      # Installer is up (user deciding, or download in progress) — keep waiting.
+      saw_helper=1
+    elif [ "$saw_helper" = 1 ]; then
+      # The installer was running and has now closed. Let the toolchain settle,
+      # then decide: tools present -> the install finished (don't misread the brief
+      # window where the helper exits just before the switch completes); still
+      # absent -> the user cancelled.
+      sleep "$interval"
+      if clt_tools_present; then
+        break
+      fi
       err "Command Line Tools install was cancelled (the installer closed before finishing)."
       err "Re-run this installer and click Install, or install the tools with 'xcode-select --install'."
       exit 1
