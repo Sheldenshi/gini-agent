@@ -230,6 +230,11 @@ ensure_git_macos() {
   local saw_helper=0
   local timeout="${GINI_CLT_WAIT_TIMEOUT_S:-1800}"
   local interval="${GINI_CLT_WAIT_INTERVAL_S:-5}"
+  # How long to wait for the install dialog to even appear. If it never shows
+  # (headless/SSH session, MDM-managed Mac, or `xcode-select --install` failed to
+  # launch it) there's nothing for the user to click, so bail fast with an
+  # actionable message instead of hanging for the full $timeout.
+  local appear="${GINI_CLT_HELPER_APPEAR_S:-60}"
 
   while ! clt_tools_present; do
     if [ "$waited" -ge "$timeout" ]; then
@@ -251,6 +256,12 @@ ensure_git_macos() {
       fi
       err "Command Line Tools install was cancelled (the installer closed before finishing)."
       err "Re-run this installer and click Install, or install the tools with 'xcode-select --install'."
+      exit 1
+    elif [ "$waited" -ge "$appear" ]; then
+      # The helper never appeared within the window and the tools still aren't
+      # here — there's no dialog to click, so don't sit through the full timeout.
+      err "No Command Line Tools installer dialog appeared after ${appear}s."
+      err "Run 'xcode-select --install' manually, then re-run this installer."
       exit 1
     fi
     sleep "$interval"

@@ -14,9 +14,9 @@
 // `command` resolution driven by stubs on a temp PATH. State is driven by files
 // in the stub dir:
 //   - poll counter (bumped by `xcode-select -p`); tools "appear" at READY_AFTER
-//   - a `helper_until` ceiling that makes the pgrep stub report the install
-//     helper alive until the poll counter passes it (so the helper is "seen then
-//     gone" -> the Cancel scenario).
+//   - a separate pgrep call counter; the helper stub reports "alive" for the
+//     first STUB_HELPER_UNTIL pgrep calls then "gone" (so the helper is "seen
+//     then gone" -> the Cancel scenario), independent of the poll counter.
 //
 // The child env is built explicitly (not inherited from process.env): a stray
 // BASH_ENV or exported override on the developer's machine would otherwise be
@@ -63,7 +63,9 @@ esac
 `;
 
 // git --version succeeds once the poll counter reaches STUB_READY_AFTER (CLT
-// landed). STUB_GIT_PATH lets a test present git as a non-/usr/bin path so the
+// landed). STUB_GIT_ALWAYS_OK forces it to succeed regardless — combined with a
+// huge STUB_READY_AFTER (xcode-select -p never succeeds) this presents a working
+// non-Apple git (the stub resolves under stubDir, not /usr/bin/git) so the
 // preflight's "working non-Apple git" branch can be exercised.
 const GIT_STUB = `#!/usr/bin/env bash
 if [ "$1" = "--version" ]; then
@@ -125,6 +127,7 @@ function runPreflight(env: Record<string, string>): {
       STUB_DIR: stubDir,
       GINI_CLT_WAIT_INTERVAL_S: "0",
       GINI_CLT_WAIT_TIMEOUT_S: "60",
+      GINI_CLT_HELPER_APPEAR_S: "60",
       ...env
     }
   });
@@ -205,18 +208,35 @@ describe("install.sh ensure_git_macos preflight", () => {
     expect(res.stderr).toContain("cancelled");
   });
 
-  test("helper never spawns: waits for timeout, not a false cancel", () => {
+  test("helper never appears: aborts fast with 'no dialog appeared', not a false cancel", () => {
     // Helper is never alive (HELPER_UNTIL 0) and tools never land. saw_helper
-    // stays 0, so the cancel rule must NOT fire — it hits the timeout backstop
-    // and reports "still not installed" rather than "cancelled".
+    // stays 0, so the cancel rule must NOT fire; with the appear window reached
+    // (APPEAR 0) before the timeout, it reports "No Command Line Tools installer
+    // dialog appeared" instead of hanging until the timeout.
     const res = runPreflight({
       OS: "darwin",
       STUB_READY_AFTER: "999",
       STUB_HELPER_UNTIL: "0",
-      GINI_CLT_WAIT_TIMEOUT_S: "0"
+      GINI_CLT_HELPER_APPEAR_S: "0",
+      GINI_CLT_WAIT_TIMEOUT_S: "9999"
     });
     expect(res.status).toBe(1);
     expect(res.installCalled).toBe(true);
+    expect(res.stderr).toContain("No Command Line Tools installer dialog appeared");
+    expect(res.stderr).not.toContain("cancelled");
+  });
+
+  test("timeout precedes the appear window when both are due: reports 'still not installed'", () => {
+    // Helper never appears, but the timeout is also reached first (both 0; the
+    // timeout check is evaluated before the appear branch). The backstop wins.
+    const res = runPreflight({
+      OS: "darwin",
+      STUB_READY_AFTER: "999",
+      STUB_HELPER_UNTIL: "0",
+      GINI_CLT_HELPER_APPEAR_S: "0",
+      GINI_CLT_WAIT_TIMEOUT_S: "0"
+    });
+    expect(res.status).toBe(1);
     expect(res.stderr).toContain("still not installed");
     expect(res.stderr).not.toContain("cancelled");
   });
