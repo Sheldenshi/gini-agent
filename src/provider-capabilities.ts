@@ -81,16 +81,31 @@ function openrouterContextWindowTokens(model: string): number {
   const routedModel = slug.slice(slash + 1);
   if (vendor === "openai") return openaiContextWindowTokens(routedModel);
   if (vendor === "deepseek") return deepseekContextWindowTokens(routedModel);
-  if (vendor === "anthropic") return 200_000;
+  if (vendor === "anthropic") return claudeContextWindowTokens(routedModel);
   if (vendor === "google" && routedModel.startsWith("gemini")) return 1_000_000;
   return FALLBACK_CONTEXT_WINDOW_TOKENS;
 }
 
-// First-party Anthropic Messages API: the Claude family serves a 200K-token
-// context window. An unrecognized id stays conservative on the fallback.
-function anthropicContextWindowTokens(model: string): number {
-  if (/claude/.test(normalizeModel(model))) return 200_000;
+// Claude context window by family. The 1M-token window is GA on Opus 4.6+,
+// Sonnet 4.6, and Fable 5 (first-party API and Amazon Bedrock alike, at
+// standard pricing with no long-context premium); Haiku 4.5 and older or
+// unrecognized Claude ids stay at the 200K window. `slug` is the normalized
+// model id and may carry a Bedrock inference-profile prefix
+// ("us.anthropic.claude-opus-4-8") or arrive bare ("claude-opus-4-8") — both
+// match the family patterns. The minor-version classes ([6-9]|\d\d) keep
+// future point releases (Opus 4.9+) on 1M while leaving 4.5/4.1/4.0 at 200K.
+function claudeContextWindowTokens(slug: string): number {
+  if (/claude-opus-4-(?:[6-9]|\d\d)/.test(slug)) return 1_000_000;
+  if (/claude-sonnet-4-(?:[6-9]|\d\d)/.test(slug)) return 1_000_000;
+  if (/claude-fable-\d/.test(slug)) return 1_000_000;
+  if (/claude/.test(slug)) return 200_000;
   return FALLBACK_CONTEXT_WINDOW_TOKENS;
+}
+
+// First-party Anthropic Messages API. An unrecognized id stays conservative on
+// the fallback (see claudeContextWindowTokens).
+function anthropicContextWindowTokens(model: string): number {
+  return claudeContextWindowTokens(normalizeModel(model));
 }
 
 // Bedrock model ids are cross-region inference profiles, e.g.
@@ -99,7 +114,7 @@ function anthropicContextWindowTokens(model: string): number {
 // (other Bedrock families we don't enumerate) keep the conservative fallback.
 function bedrockContextWindowTokens(model: string): number {
   const slug = normalizeModel(model);
-  if (/anthropic\.claude/.test(slug)) return 200_000;
+  if (/anthropic\.claude/.test(slug)) return claudeContextWindowTokens(slug);
   if (/amazon\.nova-premier/.test(slug)) return 1_000_000;
   if (/amazon\.nova-(pro|lite)/.test(slug)) return 300_000;
   if (/amazon\.nova-micro/.test(slug)) return 128_000;
