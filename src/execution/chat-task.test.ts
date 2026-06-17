@@ -16,7 +16,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import {
   clearEchoAuxTextResponses,
   clearEchoToolCallingResponses,
@@ -3937,7 +3937,11 @@ describe("chat-task loop", () => {
   // chatMessages carry both the assistant call AND a role:"tool" result for it.
   test("inline load_tools persists a paired tool_result row in the durable transcript", async () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
-    const config = buildConfig(workspaceRoot, "chat-task-inline-persist");
+    // This turn opens memory.db (recall + auto-retain), and memory-db.ts caches
+    // SQLite handles by instance NAME across the process. Derive the instance
+    // from the unique mkdtemp basename so a rerun in the same worker can't reuse
+    // a cached handle pointing at this run's already-removed state dir.
+    const config = buildConfig(workspaceRoot, `chat-task-inline-persist-${basename(workspaceRoot)}`);
     const provider = normalizeProvider(config.provider);
 
     const sessionId = await mutateState(config.instance, (state) =>
