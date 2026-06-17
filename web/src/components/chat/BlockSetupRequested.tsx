@@ -216,12 +216,8 @@ export function BlockSetupRequested({ block }: { block: SetupRequestedBlock }) {
     : [];
 
   // === confirmation.request card state ===
-  // Summary + optional details + confirm label come from the TRUSTED setup
-  // payload the dispatcher minted (block.summary carries the summary too, as
-  // the transcript line).
-  const confirmationSummary = isConfirmationRequest && setup && typeof setup.payload?.summary === "string"
-    ? (setup.payload.summary as string)
-    : block.summary;
+  // Optional details + confirm label come from the TRUSTED setup payload the
+  // dispatcher minted. The summary renders via displaySummary / block.summary.
   const confirmationDetails = isConfirmationRequest && setup && typeof setup.payload?.details === "string"
     ? (setup.payload.details as string)
     : "";
