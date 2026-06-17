@@ -712,6 +712,27 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         return json({ ok: true });
       }
 
+      if (setup.action === "confirmation.request") {
+        // request_confirmation's Confirm button. The body carries no fields —
+        // hitting /complete IS the confirmation (Cancel is the /cancel
+        // endpoint). Resume the chat-task loop with an unambiguous boolean tool
+        // result {confirmed:true} so the model performs the irreversible action
+        // itself. Same shape as the chat.choice winning path: atomically claim
+        // the row, persist a human-readable outcome (so the resolved card reads
+        // truthfully after reload), then resume detached. No side effects run
+        // here — the agent does the send on resume.
+        await resolveSetupRequest(config, setupId, "complete", { actor: "user", resumeChatTask: false });
+        await persistConnectOutcome(config, setupId, { ok: true, message: "Confirmed" });
+        const confirmToolCallId = typeof setup.payload.toolCallId === "string" ? setup.payload.toolCallId : undefined;
+        if (setup.taskId && confirmToolCallId) {
+          void safeResume(config, setup.taskId, confirmToolCallId, JSON.stringify({ confirmed: true }), {
+            context: "confirmation.request",
+            approvalId: setupId
+          });
+        }
+        return json({ ok: true });
+      }
+
       if (setup.action === "connector.request") {
         const scopes = Array.isArray(payload.scopes) ? payload.scopes.map(String) : [];
         // Two payload shapes (see SetupRequest.target doc in types.ts):
