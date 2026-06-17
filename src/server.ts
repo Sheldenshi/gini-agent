@@ -9,6 +9,7 @@ import { runConnectorDetection } from "./jobs/connector-detection";
 import { runDailyReview } from "./learning/daily-review";
 import { syncProviderMcpServers } from "./integrations/mcp-sync";
 import { install } from "./runtime";
+import { isRunning } from "./cli/process";
 import { migrateIfNeeded } from "./memory";
 import { loadConfig, parseInstance, runtimePortPath } from "./paths";
 import { appendLog, backfillEmailWatcherJobs, mutateState, now, readState } from "./state";
@@ -48,6 +49,29 @@ const SCHEDULER_DRAIN_TIMEOUT_MS = 5000;
 
 const instance = parseInstance();
 const config = loadConfig(instance);
+
+// Singleton preflight. A gateway is a per-instance, per-port singleton. If a
+// healthy gateway for this instance is already listening on config.port, this
+// process is a duplicate spawn — a supervisor that respawned us while the
+// incumbent is still up, or two overlapping supervisors (launchd core service +
+// a foreground `gini run`). Without this guard the duplicate runs the whole
+// boot (install, writePid, mutateState reconciles) and then Bun.serve throws
+// "Failed to start server. Is port <port> in use?" as an uncaughtException; the
+// supervisor respawns it into a crash loop that floods identical crash reports
+// AND races the incumbent's state.json writes. Defer cleanly instead: log and
+// exit(0) before any boot work or state mutation runs. A free port (the probe's
+// fetch is refused) or a foreign non-gateway holder both fall through to the
+// real bind below, where a genuine conflict still surfaces as a clear error. A
+// legitimate restart frees the port before relaunch (autostart enable() awaits
+// waitForPortFree after bootout), so the probe only fires for a true duplicate.
+if (await isRunning(config)) {
+  appendLog(config.instance, "runtime.boot.incumbent", { port: config.port, pid: process.pid });
+  console.log(
+    `Gini gateway already listening on http://127.0.0.1:${config.port} instance=${config.instance}; duplicate boot exiting.`
+  );
+  process.exit(0);
+}
+
 // Install crash handlers before any runtime work so an uncaughtException or
 // unhandledRejection thrown during boot is still captured. The handler queues a
 // redacted report; nothing is filed here — the on-restart consent flow
