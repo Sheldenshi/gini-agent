@@ -318,7 +318,9 @@ persist the resolved bridge id (`[]` clears). Delivery runs on every
 terminal finalize: a job with no chat session (created via `POST
 /api/jobs` or from a non-chat task) or whose session vanished delivers
 the task summary instead of the synced chat reply, and both paths
-honor the exact-`[SILENT]` suppression contract. A bridge the origin
+honor the `[SILENT]` suppression contract (the literal token, or a
+trailing standalone `[SILENT]` line after a no-op preamble; a
+leading/inline sentinel still delivers — see `src/jobs/silent.ts`). A bridge the origin
 mirror already delivered to is skipped. Fire-time resolution failures
 and send failures are logged (`job.delivery.target.error`) and audited
 (`job.delivery.failed`) without failing the run.
