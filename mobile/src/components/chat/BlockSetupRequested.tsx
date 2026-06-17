@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Alert, Pressable, StyleSheet, Text, View } from "react-native";
+import { Alert, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
 import { useQueryClient } from "@tanstack/react-query";
 import { api } from "@/src/api";
 import { useSetupRequests } from "@/src/queries";
@@ -23,11 +23,11 @@ const CONFIRMATION_INVALIDATE_KEYS = [
 // SetupRequest bubble: user-actor gate. No risk pill — the rule is
 // structural per docs/adr/authorization-vs-setup-request.md.
 //
-// confirmation.request is interactive on mobile (Confirm/Cancel mirroring
-// the web card, see docs/adr/user-confirmation-primitive.md): the agent
-// pauses before an irreversible action toward another person and the user
-// decides here. Every OTHER action (connector.request, browser.connect,
-// browser.fill_secret, chat.choice, messaging.*) stays read-only — those
+// confirmation.request and chat.choice are interactive on mobile, mirroring
+// the web cards (see docs/adr/user-confirmation-primitive.md and
+// docs/adr/user-choice-prompt.md): the agent pauses for a user decision and
+// the user resolves it here. Every OTHER action (connector.request,
+// browser.connect, browser.fill_secret, messaging.*) stays read-only — those
 // flows are driven from the web client / Gini on the Mac.
 export function BlockSetupRequested({
   block
@@ -36,6 +36,9 @@ export function BlockSetupRequested({
 }) {
   if (block.action === "confirmation.request") {
     return <ConfirmationCard block={block} />;
+  }
+  if (block.action === "chat.choice") {
+    return <ChoiceCard block={block} />;
   }
   return <ReadOnlyCard block={block} />;
 }
@@ -175,6 +178,184 @@ function ConfirmationCard({ block }: { block: SetupRequestedBlock }) {
   );
 }
 
+type ChoiceOption = { label: string; description?: string };
+
+// Defensive parse of the dispatcher-minted options array (mirrors web
+// parseChoiceOptions). The dispatcher already validated shape (2-6 entries,
+// non-empty distinct labels); this just narrows the unknown payload and
+// drops anything malformed so a bad payload can't crash the renderer.
+function parseChoiceOptions(raw: unknown): ChoiceOption[] {
+  if (!Array.isArray(raw)) return [];
+  const out: ChoiceOption[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object") continue;
+    const candidate = entry as { label?: unknown; description?: unknown };
+    if (typeof candidate.label !== "string" || candidate.label.length === 0) continue;
+    out.push({
+      label: candidate.label,
+      ...(typeof candidate.description === "string" && candidate.description.length > 0
+        ? { description: candidate.description }
+        : {})
+    });
+  }
+  return out;
+}
+
+// Interactive single-select card for a pending chat.choice (ask_user)
+// SetupRequest, mirroring the web ChoiceCard. The question + options come
+// from the TRUSTED setup payload the dispatcher minted (the block carries
+// only the summary, which is the question too). The card always adds its own
+// "Other (type your answer)" freeform row — mobile has no auto-Other — and a
+// Skip affordance (Skip = the /cancel endpoint, which resumes the agent with
+// a skip fallback rather than failing the task). Selecting an option clears
+// any typed Other text and vice-versa, so exactly one answer is submitted.
+// When the request resolves (status !== "pending") the controls give way to
+// the chosen answer (completed) or "Skipped." (cancelled).
+function ChoiceCard({ block }: { block: SetupRequestedBlock }) {
+  const qc = useQueryClient();
+  const setupRequests = useSetupRequests();
+  const [selected, setSelected] = useState<number | "other" | null>(null);
+  const [otherText, setOtherText] = useState("");
+  const [inFlight, setInFlight] = useState(false);
+
+  const setup = (setupRequests.data ?? []).find((s) => s.id === block.setupRequestId) ?? null;
+  const isPending = setup ? setup.status === "pending" : true;
+  const question =
+    setup && typeof setup.payload?.question === "string"
+      ? (setup.payload.question as string)
+      : block.summary;
+  const options: ChoiceOption[] = setup ? parseChoiceOptions(setup.payload?.options) : [];
+
+  const ready = selected === "other" ? otherText.trim().length > 0 : selected !== null;
+
+  // Submit posts { choice: { label } } for a listed option or
+  // { choice: { other } } for the freeform input; both resume the paused
+  // chat task. Skip posts to /cancel. invalidate refreshes the card out of
+  // pending state and bumps the chat surface so the resumed turn renders
+  // promptly. The in-flight flag disables the controls until the request
+  // settles.
+  const submit = async () => {
+    if (inFlight || !isPending || !ready) return;
+    setInFlight(true);
+    try {
+      const body =
+        selected === "other"
+          ? { choice: { other: otherText.trim() } }
+          : { choice: { label: typeof selected === "number" ? options[selected]?.label : null } };
+      await api(`/setup-requests/${block.setupRequestId}/complete`, {
+        method: "POST",
+        body: JSON.stringify(body)
+      });
+      for (const key of CONFIRMATION_INVALIDATE_KEYS) {
+        qc.invalidateQueries({ queryKey: [key] });
+      }
+    } catch (err) {
+      Alert.alert("Submit failed", err instanceof Error ? err.message : String(err));
+    } finally {
+      setInFlight(false);
+    }
+  };
+
+  const skip = async () => {
+    if (inFlight || !isPending) return;
+    setInFlight(true);
+    try {
+      await api(`/setup-requests/${block.setupRequestId}/cancel`, { method: "POST" });
+      for (const key of CONFIRMATION_INVALIDATE_KEYS) {
+        qc.invalidateQueries({ queryKey: [key] });
+      }
+    } catch (err) {
+      Alert.alert("Skip failed", err instanceof Error ? err.message : String(err));
+    } finally {
+      setInFlight(false);
+    }
+  };
+
+  if (!isPending) {
+    // Completed rows carry the human-readable selection ("You selected: X" /
+    // "You answered: ...") as the persisted outcome message; Skip is a
+    // /cancel, so cancelled = skipped.
+    const answer =
+      setup?.status === "completed"
+        ? setup.connectOutcome?.message ?? "Answered."
+        : "Skipped.";
+    return (
+      <View style={styles.row}>
+        <View style={styles.header}>
+          <Text style={styles.action}>Question</Text>
+        </View>
+        <Text style={styles.summary}>{question}</Text>
+        <Text style={styles.outcome}>{answer}</Text>
+      </View>
+    );
+  }
+
+  return (
+    <View style={[styles.row, styles.pendingCard]}>
+      <View style={styles.header}>
+        <Text style={styles.action}>Question</Text>
+      </View>
+      <Text style={styles.summary}>{question}</Text>
+      <View style={styles.optionList}>
+        {options.map((option, index) => {
+          const active = selected === index;
+          return (
+            <Pressable
+              key={option.label}
+              onPress={() => {
+                setSelected(index);
+                setOtherText("");
+              }}
+              disabled={inFlight}
+              style={[styles.optionRow, active && styles.optionRowActive]}
+            >
+              <Text style={styles.optionLabel}>{option.label}</Text>
+              {option.description ? (
+                <Text style={styles.optionDescription}>{option.description}</Text>
+              ) : null}
+            </Pressable>
+          );
+        })}
+        <Pressable
+          onPress={() => setSelected("other")}
+          disabled={inFlight}
+          style={[styles.optionRow, selected === "other" && styles.optionRowActive]}
+        >
+          <Text style={styles.optionLabel}>Other (type your answer)</Text>
+        </Pressable>
+        <TextInput
+          value={otherText}
+          onChangeText={(text) => {
+            setOtherText(text);
+            if (text.length > 0) setSelected("other");
+          }}
+          placeholder="Type your answer"
+          placeholderTextColor={theme.muted}
+          editable={!inFlight}
+          style={styles.otherInput}
+          autoCapitalize="sentences"
+          autoCorrect
+        />
+      </View>
+      <View style={styles.actions}>
+        <Pressable
+          onPress={submit}
+          disabled={inFlight || !ready}
+          style={({ pressed }) => [
+            styles.confirmButton,
+            (pressed || inFlight || !ready) && styles.buttonDimmed
+          ]}
+        >
+          <Text style={styles.confirmText}>Submit</Text>
+        </Pressable>
+        <Pressable onPress={skip} disabled={inFlight} hitSlop={6}>
+          <Text style={[styles.skipText, inFlight && styles.buttonDimmed]}>Skip</Text>
+        </Pressable>
+      </View>
+    </View>
+  );
+}
+
 const styles = StyleSheet.create({
   row: {
     alignSelf: "stretch",
@@ -271,5 +452,54 @@ const styles = StyleSheet.create({
     color: theme.muted,
     fontFamily: family("HankenGrotesk", 500),
     fontSize: 13
+  },
+  optionList: {
+    gap: 6,
+    marginTop: 2
+  },
+  optionRow: {
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: theme.inputBorder,
+    backgroundColor: theme.bg,
+    gap: 2
+  },
+  // Selected single-select row — navy accent matching the confirm button
+  // (#0A1A3F) so the chosen answer reads as active.
+  optionRowActive: {
+    borderColor: theme.button,
+    backgroundColor: "rgba(10, 26, 63, 0.06)"
+  },
+  optionLabel: {
+    color: theme.text,
+    fontFamily: family("HankenGrotesk", 500),
+    fontSize: 14,
+    lineHeight: 19
+  },
+  optionDescription: {
+    color: theme.muted,
+    fontFamily: family("HankenGrotesk", 400),
+    fontSize: 12,
+    lineHeight: 16
+  },
+  otherInput: {
+    color: theme.text,
+    fontFamily: family("HankenGrotesk", 400),
+    fontSize: 14,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: theme.inputBorder,
+    backgroundColor: theme.bg
+  },
+  skipText: {
+    marginLeft: "auto",
+    color: theme.muted,
+    fontFamily: family("HankenGrotesk", 500),
+    fontSize: 12,
+    textDecorationLine: "underline"
   }
 });
