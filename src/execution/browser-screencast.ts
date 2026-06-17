@@ -109,6 +109,10 @@ export class ScreencastBridge {
   private readonly pending = new Map<number, (v: unknown) => void>();
   private latest: ScreencastFrame | undefined;
   private readonly subscribers = new Set<(frame: ScreencastFrame) => void>();
+  // Callbacks fired once when the bridge closes, so an SSE route can close its
+  // stream (and the modal's EventSource reconnects / re-evaluates the gate)
+  // instead of dangling on a stale frame behind keepalives.
+  private readonly closeSubscribers = new Set<() => void>();
   private readonly deps: ScreencastDeps;
   private closed = false;
   // How long stop() waits for Page.stopScreencast before forcing the socket
@@ -128,11 +132,10 @@ export class ScreencastBridge {
   // We instead follow only the sign-in's OWN target family: the watched page
   // plus popups it (transitively) opened. openerId comes from a browser-level
   // Target.targetCreated stream (/json/list omits it). signInFamily holds the
-  // CDP targetIds in that family; targetWsUrls maps targetId → page wsUrl.
+  // CDP targetIds in that family.
   private browserCdp: WebSocketLike | undefined;
   private browserCdpId = 0;
   private readonly signInFamily = new Set<string>();
-  private readonly targetWsUrls = new Map<string, string>();
   private currentTargetId: string | undefined;
   // Family targets the screencast has already shown. The watcher follows a
   // family member only ONCE (when it first appears) — otherwise, with the
@@ -178,7 +181,6 @@ export class ScreencastBridge {
       this.currentTargetId = pageTarget.id;
       this.signInFamily.add(pageTarget.id);
       this.visitedTargetIds.add(pageTarget.id);
-      this.targetWsUrls.set(pageTarget.id, pageTarget.webSocketDebuggerUrl);
     }
     await this.attachTo(pageTarget.webSocketDebuggerUrl);
     // Follow popup / new-tab sign-in: many OAuth flows open a popup the user
@@ -319,10 +321,6 @@ export class ScreencastBridge {
         } catch {
           return; // transient; try again next tick
         }
-        // Keep the id → wsUrl map fresh for the family members present now.
-        for (const p of pages) {
-          if (typeof p.id === "string" && p.webSocketDebuggerUrl) this.targetWsUrls.set(p.id, p.webSocketDebuggerUrl);
-        }
         const live = (id: string): CdpVersionTarget | undefined =>
           pages.find((p) => p.id === id && p.webSocketDebuggerUrl);
         // A family page we haven't shown yet is a popup the sign-in just opened
@@ -439,6 +437,17 @@ export class ScreencastBridge {
       }
       this.browserCdp = undefined;
     }
+    // Tell SSE viewers the channel is dead so they close their stream (the
+    // client reconnects and re-evaluates the gate) instead of dangling on a
+    // stale frame behind keepalives. Fire before clearing frame subscribers.
+    for (const onClose of this.closeSubscribers) {
+      try {
+        onClose();
+      } catch {
+        // a broken close subscriber must not break the others
+      }
+    }
+    this.closeSubscribers.clear();
     this.subscribers.clear();
     for (const resolve of this.pending.values()) resolve(undefined);
     this.pending.clear();
@@ -456,9 +465,12 @@ export class ScreencastBridge {
 
   // Subscribe to frames. Immediately replays the latest frame (if any) so a
   // newly-connected viewer paints without waiting for the next page change,
-  // then streams subsequent frames. Returns an unsubscribe fn.
-  subscribe(onFrame: (frame: ScreencastFrame) => void): () => void {
+  // then streams subsequent frames. The optional onClose fires once if the
+  // bridge closes while subscribed, so the caller can tear down its stream.
+  // Returns an unsubscribe fn that drops both callbacks.
+  subscribe(onFrame: (frame: ScreencastFrame) => void, onClose?: () => void): () => void {
     this.subscribers.add(onFrame);
+    if (onClose) this.closeSubscribers.add(onClose);
     if (this.latest) {
       try {
         onFrame(this.latest);
@@ -466,7 +478,10 @@ export class ScreencastBridge {
         // ignore
       }
     }
-    return () => this.subscribers.delete(onFrame);
+    return () => {
+      this.subscribers.delete(onFrame);
+      if (onClose) this.closeSubscribers.delete(onClose);
+    };
   }
 
   // Translate one modal input event into CDP Input.* calls. Mirrors the proven

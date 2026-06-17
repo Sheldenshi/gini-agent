@@ -56,6 +56,10 @@ function bridgeWith(over: Partial<ScreencastDeps> = {}): { bridge: ScreencastBri
     openSocket: () => socket,
     fetchJson: async () => [{ type: "page", webSocketDebuggerUrl: "ws://127.0.0.1:9333/devtools/page/abc" }],
     resolvePort: () => 9333,
+    // These tests exercise the page-level screencast, not popup-follow (covered
+    // by followHarness). Disable discovery so start() never hits the real
+    // /json/version fetch in defaultDeps.
+    fetchBrowserWsUrl: async () => null,
     ...over
   };
   return { bridge: new ScreencastBridge(deps), socket };
@@ -338,6 +342,28 @@ describe("ScreencastBridge.stop + close", () => {
     await startWithOpen(bridge, socket);
     socket.fire("error", {});
     expect(bridge.isClosed()).toBe(true);
+  });
+
+  test("close notifies onClose subscribers so a viewer can tear down its stream", async () => {
+    const { bridge, socket } = bridgeWith();
+    await startWithOpen(bridge, socket);
+    let closed = 0;
+    bridge.subscribe(() => undefined, () => closed++);
+    socket.close();
+    expect(closed).toBe(1);
+    // A broken/duplicate close fires the callback only once.
+    await bridge.stop();
+    expect(closed).toBe(1);
+  });
+
+  test("unsubscribe drops the onClose callback too", async () => {
+    const { bridge, socket } = bridgeWith();
+    await startWithOpen(bridge, socket);
+    let closed = 0;
+    const unsub = bridge.subscribe(() => undefined, () => closed++);
+    unsub();
+    socket.close();
+    expect(closed).toBe(0); // unsubscribed before close → no notification
   });
 
   test("stop is safe to call twice and on an already-closed bridge", async () => {

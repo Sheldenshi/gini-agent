@@ -2804,6 +2804,52 @@ describe("runtime api", () => {
     }
   });
 
+  test("the frames SSE stream closes when the bridge dies (no dangling keepalives)", async () => {
+    const config = testConfig("screencast-frames-close-on-death");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const sc = await import("./execution/browser-screencast");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "browser.connect",
+        target: "https://example.com",
+        reason: "Sign in",
+        payload: { toolCallId: "call_close", signInStarted: true, screencast: true }
+      })
+    );
+    // A fake bridge that captures the onClose callback so the test can fire it,
+    // simulating the CDP socket dropping.
+    let fireClose: (() => void) | undefined;
+    const fakeBridge = {
+      isClosed: () => false,
+      subscribe(onFrame: (f: { data: string; meta: Record<string, unknown> }) => void, onClose?: () => void) {
+        onFrame({ data: "QUJD", meta: { deviceWidth: 800 } });
+        fireClose = onClose;
+        return () => undefined;
+      },
+      dispatchInput: async () => undefined,
+      start: async () => undefined,
+      stop: async () => undefined
+    };
+    sc.__setActiveBridgeForTest(fakeBridge as never, setup.id);
+    try {
+      const framesRes = await handler(
+        new Request(`http://127.0.0.1:${config.port}/api/browser/screencast/${setup.id}/frames`, {
+          headers: { authorization: `Bearer ${config.token}` }
+        })
+      );
+      expect(framesRes.status).toBe(200);
+      const reader = framesRes.body!.getReader();
+      await reader.read(); // first frame
+      expect(fireClose).toBeDefined();
+      fireClose!(); // bridge dies → route should close the stream
+      const next = await reader.read();
+      expect(next.done).toBe(true); // stream ended, not dangling on keepalives
+    } finally {
+      sc.__resetActiveBridgeForTest();
+    }
+  });
+
   test("completing a screencast browser.connect resolves the setup without a managed relaunch", async () => {
     // The screencast path keeps the agent on its headless Chrome the whole
     // time, so /complete just stops the bridge (a no-op here, no live bridge)

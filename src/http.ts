@@ -1285,7 +1285,17 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
               // controller already closed — drop the frame
             }
           };
-          unsubscribe = bridge.subscribe(sendFrame);
+          // onClose: when the CDP bridge dies, close the stream so the modal's
+          // EventSource reconnects (and re-hits the gate, 404ing if the setup is
+          // gone) instead of dangling on a stale frame behind keepalives.
+          unsubscribe = bridge.subscribe(sendFrame, () => {
+            if (keepalive) clearInterval(keepalive);
+            try {
+              controller.close();
+            } catch {
+              // already closed
+            }
+          });
           // Comment keepalive so proxies don't idle-close the stream between
           // frames (a static page emits no frames until it changes).
           keepalive = setInterval(() => {
