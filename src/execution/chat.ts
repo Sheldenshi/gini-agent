@@ -26,6 +26,7 @@ import { getSttProvider } from "../stt";
 import { generateStructured, providerAuthFailureText, providerDisplayLabel, providerReauth } from "../provider";
 import { providerOverrideForRuntime, resolveEffectiveContext } from "./effective-context";
 import { createConversationRun, linkRunToTask } from "./runs";
+import { isSilentReply } from "../jobs/silent";
 
 // Statuses where a task is no longer producing partial text. Once a task
 // reaches one of these, the synthesized streaming message is dropped in
@@ -768,15 +769,15 @@ export async function syncChatTaskResult(config: RuntimeConfig, sessionId: strin
     }
     // [SILENT] sentinel — emitted by scheduled jobs that have nothing
     // new to report (e.g. a watcher run that found no change). The
-    // cron-execution hint instructs the LLM to respond with exactly
-    // "[SILENT]" to suppress delivery. We only honor the literal token
-    // (trim trailing whitespace tolerantly but reject any other content,
-    // including lowercase variants), and only for successfully completed
-    // tasks — a failure should still surface in chat.
+    // cron-execution hint instructs the LLM to respond with "[SILENT]"
+    // to suppress delivery. We honor the literal token or a trailing
+    // "[SILENT]" line after a no-op preamble, but reject a leading/inline
+    // sentinel (see src/jobs/silent.ts), and only for successfully
+    // completed tasks — a failure should still surface in chat.
     if (
       task.status === "completed" &&
       typeof task.summary === "string" &&
-      task.summary.trim() === "[SILENT]"
+      isSilentReply(task.summary)
     ) {
       addAudit(
         state,

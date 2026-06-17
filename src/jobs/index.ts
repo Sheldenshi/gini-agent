@@ -5,6 +5,7 @@ import { addAudit, appendEvent, appendLog, appendTrace, createChatMessage, creat
 import { isSkillActive } from "../integrations/connectors";
 import { resolveEffectiveContext } from "../execution/effective-context";
 import { isKnownHook, runHook, type HookConfig } from "../hooks";
+import { isSilentReply } from "./silent";
 import { spawn } from "bun";
 import { Cron } from "croner";
 
@@ -696,11 +697,12 @@ async function finalizeShortCircuit(
   summary?: string
 ): Promise<void> {
   // Empty / "[SILENT]" suppresses chat + bridge delivery — a "nothing new" tick
-  // delivers nothing. The match is exact-trimmed, mirroring the chat-side
-  // suppression contract (src/execution/chat.ts) and the cron-hint instruction.
+  // delivers nothing. A trailing-line sentinel after a no-op preamble also
+  // suppresses, mirroring the chat-side suppression contract
+  // (src/execution/chat.ts) and the cron-hint instruction (see src/jobs/silent.ts).
   const effectiveSummary = summary ?? "[SILENT]";
   const trimmed = effectiveSummary.trim();
-  const isSilent = trimmed.length === 0 || trimmed === "[SILENT]";
+  const isSilent = trimmed.length === 0 || isSilentReply(effectiveSummary);
 
   const outcome = await mutateState(config.instance, (state) => {
     const runItem = state.jobRuns.find((candidate) => candidate.id === run.id);

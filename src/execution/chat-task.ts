@@ -119,6 +119,7 @@ import { listEnabledSkillScripts } from "../capabilities/skill-scripts";
 import { autoRenameChatAfterTurn, dispatchNextPendingChatMessage } from "./chat";
 import { finalizeJobRunFromTask } from "../jobs/finalize";
 import { listJobs } from "../jobs";
+import { isSilentReply } from "../jobs/silent";
 import { peekRefLabel } from "../tools/browser";
 import { isSkillActive } from "../integrations/connectors";
 import { getProvider, providerForCredentialName } from "../integrations/connectors/registry";
@@ -1056,7 +1057,7 @@ async function persistFinalAnswerRow(
     finished.jobId ||
     !transcriptSessionId ||
     finalText.trim().length === 0 ||
-    finalText.trim() === "[SILENT]"
+    isSilentReply(finalText)
   ) {
     return;
   }
@@ -2600,14 +2601,14 @@ async function runLoop(
       // partial-text invariant from ADR risks §4 holds.
       if (finished.status === "completed") {
         // [SILENT] sentinel — a scheduled job (or fan-out subagent
-        // worker) with nothing to report responds with exactly
-        // "[SILENT]" to suppress delivery. The legacy message layer
-        // (syncChatTaskResult) drops the ChatMessageRecord, but the UI
-        // renders chat blocks, so we must also retract the assistant_text
-        // block here or the channel shows a literal "[SILENT]" row. Mirror
-        // the legacy exactness: only the literal token (trailing
-        // whitespace tolerated), never content that merely contains it.
-        if (finalText.trim() === "[SILENT]") {
+        // worker) with nothing to report responds with "[SILENT]" to
+        // suppress delivery. The legacy message layer (syncChatTaskResult)
+        // drops the ChatMessageRecord, but the UI renders chat blocks, so
+        // we must also retract the assistant_text block here or the channel
+        // shows a literal "[SILENT]" row. Mirror the legacy contract: the
+        // literal token or a trailing "[SILENT]" line, never a leading/inline
+        // sentinel that merely contains it (see src/jobs/silent.ts).
+        if (isSilentReply(finalText)) {
           if (inFlightAssistantBlockId) {
             deleteAssistantTextBlock(emitCtx, inFlightAssistantBlockId);
           }

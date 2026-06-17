@@ -15,6 +15,7 @@ import type { RuntimeConfig, RuntimeState, Task } from "../types";
 import { addAudit, appendEvent, appendLog, insertChatBlock, isTerminalTaskStatus, mutateState, now, readState } from "../state";
 import { syncChatTaskResult } from "../execution/chat";
 import { providerAuthFailureText, providerDisplayLabel, providerReauth } from "../provider";
+import { isSilentReply } from "./silent";
 // `sendMessagingOutput` is imported lazily inside the bridge-dispatch
 // helpers to avoid closing a static import cycle. The runtime graph would be:
 //   agent.ts -> jobs/finalize.ts -> integrations/messaging.ts -> agent.ts
@@ -224,18 +225,19 @@ function findSyncedAssistantMessage(state: RuntimeState, chatSessionId: string, 
     .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))[0];
 }
 
-// `[SILENT]` replies explicitly suppress bridge dispatch. The
-// canonical match is EXACT (trimmed), not prefix — matching the
-// suppression contract in src/execution/chat.ts and the system-
-// prompt instruction at src/jobs/index.ts that tells the LLM to
-// "respond with exactly [SILENT] and nothing else". A prefix match
+// `[SILENT]` replies explicitly suppress bridge dispatch. The match
+// honors the literal sentinel or a TRAILING `[SILENT]` line after a
+// no-op preamble, but NOT a prefix — matching the suppression contract
+// in src/execution/chat.ts and the system-prompt instruction at
+// src/jobs/index.ts that tells the LLM to "respond with exactly
+// [SILENT] and nothing else" (see src/jobs/silent.ts). A prefix match
 // here would silently drop a legitimate reply like
 // `"[SILENT] but here's an update"`, which is the exact failure
 // mode the chat-side test pins against.
 function suppressSilentReply(raw: string | undefined): string | undefined {
   const text = raw?.trim();
   if (!text || text.length === 0) return undefined;
-  if (text === "[SILENT]") return undefined;
+  if (isSilentReply(text)) return undefined;
   return text;
 }
 
