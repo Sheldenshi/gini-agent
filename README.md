@@ -11,6 +11,7 @@ Gini is not just a chat box, CLI, messaging bot, or pile of tools. Chat is an in
 - [Gateway And Control Plane](docs/gateway.md): runtime process, BFF, auth, instances, ports, disk layout
 - [Conversation And Runs](docs/conversation-runs.md): chat, runs, tasks, plan steps, traces, and audit handoff
 - [Memory](docs/memory.md): retain, recall, embeddings, reranking, review, and storage
+- [Skill Learning From Skills](docs/skill-learning.md): how Gini improves its own skills from task outcomes (two-tier reward, attribution, the daily review, the human gate)
 - [Runtime Capabilities](docs/runtime-capabilities.md): current CLI/API capability map and verification commands
 - [Model Providers](docs/providers/README.md): per-provider setup guides (credentials, prerequisites, CLI/web config) for OpenAI, Anthropic, Bedrock, Azure, OpenRouter, DeepSeek, Codex, and Local
 - [Operations](docs/operations.md): install, start, stop, smoke, diagnostics, and cleanup
