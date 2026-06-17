@@ -110,10 +110,13 @@ export async function api<T = unknown>(path: string, init: ApiOptions = {}): Pro
 
   // Arm a timeout that aborts the request if the gateway never responds.
   // RN polyfills AbortController (abort-controller@3) but NOT the static
-  // AbortSignal.timeout()/any() helpers, so wire it manually: one
-  // controller fires on our timer, and a caller-supplied signal (React
-  // Query passes one on every queryFn it owns) chains in so an upstream
-  // cancel still aborts the request.
+  // AbortSignal.timeout()/any() helpers, so wire it manually: our timer
+  // fires the controller. The internal timeout is what guarantees the
+  // request settles (issue #396) — it does not depend on the caller. A
+  // caller that DOES pass a `signal` (e.g. to forward React Query's
+  // cancellation) chains in so an upstream cancel also aborts; current
+  // query hooks don't forward one, so this is an opt-in capability, not a
+  // requirement.
   //
   // The timer must stay armed across BOTH the fetch AND the body read.
   // Expo's winter fetch resolves the Response as soon as headers arrive
