@@ -105,15 +105,19 @@ actions (those stay on the authorization flow) or for picking between options
 
 ## Surfaces
 
-The Confirm/Cancel card is React UI in the web chat only. The dispatcher
-carries the same surface guard as the sibling chat-card tools (`ask_user`,
-`browser_fill_secrets`): a task with no web chat session — subagent child,
-scheduled job, or Telegram/Discord bridge — gets a synchronous error telling
-the agent NOT to proceed with the irreversible action and to ask for an
-explicit go-ahead as a regular message instead, so it never strands in
-`waiting_approval`. The mobile `BlockSetupRequested` renders the action
-read-only (a label + a "confirm from Gini on your Mac" hint); making the card
-actionable on mobile is a follow-up, not part of this decision.
+The Confirm/Cancel card renders in both the web chat and the mobile app. The
+dispatcher carries the same surface guard as the sibling chat-card tools
+(`ask_user`, `browser_fill_secrets`): a task with no interactive user chat
+session — subagent child, scheduled job, or Telegram/Discord bridge — gets a
+synchronous error telling the agent NOT to proceed with the irreversible action
+and to ask for an explicit go-ahead as a regular message instead, so it never
+strands in `waiting_approval`. On mobile, `BlockSetupRequested` renders an
+actionable Confirm/Cancel card backed by a `useSetupRequests` query for
+pending/resolved state (the `chat.choice` choice card is actionable there too).
+The setup actions that stay read-only on mobile — `connector.request`,
+`browser.connect`, `browser.fill_secret`, messaging-bridge setup — do so because
+their flows (OAuth, the desktop browser handoff, secret entry) require the
+gateway machine, not because confirmation is web-only.
 
 ## Consequences
 
@@ -127,6 +131,12 @@ actionable on mobile is a follow-up, not part of this decision.
 - Editing the bundled INSTRUCTIONS.md to encode the behavior rotates its hash;
   the prior default joins `HISTORICAL_DEFAULT_INSTRUCTIONS_HASHES` so existing
   instances auto-reseed (see [runtime-identity-files.md](runtime-identity-files.md)).
+- Integration skills that send on the user's behalf defer to this primitive for
+  a reply the agent composed or an outcome the user only delegated, rather than
+  asserting "just execute / the `terminal_exec` gate is the safety net" — that
+  gate does not fire under auto-approval, so a skill bypassing confirmation would
+  send in the user's name with no consent. Skills keep the direct-execute path
+  only for a message the user dictated and explicitly told the agent to send.
 
 ## Acceptance checks
 
