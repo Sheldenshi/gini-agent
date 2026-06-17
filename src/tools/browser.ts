@@ -39,26 +39,14 @@ import { addAudit, assertInsideWorkspace, mutateState, readState } from "../stat
 import { sanitizeUrlForAuditTarget } from "../execution/browser-fill-secrets-types";
 import type { BrowserConnectionRecord, BrowserDomainPolicy, Instance, RuntimeConfig } from "../types";
 
-// Chrome profile directory. The agent persists ALL sign-ins and cookies
-// here; the directory survives runtime restarts and (for the spawned
-// default launch) Chrome process restarts. Removing it requires deleting
-// the directory manually.
-//
-// When an agentId is supplied, the profile is nested PER AGENT under
-// `agents/<agentId>/chrome-profile`, so each gini agent drives its own
-// Chrome with its own cookies and logins — the same isolation key memory
-// uses (see ADR agent-memory-isolation.md). The agentId is sanitized to a
-// filesystem-safe segment. When no agentId is supplied (the visible
-// Connect/managed flow, and any system-driven task without an agent), the
-// profile falls back to the legacy per-instance `chrome-profile` dir so
-// existing sign-ins and the Connect flow are unchanged.
-export function chromeProfileDirFor(instance: Instance, agentId?: string): string {
-  const root = instanceRoot(instance);
-  if (agentId) {
-    const safe = agentId.replace(/[^A-Za-z0-9._-]/g, "_");
-    if (safe.length > 0) return join(root, "agents", safe, "chrome-profile");
-  }
-  return join(root, "chrome-profile");
+// Per-instance Chrome profile directory. The agent persists ALL sign-ins
+// and cookies here; the directory survives runtime restarts and (for the
+// spawned default launch) Chrome process restarts. The spawned default
+// launch, the visible Connect/managed window, and a re-attach all share this
+// one dir, so a sign-in done in any of them is visible to the others.
+// Removing it requires deleting the directory manually.
+export function chromeProfileDirFor(instance: Instance): string {
+  return join(instanceRoot(instance), "chrome-profile");
 }
 
 // Synchronously read the current URL of the task's browser session, if any.
@@ -166,44 +154,31 @@ interface Session {
 // Discriminated union describing the currently-installed shared handle.
 //   - spawned: the DEFAULT agent path. We launched a branded Chrome ourselves
 //     via launchPersistentContext (--headless=new + stealth flags + clean UA +
-//     per-agent profile + a free-picked --remote-debugging-port) over the pipe
-//     transport. Carries the per-agent profileDir we reap on teardown (a
+//     the per-instance profile + a free-picked --remote-debugging-port) over
+//     the pipe transport. Carries the profileDir we reap on teardown (a
 //     profile-dir-scoped SIGKILL — never killall, never the user's :9222) and
-//     the agentKey the profile is scoped to, so each agent owns its own Chrome.
+//     the debug port (used by the sign-in modal that attaches over CDP).
 //   - persistent: the visible "Connect"/managed window, launched by
 //     browser-connect via chromium.launchPersistentContext. Unchanged.
 //   - cdp: attach to an external Chrome the user started themselves. Unchanged.
+//
+// All three are PER INSTANCE: there is one shared browser per instance, stored
+// in the single `shared` slot below, and tasks share its context (cookies
+// bleed across tasks within an instance, per the explicit product decision).
 type SharedHandle =
-  | { kind: "spawned"; context: BrowserContext; port: number; agentKey: string; profileDir: string }
+  | { kind: "spawned"; context: BrowserContext; port: number; profileDir: string }
   | { kind: "persistent"; context: BrowserContext; headed: boolean }
   | { kind: "cdp"; browser: Browser; context: BrowserContext };
 
-// Sentinel agent key for the spawned default launch when a task has no owning
-// agent (system-driven flows, direct tool callers). Maps to the legacy
-// per-instance profile dir. Real agent keys are the agentId string.
-const DEFAULT_AGENT_KEY = "__default__";
-
-// The single instance-level handle used ONLY by the visible "Connect"/managed
-// window and the cdp attach — there is exactly one of each per instance, so a
-// single slot fits. The spawned default path does NOT use this slot; it keys
-// off the per-agent map below so multiple agents' Chromes coexist.
+// The single instance-level handle every mode installs into. The spawned
+// default, the visible Connect window, and the cdp attach are each
+// one-per-instance, so a single slot fits all three.
 let shared: SharedHandle | null = null;
 let chromiumImport: Promise<typeof import("playwright-core").chromium> | undefined;
 // In-flight launch/attach promise so concurrent ensureShared callers share
-// one chromium.launch() / launchPersistentContext() / connectOverCDP()
-// instead of orphaning the loser's handle.
+// one launchPersistentContext() / connectOverCDP() instead of orphaning the
+// loser's handle.
 let pendingShared: Promise<SharedHandle> | null = null;
-// Per-agent spawned Chrome handles, keyed by agentKey (agentId, or
-// DEFAULT_AGENT_KEY for agentless tasks). Each entry is its own Chrome
-// process with its own profile dir, so different agents browse concurrently
-// without thrashing a single slot — the property the single shared slot above
-// cannot provide. Torn down only by disconnectSharedBrowser (switch to
-// managed/cdp) and closeAll (process exit); an idle handle with no live
-// sessions stays alive for reuse, exactly like the shared context does.
-const spawnedHandles = new Map<string, SharedHandle>();
-// Single-flight per agentKey so concurrent first-tool-calls for the same agent
-// share one launch instead of racing two Chromes against one profile dir.
-const pendingSpawned = new Map<string, Promise<SharedHandle>>();
 // Monotonically-increasing disconnect counter. Bumped at the start of
 // every disconnectSharedBrowser call. Replaces an earlier boolean
 // `disconnecting` flag whose two-state design lost information across
@@ -412,26 +387,23 @@ function modeFromRecord(record: BrowserConnectionRecord | undefined): Mode {
 interface BrowserSessionProvider {
   kind: Mode;
   // Establish the transport and return the live handle. Called by
-  // ensureShared under the single-flight pendingShared promise. agentKey is
-  // the per-agent profile key for the spawned provider (DEFAULT_AGENT_KEY for
-  // agentless tasks); the persistent/cdp providers ignore it.
-  connect(record: BrowserConnectionRecord | undefined, agentKey: string): Promise<SharedHandle>;
+  // ensureShared under the single-flight pendingShared promise.
+  connect(record: BrowserConnectionRecord | undefined): Promise<SharedHandle>;
   // Release the handle this provider built. Must never throw — teardown
   // runs on paths (disconnect, exit hooks) that cannot surface errors.
   disconnect(handle: SharedHandle): Promise<void>;
 }
 
-// Map a per-agent key to its profile dir. DEFAULT_AGENT_KEY → the legacy
-// per-instance profile (system-driven / agentless tasks); any other key →
-// the per-agent profile under agents/<agentId>/chrome-profile.
-function spawnedProfileDir(agentKey: string): string {
+// The per-instance profile dir the spawned default launch uses. Refuses to
+// launch when no instance is registered (raw test imports install a fake
+// handle instead).
+function spawnedProfileDir(): string {
   if (!runtimeInstance) {
     throw new Error(
       "No instance registered for the browser session manager; call setBrowserInstance() before triggering a browser tool."
     );
   }
-  const agentId = agentKey === DEFAULT_AGENT_KEY ? undefined : agentKey;
-  return chromeProfileDirFor(runtimeInstance, agentId);
+  return chromeProfileDirFor(runtimeInstance);
 }
 
 // The spawn-and-attach launcher, indirected through a module-level binding so
@@ -442,20 +414,21 @@ let spawnChrome: typeof launchSpawnedChrome = launchSpawnedChrome;
 
 const spawnedSessionProvider: BrowserSessionProvider = {
   kind: "spawned",
-  async connect(_record, agentKey) {
-    // Launch our OWN branded Chrome (headless) against this agent's profile
+  async connect() {
+    // Launch our OWN branded Chrome (headless) against the per-instance profile
     // dir on a free debug port, over Playwright's pipe transport. The user's
-    // :9222 is never touched; the debug port is free-picked above it.
-    const profileDir = spawnedProfileDir(agentKey);
+    // :9222 is never touched; the debug port is free-picked above it (and is
+    // the endpoint the sign-in modal attaches to over CDP).
+    const profileDir = spawnedProfileDir();
     const { context, port } = await spawnChrome({ profileDir, headless: true });
-    return { kind: "spawned", context, port, agentKey, profileDir };
+    return { kind: "spawned", context, port, profileDir };
   },
   async disconnect(handle) {
     if (handle.kind !== "spawned") return;
     // Close the persistent context, which terminates the Chrome Playwright
     // launched. Bound it so a wedged Chrome can't hang teardown; on timeout,
-    // reap by THIS agent's profile dir (unique per agent, so the scan SIGKILLs
-    // only this agent's Chrome — never killall, never the user's :9222). The
+    // reap by the instance profile dir (so the scan SIGKILLs only this
+    // instance's spawned Chrome — never killall, never the user's :9222). The
     // profile dir on disk stays put so sign-ins persist.
     const settled = await settledWithin(handle.context.close(), teardownCloseTimeoutMs);
     if (!settled) {
@@ -662,10 +635,8 @@ async function ensureShared(): Promise<SharedHandle> {
   const launchGeneration = disconnectGeneration;
   pendingShared = (async () => {
     // Transport acquisition is fully delegated to the session provider —
-    // the generation choreography around it is transport-agnostic. ensureShared
-    // only serves managed/cdp here (the spawned default routes through
-    // ensureSpawned), and both ignore the agentKey, so pass the sentinel.
-    const built: SharedHandle = await sessionProviders[mode].connect(record, DEFAULT_AGENT_KEY);
+    // the generation choreography around it is transport-agnostic.
+    const built: SharedHandle = await sessionProviders[mode].connect(record);
     if (disconnectGeneration !== launchGeneration) {
       // Disconnect bumped the generation while we were launching. Clean
       // up the freshly-built handle and surface a clear error to the
@@ -715,56 +686,6 @@ async function ensureShared(): Promise<SharedHandle> {
       pendingShared = null;
     });
   return pendingShared;
-}
-
-// Acquire (or reuse) the spawned Chrome handle for one agent. Mirrors
-// ensureShared's single-flight + disconnect-generation choreography, but keyed
-// per agentKey so each agent owns an independent Chrome process and profile
-// dir. A live handle is reused; a dead one (Chrome crashed or was reaped) is
-// dropped and relaunched. The disconnect-generation re-check guards against a
-// disconnectSharedBrowser landing mid-launch.
-async function ensureSpawned(agentKey: string): Promise<SharedHandle> {
-  const existing = spawnedHandles.get(agentKey);
-  if (existing && isHandleAlive(existing)) return existing;
-  if (existing) {
-    // Dead handle — drop it so we relaunch cleanly below.
-    spawnedHandles.delete(agentKey);
-  }
-  const inflight = pendingSpawned.get(agentKey);
-  if (inflight) return inflight;
-  const launchGeneration = disconnectGeneration;
-  const promise = (async () => {
-    // Dispatch through the registry (not the const) so the test seam's
-    // provider swap is honored, mirroring ensureShared.
-    const built = await sessionProviders.spawned.connect(undefined, agentKey);
-    // If a disconnect bumped the generation while we were launching, the
-    // disconnect already cleared this agent's slot — installing the
-    // freshly-built handle would re-attach to a soon-to-be-dead Chrome. Tear
-    // it down (reaping its pid) and surface the standard sentinel instead.
-    if (disconnectGeneration !== launchGeneration) {
-      await teardownHandle(built).catch(() => undefined);
-      throw new Error("Browser disconnecting, retry shortly.");
-    }
-    spawnedHandles.set(agentKey, built);
-    registerExitHook();
-    startSweeper();
-    return built;
-  })()
-    .catch((error) => {
-      const message = error instanceof Error ? error.message : String(error);
-      if (message.startsWith("Browser disconnecting")) {
-        throw error instanceof Error ? error : new Error(message);
-      }
-      throw new Error(
-        `Failed to launch Chrome: ${message}. ` +
-          "Confirm Chrome / Chromium is installed (or set GINI_CHROME_PATH) and retry."
-      );
-    })
-    .finally(() => {
-      pendingSpawned.delete(agentKey);
-    });
-  pendingSpawned.set(agentKey, promise);
-  return promise;
 }
 
 // Called by the browser-connect capability after it builds the visible
@@ -880,8 +801,8 @@ function startSweeper(): void {
 // context is CREATED — impossible for both the persistent context
 // (launched before any task exists) and a CDP-attached user Chrome —
 // while tracing can start on an already-live context in either mode. The
-// BrowserContext is shared across tasks, so only one trace runs at a
-// time: the first session created while none is active claims it;
+// BrowserContext is shared across tasks (one per instance), so only one trace
+// runs at a time: the first session created while none is active claims it;
 // sessions starting while a trace is in flight are simply not recorded.
 //
 // Trace archives are raw Playwright captures (DOM snapshots +
@@ -1004,19 +925,6 @@ async function stopSessionTrace(taskId: string, context: BrowserContext): Promis
   }
 }
 
-// Pick the live BrowserContext a task should drive. The default path (no
-// state.browser record) routes to the task's PER-AGENT spawned Chrome; an
-// explicit managed/cdp record routes to the single instance-level shared
-// handle (the visible Connect window or the user's attached Chrome). Resolved
-// per call so a Connect/Disconnect between tool calls is observed.
-async function acquireHandleForTask(taskId: string): Promise<SharedHandle> {
-  const mode = modeFromRecord(activeBrowserRecord());
-  if (mode === "spawned") {
-    return ensureSpawned(agentIdForTask(taskId) ?? DEFAULT_AGENT_KEY);
-  }
-  return ensureShared();
-}
-
 async function getOrCreate(taskId: string): Promise<Session> {
   const existing = sessions.get(taskId);
   if (existing) {
@@ -1035,13 +943,12 @@ async function getOrCreate(taskId: string): Promise<Session> {
   const inflight = pendingSessions.get(taskId);
   if (inflight) return inflight;
   const promise = (async () => {
-    const handle = await acquireHandleForTask(taskId);
+    const handle = await ensureShared();
     // Tasks sharing one BrowserContext share its cookies (by design — one
-    // profile per agent, or per instance for managed/cdp). The FIRST task on a
-    // given context claims any existing page (e.g. the about:blank Chrome opens
-    // at launch); later tasks on that same context each get a fresh tab so they
-    // don't trample each other. Count by context (not global session count) so
-    // each per-agent Chrome's initial page is claimed exactly once.
+    // profile per instance). The FIRST task on the context claims any existing
+    // page (e.g. the about:blank Chrome opens at launch); later tasks each get
+    // a fresh tab so they don't trample each other. Count by context (not
+    // global session count) so the initial page is claimed exactly once.
     const context = handle.context;
     const contextHasSession = Array.from(sessions.values()).some((s) => s.context === context);
     const reusable = contextHasSession ? undefined : context.pages()[0];
@@ -1210,12 +1117,6 @@ export async function disconnectSharedBrowser(): Promise<void> {
     if (pendingShared) {
       await pendingShared.catch(() => undefined);
     }
-    // Same drain for in-flight per-agent spawned launches, for the same
-    // reason: a launch that finishes after this point would install a live
-    // Chrome into spawnedHandles that we'd then leak past this teardown.
-    if (pendingSpawned.size > 0) {
-      await Promise.all(Array.from(pendingSpawned.values()).map((p) => p.catch(() => undefined)));
-    }
 
     const ids = Array.from(sessions.keys());
     for (const id of ids) {
@@ -1256,14 +1157,6 @@ export async function disconnectSharedBrowser(): Promise<void> {
       await teardownHandle(shared).catch(() => undefined);
       shared = null;
     }
-    // Tear down every per-agent spawned Chrome too. A disconnect is an
-    // instance-wide reset (the caller is switching to a managed/cdp browser or
-    // wiping), so no agent's spawned Chrome should survive it. Each teardown
-    // reaps its own exact pid.
-    for (const [key, handle] of Array.from(spawnedHandles.entries())) {
-      spawnedHandles.delete(key);
-      await teardownHandle(handle).catch(() => undefined);
-    }
     if (sweepTimer) {
       clearInterval(sweepTimer);
       sweepTimer = undefined;
@@ -1302,6 +1195,15 @@ export async function withTeardownLock<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 export async function closeAll(): Promise<void> {
+  // Bump the generation so an in-flight launch that resolves during this
+  // teardown sees the mismatch and tears its own handle down instead of
+  // installing it into `shared` after our cleanup ran (a leak past process
+  // exit). Then drain the in-flight launch before tearing down, mirroring
+  // disconnectSharedBrowser.
+  disconnectGeneration++;
+  if (pendingShared) {
+    await pendingShared.catch(() => undefined);
+  }
   const ids = Array.from(sessions.keys());
   for (const id of ids) {
     const session = sessions.get(id);
@@ -1331,12 +1233,6 @@ export async function closeAll(): Promise<void> {
   if (shared) {
     await teardownHandle(shared).catch(() => undefined);
     shared = null;
-  }
-  // Reap every per-agent spawned Chrome (each by its exact pid) on process
-  // exit so no headless Chrome is orphaned when the runtime stops.
-  for (const [key, handle] of Array.from(spawnedHandles.entries())) {
-    spawnedHandles.delete(key);
-    await teardownHandle(handle).catch(() => undefined);
   }
   if (sweepTimer) {
     clearInterval(sweepTimer);
@@ -1641,23 +1537,6 @@ function agentDomainPolicyForTask(taskId: string | undefined): BrowserDomainPoli
     const agentId = state.tasks.find((task) => task.id === taskId)?.agentId;
     if (!agentId) return undefined;
     return state.agents.find((agent) => agent.id === agentId)?.browserDomainPolicy;
-  } catch {
-    return undefined;
-  }
-}
-
-// Resolve the owning agentId for a task through the same state channel. Used
-// by the spawned launch path to pick a PER-AGENT Chrome profile (and to key
-// the shared handle so switching agents relaunches against the right
-// profile). Returns undefined when no runtime instance is registered (tests /
-// direct tool callers), the task has no agentId (system-driven flows), or the
-// state read fails — in which case the launch falls back to the legacy
-// per-instance profile.
-function agentIdForTask(taskId: string | undefined): string | undefined {
-  if (!runtimeInstance || !taskId) return undefined;
-  try {
-    const state = readState(runtimeInstance);
-    return state.tasks.find((task) => task.id === taskId)?.agentId ?? undefined;
   } catch {
     return undefined;
   }
@@ -5230,9 +5109,8 @@ export const __test = {
     runtimeInstance = undefined;
   },
   // Swap a session provider so the seam-dispatch test can verify
-  // ensureShared / ensureSpawned / teardownHandle route through the registry
-  // without touching playwright-core. Pass null to restore the built-in
-  // provider.
+  // ensureShared / teardownHandle route through the registry without touching
+  // playwright-core. Pass null to restore the built-in provider.
   setSessionProviderForTest(kind: Mode, provider: BrowserSessionProvider | null): void {
     const builtIn: Record<Mode, BrowserSessionProvider> = {
       spawned: spawnedSessionProvider,
@@ -5241,49 +5119,25 @@ export const __test = {
     };
     sessionProviders[kind] = provider ?? builtIn[kind];
   },
-  // Install / clear an in-flight spawned launch (per agentKey) so the
-  // disconnect-generation race test can suspend the default path's launch
-  // exactly as installPendingSharedForTest does for the managed/cdp path.
-  installPendingSpawnedForTest(agentKey: string, promise: Promise<SharedHandle>): void {
-    pendingSpawned.set(agentKey, promise as Promise<SharedHandle>);
-  },
-  clearPendingSpawnedForTest(): void {
-    pendingSpawned.clear();
-    spawnedHandles.clear();
-  },
   // Swap the spawn-and-attach launcher so the spawned-provider tests exercise
-  // the real provider/ensureSpawned bodies without launching Chrome. Pass null
-  // to restore the production launcher.
+  // the real provider body without launching Chrome. Pass null to restore the
+  // production launcher.
   setSpawnChromeForTest(fn: typeof launchSpawnedChrome | null): void {
     spawnChrome = fn ?? launchSpawnedChrome;
   },
-  // Drive ensureSpawned directly for the per-agent acquisition tests.
-  ensureSpawnedForTest(agentKey: string): Promise<SharedHandle> {
-    return ensureSpawned(agentKey);
+  // Read the resolved per-instance spawned profile dir (exercises the
+  // no-instance throw).
+  spawnedProfileDirForTest(): string {
+    return spawnedProfileDir();
   },
-  // Read the resolved spawned profile dir for an agent key (exercises the
-  // DEFAULT_AGENT_KEY → per-instance vs per-agent mapping + the no-instance
-  // throw).
-  spawnedProfileDirForTest(agentKey: string): string {
-    return spawnedProfileDir(agentKey);
-  },
-  // Drive a provider's connect() directly so the managed/cdp body branches
-  // (no-instance refusal, missing cdpUrl) can be exercised without routing a
-  // whole tool call.
+  // Drive a provider's connect() directly so the managed/cdp/spawned body
+  // branches (no-instance refusal, missing cdpUrl) can be exercised without
+  // routing a whole tool call.
   connectProviderForTest(
     kind: Mode,
     record: BrowserConnectionRecord | undefined
   ): Promise<SharedHandle> {
-    return sessionProviders[kind].connect(record, DEFAULT_AGENT_KEY);
-  },
-  // Resolve a task's agentId via the same state channel the spawned path uses,
-  // so the state-read-failure fallback can be exercised directly.
-  agentIdForTaskForTest(taskId: string | undefined): string | undefined {
-    return agentIdForTask(taskId);
-  },
-  // Inspect / seed the per-agent spawned handle map.
-  spawnedHandleKeysForTest(): string[] {
-    return Array.from(spawnedHandles.keys());
+    return sessionProviders[kind].connect(record);
   },
   // Reset the opt-in recording flag and any active trace claim so
   // recording tests don't leak state into siblings.

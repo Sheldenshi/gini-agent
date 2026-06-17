@@ -469,7 +469,6 @@ describe("browser disconnect lifecycle", () => {
     browserTest.clearFakeSessionsForTest();
     browserTest.setInFlightDisconnectsForTest(0);
     browserTest.clearPendingSharedForTest();
-    browserTest.clearPendingSpawnedForTest();
     browserTest.resetTeardownCloseTimeoutForTest();
     browserTest.resetChromeKillerForTest();
     browserTest.resetBrowserInstanceForTest();
@@ -634,8 +633,8 @@ describe("browser disconnect lifecycle", () => {
   // getOrCreate's await suspends until we resolve it AFTER bumping the
   // generation.
   test("withSession bails when disconnect generation advances during admission", async () => {
-    // Install a pending SPAWNED launch that we control so the default tool
-    // path's ensureSpawned await suspends at our latch instead of hitting the
+    // Install a pending shared launch that we control so the default tool
+    // path's ensureShared await suspends at our latch instead of hitting the
     // real spawn (which would fail with "Chrome not found" and obscure the
     // assertion). The fake spawned handle is what getOrCreate would see after
     // the await resolves — but the test bumps the generation BEFORE we
@@ -657,13 +656,12 @@ describe("browser disconnect lifecycle", () => {
       kind: "spawned" as const,
       context: fakeContext,
       port: 9333,
-      agentKey: "__default__",
       profileDir: "/tmp/fake-profile"
     };
     const pending = new Promise<unknown>((resolve) => {
       resolveShared = resolve;
     });
-    browserTest.installPendingSpawnedForTest("__default__", pending as Promise<never>);
+    browserTest.installPendingSharedForTest(pending as Promise<never>);
 
     // Kick off the navigation. withSession captures the generation,
     // bumps pendingAdmissions, awaits getOrCreate -> ensureShared ->
@@ -2805,7 +2803,6 @@ describe("withTeardownLock", () => {
     browserTest.clearFakeSessionsForTest();
     browserTest.setInFlightDisconnectsForTest(0);
     browserTest.clearPendingSharedForTest();
-    browserTest.clearPendingSpawnedForTest();
   });
 
   test("rejects parallel withSession admissions while the lock is held", async () => {
@@ -2848,7 +2845,6 @@ describe("disconnectSharedBrowser pending-launch handling", () => {
     browserTest.clearFakeSessionsForTest();
     browserTest.setInFlightDisconnectsForTest(0);
     browserTest.clearPendingSharedForTest();
-    browserTest.clearPendingSpawnedForTest();
   });
 
   test("waits for an in-flight pendingShared launch and clears the resulting handle", async () => {
@@ -2936,7 +2932,7 @@ describe("isHandleAlive persistent liveness", () => {
 
 // The no-record default tool path now acquires its browser via the SPAWNED
 // provider (we launch our own branded Chrome on a free debug port and attach
-// over CDP) against a per-agent profile dir. These tests swap the spawned
+// over CDP) against the per-instance profile dir. These tests swap the spawned
 // provider with a fake so the default path is exercised without launching a
 // real Chrome — the launch internals themselves are covered in
 // chrome-launch.test.ts.
@@ -2961,22 +2957,20 @@ describe("spawned default browser launch", () => {
     browserTest.setSessionProviderForTest("spawned", null);
     browserTest.uninstallFakeBrowserForTest();
     browserTest.clearFakeSessionsForTest();
-    browserTest.clearPendingSpawnedForTest();
     browserTest.setInFlightDisconnectsForTest(0);
     browserTest.clearPendingSharedForTest();
   });
 
   test("routes the no-record default path through the spawned provider", async () => {
-    const connectKeys: string[] = [];
+    let connectCalls = 0;
     browserTest.setSessionProviderForTest("spawned", {
       kind: "spawned",
-      connect: async (_record, agentKey) => {
-        connectKeys.push(agentKey);
+      connect: async (_record) => {
+        connectCalls++;
         return {
           kind: "spawned",
           context: fakeSpawnedContext() as never,
           port: 9333,
-          agentKey,
           profileDir: "/tmp/fake-profile"
         };
       },
@@ -2984,14 +2978,14 @@ describe("spawned default browser launch", () => {
     });
 
     try {
-      // No runtime instance / agentId on this task, so it maps to the default
-      // agent key — the spawned provider should be asked exactly once.
+      // No record on this task, so the default path maps to the spawned
+      // provider — it should be asked exactly once.
       await browserNavigate("spawned-default-task", { url: "https://example.com/" });
     } catch {
       // Snapshot wiring may throw on the fake page; the assertion is below.
     }
 
-    expect(connectKeys).toEqual(["__default__"]);
+    expect(connectCalls).toBe(1);
   });
 
   test("drops a cached session whose browser was killed and relaunches via spawned provider", async () => {
@@ -3006,13 +3000,12 @@ describe("spawned default browser launch", () => {
     let connectCalls = 0;
     browserTest.setSessionProviderForTest("spawned", {
       kind: "spawned",
-      connect: async (_record, agentKey) => {
+      connect: async (_record) => {
         connectCalls++;
         return {
           kind: "spawned",
           context: fakeSpawnedContext() as never,
           port: 9333,
-          agentKey,
           profileDir: "/tmp/fake-profile"
         };
       },
@@ -3031,12 +3024,13 @@ describe("spawned default browser launch", () => {
   });
 });
 
-// Per-agent spawned launch internals: the real spawnedSessionProvider body,
-// the profile-dir mapping, ensureSpawned's reuse/relaunch/generation guards,
-// and per-agent teardown. The spawn-and-attach launcher is swapped for a fake
-// so no real Chrome is launched (the launcher itself is covered in
-// chrome-launch.test.ts).
-describe("per-agent spawned launch internals", () => {
+// Spawned launch internals: the real spawnedSessionProvider body, the
+// per-instance profile-dir mapping, ensureShared's reuse/relaunch/generation
+// guards, and teardown. The default (no-record) tool path routes through the
+// spawned provider against the single per-instance shared slot. The
+// spawn-and-attach launcher is swapped for a fake so no real Chrome is
+// launched (the launcher itself is covered in chrome-launch.test.ts).
+describe("spawned launch internals", () => {
   // A fake persistent context whose close() is observable and whose
   // browser().isConnected() drives liveness. `connected` can flip to simulate
   // an external kill.
@@ -3059,82 +3053,92 @@ describe("per-agent spawned launch internals", () => {
       context: context as never,
       port: opts.port ?? 9444,
       chromePath: "/fake/chrome",
-      profileDir: "/tmp/fake-agent-profile"
+      profileDir: "/tmp/fake-instance-profile"
     };
     return { result, close };
   }
-  function fakeContext() {
-    return fakeSpawnedResult().result.context;
-  }
 
-  afterEach(() => {
+  afterEach(async () => {
+    await disconnectSharedBrowser().catch(() => undefined);
     browserTest.setSpawnChromeForTest(null);
-    browserTest.clearPendingSpawnedForTest();
+    browserTest.uninstallFakeBrowserForTest();
+    browserTest.clearFakeSessionsForTest();
+    browserTest.clearPendingSharedForTest();
     browserTest.setInFlightDisconnectsForTest(0);
     browserTest.resetBrowserInstanceForTest();
     delete process.env["GINI_STATE_ROOT"];
   });
 
-  test("spawnedProfileDir maps the default key to the per-instance dir and a real agent to a per-agent dir", () => {
+  test("spawnedProfileDir resolves the per-instance chrome-profile dir (not a per-agent dir)", () => {
     process.env["GINI_STATE_ROOT"] = "/tmp/gini-spawn-profiledir";
     setBrowserInstance("pd-inst");
-    const def = browserTest.spawnedProfileDirForTest("__default__");
-    expect(def).toContain("pd-inst");
-    expect(def).toContain("chrome-profile");
-    expect(def).not.toContain("agents");
-    const perAgent = browserTest.spawnedProfileDirForTest("agent_42");
-    expect(perAgent).toContain(join("agents", "agent_42", "chrome-profile"));
+    const dir = browserTest.spawnedProfileDirForTest();
+    expect(dir).toContain("pd-inst");
+    expect(dir).toContain("chrome-profile");
+    expect(dir).not.toContain("agents");
   });
 
   test("spawnedProfileDir throws when no instance is registered", () => {
     browserTest.resetBrowserInstanceForTest();
-    expect(() => browserTest.spawnedProfileDirForTest("__default__")).toThrow(/No instance registered/);
+    expect(() => browserTest.spawnedProfileDirForTest()).toThrow(/No instance registered/);
   });
 
-  test("the spawned provider launches per agent and closes the context on disconnect", async () => {
+  test("the default path launches via the spawned provider and closes the context on disconnect", async () => {
     process.env["GINI_STATE_ROOT"] = "/tmp/gini-spawn-provider";
     setBrowserInstance("sp-inst");
     const { result, close } = fakeSpawnedResult();
     const spawnFake = mock(async () => result);
     browserTest.setSpawnChromeForTest(spawnFake as never);
 
-    const handle = await browserTest.ensureSpawnedForTest("agent_a");
-    expect(handle.kind).toBe("spawned");
+    // No state.browser record → spawned mode → ensureShared → spawned provider.
+    try {
+      await browserNavigate("sp-task", { url: "https://example.com/" });
+    } catch {
+      // Snapshot wiring may throw on the fake page; the launch is what's pinned.
+    }
     expect(spawnFake).toHaveBeenCalledTimes(1);
-    // A second call for the SAME agent reuses the live handle (no relaunch).
-    const again = await browserTest.ensureSpawnedForTest("agent_a");
-    expect(again).toBe(handle);
+    expect(browserTest.isSharedHandleAliveForTest()).toBe(true);
+    // A second tool call on the live handle reuses it (no relaunch).
+    try {
+      await browserNavigate("sp-task-2", { url: "https://example.com/" });
+    } catch {
+      // ignore fake-page wiring throw
+    }
     expect(spawnFake).toHaveBeenCalledTimes(1);
-    // A different agent launches its own Chrome.
-    await browserTest.ensureSpawnedForTest("agent_b");
-    expect(spawnFake).toHaveBeenCalledTimes(2);
-    expect(browserTest.spawnedHandleKeysForTest().sort()).toEqual(["agent_a", "agent_b"]);
 
-    // disconnectSharedBrowser tears down every per-agent handle by closing its
+    // disconnectSharedBrowser tears down the spawned handle by closing its
     // persistent context (which terminates the launched Chrome).
     await disconnectSharedBrowser();
     expect(close).toHaveBeenCalled();
-    expect(browserTest.spawnedHandleKeysForTest()).toEqual([]);
+    expect(browserTest.isSharedHandleAliveForTest()).toBeNull();
   });
 
-  test("ensureSpawned relaunches when the cached handle's context is disconnected", async () => {
+  test("ensureShared relaunches when the cached spawned handle's context is disconnected", async () => {
     process.env["GINI_STATE_ROOT"] = "/tmp/gini-spawn-relaunch";
     setBrowserInstance("relaunch-inst");
     let connected = true;
     const spawnFake = mock(async () => fakeSpawnedResult({ connected: () => connected }).result);
     browserTest.setSpawnChromeForTest(spawnFake as never);
 
-    await browserTest.ensureSpawnedForTest("agent_c");
+    try {
+      await browserNavigate("relaunch-task", { url: "https://example.com/" });
+    } catch {
+      // ignore fake-page wiring throw
+    }
     expect(spawnFake).toHaveBeenCalledTimes(1);
-    // The Chrome dies; the next ensureSpawned drops the dead handle and relaunches.
+    // The Chrome dies; the next tool call drops the dead handle and relaunches.
     connected = false;
-    await browserTest.ensureSpawnedForTest("agent_c");
+    try {
+      await browserNavigate("relaunch-task-2", { url: "https://example.com/" });
+    } catch {
+      // ignore fake-page wiring throw
+    }
     expect(spawnFake).toHaveBeenCalledTimes(2);
     await closeAll();
-    expect(browserTest.spawnedHandleKeysForTest()).toEqual([]);
+    expect(browserTest.isSharedHandleAliveForTest()).toBeNull();
   });
 
-  test("ensureSpawned bails and tears down when a disconnect lands mid-launch", async () => {
+  test("ensureShared bails and tears down the spawned handle when a disconnect lands mid-launch", async () => {
     process.env["GINI_STATE_ROOT"] = "/tmp/gini-spawn-genrace";
     setBrowserInstance("genrace-inst");
     const { result, close } = fakeSpawnedResult();
@@ -3145,19 +3149,25 @@ describe("per-agent spawned launch internals", () => {
     });
     browserTest.setSpawnChromeForTest(spawnFake as never);
 
-    await expect(browserTest.ensureSpawnedForTest("agent_d")).rejects.toThrow(/disconnecting/i);
+    const navResult = await browserNavigate("genrace-task", { url: "https://example.com/" });
+    const parsed = JSON.parse(navResult) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toMatch(/disconnecting/i);
     // The freshly-built handle was torn down (context closed) and never installed.
     expect(close).toHaveBeenCalled();
-    expect(browserTest.spawnedHandleKeysForTest()).toEqual([]);
+    expect(browserTest.isSharedHandleAliveForTest()).toBeNull();
   });
 
-  test("ensureSpawned wraps a launch failure with a friendly message", async () => {
+  test("ensureShared wraps a spawned launch failure with a friendly message", async () => {
     process.env["GINI_STATE_ROOT"] = "/tmp/gini-spawn-fail";
     setBrowserInstance("fail-inst");
     browserTest.setSpawnChromeForTest((async () => {
       throw new Error("chrome go boom");
     }) as never);
-    await expect(browserTest.ensureSpawnedForTest("agent_e")).rejects.toThrow(/Failed to launch Chrome: chrome go boom/);
+    const navResult = await browserNavigate("fail-task", { url: "https://example.com/" });
+    const parsed = JSON.parse(navResult) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toMatch(/Failed to launch Chromium: chrome go boom/);
   });
 
   test("disconnectSharedBrowser drains an in-flight spawned launch before teardown", async () => {
@@ -3174,32 +3184,19 @@ describe("per-agent spawned launch internals", () => {
     }) as never);
 
     // Start a launch and leave it suspended at the gate.
-    const launching = browserTest.ensureSpawnedForTest("agent_drain");
+    const launching = browserNavigate("drain-task", { url: "https://example.com/" });
     await new Promise((r) => setImmediate(r));
-    // Disconnect runs concurrently; its pendingSpawned drain must await the
+    // Disconnect runs concurrently; its pendingShared drain must await the
     // in-flight launch (which we now release).
     const disconnecting = disconnectSharedBrowser();
     await new Promise((r) => setImmediate(r));
     releaseLaunch();
     await Promise.all([launching.catch(() => undefined), disconnecting]);
-    // The drained launch's handle was torn down, leaving no per-agent handles.
-    expect(browserTest.spawnedHandleKeysForTest()).toEqual([]);
+    // The drained launch's handle was torn down, leaving no shared handle.
+    expect(browserTest.isSharedHandleAliveForTest()).toBeNull();
   });
 
-  test("agentIdForTask falls back to undefined when the state read throws", async () => {
-    const ROOT = "/tmp/gini-agentid-corrupt";
-    process.env["GINI_STATE_ROOT"] = ROOT;
-    const instance = `agentid-corrupt-${process.pid}`;
-    const dir = `${ROOT}/instances/${instance}`;
-    rmSync(dir, { recursive: true, force: true });
-    mkdirSync(dir, { recursive: true });
-    // Corrupt state.json so readState throws inside agentIdForTask's try.
-    writeFileSync(join(dir, "state.json"), "{ this is not valid json ]");
-    setBrowserInstance(instance);
-    expect(browserTest.agentIdForTaskForTest("any-task")).toBeUndefined();
-  });
-
-  test("a wedged spawned context close reaps the agent's Chrome by its profile dir", async () => {
+  test("a wedged spawned context close reaps the instance's Chrome by its profile dir", async () => {
     process.env["GINI_STATE_ROOT"] = "/tmp/gini-spawn-wedged";
     setBrowserInstance("wedged-inst");
     // A context whose close() never resolves, so teardown hits the timeout
@@ -3219,49 +3216,57 @@ describe("per-agent spawned launch internals", () => {
     };
     browserTest.setSpawnChromeForTest((async () => ({
       context: neverCloses as never,
-      port: 9444,
-      chromePath: "/fake/chrome",
-      profileDir: "/tmp/wedged-agent-profile"
+      port: 9444
     })) as never);
     browserTest.setTeardownCloseTimeoutForTest(20);
     const killer = mock((_dir: string) => 1);
     browserTest.setChromeKillerForTest(killer);
     try {
-      const handle = await browserTest.ensureSpawnedForTest("agent_wedged");
-      // The provider scopes the handle to the agent's real per-agent profile
-      // dir (computed by spawnedProfileDir), not whatever the launcher echoed.
-      const expectedDir = (handle as { profileDir: string }).profileDir;
-      expect(expectedDir).toContain(join("agents", "agent_wedged", "chrome-profile"));
+      try {
+        await browserNavigate("wedged-task", { url: "https://example.com/" });
+      } catch {
+        // ignore fake-page wiring throw
+      }
       await disconnectSharedBrowser();
       // The wedged close timed out, so the profile-dir reaper fired against
-      // THIS agent's dir (never killall).
-      expect(killer).toHaveBeenCalledWith(expectedDir);
-      expect(browserTest.spawnedHandleKeysForTest()).toEqual([]);
+      // THIS instance's chrome-profile dir (never killall, never agents/).
+      expect(killer).toHaveBeenCalledTimes(1);
+      const reapedDir = killer.mock.calls[0]![0]!;
+      expect(reapedDir).toContain("chrome-profile");
+      expect(reapedDir).not.toContain("agents");
+      expect(browserTest.isSharedHandleAliveForTest()).toBeNull();
     } finally {
       browserTest.resetTeardownCloseTimeoutForTest();
       browserTest.resetChromeKillerForTest();
     }
   });
 
-  test("closeAll drains a live session's owned pages then clears spawned handles", async () => {
+  test("closeAll drains a live session's owned pages then clears the spawned handle", async () => {
     process.env["GINI_STATE_ROOT"] = "/tmp/gini-spawn-closeall";
     setBrowserInstance("closeall-inst");
+    // Seed the spawned handle so closeAll's teardown loop runs against a real
+    // entry. Driving a navigate with no record routes through ensureShared →
+    // the spawned provider, installing the fake context into the shared slot.
+    const { result, close } = fakeSpawnedResult();
+    browserTest.setSpawnChromeForTest((async () => result) as never);
     const pageClose = mock(() => Promise.resolve());
-    // A live session with an agent-owned page so closeAll's ownedPageIds drain
-    // loop runs against a real entry.
+    // Pre-install a live session with an agent-owned page so closeAll's
+    // ownedPageIds drain loop runs against a real entry.
     browserTest.installFakeSessionWithPageForTest("closeall-task", {
       url: () => "about:blank",
       close: pageClose
     } as never);
-    // Seed a spawned handle so closeAll's per-agent teardown loop also runs.
-    const { result, close } = fakeSpawnedResult();
-    browserTest.setSpawnChromeForTest((async () => result) as never);
-    await browserTest.ensureSpawnedForTest("agent_close");
+    try {
+      await browserNavigate("closeall-task-2", { url: "https://example.com/" });
+    } catch {
+      // ignore fake-page wiring throw
+    }
+    expect(browserTest.isSharedHandleAliveForTest()).toBe(true);
 
     await closeAll();
     expect(pageClose).toHaveBeenCalled();
     expect(close).toHaveBeenCalled();
-    expect(browserTest.spawnedHandleKeysForTest()).toEqual([]);
+    expect(browserTest.isSharedHandleAliveForTest()).toBeNull();
   });
 });
 
@@ -3278,7 +3283,6 @@ describe("ensureShared managed + cdp provider bodies", () => {
     browserTest.uninstallFakeBrowserForTest();
     browserTest.clearFakeSessionsForTest();
     browserTest.clearPendingSharedForTest();
-    browserTest.clearPendingSpawnedForTest();
     browserTest.setInFlightDisconnectsForTest(0);
     browserTest.resetChromiumImportForTest();
     browserTest.resetBrowserInstanceForTest();
@@ -3563,7 +3567,6 @@ describe("browser session provider seam", () => {
     browserTest.uninstallFakeBrowserForTest();
     browserTest.clearFakeSessionsForTest();
     browserTest.clearPendingSharedForTest();
-    browserTest.clearPendingSpawnedForTest();
   });
 
   test("the default path connects and teardown disconnects through the registered provider", async () => {
@@ -3585,13 +3588,12 @@ describe("browser session provider seam", () => {
     const disconnectedKinds: string[] = [];
     browserTest.setSessionProviderForTest("spawned", {
       kind: "spawned",
-      connect: async (_record, agentKey) => {
+      connect: async (_record) => {
         connectCalls++;
         return {
           kind: "spawned",
           context: fakeContext as never,
           port: 9333,
-          agentKey,
           profileDir: "/tmp/fake-profile"
         };
       },
@@ -3609,8 +3611,8 @@ describe("browser session provider seam", () => {
     }
     expect(connectCalls).toBe(1);
 
-    // disconnectSharedBrowser is the instance-wide reset; it must also tear
-    // down per-agent spawned handles through their provider.
+    // disconnectSharedBrowser is the instance-wide reset; it must tear down
+    // the spawned handle through its provider.
     await disconnectSharedBrowser();
     expect(disconnectedKinds).toEqual(["spawned"]);
   });
@@ -3656,11 +3658,10 @@ describe("browser session trace recording", () => {
   const installSpawnedTracingProvider = (context: unknown) => {
     browserTest.setSessionProviderForTest("spawned", {
       kind: "spawned",
-      connect: async (_record, agentKey) => ({
+      connect: async (_record) => ({
         kind: "spawned",
         context: context as never,
         port: 9333,
-        agentKey,
         profileDir: "/tmp/fake-profile"
       }),
       disconnect: async () => undefined
@@ -3674,7 +3675,6 @@ describe("browser session trace recording", () => {
     browserTest.uninstallFakeBrowserForTest();
     browserTest.clearFakeSessionsForTest();
     browserTest.clearPendingSharedForTest();
-    browserTest.clearPendingSpawnedForTest();
     browserTest.resetChromiumImportForTest();
     setBrowserInstance("dev");
     rmSync(TEST_ROOT, { recursive: true, force: true });

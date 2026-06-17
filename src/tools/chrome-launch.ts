@@ -28,6 +28,7 @@ import type { BrowserContext } from "playwright-core";
 import {
   CHROME_LAUNCH_ARGS,
   cleanChromeUserAgent,
+  findChromePath,
   resolveBrowserLaunchTarget
 } from "./chrome-discovery";
 
@@ -52,6 +53,8 @@ export interface ChromeLaunchDeps {
   findFreePort: (base: number) => Promise<number>;
   resolveLaunchTarget: typeof resolveBrowserLaunchTarget;
   cleanUserAgent: typeof cleanChromeUserAgent;
+  // Bundled-first fallback chain, used only when a BRANDED launch fails.
+  findChromePath: typeof findChromePath;
 }
 
 async function loadLaunchPersistentContext(): Promise<LaunchPersistentContextFn> {
@@ -68,7 +71,8 @@ export function defaultDeps(): ChromeLaunchDeps {
       (await loadLaunchPersistentContext())(dataDir, options),
     findFreePort,
     resolveLaunchTarget: resolveBrowserLaunchTarget,
-    cleanUserAgent: cleanChromeUserAgent
+    cleanUserAgent: cleanChromeUserAgent,
+    findChromePath
   };
 }
 
@@ -150,16 +154,36 @@ export async function launchSpawnedChrome(options: LaunchSpawnedChromeOptions): 
         "or run `bunx playwright install chromium`."
     );
   }
-  const userAgent = headless ? await deps.cleanUserAgent(target.executablePath) : undefined;
   const port = options.port ?? (await deps.findFreePort(DEFAULT_CDP_PORT_BASE));
 
-  const context = await deps.launchPersistentContext(options.profileDir, {
-    headless,
-    executablePath: target.executablePath,
-    args: [...CHROME_LAUNCH_ARGS, `--remote-debugging-port=${port}`],
-    ...(userAgent ? { userAgent } : {}),
-    ...(options.extraOptions ?? {})
-  });
+  // Build options per binary so a bundled fallback recomputes the headless UA
+  // from the bundled binary rather than reusing the branded binary's UA.
+  const buildOptions = async (execPath: string): Promise<Record<string, unknown>> => {
+    const userAgent = headless ? await deps.cleanUserAgent(execPath) : undefined;
+    return {
+      headless,
+      executablePath: execPath,
+      args: [...CHROME_LAUNCH_ARGS, `--remote-debugging-port=${port}`],
+      ...(userAgent ? { userAgent } : {}),
+      ...(options.extraOptions ?? {})
+    };
+  };
 
-  return { context, port, chromePath: target.executablePath, profileDir: options.profileDir };
+  try {
+    const context = await deps.launchPersistentContext(
+      options.profileDir,
+      await buildOptions(target.executablePath)
+    );
+    return { context, port, chromePath: target.executablePath, profileDir: options.profileDir };
+  } catch (error) {
+    // Only a BRANDED launch retries on the bundled Chromium: a too-new system
+    // Chrome can drift from playwright-core's pinned CDP protocol and fail to
+    // drive. An override or already-bundled target has no better fallback, so
+    // it rethrows. Mirrors launchPersistentChrome in chrome-discovery.ts.
+    if (!target.branded) throw error instanceof Error ? error : new Error(String(error));
+    const fallback = await deps.findChromePath();
+    if (!fallback) throw error instanceof Error ? error : new Error(String(error));
+    const context = await deps.launchPersistentContext(options.profileDir, await buildOptions(fallback));
+    return { context, port, chromePath: fallback, profileDir: options.profileDir };
+  }
 }

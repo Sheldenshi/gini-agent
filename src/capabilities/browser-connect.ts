@@ -121,9 +121,10 @@ function stripUrlCredentials(url: string): string {
   }
 }
 
-// Thin alias kept for back-compat with the test helpers. Same directory
-// every browser tool call uses — sign-ins persist regardless of whether
-// the user has clicked Connect.
+// Thin alias kept for back-compat with the test helpers. The managed (visible
+// Connect) launch uses the SAME per-instance profile dir as the agent's
+// spawned default browsing, so a sign-in done in the visible window is visible
+// to the agent's subsequent headless tool calls.
 function profileDirFor(config: RuntimeConfig): string {
   return chromeProfileDirFor(config.instance);
 }

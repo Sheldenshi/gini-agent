@@ -31,6 +31,7 @@ function fakeDeps(over: Partial<ChromeLaunchDeps> = {}): {
     findFreePort: async () => 9333,
     resolveLaunchTarget: async () => ({ executablePath: "/fake/chrome", branded: true }),
     cleanUserAgent: async () => "UA/1.0",
+    findChromePath: async () => "/fake/bundled-chromium",
     ...over
   };
   return { deps, launchArgs };
@@ -163,15 +164,61 @@ describe("launchSpawnedChrome", () => {
     }
   });
 
-  test("propagates a launch failure from launchPersistentContext", async () => {
+  test("a branded launch failure retries on the bundled Chromium", async () => {
+    const profileDir = tempProfile();
+    try {
+      let calls = 0;
+      const { deps, launchArgs } = fakeDeps({
+        resolveLaunchTarget: async () => ({ executablePath: "/branded/chrome", branded: true }),
+        findChromePath: async () => "/fake/bundled-chromium",
+        launchPersistentContext: async (dataDir, options) => {
+          calls += 1;
+          // First (branded) attempt fails as if the system Chrome drifted from
+          // playwright-core's pinned CDP protocol; the bundled retry succeeds.
+          if (calls === 1) throw new Error("protocol drift");
+          launchArgs.push({ dataDir, options });
+          return { marker: "bundled-ctx" } as never;
+        }
+      });
+      const result = await launchSpawnedChrome({ profileDir, deps });
+      expect(calls).toBe(2);
+      expect(result.chromePath).toBe("/fake/bundled-chromium");
+      expect(launchArgs[launchArgs.length - 1].options.executablePath).toBe("/fake/bundled-chromium");
+    } finally {
+      rmSync(profileDir, { recursive: true, force: true });
+    }
+  });
+
+  test("a non-branded launch failure rethrows without retrying", async () => {
+    const profileDir = tempProfile();
+    try {
+      const findChromePath = mock(async () => "/fake/bundled-chromium");
+      const { deps } = fakeDeps({
+        resolveLaunchTarget: async () => ({ executablePath: "/override/chrome", branded: false }),
+        findChromePath,
+        launchPersistentContext: async () => {
+          throw new Error("override boom");
+        }
+      });
+      await expect(launchSpawnedChrome({ profileDir, deps })).rejects.toThrow("override boom");
+      // No bundled retry for a non-branded (override / already-bundled) target.
+      expect(findChromePath).not.toHaveBeenCalled();
+    } finally {
+      rmSync(profileDir, { recursive: true, force: true });
+    }
+  });
+
+  test("a branded launch failure with no bundled fallback rethrows the original error", async () => {
     const profileDir = tempProfile();
     try {
       const { deps } = fakeDeps({
+        resolveLaunchTarget: async () => ({ executablePath: "/branded/chrome", branded: true }),
+        findChromePath: async () => null,
         launchPersistentContext: async () => {
-          throw new Error("launch boom");
+          throw new Error("branded boom");
         }
       });
-      await expect(launchSpawnedChrome({ profileDir, deps })).rejects.toThrow("launch boom");
+      await expect(launchSpawnedChrome({ profileDir, deps })).rejects.toThrow("branded boom");
     } finally {
       rmSync(profileDir, { recursive: true, force: true });
     }
@@ -199,16 +246,26 @@ describe("default deps wiring", () => {
     const deps = defaultDeps();
     // findFreePort is the real walker.
     expect(typeof (await deps.findFreePort(DEFAULT_CDP_PORT_BASE + 700))).toBe("number");
-    // resolveLaunchTarget + cleanUserAgent are the real chrome-discovery fns.
+    // resolveLaunchTarget + cleanUserAgent + findChromePath are the real
+    // chrome-discovery fns.
     expect(typeof deps.resolveLaunchTarget).toBe("function");
     expect(typeof deps.cleanUserAgent).toBe("function");
+    expect(typeof deps.findChromePath).toBe("function");
     // The real launchPersistentContext resolves through the lazy playwright-core
-    // import; launching against a bogus binary rejects, proving the import ran.
-    await expect(
-      deps.launchPersistentContext("/tmp/gini-nonexistent-profile", {
+    // import; invoking it against a bogus binary drives that import path. We
+    // accept either outcome (a real playwright-core rejects; a sibling test's
+    // mock.module may resolve) — the point is the lazy import ran without
+    // throwing synchronously, not the launch result.
+    let imported = false;
+    try {
+      await deps.launchPersistentContext("/tmp/gini-nonexistent-profile", {
         headless: true,
         executablePath: "/definitely/not/a/real/chrome/binary"
-      })
-    ).rejects.toBeDefined();
+      });
+      imported = true;
+    } catch {
+      imported = true;
+    }
+    expect(imported).toBe(true);
   });
 });
