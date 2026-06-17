@@ -169,6 +169,74 @@ ensure_bun() {
   fi
 }
 
+# fetch_runtime needs a working git. On macOS, /usr/bin/git is a stub until the
+# Xcode Command Line Tools (CLT) are present: the first git call pops a GUI
+# "Install Command Line Developer Tools" dialog and exits non-zero. Without this
+# preflight, fetch_runtime's `git clone` trips that dialog and quiet() aborts the
+# installer (exit 1) while the dialog is still waiting for the user. So detect the
+# missing CLT, trigger Apple's installer, and track the user's choice.
+#
+# There is no programmatic "Install vs Cancel" signal, so we watch the install
+# helper process ("Install Command Line Developer Tools") together with whether
+# the tools actually land:
+#   - tools present              -> success (Install clicked, download finished)
+#   - helper alive, tools absent -> user still deciding, or download in progress
+#   - helper gone,  tools absent -> Cancel / dismissed -> abort with a clear error
+# This honors "wait until they click Install; terminate cleanly if they Cancel"
+# without trying to introspect a system alert that exposes no AX window.
+#
+# Detection probes `xcode-select -p` first (it never spawns the install dialog),
+# so on a fresh machine the short-circuit skips the git probe and the dialog
+# appears only after our explanatory message — not as a detection side effect.
+# Poll interval, timeout, the helper-match pattern, and the post-trigger grace
+# window are env-injectable for testing.
+clt_tools_present() {
+  xcode-select -p >/dev/null 2>&1 && git --version >/dev/null 2>&1
+}
+
+clt_helper_running() {
+  pgrep -f "${GINI_CLT_HELPER_PATTERN:-Install Command Line Developer Tools}" >/dev/null 2>&1
+}
+
+ensure_git_macos() {
+  [ "$OS" = "darwin" ] || return 0
+
+  if clt_tools_present; then
+    step "Git ready ($(git --version 2>/dev/null | awk '{print $3}'))"
+    return 0
+  fi
+
+  info "Git needs the Xcode Command Line Tools, which aren't installed yet."
+  info "Click Install on the macOS dialog — this continues automatically once it finishes."
+  # Trigger Apple's GUI installer. Harmless if a request is already in flight
+  # (it just reports so) — tolerate any non-zero exit and fall through to the wait.
+  xcode-select --install >/dev/null 2>&1 || true
+
+  local waited=0
+  local timeout="${GINI_CLT_WAIT_TIMEOUT_S:-1800}"
+  local interval="${GINI_CLT_WAIT_INTERVAL_S:-5}"
+  # The helper can take a moment to appear after --install; don't treat that
+  # startup gap as a cancel. Wait at least this long for the helper or the tools
+  # before the "helper gone -> cancelled" rule can fire.
+  local grace="${GINI_CLT_HELPER_GRACE_S:-15}"
+
+  while ! clt_tools_present; do
+    if [ "$waited" -ge "$timeout" ]; then
+      err "Xcode Command Line Tools still not installed after ${timeout}s."
+      err "Finish the install (or run 'xcode-select --install'), then re-run this installer."
+      exit 1
+    fi
+    if [ "$waited" -ge "$grace" ] && ! clt_helper_running; then
+      err "Command Line Tools install was cancelled (the installer closed before finishing)."
+      err "Re-run this installer and click Install, or install the tools with 'xcode-select --install'."
+      exit 1
+    fi
+    sleep "$interval"
+    waited=$((waited + interval))
+  done
+  step "Git ready ($(git --version 2>/dev/null | awk '{print $3}'))"
+}
+
 fetch_runtime() {
   mkdir -p "$HOME/.gini"
 
@@ -541,6 +609,7 @@ main() {
   fi
 
   ensure_bun
+  ensure_git_macos
   fetch_runtime
   install_deps
   write_wrapper
@@ -555,4 +624,11 @@ main() {
   print_done
 }
 
-main "$@"
+# Run the installer unless a caller asks to load the functions only (tests
+# source this file to exercise ensure_git_macos in isolation). The default —
+# nothing set — always runs main, so the `curl | bash` path is unaffected; a
+# BASH_SOURCE/$0 guard can't be used here because under `curl | bash`
+# BASH_SOURCE[0] is unset, which would wrongly suppress main on real installs.
+if [ -z "${GINI_INSTALL_SH_NO_MAIN:-}" ]; then
+  main "$@"
+fi
