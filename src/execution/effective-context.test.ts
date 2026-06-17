@@ -70,6 +70,8 @@ function buildState(overrides: Partial<RuntimeState> = {}): RuntimeState {
     jobs: [],
     connectors: [],
     improvements: [],
+    skillOutcomes: [],
+    learningFindings: [],
     pairingCodes: [],
     pairingRequests: [],
     devices: [],

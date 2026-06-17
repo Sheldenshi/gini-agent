@@ -658,6 +658,15 @@ export interface RuntimeState {
   jobs: JobRecord[];
   connectors: ConnectorRecord[];
   improvements: ImprovementProposal[];
+  // Skill-learning outcome rows (ADR skill-learning-from-outcomes.md). One row
+  // per attributable run outcome (a skill script's success/failure, or an
+  // unattributed task failure). Bounded ring, newest-first. Defaulted to [] by
+  // normalizeState so older state files load.
+  skillOutcomes: SkillOutcome[];
+  // Non-skill-edit findings the daily review surfaces but never auto-actions
+  // (environment / credential / model-ignored / bundled-skill). Bounded,
+  // newest-first. Defaulted to [] by normalizeState.
+  learningFindings: LearningFinding[];
   pairingCodes: PairingCode[];
   pairingRequests: PairingRequest[];
   devices: PairedDevice[];
@@ -1011,7 +1020,9 @@ export interface ChatSessionRecord {
   // the shared email-watch session is created and backfilled by the
   // self-heal migration. DISTINCT from `source` (messaging-bridge routing).
   // Optional, so legacy sessions just lack it — no normalizeState backfill.
-  feature?: "email-watch";
+  // "skill-review" marks the dedicated channel the daily skill-learning review
+  // posts its digest into (ADR skill-learning-from-outcomes.md).
+  feature?: "email-watch" | "skill-review";
 }
 
 // `lastInboundMessageId` is the most recent originating-message id the
@@ -2045,6 +2056,77 @@ export interface ImprovementProposal {
   createdAt: string;
   updatedAt: string;
 }
+
+// Skill-learning signal & finding types (ADR skill-learning-from-outcomes.md).
+
+export type OutcomeSignal = "success" | "failure";
+// Where the row came from: "objective" rows are harvested from already-
+// persisted audit/trace at task terminal (free, high-confidence-negative);
+// "user_feedback" rows carry a human verdict captured via record_skill_feedback.
+export type OutcomeSource = "objective" | "user_feedback";
+// How the reflection pass classifies a failure batch. Only `skill_defect`
+// routes to a skill edit; the rest become findings or are dropped.
+export type DefectClass =
+  | "skill_defect"
+  | "environment"
+  | "credential"
+  | "model_ignored"
+  | "transient"
+  | "unknown";
+
+// One row per attributable run outcome. Attribution is via the
+// `skill.script.invoked` audit row (`target: skill.id`); a `failed` task with
+// no script invocation yields one unattributed (`skillId` unset) failure row
+// for the digest's "what didn't work" summary only.
+export interface SkillOutcome {
+  id: string;
+  instance: Instance;
+  taskId: string;
+  agentId?: string;
+  skillId?: string;
+  skillName?: string;
+  scriptName?: string;
+  signal: OutcomeSignal;
+  source: OutcomeSource;
+  exitCode?: number;
+  // Scrubbed (redactSecrets) and capped failure detail. Absent for successes.
+  errorDetail?: string;
+  // True when the attributed skill declares requiredPermissions or the task
+  // carried an approval/side-effecting audit row — i.e. the action mattered.
+  consequential: boolean;
+  // True when an objective signal existed (a script ok/exit, a terminal
+  // status) so the outcome could be judged without asking the human.
+  selfVerifiable: boolean;
+  defectClass?: DefectClass;
+  // Set once the reflection pass has consumed this row into a proposal/finding.
+  reviewed: boolean;
+  // Set once the daily review has asked the user about this (success) outcome.
+  feedbackPrompted: boolean;
+  createdAt: string;
+}
+
+// A non-skill-edit finding surfaced in the digest and via a read-only
+// endpoint; never auto-actioned.
+export interface LearningFinding {
+  id: string;
+  instance: Instance;
+  agentId?: string;
+  skillId?: string;
+  skillName?: string;
+  kind: "environment" | "credential" | "model_ignored" | "bundled_skill";
+  summary: string;
+  sourceTaskIds: string[];
+  status: "open" | "dismissed";
+  createdAt: string;
+}
+
+// A bounded edit to a skill's markdown body (SkillOpt-style). Anchors/targets
+// match as EXACT substrings; a no-match is recorded as skipped, never thrown.
+export type SkillEditOp =
+  | { op: "append"; content: string }
+  | { op: "insert_after"; anchor: string; content: string }
+  | { op: "replace"; target: string; content: string }
+  | { op: "delete"; target: string };
 
 export interface PairingCode {
   id: string;

@@ -45,6 +45,8 @@ export function createEmptyState(instance: Instance): RuntimeState {
       }
     ],
     improvements: [],
+    skillOutcomes: [],
+    learningFindings: [],
     pairingCodes: [],
     pairingRequests: [],
     devices: [],
@@ -1105,6 +1107,10 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
   migrateIdentitiesToConnectors(state);
   state.instance = instance;
   state.improvements ??= [];
+  // Skill-learning rows (ADR skill-learning-from-outcomes.md). Default to []
+  // so older state files predating the feature load.
+  state.skillOutcomes ??= [];
+  state.learningFindings ??= [];
   state.connectors ??= [];
   state.tasks ??= [];
   migrateApprovalsToAuthorizationsAndSetupRequests(state);

@@ -23,6 +23,8 @@ import type {
   RuntimeState,
   SetupRequest,
   SkillRecord,
+  SkillOutcome,
+  LearningFinding,
   SnapshotRecord,
   SubagentRecord,
   Task,
@@ -578,6 +580,51 @@ export function createImprovementProposal(
     },
     item.sourceTaskId ? { taskId: item.sourceTaskId } : { system: true }
   );
+  return item;
+}
+
+// Newest-first ring caps for the skill-learning rows. Bounded so the harvest
+// loop can never grow durable state without limit (same posture as the
+// pairing/audit rings).
+const MAX_SKILL_OUTCOMES = 500;
+const MAX_LEARNING_FINDINGS = 500;
+
+// Record one skill-learning outcome (ADR skill-learning-from-outcomes.md).
+// Writes via the caller's mutateState transaction; bounds the ring on insert.
+export function createSkillOutcome(
+  state: RuntimeState,
+  outcome: Omit<SkillOutcome, "id" | "instance" | "createdAt">
+): SkillOutcome {
+  const item: SkillOutcome = {
+    id: id("skillout"),
+    instance: state.instance,
+    createdAt: now(),
+    ...outcome
+  };
+  state.skillOutcomes.unshift(item);
+  if (state.skillOutcomes.length > MAX_SKILL_OUTCOMES) {
+    state.skillOutcomes = state.skillOutcomes.slice(0, MAX_SKILL_OUTCOMES);
+  }
+  return item;
+}
+
+// Record one non-skill-edit learning finding (environment / credential /
+// model-ignored / bundled-skill). Surfaced in the digest; never auto-actioned.
+export function createLearningFinding(
+  state: RuntimeState,
+  finding: Omit<LearningFinding, "id" | "instance" | "status" | "createdAt">
+): LearningFinding {
+  const item: LearningFinding = {
+    id: id("finding"),
+    instance: state.instance,
+    status: "open",
+    createdAt: now(),
+    ...finding
+  };
+  state.learningFindings.unshift(item);
+  if (state.learningFindings.length > MAX_LEARNING_FINDINGS) {
+    state.learningFindings = state.learningFindings.slice(0, MAX_LEARNING_FINDINGS);
+  }
   return item;
 }
 

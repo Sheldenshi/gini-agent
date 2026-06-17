@@ -49,7 +49,7 @@ function stateWithToolsets(toolsets: ToolsetRecord[]): RuntimeState {
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",
     tasks: [], authorizations: [], setupRequests: [], audit: [], skills: [], jobs: [],
-    connectors: [], improvements: [], pairingCodes: [], pairingRequests: [], devices: [],
+    connectors: [], improvements: [], skillOutcomes: [], learningFindings: [], pairingCodes: [], pairingRequests: [], devices: [],
     promotions: [], snapshots: [], tools: [], toolsets, subagents: [],
     mcpServers: [], messagingBridges: [], importReports: [], agents: [],
     activeAgentId: undefined, relays: [], notifications: [], emailWatchers: [], events: [],
