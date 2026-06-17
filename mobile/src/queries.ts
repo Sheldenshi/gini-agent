@@ -669,6 +669,19 @@ export function useChatStream(
       cancelled = true;
       closeStream();
       if (appStateSub) appStateSub.remove();
+      // Navigated away from this chat (sessionId/threadId change) or the
+      // screen unmounted — we've stopped watching THIS session. closeStream()
+      // closes our SSE end, but behind a relay the gateway-side socket can
+      // linger (see the AppState beacon above), leaving this session's
+      // watch-state stale and suppressing its completion pushes. Beacon a
+      // SESSION-SCOPED unwatch so the gateway drops only this session — not
+      // the whole device — which is critical here because the very next
+      // chat's stream is opening concurrently and a device-wide clear could
+      // race-wipe its fresh registration. Best-effort; the reopened chat
+      // re-registers via its own SSE handshake regardless.
+      if (sessionId) {
+        void api(`/push/unwatch?sessionId=${encodeURIComponent(sessionId)}`, { method: "POST" }).catch(() => {});
+      }
     };
   }, [sessionId, threadId]);
 

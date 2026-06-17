@@ -5107,7 +5107,7 @@ describe("runtime api", () => {
       expect(badSession.status).toBe(404);
     });
 
-    test("POST /api/push/unwatch clears the device's watch state", async () => {
+    test("POST /api/push/unwatch (no sessionId) clears the whole device bucket", async () => {
       const config = testConfig("push-unwatch");
       const handler = createHandler(config);
       // Register the device so requireDeviceToken accepts the header.
@@ -5116,25 +5116,58 @@ describe("runtime api", () => {
         body: JSON.stringify({ token: "tok_unwatch", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
       });
       const { addSseSubscription, isDeviceWatching } = await import("./state");
-      // Seed two watched sessions for this device (as if it had opened
-      // two chats), plus one for a different device that must survive.
-      addSseSubscription(config.instance, "tok_unwatch", "chat_a");
-      addSseSubscription(config.instance, "tok_unwatch", "chat_b");
-      addSseSubscription(config.instance, "tok_other", "chat_a");
-      expect(isDeviceWatching(config.instance, "tok_unwatch", "chat_a")).toBe(true);
+      const { __resetSseSubscriptionsForTests } = await import("./state/sse-subscriptions");
+      try {
+        // Seed two watched sessions for this device (as if it had opened
+        // two chats), plus one for a different device that must survive.
+        addSseSubscription(config.instance, "tok_unwatch", "chat_a");
+        addSseSubscription(config.instance, "tok_unwatch", "chat_b");
+        addSseSubscription(config.instance, "tok_other", "chat_a");
+        expect(isDeviceWatching(config.instance, "tok_unwatch", "chat_a")).toBe(true);
 
-      const res = await call(handler, config, "/api/push/unwatch", {
+        // No sessionId → background beacon → clear everything for the device.
+        const res = await call(handler, config, "/api/push/unwatch", {
+          method: "POST",
+          headers: { "x-device-token": "tok_unwatch" }
+        });
+        expect(res.ok).toBe(true);
+        expect(res.cleared).toBe(2);
+        expect(isDeviceWatching(config.instance, "tok_unwatch", "chat_a")).toBe(false);
+        expect(isDeviceWatching(config.instance, "tok_unwatch", "chat_b")).toBe(false);
+        // The other device is untouched.
+        expect(isDeviceWatching(config.instance, "tok_other", "chat_a")).toBe(true);
+      } finally {
+        // Don't leak seeded entries into the process-wide registry.
+        __resetSseSubscriptionsForTests();
+      }
+    });
+
+    test("POST /api/push/unwatch?sessionId clears only that session", async () => {
+      const config = testConfig("push-unwatch-session");
+      const handler = createHandler(config);
+      await call(handler, config, "/api/push/devices", {
         method: "POST",
-        headers: { "x-device-token": "tok_unwatch" }
+        body: JSON.stringify({ token: "tok_nav", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
       });
-      expect(res.ok).toBe(true);
-      expect(res.cleared).toBe(2);
-      // The backgrounding device no longer watches anything → completion
-      // pushes to it won't be suppressed.
-      expect(isDeviceWatching(config.instance, "tok_unwatch", "chat_a")).toBe(false);
-      expect(isDeviceWatching(config.instance, "tok_unwatch", "chat_b")).toBe(false);
-      // The other device is untouched.
-      expect(isDeviceWatching(config.instance, "tok_other", "chat_a")).toBe(true);
+      const { addSseSubscription, isDeviceWatching } = await import("./state");
+      const { __resetSseSubscriptionsForTests } = await import("./state/sse-subscriptions");
+      try {
+        // Device watches two chats; navigating away from chat_a must leave
+        // chat_b watched (the just-opened chat mustn't be race-cleared).
+        addSseSubscription(config.instance, "tok_nav", "chat_a");
+        addSseSubscription(config.instance, "tok_nav", "chat_b");
+
+        const res = await call(handler, config, "/api/push/unwatch?sessionId=chat_a", {
+          method: "POST",
+          headers: { "x-device-token": "tok_nav" }
+        });
+        expect(res.ok).toBe(true);
+        expect(res.cleared).toBe(1);
+        expect(isDeviceWatching(config.instance, "tok_nav", "chat_a")).toBe(false);
+        expect(isDeviceWatching(config.instance, "tok_nav", "chat_b")).toBe(true);
+      } finally {
+        __resetSseSubscriptionsForTests();
+      }
     });
 
     test("POST /api/push/unwatch requires auth + a registered device token", async () => {

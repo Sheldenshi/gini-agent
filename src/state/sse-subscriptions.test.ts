@@ -4,6 +4,7 @@ import {
   __resetSseSubscriptionsForTests,
   addSseSubscription,
   clearDeviceWatch,
+  clearSessionWatch,
   hasAnyActiveSubscription,
   isDeviceWatching
 } from "./sse-subscriptions";
@@ -110,5 +111,36 @@ describe("sse-subscriptions registry", () => {
     expect(clearDeviceWatch(INST, "tok_a")).toBe(1);
     expect(() => cleanup()).not.toThrow();
     expect(isDeviceWatching(INST, "tok_a", "chat_x")).toBe(false);
+  });
+
+  test("clearSessionWatch drops only the named session, leaving the device's others", () => {
+    addSseSubscription(INST, "tok_a", "chat_x");
+    addSseSubscription(INST, "tok_a", "chat_y");
+    // Navigating away from chat_x clears only chat_x for this device.
+    expect(clearSessionWatch(INST, "tok_a", "chat_x")).toBe(1);
+    expect(isDeviceWatching(INST, "tok_a", "chat_x")).toBe(false);
+    expect(isDeviceWatching(INST, "tok_a", "chat_y")).toBe(true);
+  });
+
+  test("clearSessionWatch does NOT touch a session opened on a different device", () => {
+    addSseSubscription(INST, "tok_a", "chat_x");
+    addSseSubscription(INST, "tok_b", "chat_x");
+    expect(clearSessionWatch(INST, "tok_a", "chat_x")).toBe(1);
+    expect(isDeviceWatching(INST, "tok_b", "chat_x")).toBe(true);
+  });
+
+  test("clearSessionWatch is a no-op (0) for an unknown device or session", () => {
+    expect(clearSessionWatch(INST, "tok_none", "chat_x")).toBe(0);
+    addSseSubscription(INST, "tok_a", "chat_x");
+    expect(clearSessionWatch(INST, "tok_a", "chat_other")).toBe(0);
+    // chat_x untouched by the miss.
+    expect(isDeviceWatching(INST, "tok_a", "chat_x")).toBe(true);
+  });
+
+  test("clearSessionWatch clears the last session and prunes the empty device bucket", () => {
+    addSseSubscription(INST, "tok_a", "chat_x");
+    expect(clearSessionWatch(INST, "tok_a", "chat_x")).toBe(1);
+    // Bucket pruned → device reports no active subscriptions.
+    expect(hasAnyActiveSubscription(INST, "tok_a")).toBe(false);
   });
 });

@@ -131,6 +131,34 @@ export function clearDeviceWatch(instance: Instance, deviceToken: string): numbe
   return cleared;
 }
 
+// Drop watch entries for ONE session of a device, leaving the device's
+// other watched sessions intact. Used by the mobile client when it
+// navigates away from a chat (or the chat screen unmounts) WITHOUT
+// backgrounding the app — the departed session's relay-held stream may
+// never fire cancel(), so its entry would otherwise linger and suppress
+// that chat's completion pushes. Scoped to the one session (not the whole
+// device) so it can't race-clear a different chat the client just opened.
+// Returns the number of handles cleared. Idempotent.
+export function clearSessionWatch(
+  instance: Instance,
+  deviceToken: string,
+  sessionId: string
+): number {
+  const bucket = subscriptions.get(instance);
+  const sessions = bucket?.get(deviceToken);
+  if (!bucket || !sessions) return 0;
+  let cleared = 0;
+  for (const handle of [...sessions]) {
+    if (handle.startsWith(`${sessionId}::`)) {
+      sessions.delete(handle);
+      cleared += 1;
+    }
+  }
+  if (sessions.size === 0) bucket.delete(deviceToken);
+  if (bucket.size === 0) subscriptions.delete(instance);
+  return cleared;
+}
+
 // Test-only entry — wipes every recorded subscription so tests that
 // drive add/remove cycles don't leak into each other.
 export function __resetSseSubscriptionsForTests(): void {

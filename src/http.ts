@@ -6,6 +6,7 @@ import {
   addAudit,
   addSseSubscription,
   clearDeviceWatch,
+  clearSessionWatch,
   appendTrace,
   assertInsideWorkspace,
   createSetupRequest,
@@ -1724,16 +1725,22 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     // relay the gateway-side socket can stay open after the phone is gone
     // (keepalive writes keep succeeding into the relay buffer), so cancel()
     // may never fire and the stale entry permanently suppresses completion
-    // pushes for that session. The mobile client POSTs here when it
-    // backgrounds — it watches nothing then — and we clear the device's
-    // entire watch bucket so the next completion push is delivered.
+    // pushes for that session. Two callers:
+    //   - background: app posts with NO sessionId → clear the whole device
+    //     bucket (it's watching nothing).
+    //   - navigate away / unmount: app posts WITH ?sessionId → clear only
+    //     the departed session, so a different chat the client just opened
+    //     isn't race-cleared.
     // Best-effort and idempotent; device-scoped like /read and /badge.
     ["POST", /^\/api\/push\/unwatch$/, async (request) => {
       const credential = await resolveCredentialFromBearer(config, bearerFromRequest(request));
       if (!credential) return json({ error: "Unauthorized" }, 401);
       const dev = requireDeviceToken(config, request, credential);
       if (!dev.ok) return json({ error: dev.reason }, dev.status);
-      const cleared = clearDeviceWatch(config.instance, dev.token);
+      const sessionId = (new URL(request.url).searchParams.get("sessionId") ?? "").trim();
+      const cleared = sessionId
+        ? clearSessionWatch(config.instance, dev.token, sessionId)
+        : clearDeviceWatch(config.instance, dev.token);
       return json({ ok: true, cleared });
     }],
     // Chat read-state + badge endpoints. The mobile app POSTs to

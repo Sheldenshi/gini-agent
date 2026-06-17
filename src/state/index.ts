@@ -130,7 +130,8 @@ export {
   addSseSubscription,
   isDeviceWatching,
   hasAnyActiveSubscription,
-  clearDeviceWatch
+  clearDeviceWatch,
+  clearSessionWatch
 } from "./sse-subscriptions";
 export {
   subscribeChatSession,
