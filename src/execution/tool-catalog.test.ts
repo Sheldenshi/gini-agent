@@ -99,6 +99,7 @@ const ALWAYS_ON = new Set([
   // model must be able to answer "what time is it" regardless of toolset state.
   "get_current_time",
   "read_skill",
+  "record_skill_feedback",
   "spawn_subagent",
   "create_job",
   "list_jobs",

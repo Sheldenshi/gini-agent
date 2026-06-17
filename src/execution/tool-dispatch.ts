@@ -60,6 +60,7 @@ import { dbExecute, dbListTables, dbQuery } from "../state";
 import { resolveEmitContext, setToolCallRunningHint } from "./chat-task-emit";
 import { searchSessions } from "./search";
 import { installSkillFromBody, setSkillStatus } from "../capabilities/skills";
+import { recordFeedbackOutcome } from "../learning/outcomes";
 import { credentialTemplateForProvider, firstUngrantedCredential, isSkillActive } from "../integrations/connectors";
 import { getProvider } from "../integrations/connectors/registry";
 import { resolveConnectorSecret } from "../integrations/connectors";
@@ -218,6 +219,8 @@ async function dispatchToolCallInner(
       return { kind: "sync", result: await webSearchTool(config, taskId, args) };
     case "read_skill":
       return { kind: "sync", result: await readSkillTool(config, taskId, args) };
+    case "record_skill_feedback":
+      return { kind: "sync", result: await recordSkillFeedbackTool(config, taskId, args) };
     case "spawn_subagent":
       return { kind: "sync", result: await spawnSubagentTool(config, taskId, args) };
     case "create_job":
@@ -1036,6 +1039,36 @@ async function readSkillTool(config: RuntimeConfig, taskId: string, args: Record
     allowedTools: skill.allowedTools
   });
   return skill.body || "(skill body is empty)";
+}
+
+// Skill-learning feedback capture (ADR skill-learning-from-outcomes.md). The
+// model calls this when the user answers a "Skill review" question about a
+// recent action. It records the verdict as a SkillOutcome with
+// source:"user_feedback" — a negative answer attributed to the named skill so
+// the next review reflects on it. Low-risk: appends one bounded row.
+async function recordSkillFeedbackTool(config: RuntimeConfig, taskId: string, args: Record<string, unknown>): Promise<string> {
+  const targetTaskId = requireString(args, "task_id");
+  const ok = args.ok;
+  if (typeof ok !== "boolean") throw new Error("Argument ok must be a boolean.");
+  const skillName = optionalString(args, "skill_name", "");
+  const detail = optionalString(args, "detail", "");
+  // Attribute the feedback row to the agent that ran the judged task when known.
+  const agentId = readState(config.instance).tasks.find((t) => t.id === targetTaskId)?.agentId;
+  const outcome = await recordFeedbackOutcome(config, {
+    skillName: skillName || undefined,
+    taskId: targetTaskId,
+    agentId,
+    ok,
+    detail: detail || undefined
+  });
+  await recordLowRiskAudit(config, taskId, "skill.feedback.recorded", outcome.skillId ?? outcome.id, {
+    taskId: targetTaskId,
+    signal: outcome.signal,
+    skillName: outcome.skillName
+  });
+  return ok
+    ? `Recorded: the action turned out right${outcome.skillName ? ` (${outcome.skillName})` : ""}.`
+    : `Recorded a problem${outcome.skillName ? ` with ${outcome.skillName}` : ""} — the next skill review will look at it.`;
 }
 
 // Generic MCP tool dispatch. Routes (server, tool, arguments) to the

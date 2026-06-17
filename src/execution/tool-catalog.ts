@@ -232,6 +232,29 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     }
   },
   {
+    // Skill-learning feedback capture (ADR skill-learning-from-outcomes.md).
+    // When the user answers a "Skill review" question about whether a recent
+    // action turned out right, the model records the verdict here so the next
+    // review reflects on it. Sync, low-risk: it only appends a SkillOutcome row.
+    toolset: "skills",
+    displayLabel: "Record skill feedback",
+    type: "function",
+    function: {
+      name: "record_skill_feedback",
+      description: "Record the user's verdict on whether a recent skill-driven action turned out right, in answer to a Skill review question. A negative verdict is attributed to the named skill so it can be improved. Only call this when the user is answering such a question.",
+      parameters: {
+        type: "object",
+        properties: {
+          skill_name: { type: "string", description: "The skill the question was about (e.g. 'apple-notes')." },
+          task_id: { type: "string", description: "The id of the task whose action the user is judging (from the review question)." },
+          ok: { type: "boolean", description: "true if the action turned out right, false if it was wrong." },
+          detail: { type: "string", description: "Optional: what went wrong, when ok is false." }
+        },
+        required: ["task_id", "ok"]
+      }
+    }
+  },
+  {
     // Subagent delegation. Spawns a constrained child task running the
     // chat-task agent loop with its own system prompt and toolset/skill
     // subsets. The dispatch waits for the child to reach a terminal state
@@ -2153,6 +2176,12 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     // instance can't follow its own skill prompt without a toolset toggle.
     if (tool.function.name === "list_skills") return true;
     if (tool.function.name === "read_skill") return true;
+    // record_skill_feedback (ADR skill-learning-from-outcomes.md) — the model
+    // records the user's answer to a "Skill review" question. Always-on like
+    // read_skill: a review question can land in any session, and the agent must
+    // be able to capture the verdict regardless of toolset state. Low-risk: it
+    // only appends a SkillOutcome row.
+    if (tool.function.name === "record_skill_feedback") return true;
     // Always expose spawn_subagent. Like read_skill it's a runtime
     // capability not tied to a legacy default toolset row, and gating it
     // on enable would silently disable delegation on freshly cloned
