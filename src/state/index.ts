@@ -129,7 +129,8 @@ export type { PushDevice, UpsertDeviceInput, DeviceOrigin } from "./devices";
 export {
   addSseSubscription,
   isDeviceWatching,
-  hasAnyActiveSubscription
+  hasAnyActiveSubscription,
+  clearDeviceWatch
 } from "./sse-subscriptions";
 export {
   subscribeChatSession,

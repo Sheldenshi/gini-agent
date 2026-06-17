@@ -336,7 +336,10 @@ export function createApnsDispatcher(instance: Instance, deps?: DispatcherDeps):
     // is per-device (keyed by APNs token) because two iOS installs
     // of the same human can be in different app states; the
     // backgrounded install still needs the silent wake (or alert)
-    // even when the foregrounded one is already watching.
+    // even when the foregrounded one is already watching. The device
+    // POSTs /api/push/unwatch when it backgrounds to clear its
+    // watch-state, so a relay holding the SSE socket open past
+    // backgrounding can't leave a stale entry that over-suppresses.
     await Promise.all(devices.map((device) => {
       if (isWatching(instance, device.token, block.sessionId)) {
         return Promise.resolve();

@@ -110,6 +110,27 @@ export function hasAnyActiveSubscription(
   return Boolean(sessions && sessions.size > 0);
 }
 
+// Drop ALL watch entries for a device in one shot. The stream's own
+// `cancel()` cleanup is the normal path, but it only fires when the
+// gateway observes the SSE connection close — and behind a relay the
+// gateway-side socket can be held open after the phone is gone (the
+// keepalive writes keep succeeding into the relay buffer), so `cancel()`
+// may never run and the watch entry goes stale, permanently suppressing
+// completion pushes for that session. The mobile client therefore POSTs
+// /api/push/unwatch when it backgrounds (it is no longer watching
+// anything), and this clears the device's entire bucket so the next
+// completion push is delivered rather than suppressed. Returns the number
+// of session handles cleared (0 when the device had none). Idempotent.
+export function clearDeviceWatch(instance: Instance, deviceToken: string): number {
+  const bucket = subscriptions.get(instance);
+  const sessions = bucket?.get(deviceToken);
+  if (!bucket || !sessions) return 0;
+  const cleared = sessions.size;
+  bucket.delete(deviceToken);
+  if (bucket.size === 0) subscriptions.delete(instance);
+  return cleared;
+}
+
 // Test-only entry — wipes every recorded subscription so tests that
 // drive add/remove cycles don't leak into each other.
 export function __resetSseSubscriptionsForTests(): void {

@@ -5,6 +5,7 @@ import { pidPath } from "./paths";
 import {
   addAudit,
   addSseSubscription,
+  clearDeviceWatch,
   appendTrace,
   assertInsideWorkspace,
   createSetupRequest,
@@ -1717,6 +1718,23 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       // as-sent banner instead of blanking it.
       if (!preview) return json({ error: "No preview available" }, 404);
       return json(preview);
+    }],
+    // Explicit "I've stopped watching" beacon. The SSE stream's own
+    // cancel() clears a device's watch-state on disconnect, but behind a
+    // relay the gateway-side socket can stay open after the phone is gone
+    // (keepalive writes keep succeeding into the relay buffer), so cancel()
+    // may never fire and the stale entry permanently suppresses completion
+    // pushes for that session. The mobile client POSTs here when it
+    // backgrounds — it watches nothing then — and we clear the device's
+    // entire watch bucket so the next completion push is delivered.
+    // Best-effort and idempotent; device-scoped like /read and /badge.
+    ["POST", /^\/api\/push\/unwatch$/, async (request) => {
+      const credential = await resolveCredentialFromBearer(config, bearerFromRequest(request));
+      if (!credential) return json({ error: "Unauthorized" }, 401);
+      const dev = requireDeviceToken(config, request, credential);
+      if (!dev.ok) return json({ error: dev.reason }, dev.status);
+      const cleared = clearDeviceWatch(config.instance, dev.token);
+      return json({ ok: true, cleared });
     }],
     // Chat read-state + badge endpoints. The mobile app POSTs to
     // /read every time the user lands on a chat detail so the gateway

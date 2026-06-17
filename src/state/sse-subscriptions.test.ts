@@ -3,6 +3,7 @@ import type { Instance } from "../types";
 import {
   __resetSseSubscriptionsForTests,
   addSseSubscription,
+  clearDeviceWatch,
   hasAnyActiveSubscription,
   isDeviceWatching
 } from "./sse-subscriptions";
@@ -78,5 +79,36 @@ describe("sse-subscriptions registry", () => {
     const cleanup = addSseSubscription(INST, "tok_a", "chat_x");
     expect(isDeviceWatching(otherInst, "tok_a", "chat_x")).toBe(false);
     cleanup();
+  });
+
+  test("clearDeviceWatch drops every session for a device in one shot", () => {
+    addSseSubscription(INST, "tok_a", "chat_x");
+    addSseSubscription(INST, "tok_a", "chat_y");
+    addSseSubscription(INST, "tok_b", "chat_x");
+    // The backgrounding beacon clears the whole bucket for tok_a.
+    expect(clearDeviceWatch(INST, "tok_a")).toBe(2);
+    expect(isDeviceWatching(INST, "tok_a", "chat_x")).toBe(false);
+    expect(isDeviceWatching(INST, "tok_a", "chat_y")).toBe(false);
+    expect(hasAnyActiveSubscription(INST, "tok_a")).toBe(false);
+    // Other devices are untouched.
+    expect(isDeviceWatching(INST, "tok_b", "chat_x")).toBe(true);
+  });
+
+  test("clearDeviceWatch is a no-op (returns 0) for a device with no entries", () => {
+    expect(clearDeviceWatch(INST, "tok_none")).toBe(0);
+    // And idempotent after a real clear.
+    addSseSubscription(INST, "tok_a", "chat_x");
+    expect(clearDeviceWatch(INST, "tok_a")).toBe(1);
+    expect(clearDeviceWatch(INST, "tok_a")).toBe(0);
+  });
+
+  test("a stale stream cancel after clearDeviceWatch is harmless", () => {
+    // Models the relay case: the beacon clears watch-state, then the
+    // long-lived stream's cancel() finally fires and calls its cleanup.
+    // The cleanup must not throw or resurrect the entry.
+    const cleanup = addSseSubscription(INST, "tok_a", "chat_x");
+    expect(clearDeviceWatch(INST, "tok_a")).toBe(1);
+    expect(() => cleanup()).not.toThrow();
+    expect(isDeviceWatching(INST, "tok_a", "chat_x")).toBe(false);
   });
 });

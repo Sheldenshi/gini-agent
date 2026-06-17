@@ -5106,6 +5106,56 @@ describe("runtime api", () => {
       );
       expect(badSession.status).toBe(404);
     });
+
+    test("POST /api/push/unwatch clears the device's watch state", async () => {
+      const config = testConfig("push-unwatch");
+      const handler = createHandler(config);
+      // Register the device so requireDeviceToken accepts the header.
+      await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_unwatch", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      const { addSseSubscription, isDeviceWatching } = await import("./state");
+      // Seed two watched sessions for this device (as if it had opened
+      // two chats), plus one for a different device that must survive.
+      addSseSubscription(config.instance, "tok_unwatch", "chat_a");
+      addSseSubscription(config.instance, "tok_unwatch", "chat_b");
+      addSseSubscription(config.instance, "tok_other", "chat_a");
+      expect(isDeviceWatching(config.instance, "tok_unwatch", "chat_a")).toBe(true);
+
+      const res = await call(handler, config, "/api/push/unwatch", {
+        method: "POST",
+        headers: { "x-device-token": "tok_unwatch" }
+      });
+      expect(res.ok).toBe(true);
+      expect(res.cleared).toBe(2);
+      // The backgrounding device no longer watches anything → completion
+      // pushes to it won't be suppressed.
+      expect(isDeviceWatching(config.instance, "tok_unwatch", "chat_a")).toBe(false);
+      expect(isDeviceWatching(config.instance, "tok_unwatch", "chat_b")).toBe(false);
+      // The other device is untouched.
+      expect(isDeviceWatching(config.instance, "tok_other", "chat_a")).toBe(true);
+    });
+
+    test("POST /api/push/unwatch requires auth + a registered device token", async () => {
+      const config = testConfig("push-unwatch-auth");
+      const handler = createHandler(config);
+      // Unauthenticated.
+      const noAuth = await rawCall(handler, config, "/api/push/unwatch", { method: "POST" });
+      expect(noAuth.status).toBe(401);
+      // Authenticated but no X-Device-Token header.
+      const noDevice = await rawCall(handler, config, "/api/push/unwatch", { method: "POST" }, config.token);
+      expect(noDevice.status).toBe(400);
+      // Authenticated with an unregistered device token.
+      const badDevice = await rawCall(
+        handler,
+        config,
+        "/api/push/unwatch",
+        { method: "POST", headers: { "x-device-token": "tok_ghost" } },
+        config.token
+      );
+      expect(badDevice.status).toBe(403);
+    });
   });
 
   describe("cors", () => {

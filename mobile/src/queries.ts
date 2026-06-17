@@ -649,6 +649,18 @@ export function useChatStream(
         maybeOpenStream();
       } else if (state === "background" || state === "inactive") {
         closeStream();
+        // Beacon the gateway that we've stopped watching. closeStream()
+        // closes our end of the SSE, but behind a relay the gateway-side
+        // socket can stay open (keepalive writes keep succeeding into the
+        // relay buffer), so the stream's cancel() — which clears watch
+        // state — may never fire, leaving the device permanently
+        // "watching" and suppressing completion pushes. This discrete POST
+        // reaches the gateway even when the long-lived stream's close
+        // doesn't, clearing the device's watch bucket so the next
+        // completion push is delivered. Fire-and-forget + best-effort: a
+        // dropped beacon (instant suspend / no network) self-heals on the
+        // next foreground, which re-opens and re-registers the stream.
+        void api("/push/unwatch", { method: "POST" }).catch(() => {});
       }
     };
     appStateSub = AppState.addEventListener("change", onAppState);
