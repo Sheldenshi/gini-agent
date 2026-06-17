@@ -1,6 +1,8 @@
-import { describe, expect, it } from "bun:test";
-import type { CostRecord, RuntimeState, UsageContext, UsageLedgerEntry } from "../types";
-import { applyUsage, buildDailyUsage, localDayKey } from "./usage";
+import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { rmSync } from "node:fs";
+import type { CostRecord, RuntimeState, Task, UsageContext, UsageLedgerEntry } from "../types";
+import { applyUsage, backfillUsageLedger, backfillUsageLedgerOnce, buildDailyUsage, localDayKey } from "./usage";
+import { createEmptyState, readState, writeState } from "./store";
 
 function emptyLedgerState(): RuntimeState {
   return { usageLedger: [] } as unknown as RuntimeState;
@@ -115,5 +117,97 @@ describe("buildDailyUsage", () => {
   it("drops ledger entries outside the window", () => {
     const out = buildDailyUsage([entry({ day: "2026-01-01", inputTokens: 9, totalTokens: 9 })], 14, undefined, now);
     expect(out.reduce((s, d) => s + d.input, 0)).toBe(0);
+  });
+});
+
+describe("backfillUsageLedger", () => {
+  function task(over: Partial<Task> & { id: string; status: Task["status"] }): Task {
+    return {
+      title: "t",
+      input: "",
+      createdAt: "2026-06-17T10:00:00Z",
+      updatedAt: "2026-06-17T10:00:00Z",
+      ...over
+    } as Task;
+  }
+
+  function ledgerState(tasks: Task[]): RuntimeState {
+    return { tasks, usageLedger: [] } as unknown as RuntimeState;
+  }
+
+  it("seeds terminal task.cost rows, derives source, and recomputes missing USD", () => {
+    const state = ledgerState([
+      task({
+        id: "t1",
+        status: "completed",
+        agentId: "agent_default",
+        cost: { provider: "anthropic", model: "claude-opus-4-8", inputTokens: 100, outputTokens: 20 }
+      }),
+      task({ id: "t2", status: "completed", jobId: "job_1", cost: { provider: "codex", model: "gpt-5.5", inputTokens: 5, outputTokens: 1 } }),
+      task({ id: "t3", status: "completed", parentTaskId: "t1", cost: { provider: "codex", model: "gpt-5.5", inputTokens: 7, outputTokens: 2 } })
+    ]);
+    backfillUsageLedger(state);
+    const chat = state.usageLedger.find((e) => e.source === "chat");
+    expect(chat).toMatchObject({ inputTokens: 100, outputTokens: 20, source: "chat", agentId: "agent_default" });
+    // opus 4.8 = $5/$25 per MTok → 100 in + 20 out = $0.001, recomputed from undefined.
+    expect(chat?.estimatedUsd).toBeCloseTo(0.001, 9);
+    expect(state.usageLedger.find((e) => e.source === "job")?.inputTokens).toBe(5);
+    expect(state.usageLedger.find((e) => e.source === "subagent")?.inputTokens).toBe(7);
+  });
+
+  it("skips non-terminal tasks (they record forward) and cost-less/zero rows", () => {
+    const state = ledgerState([
+      task({ id: "r", status: "running", cost: { provider: "codex", model: "gpt-5.5", inputTokens: 999, outputTokens: 9 } }),
+      task({ id: "n", status: "completed" }),
+      task({ id: "z", status: "completed", cost: { provider: "codex", model: "gpt-5.5", inputTokens: 0, outputTokens: 0 } })
+    ]);
+    backfillUsageLedger(state);
+    expect(state.usageLedger).toHaveLength(0);
+  });
+
+  it("preserves an already-priced estimatedUsd instead of recomputing", () => {
+    const state = ledgerState([
+      task({ id: "p", status: "completed", cost: { provider: "anthropic", model: "claude-opus-4-8", inputTokens: 100, outputTokens: 20, estimatedUsd: 99 } })
+    ]);
+    backfillUsageLedger(state);
+    expect(state.usageLedger[0].estimatedUsd).toBe(99);
+  });
+});
+
+describe("backfillUsageLedgerOnce (boot: persisted + idempotent)", () => {
+  const ROOT = "/tmp/gini-usage-backfill-test";
+  beforeAll(() => {
+    rmSync(ROOT, { recursive: true, force: true });
+    process.env.GINI_STATE_ROOT = ROOT;
+    process.env.GINI_LOG_ROOT = `${ROOT}-logs`;
+  });
+  afterAll(() => {
+    rmSync(ROOT, { recursive: true, force: true });
+  });
+
+  it("seeds the ledger once, persists the marker, and never re-seeds", async () => {
+    const instance = "backfill-test";
+    const state = createEmptyState(instance);
+    state.tasks.push({
+      id: "t1",
+      title: "x",
+      input: "",
+      status: "completed",
+      createdAt: "2026-06-17T10:00:00Z",
+      updatedAt: "2026-06-17T10:00:00Z",
+      agentId: "agent_default",
+      cost: { provider: "codex", model: "gpt-5.5", inputTokens: 100, outputTokens: 10 }
+    } as unknown as Task);
+    writeState(instance, state);
+
+    await backfillUsageLedgerOnce(instance);
+    const after1 = readState(instance);
+    expect(after1.usageLedger).toHaveLength(1);
+    expect(after1.usageLedger[0]).toMatchObject({ source: "chat", inputTokens: 100, outputTokens: 10 });
+    expect(after1.usageLedgerBackfilledAt).toBeTruthy();
+
+    // A second boot must NOT re-seed (the run-once marker guards it).
+    await backfillUsageLedgerOnce(instance);
+    expect(readState(instance).usageLedger).toHaveLength(1);
   });
 });

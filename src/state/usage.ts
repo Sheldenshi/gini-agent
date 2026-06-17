@@ -1,5 +1,6 @@
-import type { CostRecord, Instance, RuntimeState, UsageContext, UsageLedgerEntry, UsageSource } from "../types";
-import { mutateState } from "./store";
+import type { CostRecord, Instance, ProviderConfig, RuntimeState, UsageContext, UsageLedgerEntry, UsageSource } from "../types";
+import { isTerminalTaskStatus, mutateState } from "./store";
+import { estimateUsd } from "../provider-capabilities";
 
 // Local-calendar day key (YYYY-MM-DD) for a timestamp. The home usage chart
 // buckets by local day, so recording the same way keeps the ledger and chart
@@ -73,6 +74,56 @@ export async function recordUsage(
   if (!cost) return;
   await mutateState(instance, (state) => {
     applyUsage(state, context, cost, at);
+  });
+}
+
+// One-time historical seed: fold existing TERMINAL task.cost rows into the
+// ledger so the home chart shows pre-ledger history rather than starting blank.
+// Only terminal tasks are backfilled — a still-running task will record its
+// spend forward via recordUsage, so backfilling it too would double count.
+// Legacy task.cost rows predate USD pricing (estimatedUsd undefined), so USD is
+// recomputed from the now-priced model. Source is derived from the task's own
+// provenance the same way the live chat-task path does. Pure + idempotent given
+// a fresh ledger; the caller guards it behind a run-once marker. Memory / title
+// / vision history is unrecoverable here — it was never stored on a task.
+export function backfillUsageLedger(state: RuntimeState): void {
+  state.usageLedger ??= [];
+  for (const task of state.tasks) {
+    if (!isTerminalTaskStatus(task.status)) continue;
+    const cost = task.cost;
+    if (!cost) continue;
+    const input = cost.inputTokens ?? 0;
+    const output = cost.outputTokens ?? 0;
+    if (input === 0 && output === 0) continue;
+    const at = new Date(task.createdAt).getTime();
+    if (!Number.isFinite(at)) continue;
+    const source: UsageSource = task.subagentId || task.parentTaskId ? "subagent" : task.jobId ? "job" : "chat";
+    const estimatedUsd =
+      cost.estimatedUsd ?? estimateUsd({ name: cost.provider, model: cost.model } as ProviderConfig, input, output);
+    applyUsage(
+      state,
+      { source, agentId: task.agentId, taskId: task.id },
+      {
+        provider: cost.provider,
+        model: cost.model,
+        inputTokens: input,
+        outputTokens: output,
+        totalTokens: cost.totalTokens,
+        estimatedUsd
+      },
+      at
+    );
+  }
+}
+
+// Boot-time wrapper: run the backfill exactly once per instance, persisting the
+// ledger entries and the run-once marker atomically so it never re-seeds on a
+// later boot (or a later readState before a write lands).
+export async function backfillUsageLedgerOnce(instance: Instance): Promise<void> {
+  await mutateState(instance, (state) => {
+    if (state.usageLedgerBackfilledAt) return;
+    backfillUsageLedger(state);
+    state.usageLedgerBackfilledAt = new Date().toISOString();
   });
 }
 

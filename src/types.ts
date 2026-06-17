@@ -703,6 +703,11 @@ export interface RuntimeState {
   // captures spend that never lands on a task. Legacy states omit it (healed
   // to []). See ADR usage-accounting.md.
   usageLedger: UsageLedgerEntry[];
+  // Run-once marker (ISO timestamp) for the one-time backfill that seeds the
+  // usage ledger from existing terminal task.cost rows on first boot after the
+  // ledger shipped. Once set, the backfill is skipped so it never duplicates.
+  // Legacy/new states omit it until the backfill runs. See ADR usage-accounting.md.
+  usageLedgerBackfilledAt?: string;
   chatSessions: ChatSessionRecord[];
   chatMessages: ChatMessageRecord[];
   messagingMessages: MessagingMessageRecord[];

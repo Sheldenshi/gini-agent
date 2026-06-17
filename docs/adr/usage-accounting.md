@@ -63,10 +63,17 @@ boundary cannot attribute spend on its own — the caller must.
   a source) when a provider/model is added or a price changes. Anthropic values
   are verified; OpenAI/DeepSeek rows should be re-verified before relying on the
   USD figure for billing.
+- **Historical backfill.** On the first boot after the ledger ships,
+  `backfillUsageLedgerOnce` seeds the ledger from existing **terminal**
+  `task.cost` rows (source derived from task provenance, USD recomputed from the
+  now-priced model), guarded by a run-once marker (`usageLedgerBackfilledAt`) so
+  it never re-seeds. Only terminal tasks are backfilled — a still-running task
+  records forward via `recordUsage`, so backfilling it too would double count.
+  Memory / title / vision history is **not** recoverable (it was never stored on
+  a task); only the chat/task-attributed portion of history is restored.
 - **Not yet covered (intentional):** embeddings/vector-indexing tokens are
   excluded by product decision; failed context-overflow retry attempts are not
-  billed into the ledger; the ledger starts empty (no backfill from existing
-  `task.cost`).
+  billed into the ledger.
 
 ## Acceptance checks
 
