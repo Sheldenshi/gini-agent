@@ -49,6 +49,25 @@ export function isUnauthorized(error: unknown): boolean {
   return error instanceof ApiError && error.status === 401;
 }
 
+// Request timeouts. A gateway that accepts the TCP connection but never
+// answers (a half-dead socket left behind by a torn-down chat SSE stream,
+// a proxy hop that dropped the response, the device losing the network
+// mid-flight) would otherwise leave the fetch pending forever: React
+// Query's `isLoading` stays latched, the screen's spinner never resolves,
+// and there's no error to retry — the user has to force-quit (issue #396).
+//
+// GETs are idempotent reads that should return in well under a second on
+// the local/Tailscale links this app talks to, and they're what backs the
+// list screens whose spinner the user stares at. A short ceiling means a
+// stuck read surfaces a retryable error fast instead of after a long hang
+// (with React Query's retry:1, the felt wait is two timeouts plus the
+// retry backoff). Writes (POST/PUT/PATCH/DELETE) can legitimately block on
+// server-side work, so they get a more forgiving ceiling. Either way the
+// per-call `timeoutMs` wins — the voice send path passes a much larger
+// value so first-run transcription isn't cut off.
+const GET_TIMEOUT_MS = 10_000;
+const WRITE_TIMEOUT_MS = 20_000;
+
 interface ApiOptions extends Omit<RequestInit, "headers" | "credentials"> {
   headers?: Record<string, string>;
   // Override the cached gateway credentials (used by the setup screen to
@@ -56,13 +75,20 @@ interface ApiOptions extends Omit<RequestInit, "headers" | "credentials"> {
   // rather than `credentials` to avoid colliding with the standard
   // RequestInit.credentials cookie/CORS field.
   auth?: AuthCredentials;
+  // Per-call request timeout in milliseconds. Defaults by method
+  // (GET_TIMEOUT_MS for reads, WRITE_TIMEOUT_MS for writes); pass a larger
+  // value for routes that block on slow server-side work (e.g. first-run
+  // voice transcription). A timeout aborts the in-flight fetch and surfaces
+  // as ApiError(0, …) so the caller settles into an error state instead of
+  // hanging.
+  timeoutMs?: number;
 }
 
 export async function api<T = unknown>(path: string, init: ApiOptions = {}): Promise<T> {
   const creds = init.auth ?? readCachedCredentials();
   if (!creds) throw new ApiError(401, "No credentials configured");
 
-  const { auth: _auth, ...rest } = init;
+  const { auth: _auth, timeoutMs, signal: callerSignal, ...rest } = init;
 
   // Defensively re-derive the origin so a malformed value in storage
   // (e.g. one written by an older build that didn't normalize) can't
@@ -82,8 +108,45 @@ export async function api<T = unknown>(path: string, init: ApiOptions = {}): Pro
     ...(init.headers ?? {})
   };
 
+  // Arm a timeout that aborts the fetch if the gateway never responds.
+  // RN polyfills AbortController (abort-controller@3) but NOT the static
+  // AbortSignal.timeout()/any() helpers, so wire it manually: one
+  // controller fires on our timer, and a caller-supplied signal (React
+  // Query passes one on every queryFn it owns) chains in so an upstream
+  // cancel still aborts the request. The timer is always cleared in
+  // finally so a fast response doesn't leave a dangling abort armed.
+  const controller = new AbortController();
+  // Default by method: a missing/"GET" method is an idempotent read and
+  // gets the short ceiling; anything else is a write and gets the longer
+  // one. An explicit timeoutMs overrides both.
+  const method = (rest.method ?? "GET").toUpperCase();
+  const defaultTimeout = method === "GET" ? GET_TIMEOUT_MS : WRITE_TIMEOUT_MS;
+  const timeout = timeoutMs ?? defaultTimeout;
+  const timer = setTimeout(() => controller.abort(), timeout);
+  const onCallerAbort = () => controller.abort();
+  if (callerSignal) {
+    if (callerSignal.aborted) controller.abort();
+    else callerSignal.addEventListener("abort", onCallerAbort);
+  }
+
   const url = `${parsed.origin}/api${path}`;
-  const response = await fetch(url, { ...rest, headers });
+  let response: Response;
+  try {
+    response = await fetch(url, { ...rest, headers, signal: controller.signal });
+  } catch (err) {
+    // A timeout-driven abort (our timer fired while the caller's own
+    // signal, if any, is still live) becomes a tagged transport error so
+    // the query settles into isError instead of staying pending forever.
+    // A caller-initiated abort is a real cancellation — rethrow it as-is
+    // so React Query treats it as a cancelled query, not a failure.
+    if (isAbortError(err) && !callerSignal?.aborted) {
+      throw new ApiError(0, `Request to ${path} timed out`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+    if (callerSignal) callerSignal.removeEventListener("abort", onCallerAbort);
+  }
 
   // 204 No Content (or any empty body) — return null cast as T so callers
   // that don't care about the body don't choke on JSON.parse.
@@ -97,6 +160,14 @@ export async function api<T = unknown>(path: string, init: ApiOptions = {}): Pro
     throw new ApiError(response.status, message);
   }
   return value as T;
+}
+
+// The RN fetch polyfill rejects an aborted request with
+// DOMException("Aborted", "AbortError"); some environments surface a
+// plain Error with the same name. Match on the name so both shapes are
+// recognised without depending on DOMException being defined.
+function isAbortError(err: unknown): boolean {
+  return err instanceof Error && err.name === "AbortError";
 }
 
 function safeParse(text: string): unknown {

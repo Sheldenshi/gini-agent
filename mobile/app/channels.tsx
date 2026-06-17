@@ -236,7 +236,12 @@ export default function ChannelsScreen() {
         <View style={styles.center}>
           <ActivityIndicator color={theme.muted} />
         </View>
-      ) : agents.isError ? (
+      ) : agents.isError && agentList.length === 0 ? (
+        // Only commandeer the screen with the error + Retry when there's
+        // nothing cached to show. A background poll failure (the 30s
+        // refetch) with a populated list keeps rendering the cached agents
+        // and chats — the next poll or a pull-to-refresh recovers quietly —
+        // rather than blowing a usable list away with a full-screen error.
         <View style={styles.center}>
           <Text style={styles.error}>
             {agents.error instanceof Error ? agents.error.message : "Failed to load agents"}

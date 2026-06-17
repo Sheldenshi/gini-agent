@@ -880,7 +880,13 @@ export function useSendMessage(sessionId: string | null) {
       if (audio) body.audio = audio;
       return api<SendMessageResult>(`/chat/${sessionId}/messages`, {
         method: "POST",
-        body: JSON.stringify(body)
+        body: JSON.stringify(body),
+        // A voice message blocks this POST on server-side transcription,
+        // and the very first one also waits on the local whisper model
+        // downloading — the composer itself warns this "can take a
+        // minute." Give the audio path a generous ceiling so the default
+        // 20s timeout can't abort a legitimate first-run transcription.
+        ...(audio ? { timeoutMs: 120_000 } : {})
       });
     },
     onSuccess: () => {
