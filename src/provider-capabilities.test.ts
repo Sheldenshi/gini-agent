@@ -203,9 +203,17 @@ describe("resolveProviderContextWindowTokens", () => {
   });
 
   test("anthropic + bedrock map to real per-model windows, not the 32K fallback", () => {
-    expect(resolveProviderContextWindowTokens(provider("anthropic", "claude-opus-4-8"))).toBe(200_000);
-    expect(resolveProviderContextWindowTokens(provider("anthropic", "claude-sonnet-4-6"))).toBe(200_000);
-    expect(resolveProviderContextWindowTokens(provider("bedrock", "us.anthropic.claude-opus-4-8"))).toBe(200_000);
+    // 1M-context Claude families: Opus 4.6+, Sonnet 4.6, Fable 5 — on first-party
+    // and on Bedrock inference profiles alike.
+    expect(resolveProviderContextWindowTokens(provider("anthropic", "claude-opus-4-8"))).toBe(1_000_000);
+    expect(resolveProviderContextWindowTokens(provider("anthropic", "claude-sonnet-4-6"))).toBe(1_000_000);
+    expect(resolveProviderContextWindowTokens(provider("anthropic", "claude-fable-5"))).toBe(1_000_000);
+    expect(resolveProviderContextWindowTokens(provider("bedrock", "us.anthropic.claude-opus-4-8"))).toBe(1_000_000);
+    expect(resolveProviderContextWindowTokens(provider("openrouter", "anthropic/claude-opus-4-8"))).toBe(1_000_000);
+    // Haiku 4.5 and older Opus/Sonnet point releases keep the 200K window.
+    expect(resolveProviderContextWindowTokens(provider("anthropic", "claude-haiku-4-5"))).toBe(200_000);
+    expect(resolveProviderContextWindowTokens(provider("anthropic", "claude-opus-4-5"))).toBe(200_000);
+    expect(resolveProviderContextWindowTokens(provider("bedrock", "us.anthropic.claude-haiku-4-5"))).toBe(200_000);
     expect(resolveProviderContextWindowTokens(provider("bedrock", "us.amazon.nova-premier-v1:0"))).toBe(1_000_000);
     expect(resolveProviderContextWindowTokens(provider("bedrock", "us.amazon.nova-pro-v1:0"))).toBe(300_000);
     expect(resolveProviderContextWindowTokens(provider("bedrock", "eu.amazon.nova-lite-v1:0"))).toBe(300_000);
