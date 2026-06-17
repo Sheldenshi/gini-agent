@@ -16,9 +16,9 @@ import {
   useInvalidate,
   useSetupRequests,
   useStatus,
-  useTasks
+  useTasks,
+  useUsage
 } from "@/lib/queries";
-import { bucketTokensByDay, useNow } from "./tasks/_components/observability";
 import { TokenUsageChart } from "./_components/TokenUsageChart";
 import type { Authorization, SetupRequest } from "@runtime/types";
 
@@ -80,18 +80,11 @@ export default function HomePage() {
   const pendingTotal = pendingAuth.length + pendingSetup.length;
   const recent = (events.data ?? []).slice().reverse().slice(0, 8);
 
-  // Daily token consumption (input vs output) over the trailing window. Token
-  // totals live on task.cost, accumulated across every model call in a turn
-  // (see addCost in src/execution/chat-task.ts); job runs roll up into tasks
-  // via taskId, so summing across tasks captures all consumption. We bucket by
-  // local calendar day. The minute ticker rolls the window forward (and lands
-  // freshly-created tasks in today's bucket) even when React Query keeps the
-  // tasks array reference stable across polls.
-  const nowTick = useNow(true, 60_000);
-  const tokenBuckets = useMemo(
-    () => bucketTokensByDay(tasks.data ?? [], TOKEN_HISTORY_DAYS, nowTick),
-    [tasks.data, nowTick]
-  );
+  // Daily token consumption (input vs output, plus USD) over the trailing
+  // window, read from the server-side usage ledger via /api/usage. The ledger
+  // captures every generative call — chat, jobs, subagents, memory, titles,
+  // vision — not just what lands on task.cost, and survives task pruning.
+  const usage = useUsage(TOKEN_HISTORY_DAYS);
 
   return (
     <>
@@ -103,7 +96,7 @@ export default function HomePage() {
           <Stat title="Pending approvals" value={String(pendingTotal)} sub={pendingTotal > 0 ? "needs review" : "all clear"} />
         </div>
 
-        <TokenUsageChart buckets={tokenBuckets} />
+        <TokenUsageChart days={usage.data ?? []} />
 
         {pendingAuth.length > 0 ? (
           <Card>
