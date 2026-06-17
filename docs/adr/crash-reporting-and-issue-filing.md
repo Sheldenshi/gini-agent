@@ -62,7 +62,13 @@ it can be read by the agent or shown to the user. `buildCrashReport`
   just the first token),
 - every literal value parsed out of `~/.gini/secrets.env`, unquoted through the
   repo's `unquoteSecretsValue` and scrubbed verbatim so a hand-edited or
-  odd-format key is caught even when it doesn't match a pattern.
+  odd-format key is caught even when it doesn't match a pattern,
+- the OS username embedded in absolute filesystem paths: the running user's home
+  directory collapses to `~` and any other-account home segment (`/Users/<name>`,
+  `/home/<name>`, `C:\Users\<name>`) is masked to `<user>`. The path structure
+  (which source/state file, line:col) is debugging signal and survives; only the
+  username — which a stack frame like `/Users/jane/.gini/runtime/src/state/store.ts`
+  would otherwise publish — is removed.
 
 Independently, the `runtime.jsonl` tail carried into a report keeps only each
 line's event name + timestamp; the `data` payload is **dropped at build time**
@@ -160,9 +166,9 @@ distinct crash for one-click filing.
 - Nothing is published without explicit consent, and `gh` authentication
   happens interactively with the user present — there is no headless `gh` path.
 - No report or issue body carries a provider key, bearer secret, gh
-  token, or user/task content: redaction at capture and the dropped `data`
-  payload are the enforced boundary, and the skill files only from the queued
-  JSON.
+  token, user/task content, or the OS username: redaction at capture (secrets +
+  home-path username masking) and the dropped `data` payload are the enforced
+  boundary, and the skill files only from the queued JSON.
 - Non-`default` and non-launchd instances (foreground, conductor, tmux,
   throwaway) capture crashes to their own queue but **never ask** and never
   file.
@@ -184,8 +190,10 @@ distinct crash for one-click filing.
   the runtime is down writes none.
 - `redactReportText` removes `sk-…`, `ghp_…`, `github_pat_…`, `gho_…`,
   `Bearer …`, an `Authorization:` header value, and a literal secrets-env
-  value; the serialized `runtime.jsonl` tail carries no `data` payload — all
-  before the report reaches the queue.
+  value; it collapses the running user's home dir to `~` and masks any other
+  `/Users/<name>`, `/home/<name>`, or `C:\Users\<name>` segment to `<user>`
+  while preserving the rest of the path; the serialized `runtime.jsonl` tail
+  carries no `data` payload — all before the report reaches the queue.
 - On a `default` launchd restart with fresh pending reports, exactly one ask job
   is created and bound to the agent's canonical chat (no dedicated channel), its
   prompt mentions the count and the `gini-bug-report` skill, and `lastAskedAt` is
