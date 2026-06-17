@@ -4,8 +4,8 @@ import { useState } from "react";
 import { ChevronRight } from "lucide-react";
 import type { ToolCallBlock, ToolResultBlock } from "@runtime/types";
 import type { ProcessStep } from "@/lib/group-exchanges";
+import { BlockThinking } from "./BlockThinking";
 import { BlockToolCall } from "./BlockToolCall";
-import { MarkdownContent } from "./MarkdownContent";
 import { iconForTool } from "./tool-icons";
 
 // Collapsed summary of every tool_call the assistant made during one
@@ -74,9 +74,7 @@ export function BlockToolCallsCollapsed({
                   result={resultsByCallId.get(step.block.callId)}
                 />
               ) : (
-                <div className="text-[14px] text-muted-foreground">
-                  <MarkdownContent text={step.block.text} />
-                </div>
+                <BlockThinking block={step.block} />
               )}
             </li>
           ))}

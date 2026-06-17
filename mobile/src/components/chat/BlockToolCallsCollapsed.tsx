@@ -4,6 +4,7 @@ import { Pressable, StyleSheet, Text, View } from "react-native";
 import type { ProcessStep } from "@/src/group-exchanges";
 import { family, theme } from "@/src/theme";
 import type { ToolCallBlock, ToolResultBlock } from "@/src/types";
+import { BlockThinking } from "./BlockThinking";
 import { BlockToolCall } from "./BlockToolCall";
 import { iconForTool } from "./tool-icons";
 
@@ -79,9 +80,7 @@ export function BlockToolCallsCollapsed({
                 result={resultsByCallId.get(step.block.callId)}
               />
             ) : (
-              <Text key={step.block.id} style={styles.narration}>
-                {step.block.text}
-              </Text>
+              <BlockThinking key={step.block.id} block={step.block} />
             )
           )}
         </View>
@@ -132,14 +131,5 @@ const styles = StyleSheet.create({
   expandedList: {
     paddingLeft: 27,
     gap: 6
-  },
-  // Pre-tool narration rendered muted so it reads as process, not a
-  // standalone reply. Narration is always settled (the streaming path
-  // never collapses), so no cursor.
-  narration: {
-    color: theme.muted,
-    fontFamily: family("HankenGrotesk", 500),
-    fontSize: 14,
-    lineHeight: 20
   }
 });
