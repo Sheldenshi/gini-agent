@@ -2675,6 +2675,100 @@ describe("runtime api", () => {
     expect(after?.status).toBe("pending");
   });
 
+  test("screencast frames + input endpoints 404 for an unknown setup request", async () => {
+    const config = testConfig("screencast-404");
+    const handler = createHandler(config);
+    const frames = await rawCall(handler, config, "/api/browser/screencast/nope/frames", {}, config.token);
+    expect(frames.status).toBe(404);
+    const input = await rawCall(handler, config, "/api/browser/screencast/nope/input", {
+      method: "POST",
+      body: JSON.stringify({ kind: "move", x: 1, y: 1 })
+    }, config.token);
+    expect(input.status).toBe(404);
+  });
+
+  test("screencast frames returns 409 when no spawned browser is running", async () => {
+    // A real browser.connect setup exists, but there's no live spawned Chrome
+    // in this unit-test context, so the bridge fails to start and the endpoint
+    // surfaces 409 rather than opening an empty stream.
+    const config = testConfig("screencast-no-browser");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "browser.connect",
+        target: "https://example.com",
+        reason: "Sign in to continue",
+        payload: { toolCallId: "call_sc", signInStarted: true, screencast: true }
+      })
+    );
+    const frames = await rawCall(handler, config, `/api/browser/screencast/${setup.id}/frames`, {}, config.token);
+    expect(frames.status).toBe(409);
+    const input = await rawCall(handler, config, `/api/browser/screencast/${setup.id}/input`, {
+      method: "POST",
+      body: JSON.stringify({ kind: "move", x: 1, y: 1 })
+    }, config.token);
+    expect(input.status).toBe(409);
+  });
+
+  test("completing a screencast browser.connect resolves the setup without a managed relaunch", async () => {
+    // The screencast path keeps the agent on its headless Chrome the whole
+    // time, so /complete just stops the bridge (a no-op here, no live bridge)
+    // and resolves the setup — no connectBrowser relaunch.
+    const config = testConfig("screencast-complete");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "browser.connect",
+        target: "https://example.com",
+        reason: "Sign in",
+        payload: { toolCallId: "call_sc3", signInStarted: true, screencast: true }
+      })
+    );
+    const res = await call(handler, config, `/api/setup-requests/${setup.id}/complete`, {
+      method: "POST",
+      body: JSON.stringify({})
+    });
+    expect(res.ok).toBe(true);
+    expect(readState(config.instance).setupRequests.find((s) => s.id === setup.id)?.status).toBe("completed");
+  });
+
+  test("cancelling a screencast browser.connect stops the bridge and cancels the setup", async () => {
+    const config = testConfig("screencast-cancel");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "browser.connect",
+        target: "https://example.com",
+        reason: "Sign in",
+        payload: { toolCallId: "call_sc4", signInStarted: true, screencast: true }
+      })
+    );
+    await call(handler, config, `/api/setup-requests/${setup.id}/cancel`, { method: "POST" });
+    expect(readState(config.instance).setupRequests.find((s) => s.id === setup.id)?.status).toBe("cancelled");
+  });
+
+  test("screencast input rejects a malformed JSON body with 400", async () => {
+    const config = testConfig("screencast-bad-body");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "browser.connect",
+        target: "https://example.com",
+        reason: "Sign in",
+        payload: { toolCallId: "call_sc2", signInStarted: true, screencast: true }
+      })
+    );
+    const res = await rawCall(handler, config, `/api/browser/screencast/${setup.id}/input`, {
+      method: "POST",
+      body: "{not json"
+    }, config.token);
+    expect(res.status).toBe(400);
+  });
+
   test("POST /api/setup-requests/<id>/complete refuses a code-less messaging.approve_pairing approve and keeps the request pending", async () => {
     // allowChat's pending-row presence check is gated on `expectedCode`
     // being defined (the legacy CLI's "operator knows what they're

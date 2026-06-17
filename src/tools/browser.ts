@@ -614,6 +614,18 @@ export function currentDisconnectGeneration(): number {
   return disconnectGeneration;
 }
 
+// The spawned default Chrome's CDP debug port, or null when the live handle
+// isn't a spawned one (no browser yet, or a managed/cdp record is active). The
+// sign-in screencast bridge dials ONLY this port (always ≥ DEFAULT_CDP_PORT_BASE,
+// well above the user's conventional :9222) to attach its raw-CDP screencast —
+// it never accepts a port from the client. Returns null rather than launching:
+// the bridge is a read/drive channel over an ALREADY-running headless Chrome,
+// not a reason to spawn one.
+export function getScreencastPort(): number | null {
+  if (shared && shared.kind === "spawned" && isHandleAlive(shared)) return shared.port;
+  return null;
+}
+
 async function ensureShared(): Promise<SharedHandle> {
   if (shared && isHandleAlive(shared)) return shared;
   if (pendingShared) return pendingShared;
@@ -5167,6 +5179,17 @@ export const __test = {
     context: Pick<BrowserContext, "close"> & Partial<{ pages: () => Page[]; browser: () => unknown }>
   ): void {
     shared = { kind: "persistent", context: context as BrowserContext, headed: false };
+  },
+  // Install a fake spawned handle so getScreencastPort and the spawned
+  // teardown can be asserted without launching Chrome. The context's
+  // browser().isConnected() drives liveness (getScreencastPort only returns
+  // the port for a LIVE spawned handle).
+  installFakeSpawnedHandleForTest(
+    port: number,
+    context: Pick<BrowserContext, "close"> & Partial<{ pages: () => Page[]; browser: () => unknown }>,
+    profileDir = "/tmp/fake-spawn-profile"
+  ): void {
+    shared = { kind: "spawned", context: context as BrowserContext, port, profileDir };
   },
   // Liveness probe over the currently-installed shared handle. Null when no
   // handle is installed. Lets tests assert that an externally-killed Chrome

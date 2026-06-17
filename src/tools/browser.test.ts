@@ -24,6 +24,7 @@ import {
   chromeProfileDirFor,
   closeAll,
   currentDisconnectGeneration,
+  getScreencastPort,
   disconnectSharedBrowser,
   domainPolicyBlockReason,
   hostnameIsLoopback,
@@ -7198,6 +7199,41 @@ describe("currentDisconnectGeneration", () => {
     expect(currentDisconnectGeneration()).toBe(before);
     const after = browserTest.bumpDisconnectGenerationForTest();
     expect(currentDisconnectGeneration()).toBe(after);
+  });
+});
+
+// getScreencastPort exposes the spawned Chrome's debug port to the sign-in
+// screencast bridge — but ONLY for a live spawned handle, never for a
+// managed/cdp handle and never when no browser is up.
+describe("getScreencastPort", () => {
+  afterEach(() => {
+    browserTest.uninstallFakeBrowserForTest();
+  });
+
+  test("returns null when no browser handle is installed", () => {
+    browserTest.uninstallFakeBrowserForTest();
+    expect(getScreencastPort()).toBeNull();
+  });
+
+  test("returns the port for a live spawned handle", () => {
+    browserTest.installFakeSpawnedHandleForTest(9412, {
+      close: () => Promise.resolve(),
+      browser: () => ({ isConnected: () => true })
+    } as never);
+    expect(getScreencastPort()).toBe(9412);
+  });
+
+  test("returns null for a spawned handle whose Chrome has died", () => {
+    browserTest.installFakeSpawnedHandleForTest(9412, {
+      close: () => Promise.resolve(),
+      browser: () => ({ isConnected: () => false })
+    } as never);
+    expect(getScreencastPort()).toBeNull();
+  });
+
+  test("returns null for a managed (non-spawned) handle", () => {
+    browserTest.installFakeManagedContextForTest({ close: () => Promise.resolve() } as never);
+    expect(getScreencastPort()).toBeNull();
   });
 });
 

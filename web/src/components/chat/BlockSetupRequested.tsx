@@ -13,6 +13,7 @@ import { useSetupRequests, useInvalidate, useProviders } from "@/lib/queries";
 import type { SetupRequest, SetupRequestedBlock } from "@runtime/types";
 import { parseFillSecretSlots, type FillSecretSlot } from "@/lib/fill-secrets-types";
 import { browserConnectButtonLabel } from "./browser-connect-card";
+import { ScreencastModal } from "@/components/browser/ScreencastModal";
 
 // User-actor gate: the user performs a setup step (sign in, enter
 // credentials, fill a form, stand up a messaging bridge, approve an
@@ -980,6 +981,20 @@ export function BlockSetupRequested({ block }: { block: SetupRequestedBlock }) {
           pending={connect.isPending}
           externalError={connectError}
           onSubmit={(body) => connect.mutate(body)}
+        />
+      ) : null}
+      {/* Screencast sign-in: once the user approves the browser.connect card,
+          the server stamps the request as a screencast and the live modal lets
+          them sign in inside the agent's headless browser. "I've signed in"
+          reuses the browserConnect mutation (which POSTs /complete when
+          signInStarted), and Cancel reuses the cancel mutation. */}
+      {isBrowserConnect && isPending && signInStarted && setup?.payload?.screencast === true ? (
+        <ScreencastModal
+          setupRequestId={block.setupRequestId}
+          onSignedIn={() => browserConnect.mutate()}
+          onCancel={() => cancel.mutate()}
+          signingIn={browserConnect.isPending}
+          cancelling={cancel.isPending}
         />
       ) : null}
     </div>
