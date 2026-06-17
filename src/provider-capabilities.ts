@@ -276,3 +276,68 @@ export function bedrockSupportsToolUse(model: string): boolean {
 export function bedrockSupportsStreamingWithTools(model: string): boolean {
   return !/llama4/i.test(model);
 }
+
+export interface ModelPricing {
+  /** USD per 1M input (prompt) tokens. */
+  inputPerMillion: number;
+  /** USD per 1M output (completion) tokens. */
+  outputPerMillion: number;
+}
+
+// Per-model token pricing in USD per million tokens, used by estimateCost to
+// fill CostRecord.estimatedUsd. This is a MAINTAINED list-price table — add a
+// row (with a source in the PR) when a provider/model is added or a price
+// changes. Matched against the normalized model id, so a Bedrock-prefixed id
+// (`anthropic.claude-opus-4-8`) hits the same row as the first-party one. The
+// first match wins, so order specific patterns before broad ones. An
+// unrecognized model returns undefined and contributes 0 USD (tokens are still
+// counted); local/echo/demo providers are intentionally unpriced.
+//
+// Anthropic values verified 2026-05 (input/output $ per MTok): Fable 5 10/50,
+// Opus 4.5–4.8 5/25, Sonnet 4.6 3/15, Haiku 4.5 1/5. OpenAI/DeepSeek rows are
+// public list prices and should be re-verified before relying on the USD
+// figure for billing.
+const MODEL_PRICING: Array<{ match: RegExp; input: number; output: number }> = [
+  // Anthropic / Claude (first-party + Bedrock `anthropic.` prefix).
+  { match: /(^|[.\-/])claude-fable-5(?=$|[-.])/, input: 10, output: 50 },
+  { match: /(^|[.\-/])claude-opus-4-[5678](?=$|[-.])/, input: 5, output: 25 },
+  { match: /(^|[.\-/])claude-opus-4-[01](?=$|[-.])/, input: 15, output: 75 },
+  { match: /(^|[.\-/])claude-3-opus(?=$|[-.])/, input: 15, output: 75 },
+  { match: /(^|[.\-/])claude-sonnet-4-[56](?=$|[-.])/, input: 3, output: 15 },
+  { match: /(^|[.\-/])claude-haiku-4-5(?=$|[-.])/, input: 1, output: 5 },
+  { match: /(^|[.\-/])claude-3-5-haiku(?=$|[-.])/, input: 0.8, output: 4 },
+  // OpenAI / Codex (gpt-5.x served through the codex backend uses gpt-5 pricing).
+  { match: /(^|[.\-/])gpt-5(\.\d+)?-?(mini|nano)(?=$|[-.])/, input: 0.25, output: 2 },
+  { match: /(^|[.\-/])gpt-5(?=$|[-.\d])/, input: 1.25, output: 10 },
+  { match: /(^|[.\-/])gpt-4o-mini(?=$|[-.])/, input: 0.15, output: 0.6 },
+  { match: /(^|[.\-/])gpt-4o(?=$|[-.])/, input: 2.5, output: 10 },
+  // DeepSeek.
+  { match: /(^|[.\-/])deepseek-reasoner(?=$|[-.])/, input: 0.55, output: 2.19 },
+  { match: /(^|[.\-/])deepseek(?=$|[-.])/, input: 0.27, output: 1.1 }
+];
+
+export function resolveModelPricing(provider: ProviderConfig): ModelPricing | undefined {
+  const slug = normalizeModel(provider.model);
+  if (slug.length === 0) return undefined;
+  for (const row of MODEL_PRICING) {
+    if (row.match.test(slug)) return { inputPerMillion: row.input, outputPerMillion: row.output };
+  }
+  return undefined;
+}
+
+/**
+ * Estimate USD for a call given resolved input/output token counts. Returns
+ * undefined when the model is unpriced (so estimatedUsd stays absent rather
+ * than a misleading 0).
+ */
+export function estimateUsd(
+  provider: ProviderConfig,
+  inputTokens: number | undefined,
+  outputTokens: number | undefined
+): number | undefined {
+  const pricing = resolveModelPricing(provider);
+  if (!pricing) return undefined;
+  const input = typeof inputTokens === "number" && Number.isFinite(inputTokens) ? inputTokens : 0;
+  const output = typeof outputTokens === "number" && Number.isFinite(outputTokens) ? outputTokens : 0;
+  return (input * pricing.inputPerMillion + output * pricing.outputPerMillion) / 1_000_000;
+}
