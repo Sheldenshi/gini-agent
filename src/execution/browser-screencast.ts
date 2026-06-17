@@ -30,6 +30,10 @@ const CTRL_OR_META = 0b0110;
 // can't hang the /complete or /cancel HTTP response.
 const STOP_SCREENCAST_TIMEOUT_MS = 2_000;
 
+// How often the bridge re-polls /json to follow a popup / new-tab sign-in. The
+// watch interval is unref'd so it never holds the process open.
+const TARGET_WATCH_INTERVAL_MS = 700;
+
 // The input events the modal can send. Deliberately does NOT include page
 // navigation: the modal is for signing in on the page the agent already
 // reached, and a free URL bar would bypass the agent's SSRF / domain-policy
@@ -42,7 +46,8 @@ export type ScreencastInput =
   | { kind: "dragselect"; x0: number; y0: number; x1: number; y1: number; modifiers?: number }
   | { kind: "key"; text?: string; key?: string; code?: string; vk?: number; modifiers?: number };
 
-interface CdpVersionTarget {
+export interface CdpVersionTarget {
+  id?: string;
   type?: string;
   url?: string;
   webSocketDebuggerUrl?: string;
@@ -95,10 +100,24 @@ export class ScreencastBridge {
   // shut. Bounded so a wedged CDP socket can't hang the /complete or /cancel
   // HTTP response (those await stopActiveBridge → stop()). Test-injectable.
   private readonly stopTimeoutMs: number;
+  // Target-follow state (popup / new-tab sign-in support).
+  private currentWsUrl: string | undefined;
+  private knownTargetIds = new Set<string>();
+  private targetWatch: ReturnType<typeof setInterval> | undefined;
+  // True while switchTo is re-pointing the socket: suppresses the old socket's
+  // close handler from tearing the whole bridge down, and pauses the watcher.
+  private switching = false;
+  private swapInProgress = false;
+  private readonly targetWatchMs: number;
 
-  constructor(deps: Partial<ScreencastDeps> = {}, stopTimeoutMs = STOP_SCREENCAST_TIMEOUT_MS) {
+  constructor(
+    deps: Partial<ScreencastDeps> = {},
+    stopTimeoutMs = STOP_SCREENCAST_TIMEOUT_MS,
+    targetWatchMs = TARGET_WATCH_INTERVAL_MS
+  ) {
     this.deps = { ...defaultDeps(), ...deps };
     this.stopTimeoutMs = stopTimeoutMs;
+    this.targetWatchMs = targetWatchMs;
   }
 
   // Open the raw CDP socket to the spawned Chrome's first page target and start
@@ -123,9 +142,27 @@ export class ScreencastBridge {
     if (!pageTarget?.webSocketDebuggerUrl) {
       throw new Error("No page target available on the spawned browser.");
     }
+    // Remember the page targets present at attach time so the watcher can
+    // recognize a NEW one (a popup the sign-in flow opens) as it appears.
+    this.knownTargetIds = new Set(pages.map((p) => p.id).filter((id): id is string => typeof id === "string"));
+    await this.attachTo(pageTarget.webSocketDebuggerUrl, true);
+    // Follow popup / new-tab sign-in: many OAuth flows open a popup window
+    // (a new page target) the user must complete in. Poll the target list and
+    // re-point the screencast to a freshly-opened page, falling back to the
+    // remaining page when it closes. Same-tab redirect sign-in needs no switch
+    // (the screencast follows the page target through its own navigations).
+    this.startTargetWatch(port);
+  }
+
+  // Open a raw CDP socket to one page target's wsUrl and start its screencast.
+  // When `settleStart` is true the returned promise rejects on a close/error
+  // that happens before the screencast starts, so start()'s caller can't hang;
+  // a target SWITCH passes false (a failed switch just leaves the prior frame).
+  private attachTo(wsUrl: string, settleStart: boolean): Promise<void> {
     const { promise, resolve, reject } = Promise.withResolvers<void>();
-    const socket = this.deps.openSocket(pageTarget.webSocketDebuggerUrl);
+    const socket = this.deps.openSocket(wsUrl);
     this.cdp = socket;
+    this.currentWsUrl = wsUrl;
     socket.addEventListener("open", () => {
       void (async () => {
         try {
@@ -153,14 +190,76 @@ export class ScreencastBridge {
     // awaiting request hangs forever. reject after a post-open resolve is a
     // no-op, so this stays correct for steady-state teardown too.
     socket.addEventListener("close", () => {
-      reject(new Error("CDP socket closed before the screencast started."));
+      if (settleStart) reject(new Error("CDP socket closed before the screencast started."));
+      // A deliberate switch closes the old socket on purpose — don't let that
+      // tear the whole bridge down; only a real drop of the live socket does.
+      if (this.swapInProgress || socket !== this.cdp) return;
       this.handleClosed();
     });
     socket.addEventListener("error", () => {
-      reject(new Error("CDP socket errored before the screencast started."));
+      if (settleStart) reject(new Error("CDP socket errored before the screencast started."));
+      if (this.swapInProgress || socket !== this.cdp) return;
       this.handleClosed();
     });
-    await promise;
+    return promise;
+  }
+
+  // Poll /json and switch the screencast to a popup/new tab when one appears,
+  // or back to a remaining page when the watched one closes. Best-effort; the
+  // interval is unref'd so it never holds the process open.
+  private startTargetWatch(port: number): void {
+    this.targetWatch = setInterval(() => {
+      void (async () => {
+        if (this.closed || this.switching) return;
+        let pages: CdpVersionTarget[];
+        try {
+          const targets = await this.deps.fetchJson(`http://127.0.0.1:${port}/json`);
+          pages = targets.filter((t) => t.type === "page" && t.webSocketDebuggerUrl);
+        } catch {
+          return; // transient; try again next tick
+        }
+        const current = pages.find((p) => p.webSocketDebuggerUrl === this.currentWsUrl);
+        // A brand-new page target (not seen at attach and not the current one)
+        // is a popup the sign-in opened — switch the screencast to it.
+        const fresh = pages.find(
+          (p) => typeof p.id === "string" && !this.knownTargetIds.has(p.id) && p.webSocketDebuggerUrl !== this.currentWsUrl
+        );
+        if (fresh?.webSocketDebuggerUrl) {
+          if (typeof fresh.id === "string") this.knownTargetIds.add(fresh.id);
+          await this.switchTo(fresh.webSocketDebuggerUrl);
+          return;
+        }
+        // The watched page closed (popup dismissed / tab gone) — fall back to
+        // whatever page remains so the operator isn't left on a dead frame.
+        if (!current && pages[0]?.webSocketDebuggerUrl) {
+          await this.switchTo(pages[0].webSocketDebuggerUrl);
+        }
+      })();
+    }, this.targetWatchMs);
+    if (typeof this.targetWatch.unref === "function") this.targetWatch.unref();
+  }
+
+  // Re-point the live screencast to a different page target: drop the current
+  // socket (without tearing the whole bridge down) and attach to the new one.
+  private async switchTo(wsUrl: string): Promise<void> {
+    if (this.closed || wsUrl === this.currentWsUrl) return;
+    this.switching = true;
+    try {
+      const old = this.cdp;
+      this.cdp = undefined;
+      // Drop the old socket's listeners' effect: mark it so its close handler
+      // (which calls handleClosed) is bypassed during a deliberate switch.
+      this.swapInProgress = true;
+      try {
+        old?.close();
+      } catch {
+        // ignore
+      }
+      this.swapInProgress = false;
+      await this.attachTo(wsUrl, false);
+    } finally {
+      this.switching = false;
+    }
   }
 
   private onCdpMessage(raw: unknown): void {
@@ -198,6 +297,10 @@ export class ScreencastBridge {
     if (this.closed) return;
     this.closed = true;
     this.cdp = undefined;
+    if (this.targetWatch) {
+      clearInterval(this.targetWatch);
+      this.targetWatch = undefined;
+    }
     this.subscribers.clear();
     for (const resolve of this.pending.values()) resolve(undefined);
     this.pending.clear();

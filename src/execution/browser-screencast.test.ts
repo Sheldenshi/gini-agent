@@ -5,6 +5,7 @@ import {
   getOrStartBridge,
   stopActiveBridge,
   __resetActiveBridgeForTest,
+  type CdpVersionTarget,
   type ScreencastDeps,
   type WebSocketLike
 } from "./browser-screencast";
@@ -345,6 +346,156 @@ describe("ScreencastBridge.stop + close", () => {
     await bridge.stop();
     await bridge.stop();
     expect(bridge.isClosed()).toBe(true);
+  });
+});
+
+// Poll until a predicate holds (or time out) — drives the unref'd target watcher
+// without sleeping a fixed amount.
+async function waitUntil(pred: () => boolean, timeoutMs = 500): Promise<void> {
+  const start = Date.now();
+  while (!pred()) {
+    if (Date.now() - start > timeoutMs) throw new Error("waitUntil timed out");
+    await new Promise((r) => setTimeout(r, 2));
+  }
+}
+
+// A target list the test can rewrite between watcher polls, with a socket-per-URL
+// factory so a switch dials a distinct socket the test can inspect.
+function followHarness(initial: CdpVersionTarget[]) {
+  let targets = initial;
+  const sockets = new Map<string, FakeSocket>();
+  const dialed: string[] = [];
+  const openSocket = (url: string): WebSocketLike => {
+    const socket = new FakeSocket();
+    // Auto-open so attachTo's startScreencast sends complete on their own.
+    const origAdd = socket.addEventListener.bind(socket);
+    socket.addEventListener = (event, listener) => {
+      origAdd(event, listener);
+      if (event === "open") queueMicrotask(() => socket.open());
+    };
+    sockets.set(url, socket);
+    dialed.push(url);
+    return socket;
+  };
+  const deps: Partial<ScreencastDeps> = {
+    openSocket,
+    fetchJson: async () => targets,
+    resolvePort: () => 9333
+  };
+  return {
+    deps,
+    dialed,
+    sockets,
+    setTargets(next: CdpVersionTarget[]) {
+      targets = next;
+    }
+  };
+}
+
+describe("ScreencastBridge target-follow (popup / new-tab)", () => {
+  const page = (
+    id: string,
+    url: string
+  ): CdpVersionTarget & { id: string; webSocketDebuggerUrl: string } => ({
+    id,
+    type: "page",
+    url,
+    webSocketDebuggerUrl: `ws://127.0.0.1:9333/devtools/page/${id}`
+  });
+
+  test("switches the screencast to a freshly-opened popup target", async () => {
+    const opener = page("opener", "https://signin.example/");
+    const h = followHarness([opener]);
+    const bridge = new ScreencastBridge(h.deps, 20, 5);
+    await bridge.start("https://signin.example/");
+    expect(h.dialed).toEqual([opener.webSocketDebuggerUrl]);
+    // OAuth pops a new tab the user must complete in.
+    const popup = page("popup", "https://idp.example/authorize");
+    h.setTargets([opener, popup]);
+    await waitUntil(() => h.dialed.includes(popup.webSocketDebuggerUrl));
+    expect(h.dialed.at(-1)).toBe(popup.webSocketDebuggerUrl);
+    // The old opener socket was dropped during the deliberate switch, but the
+    // bridge stays live (the swap guard suppresses its close handler).
+    expect(bridge.isClosed()).toBe(false);
+    expect(h.sockets.get(opener.webSocketDebuggerUrl)!.closed).toBe(true);
+    await bridge.stop();
+  });
+
+  test("falls back to the remaining page when the watched target closes", async () => {
+    const opener = page("opener", "https://app.example/");
+    const popup = page("popup", "https://idp.example/authorize");
+    const h = followHarness([opener, popup]);
+    const bridge = new ScreencastBridge(h.deps, 20, 5);
+    // Attach to the popup (preferUrl matches it); both are "known" at attach.
+    await bridge.start("https://idp.example/authorize");
+    expect(h.dialed).toEqual([popup.webSocketDebuggerUrl]);
+    // Popup closes after sign-in — only the opener remains.
+    h.setTargets([opener]);
+    await waitUntil(() => h.dialed.includes(opener.webSocketDebuggerUrl));
+    expect(h.dialed.at(-1)).toBe(opener.webSocketDebuggerUrl);
+    expect(bridge.isClosed()).toBe(false);
+    await bridge.stop();
+  });
+
+  test("does not switch when the target set is unchanged", async () => {
+    const opener = page("opener", "https://signin.example/");
+    const h = followHarness([opener]);
+    const bridge = new ScreencastBridge(h.deps, 20, 5);
+    await bridge.start("https://signin.example/");
+    // Let several poll ticks pass with no new/closed target.
+    await new Promise((r) => setTimeout(r, 30));
+    expect(h.dialed).toEqual([opener.webSocketDebuggerUrl]);
+    await bridge.stop();
+  });
+
+  test("a transient /json fetch error is swallowed and polling continues", async () => {
+    const opener = page("opener", "https://signin.example/");
+    const popup = page("popup", "https://idp.example/authorize");
+    let calls = 0;
+    const sockets = new Map<string, FakeSocket>();
+    const dialed: string[] = [];
+    const openSocket = (url: string): WebSocketLike => {
+      const socket = new FakeSocket();
+      const origAdd = socket.addEventListener.bind(socket);
+      socket.addEventListener = (event, listener) => {
+        origAdd(event, listener);
+        if (event === "open") queueMicrotask(() => socket.open());
+      };
+      sockets.set(url, socket);
+      dialed.push(url);
+      return socket;
+    };
+    const bridge = new ScreencastBridge(
+      {
+        openSocket,
+        fetchJson: async () => {
+          calls += 1;
+          if (calls === 1) return [opener]; // start()'s initial enumeration
+          if (calls === 2) throw new Error("transient /json failure");
+          return [opener, popup]; // recovers next tick
+        },
+        resolvePort: () => 9333
+      },
+      20,
+      5
+    );
+    await bridge.start("https://signin.example/");
+    await waitUntil(() => dialed.includes(popup.webSocketDebuggerUrl));
+    expect(dialed.at(-1)).toBe(popup.webSocketDebuggerUrl);
+    await bridge.stop();
+  });
+
+  test("the watcher stops polling once the bridge is closed", async () => {
+    const opener = page("opener", "https://signin.example/");
+    const h = followHarness([opener]);
+    const bridge = new ScreencastBridge(h.deps, 20, 5);
+    await bridge.start("https://signin.example/");
+    await bridge.stop();
+    const dialsAtStop = h.dialed.length;
+    // A new popup appears AFTER teardown — the cleared interval must ignore it.
+    h.setTargets([opener, page("late", "https://idp.example/late")]);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(h.dialed.length).toBe(dialsAtStop);
   });
 });
 
