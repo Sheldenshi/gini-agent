@@ -18,6 +18,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { api, ApiError } from "@/src/api";
 import { clearCredentials } from "@/src/auth";
 import { AgentAvatar } from "@/src/components/chat/AgentAvatar";
+import { NewAgentSheet } from "@/src/components/NewAgentSheet";
 import { chatListTime, jobCadence } from "@/src/format";
 import {
   useAgents,
@@ -387,16 +388,15 @@ export default function ChannelsScreen() {
         </ScrollView>
       )}
 
-      {createOpen ? (
-        <NewAgentInline
-          name={newAgentName}
-          error={newAgentError}
-          creating={createAgent.isPending}
-          onChangeName={setNewAgentName}
-          onSubmit={onSubmitNewAgent}
-          onCancel={() => setCreateOpen(false)}
-        />
-      ) : null}
+      <NewAgentSheet
+        visible={createOpen}
+        name={newAgentName}
+        error={newAgentError}
+        creating={createAgent.isPending}
+        onChangeName={setNewAgentName}
+        onSubmit={onSubmitNewAgent}
+        onCancel={() => setCreateOpen(false)}
+      />
     </SafeAreaView>
   );
 }
@@ -576,77 +576,6 @@ function ChannelRow({
         <Text style={styles.channelNext}>{time}</Text>
       )}
     </TouchableOpacity>
-  );
-}
-
-// Lightweight inline name-entry overlay for creating an agent. Anchored
-// to the bottom of the screen above the home indicator so it doesn't
-// fight the list for space.
-function NewAgentInline({
-  name,
-  error,
-  creating,
-  onChangeName,
-  onSubmit,
-  onCancel
-}: {
-  name: string;
-  error: string | null;
-  creating: boolean;
-  onChangeName: (v: string) => void;
-  onSubmit: () => void;
-  onCancel: () => void;
-}) {
-  const submitDisabled = creating || name.trim().length === 0;
-  return (
-    <View style={styles.createOverlay}>
-      <Text style={styles.createTitle}>New agent</Text>
-      <TextInput
-        value={name}
-        onChangeText={onChangeName}
-        placeholder="Agent name"
-        placeholderTextColor={theme.placeholder}
-        autoFocus
-        autoCapitalize="words"
-        autoCorrect={false}
-        returnKeyType="done"
-        onSubmitEditing={() => {
-          if (!submitDisabled) onSubmit();
-        }}
-        editable={!creating}
-        style={styles.createInput}
-        accessibilityLabel="Agent name"
-      />
-      {error ? <Text style={styles.createError}>{error}</Text> : null}
-      <View style={styles.createActions}>
-        <TouchableOpacity
-          onPress={onCancel}
-          disabled={creating}
-          style={[styles.createButton, styles.createCancel]}
-          accessibilityRole="button"
-          accessibilityLabel="Cancel"
-        >
-          <Text style={styles.createCancelText}>Cancel</Text>
-        </TouchableOpacity>
-        <TouchableOpacity
-          onPress={onSubmit}
-          disabled={submitDisabled}
-          style={[
-            styles.createButton,
-            styles.createSubmit,
-            submitDisabled && styles.createButtonDisabled
-          ]}
-          accessibilityRole="button"
-          accessibilityLabel="Create agent"
-        >
-          {creating ? (
-            <ActivityIndicator color={theme.buttonText} />
-          ) : (
-            <Text style={styles.createSubmitText}>Create</Text>
-          )}
-        </TouchableOpacity>
-      </View>
-    </View>
   );
 }
 
@@ -836,66 +765,5 @@ const styles = StyleSheet.create({
     color: theme.accent,
     fontFamily: family("HankenGrotesk", 500),
     fontSize: 14
-  },
-
-  // Create-agent overlay.
-  createOverlay: {
-    position: "absolute",
-    left: 16,
-    right: 16,
-    bottom: 24,
-    backgroundColor: theme.bg,
-    borderRadius: 16,
-    borderWidth: 1,
-    borderColor: theme.inputBorder,
-    padding: 16,
-    gap: 12,
-    shadowColor: "#000",
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.12,
-    shadowRadius: 16,
-    elevation: 8
-  },
-  createTitle: {
-    color: theme.text,
-    fontFamily: family("HankenGrotesk", 700),
-    fontSize: 17
-  },
-  createInput: {
-    backgroundColor: theme.bg,
-    color: theme.text,
-    fontFamily: family("HankenGrotesk", 400),
-    fontSize: 16,
-    paddingHorizontal: 14,
-    paddingVertical: 12,
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: theme.inputBorder
-  },
-  createError: {
-    color: theme.danger,
-    fontFamily: family("HankenGrotesk", 400),
-    fontSize: 13
-  },
-  createActions: { flexDirection: "row", gap: 8 },
-  createButton: {
-    flex: 1,
-    height: 44,
-    borderRadius: 10,
-    alignItems: "center",
-    justifyContent: "center"
-  },
-  createCancel: { backgroundColor: theme.bg, borderWidth: 1, borderColor: theme.inputBorder },
-  createCancelText: {
-    color: theme.text,
-    fontFamily: family("HankenGrotesk", 600),
-    fontSize: 15
-  },
-  createSubmit: { backgroundColor: theme.accent },
-  createSubmitText: {
-    color: theme.buttonText,
-    fontFamily: family("HankenGrotesk", 600),
-    fontSize: 15
-  },
-  createButtonDisabled: { opacity: 0.5 }
+  }
 });
