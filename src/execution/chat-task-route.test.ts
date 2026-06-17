@@ -32,8 +32,20 @@ import {
 } from "../state";
 import { listMainChatBlocks } from "../state/chat-blocks";
 import type { ChatBlock, RuntimeConfig, Task } from "../types";
-import { createChat, submitChatMessage } from "./chat";
+import { createChat, submitChatMessage as submitChatMessageRaw } from "./chat";
 import { runChatTask } from "./chat-task";
+
+// These tests submit on idle sessions, which always run immediately. Narrow
+// the submit union to the run-now branch so the existing `.taskId` reads stay
+// typed (a queued result here is a test-setup bug). See ADR
+// chat-message-queue.md.
+async function submitChatMessage(
+  ...args: Parameters<typeof submitChatMessageRaw>
+): Promise<Extract<Awaited<ReturnType<typeof submitChatMessageRaw>>, { taskId: string }>> {
+  const result = await submitChatMessageRaw(...args);
+  if ("queued" in result) throw new Error("expected run-now submission, got queued");
+  return result;
+}
 
 function buildConfig(workspaceRoot: string, instance: string): RuntimeConfig {
   return {

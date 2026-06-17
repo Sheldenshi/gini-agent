@@ -40,6 +40,10 @@ function toolCall(overrides: Partial<ToolCallBlock>): ChatBlock {
   } as ChatBlock;
 }
 
+function toolResult(callId: string, taskId: string): ChatBlock {
+  return { kind: "tool_result", id: `r${ordinal}`, sessionId: "s", instance: "test", ordinal: ordinal++, createdAt: "2026-01-01T00:00:00.000Z", callId, preview: "", truncated: false, taskId } as ChatBlock;
+}
+
 // A job-cycle exchange: an assistant preamble, a tool call, and a final
 // reply, all stamped with the same taskId. Recurring-job channels emit these
 // with no user_text — the cycle is triggered by cron, not a user message.
@@ -219,5 +223,94 @@ describe("groupExchanges by taskId", () => {
     const groups = items.filter((i) => i.kind === "tool_group");
     expect(groups.length).toBe(2);
     expect(groups.map((g) => g.calls[0]!.argsPreview)).toEqual(["auto cycle", "sports scores"]);
+  });
+});
+
+describe("groupExchanges narration folding", () => {
+  test("a completed multi-tool exchange folds non-final narration into the process and keeps only the final answer standalone", () => {
+    const items = groupExchanges([
+      user("look into it", "task_n"),
+      assistant("let me check", "task_n"),
+      toolCall({ toolName: "web_search", argsPreview: "first", status: "ok", taskId: "task_n" }),
+      assistant("found it", "task_n"),
+      toolCall({ toolName: "web_fetch", argsPreview: "second", status: "ok", taskId: "task_n" }),
+      assistant("answer", "task_n")
+    ]);
+    const groups = items.filter((i) => i.kind === "tool_group");
+    expect(groups.length).toBe(1);
+    const group = groups[0]!;
+    // calls is retained — tool_call blocks only.
+    expect(group.calls.length).toBe(2);
+    expect(group.calls.map((c) => c.argsPreview)).toEqual(["first", "second"]);
+    // steps preserve exchange order: narration, tool, narration, tool.
+    expect(group.steps.map((s) => s.kind)).toEqual([
+      "narration",
+      "tool_call",
+      "narration",
+      "tool_call"
+    ]);
+    expect(
+      group.steps.map((s) =>
+        s.kind === "narration" ? s.block.text : s.block.argsPreview
+      )
+    ).toEqual(["let me check", "first", "found it", "second"]);
+    // The only standalone assistant_text is the final answer; the
+    // narration never leaks out as its own bubble.
+    const standaloneAssistant = items.filter(
+      (i) => i.kind === "block" && i.block.kind === "assistant_text"
+    );
+    expect(standaloneAssistant.length).toBe(1);
+    expect(
+      standaloneAssistant[0]!.kind === "block" &&
+        standaloneAssistant[0]!.block.kind === "assistant_text" &&
+        standaloneAssistant[0]!.block.text
+    ).toBe("answer");
+  });
+
+  test("an incomplete version keeps narration inline as standalone blocks (no group)", () => {
+    const items = groupExchanges([
+      user("look into it", "task_stream"),
+      assistant("let me check", "task_stream"),
+      toolCall({ toolName: "web_search", argsPreview: "first", status: "ok", taskId: "task_stream" }),
+      assistant("found it", "task_stream"),
+      toolCall({ toolName: "web_fetch", argsPreview: "second", status: "ok", taskId: "task_stream" }),
+      assistant("answer", "task_stream", /* streaming */ true)
+    ]);
+    expect(items.some((i) => i.kind === "tool_group")).toBe(false);
+    // Every narration block (and the still-streaming final) renders inline.
+    const standaloneAssistant = items.filter(
+      (i) => i.kind === "block" && i.block.kind === "assistant_text"
+    );
+    expect(standaloneAssistant.length).toBe(3);
+  });
+
+  test("a terminal run that ended on a tool call (no final answer) folds all narration with no standalone bubble", () => {
+    // The run carries a "Completed" phase (terminal) but the model stopped
+    // after a tool call — its last assistant_text precedes that call. The
+    // caller passes the taskId in terminalTaskIds; everything folds.
+    const items = groupExchanges(
+      [
+        assistant("narration", "task_term"),
+        toolCall({ toolName: "web_search", argsPreview: "first", status: "ok", taskId: "task_term" }),
+        toolResult("call-1", "task_term"),
+        assistant("court", "task_term"),
+        toolCall({ toolName: "web_fetch", argsPreview: "second", status: "ok", taskId: "task_term" }),
+        toolResult("call-2", "task_term")
+      ],
+      new Set(["task_term"])
+    );
+    const groups = items.filter((i) => i.kind === "tool_group");
+    expect(groups.length).toBe(1);
+    const group = groups[0]!;
+    expect(group.calls.length).toBe(2);
+    expect(group.calls.map((c) => c.argsPreview)).toEqual(["first", "second"]);
+    // Both pre-tool narration lines fold into the process as steps.
+    const narrationSteps = group.steps.filter((s) => s.kind === "narration");
+    expect(narrationSteps.map((s) => s.kind === "narration" && s.block.text)).toEqual([
+      "narration",
+      "court"
+    ]);
+    // No assistant_text leaks out as a standalone bubble.
+    expect(items.some((i) => i.kind === "block" && i.block.kind === "assistant_text")).toBe(false);
   });
 });

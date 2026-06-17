@@ -169,6 +169,112 @@ ensure_bun() {
   fi
 }
 
+# fetch_runtime needs a working git. On macOS, /usr/bin/git is a stub until the
+# Xcode Command Line Tools (CLT) are present: the first git call pops a GUI
+# "Install Command Line Developer Tools" dialog and exits non-zero. Without this
+# preflight, fetch_runtime's `git clone` trips that dialog and quiet() aborts the
+# installer (exit 1) while the dialog is still waiting for the user. So detect the
+# missing CLT, trigger Apple's installer, and track the user's choice.
+#
+# There is no programmatic "Install vs Cancel" signal, so we watch the install
+# helper process ("Install Command Line Developer Tools") together with whether
+# the tools actually land:
+#   - tools present              -> success (Install clicked, download finished)
+#   - helper alive, tools absent -> user still deciding, or download in progress
+#   - helper seen then gone, tools absent -> Cancel -> abort with a clear error
+# This honors "wait until they click Install; terminate cleanly if they Cancel"
+# without trying to introspect a system alert that exposes no AX window. The
+# cancel rule only fires once the helper was actually observed (saw_helper), so a
+# helper that never spawns waits for the tools until the timeout rather than being
+# misreported as a cancel.
+#
+# clt_tools_present accepts a working non-Apple git (Homebrew/Nix/conda) even when
+# `xcode-select -p` reports no active developer dir: such a git clones fine without
+# the CLT, and forcing a CLT install there would regress installs that used to just
+# work. Only /usr/bin/git is the stub that needs the CLT, and we never invoke it
+# during detection (we check its path, not run it), so detection can't trip the
+# install dialog — it appears only after our explanatory message.
+#
+# Poll interval, timeout, and the helper-match pattern are env-injectable for tests.
+clt_tools_present() {
+  # Active developer dir AND git actually runs. xcode-select -p succeeding isn't
+  # enough on its own: a set-but-broken DEVELOPER_DIR, or a full Xcode whose
+  # license hasn't been accepted, makes `git` exit non-zero ("You have not agreed
+  # to the Xcode/iOS license") even though the dir resolves — so the clone would
+  # still fail. Running git here is safe (the dir is set, so it won't trip the
+  # install dialog): it either works or surfaces the real error.
+  if xcode-select -p >/dev/null 2>&1 && git --version >/dev/null 2>&1; then
+    return 0
+  fi
+  # No active developer dir. A non-Apple git on PATH clones without the CLT; only
+  # /usr/bin/git is the stub. Accept any git that resolves elsewhere and runs.
+  local git_path
+  git_path="$(command -v git 2>/dev/null || true)"
+  [ -n "$git_path" ] && [ "$git_path" != "/usr/bin/git" ] && git --version >/dev/null 2>&1
+}
+
+clt_helper_running() {
+  pgrep -f "${GINI_CLT_HELPER_PATTERN:-Install Command Line Developer Tools}" >/dev/null 2>&1
+}
+
+ensure_git_macos() {
+  [ "$OS" = "darwin" ] || return 0
+
+  if clt_tools_present; then
+    step "Git ready ($(git --version 2>/dev/null | awk '{print $3}'))"
+    return 0
+  fi
+
+  info "Git needs the Xcode Command Line Tools, which aren't installed yet."
+  info "Click Install on the macOS dialog — this continues automatically once it finishes."
+  # Trigger Apple's GUI installer. Harmless if a request is already in flight
+  # (it just reports so) — tolerate any non-zero exit and fall through to the wait.
+  xcode-select --install >/dev/null 2>&1 || true
+
+  local waited=0
+  local saw_helper=0
+  local timeout="${GINI_CLT_WAIT_TIMEOUT_S:-1800}"
+  local interval="${GINI_CLT_WAIT_INTERVAL_S:-5}"
+  # How long to wait for the install dialog to even appear. If it never shows
+  # (headless/SSH session, MDM-managed Mac, or `xcode-select --install` failed to
+  # launch it) there's nothing for the user to click, so bail fast with an
+  # actionable message instead of hanging for the full $timeout.
+  local appear="${GINI_CLT_HELPER_APPEAR_S:-60}"
+
+  while ! clt_tools_present; do
+    if [ "$waited" -ge "$timeout" ]; then
+      err "Xcode Command Line Tools still not installed after ${timeout}s."
+      err "Finish the install (or run 'xcode-select --install'), then re-run this installer."
+      exit 1
+    fi
+    if clt_helper_running; then
+      # Installer is up (user deciding, or download in progress) — keep waiting.
+      saw_helper=1
+    elif [ "$saw_helper" = 1 ]; then
+      # The installer was running and has now closed. Let the toolchain settle,
+      # then decide: tools present -> the install finished (don't misread the brief
+      # window where the helper exits just before the switch completes); still
+      # absent -> the user cancelled.
+      sleep "$interval"
+      if clt_tools_present; then
+        break
+      fi
+      err "Command Line Tools install was cancelled (the installer closed before finishing)."
+      err "Re-run this installer and click Install, or install the tools with 'xcode-select --install'."
+      exit 1
+    elif [ "$waited" -ge "$appear" ]; then
+      # The helper never appeared within the window and the tools still aren't
+      # here — there's no dialog to click, so don't sit through the full timeout.
+      err "No Command Line Tools installer dialog appeared after ${appear}s."
+      err "Run 'xcode-select --install' manually, then re-run this installer."
+      exit 1
+    fi
+    sleep "$interval"
+    waited=$((waited + interval))
+  done
+  step "Git ready ($(git --version 2>/dev/null | awk '{print $3}'))"
+}
+
 fetch_runtime() {
   mkdir -p "$HOME/.gini"
 
@@ -541,6 +647,7 @@ main() {
   fi
 
   ensure_bun
+  ensure_git_macos
   fetch_runtime
   install_deps
   write_wrapper
@@ -555,4 +662,11 @@ main() {
   print_done
 }
 
-main "$@"
+# Run the installer unless a caller asks to load the functions only (tests
+# source this file to exercise ensure_git_macos in isolation). The default —
+# nothing set — always runs main, so the `curl | bash` path is unaffected; a
+# BASH_SOURCE/$0 guard can't be used here because under `curl | bash`
+# BASH_SOURCE[0] is unset, which would wrongly suppress main on real installs.
+if [ -z "${GINI_INSTALL_SH_NO_MAIN:-}" ]; then
+  main "$@"
+fi

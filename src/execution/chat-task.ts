@@ -25,7 +25,8 @@ import {
   now,
   readState,
   readTrace,
-  recordProviderAuthFailure
+  recordProviderAuthFailure,
+  recordUsage
 } from "../state";
 import { id as makeId } from "../state/ids";
 import { readGoogleAccounts } from "../state/google-accounts";
@@ -84,7 +85,8 @@ import type {
   SubagentRecord,
   Task,
   TaskToolCallState,
-  ToolCallSummary
+  ToolCallSummary,
+  UsageContext
 } from "../types";
 import type { EffectiveContext } from "./effective-context";
 import { updateRunFromTask } from "./runs";
@@ -117,9 +119,10 @@ import { dispatchToolCall, parseToolArgsLenient, ToolDisplayError } from "./tool
 import { parseLeadingRouteDirective } from "./route-directive";
 import { getSubagentForTask, syncSubagentFromTask } from "../capabilities/subagents";
 import { listEnabledSkillScripts } from "../capabilities/skill-scripts";
-import { autoRenameChatAfterTurn } from "./chat";
+import { autoRenameChatAfterTurn, dispatchNextPendingChatMessage } from "./chat";
 import { finalizeJobRunFromTask } from "../jobs/finalize";
 import { listJobs } from "../jobs";
+import { isSilentReply } from "../jobs/silent";
 import { peekRefLabel } from "../tools/browser";
 import { isSkillActive } from "../integrations/connectors";
 import { getProvider, providerForCredentialName } from "../integrations/connectors/registry";
@@ -1057,7 +1060,7 @@ async function persistFinalAnswerRow(
     finished.jobId ||
     !transcriptSessionId ||
     finalText.trim().length === 0 ||
-    finalText.trim() === "[SILENT]"
+    isSilentReply(finalText)
   ) {
     return;
   }
@@ -1807,6 +1810,16 @@ async function runLoop(
   // entry runChatTask hands us the already-resolved EffectiveContext;
   // resumeChatTask omits it so the resume picks up any agent change.
   const effective = inheritedEffective ?? resolveEffectiveContext(state0, config);
+  // Usage-ledger attribution for every model call in this turn. The source
+  // distinguishes a subagent child / scheduled job / ordinary chat by the
+  // task's own provenance; compaction/aux calls override source to "aux".
+  const usageBaseCtx: UsageContext = {
+    source: taskRow?.subagentId || taskRow?.parentTaskId ? "subagent" : taskRow?.jobId ? "job" : "chat",
+    agentId: effective.agentId,
+    taskId,
+    jobId: taskRow?.jobId,
+    subagentId: taskRow?.subagentId
+  };
   // Provider override passed into generateToolCallingResponse / generateAuxText
   // below. We must pass the RESOLVED provider whenever it differs from
   // config.provider — an agent override OR a transient dispatch fallback (the
@@ -2358,6 +2371,7 @@ async function runLoop(
               providerOverride
             );
             accumulatedCost = addCost(accumulatedCost, aux.cost);
+            void recordUsage(config.instance, { ...usageBaseCtx, source: "aux" }, aux.cost).catch(() => {});
             summaryText = aux.text.trim();
           } catch (error) {
             // No usable aux model — compaction is impossible, and pruning
@@ -2507,6 +2521,7 @@ async function runLoop(
     await flushChain;
     await enqueueFlush();
     accumulatedCost = addCost(accumulatedCost, result.cost);
+    void recordUsage(config.instance, usageBaseCtx, result.cost).catch(() => {});
     // Recalibrate the trim budget from the provider's real prompt-token
     // count for this call (when reported). Applies from the NEXT iteration's
     // elision pass onward.
@@ -2607,14 +2622,14 @@ async function runLoop(
       // partial-text invariant from ADR risks §4 holds.
       if (finished.status === "completed") {
         // [SILENT] sentinel — a scheduled job (or fan-out subagent
-        // worker) with nothing to report responds with exactly
-        // "[SILENT]" to suppress delivery. The legacy message layer
-        // (syncChatTaskResult) drops the ChatMessageRecord, but the UI
-        // renders chat blocks, so we must also retract the assistant_text
-        // block here or the channel shows a literal "[SILENT]" row. Mirror
-        // the legacy exactness: only the literal token (trailing
-        // whitespace tolerated), never content that merely contains it.
-        if (finalText.trim() === "[SILENT]") {
+        // worker) with nothing to report responds with "[SILENT]" to
+        // suppress delivery. The legacy message layer (syncChatTaskResult)
+        // drops the ChatMessageRecord, but the UI renders chat blocks, so
+        // we must also retract the assistant_text block here or the channel
+        // shows a literal "[SILENT]" row. Mirror the legacy contract: the
+        // literal token or a trailing "[SILENT]" line, never a leading/inline
+        // sentinel that merely contains it (see src/jobs/silent.ts).
+        if (isSilentReply(finalText)) {
           if (inFlightAssistantBlockId) {
             deleteAssistantTextBlock(emitCtx, inFlightAssistantBlockId);
           }
@@ -3395,6 +3410,7 @@ async function runLoop(
       throw error;
     }
     accumulatedCost = addCost(accumulatedCost, summaryResult.cost);
+    void recordUsage(config.instance, usageBaseCtx, summaryResult.cost).catch(() => {});
     // Same clear seam as the main loop: a successful summary call proves the
     // credential works, so drop any persistent needs-reauth record (issue
     // #233). Lock-free check first — no state write on the healthy path.
@@ -3729,5 +3745,16 @@ export async function resumeChatTask(
     data: { resumedAt: snapshot.iterations }
   });
 
-  return runLoop(config, taskId, messages, snapshot.iterations);
+  const finished = await runLoop(config, taskId, messages, snapshot.iterations);
+  // Drain the per-session queue after an approval resume settles (ADR
+  // chat-message-queue.md). The submitTask `.finally` chokepoint only fires
+  // for the original runTask promise, which already resolved when the turn
+  // paused for approval — so a queue stranded behind a resumed turn would
+  // never advance without this trigger. The dispatch is guarded + idempotent:
+  // if the loop paused for approval AGAIN (still in-flight) it no-ops, and it
+  // only pops once the resumed turn is truly terminal. Top-level chat only.
+  if (finished.mode === "chat" && finished.chatSessionId && !finished.parentTaskId) {
+    void dispatchNextPendingChatMessage(config, finished.chatSessionId);
+  }
+  return finished;
 }

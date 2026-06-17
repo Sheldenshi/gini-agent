@@ -35,13 +35,25 @@ import { createScheduledJob } from "../jobs";
 import {
   getChatSession,
   listChatSessions,
-  submitChatMessage,
+  submitChatMessage as submitChatMessageRaw,
   submitThreadReply,
   syncChatTaskResult,
   createChat,
   deleteChat
 } from "./chat";
 import type { Authorization, RuntimeConfig, SetupRequest, Task } from "../types";
+
+// Most tests here submit on idle sessions, which always run immediately.
+// Narrow the submit union to the run-now branch so the existing `.taskId`
+// reads stay typed (a queued result here is a test-setup bug). See ADR
+// chat-message-queue.md.
+async function submitChatMessage(
+  ...args: Parameters<typeof submitChatMessageRaw>
+): Promise<Extract<Awaited<ReturnType<typeof submitChatMessageRaw>>, { taskId: string }>> {
+  const result = await submitChatMessageRaw(...args);
+  if ("queued" in result) throw new Error("expected run-now submission, got queued");
+  return result;
+}
 
 // Minimal valid 16 kHz mono 16-bit PCM WAV so decodeWav succeeds and the
 // stubbed transcriber actually runs (a malformed buffer would fail in the

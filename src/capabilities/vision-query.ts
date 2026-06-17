@@ -9,7 +9,7 @@
 // browser_vision does against a fresh screenshot.
 
 import type { RuntimeConfig } from "../types";
-import { addAudit, appendTrace, mutateState } from "../state";
+import { addAudit, appendTrace, mutateState, recordUsage } from "../state";
 import { readUpload } from "../state/uploads";
 import { generateVisionAnalysis } from "../provider";
 import { resolveImageByteLimit } from "../provider-capabilities";
@@ -90,6 +90,7 @@ export async function invokeVisionQuery(
   }
 
   await emitAudit(config, options.taskId, params, true, mime, upload.bytes.length, undefined);
+  void recordUsage(config.instance, { source: "vision", taskId: options.taskId }, result.cost).catch(() => {});
   return { ok: true, answer: result.text, usage: result.usage };
 }
 

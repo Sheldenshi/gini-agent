@@ -12,6 +12,8 @@ import type {
   ImprovementProposal,
   JobRecord,
   JobRunRecord,
+  PendingChatMessage,
+  RunRecord,
   RuntimeEvent,
   RuntimeStatus,
   SetupRequest,
@@ -19,7 +21,8 @@ import type {
   SubagentRecord,
   Task,
   TraceRecord,
-  AuditEvent
+  AuditEvent,
+  UsageSource
 } from "@runtime/types";
 import type {
   ChatMessage,
@@ -59,6 +62,31 @@ function scopedPath(path: string, agentId: string | undefined): string {
   if (!agentId) return path;
   const separator = path.includes("?") ? "&" : "?";
   return `${path}${separator}agentId=${encodeURIComponent(agentId)}`;
+}
+
+// One day's token usage from GET /api/usage — the server-side rollup of the
+// durable usage ledger (chat, jobs, subagents, memory, titles, vision …),
+// scoped to the active agent. Mirrors DayUsage in src/state/usage.ts.
+export interface UsageDay {
+  day: string;
+  dayStart: number;
+  input: number;
+  output: number;
+  total: number;
+  estimatedUsd: number;
+  bySource: Partial<Record<UsageSource, { input: number; output: number; total: number; estimatedUsd: number; calls: number }>>;
+}
+
+export function useUsage(days: number, options?: Partial<UseQueryOptions<UsageDay[]>>) {
+  const agentId = useActiveAgentId();
+  const { enabled: callerEnabled, ...rest } = options ?? {};
+  return useQuery<UsageDay[]>({
+    queryKey: ["usage", agentId ?? null, days],
+    queryFn: () => api<UsageDay[]>(scopedPath(`/usage?days=${days}`, agentId)),
+    refetchInterval: 60_000,
+    enabled: Boolean(agentId) && (callerEnabled ?? true),
+    ...rest
+  });
 }
 
 export function useTasks(options?: Partial<UseQueryOptions<Task[]>>) {
@@ -345,7 +373,7 @@ export function useChatSessions() {
   });
 }
 
-export type ChatSessionDetail = ChatSession & { messages: ChatMessage[]; tasks: Task[] };
+export type ChatSessionDetail = ChatSession & { messages: ChatMessage[]; tasks: Task[]; runs: RunRecord[] };
 
 // Statuses where a chat task is no longer producing partial text — used to
 // decide polling cadence below.
@@ -370,6 +398,22 @@ export function useChatSession(id: string | null) {
       const hasInflight = data.tasks?.some((t) => !CHAT_TERMINAL_TASK_STATUSES.has(t.status));
       return hasInflight ? 800 : 3000;
     }
+  });
+}
+
+// Run records for one session — used to mark job-delivered chat messages
+// with a "from <job name>" badge. GET /chat/:id returns the session's full
+// run list (incl. kind/jobId); we select just `runs` and join jobId → name
+// against the jobs list at the call site. Far leaner than useChatSession,
+// which polls the full detail at ~800ms while a task is in flight; the badge
+// name set only changes when a new run lands, so ~30s is ample.
+export function useChatRuns(id: string | null) {
+  return useQuery<ChatSessionDetail, Error, RunRecord[]>({
+    queryKey: ["chat-runs", id],
+    queryFn: () => api<ChatSessionDetail>(`/chat/${id}`),
+    enabled: Boolean(id),
+    refetchInterval: 30_000,
+    select: (detail) => detail.runs ?? []
   });
 }
 
@@ -465,10 +509,20 @@ export function latestInFlightTaskId(blocks: ChatBlock[]): string | null {
 // The SSE stream auto-attaches Last-Event-ID on browser-driven reconnects.
 // On open we still issue a fresh GET /blocks so a tab waking from sleep or
 // a fresh navigation gets the durable list before any live frames land.
-export function useChatBlocks(sessionId: string | null) {
+//
+// `initialPending` seeds the message queue (ADR chat-message-queue.md) from
+// the session record the page already holds, so the "N Queued" pill paints
+// without an extra request. Live queue changes (enqueue / drain / remove)
+// then ride the existing per-session `chat_session` SSE frame, which carries
+// the full session record including `pendingMessages`.
+export function useChatBlocks(
+  sessionId: string | null,
+  initialPending: PendingChatMessage[] = []
+) {
   const [blocks, setBlocks] = useState<ChatBlock[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(Boolean(sessionId));
   const [error, setError] = useState<Error | null>(null);
+  const [pendingMessages, setPendingMessages] = useState<PendingChatMessage[]>(initialPending);
 
   // Stash sessionId in a ref so the effect cleanup observes the exact
   // sessionId it opened against rather than whatever the latest render
@@ -476,6 +530,13 @@ export function useChatBlocks(sessionId: string | null) {
   // EventSource because the closed-over id no longer matches.
   const activeSessionRef = useRef<string | null>(sessionId);
   activeSessionRef.current = sessionId;
+
+  // Latest seed for the queue, read by the session-reset effect below. Held in
+  // a ref so re-seeding doesn't have to put `initialPending` in the SSE
+  // effect's dep array (which would tear down + rebuild the stream on every
+  // render as the page passes a fresh array reference).
+  const initialPendingRef = useRef<PendingChatMessage[]>(initialPending);
+  initialPendingRef.current = initialPending;
 
   // Guards a late refetch resolve from setting state after unmount. The
   // sessionId match below already drops cross-session writes; this drops
@@ -519,6 +580,10 @@ export function useChatBlocks(sessionId: string | null) {
     // a clean slate; the seed fetch below flips loading off on resolve.
     setBlocks([]);
     setError(null);
+    // Re-seed the queue from the session the page holds for the new id. The
+    // initial `chat_session` frame on connect (and every mutation after) then
+    // keeps it live.
+    setPendingMessages(initialPendingRef.current);
 
     if (!sessionId) {
       setIsLoading(false);
@@ -582,6 +647,21 @@ export function useChatBlocks(sessionId: string | null) {
             // wait for the next one.
           }
         });
+        // The session record (full ChatSessionRecord) is sent on connect and
+        // re-sent after every mutation, including queue changes. Track its
+        // `pendingMessages` so the "N Queued" pill stays live as messages are
+        // enqueued, drained one-per-turn, or removed — no client dispatch
+        // logic, the server is the source of truth (ADR chat-message-queue.md).
+        source.addEventListener("chat_session", (event) => {
+          const messageEvent = event as MessageEvent;
+          if (cancelled || activeSessionRef.current !== sessionId) return;
+          try {
+            const session = JSON.parse(messageEvent.data) as { pendingMessages?: PendingChatMessage[] };
+            setPendingMessages(session.pendingMessages ?? []);
+          } catch {
+            // Ignore a malformed frame; the next one will land.
+          }
+        });
       }
     });
     return () => {
@@ -620,7 +700,7 @@ export function useChatBlocks(sessionId: string | null) {
     };
   }, [sessionId, refetch]);
 
-  return { blocks, isLoading, error, refetch };
+  return { blocks, isLoading, error, refetch, pendingMessages };
 }
 
 // True when the main chat OR any thread has a non-terminal tail. The flat
@@ -815,6 +895,21 @@ export function useCancelTask() {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["chat"] });
       qc.invalidateQueries({ queryKey: ["tasks"] });
+    }
+  });
+}
+
+// Remove a single queued (pending) chat message (ADR chat-message-queue.md).
+// The DELETE publishes a fresh `chat_session` frame, so the pill updates live
+// through useChatBlocks; this mutation only fires the request and surfaces a
+// toast on failure.
+export function useRemovePendingChatMessage(sessionId: string | null) {
+  const qc = useQueryClient();
+  return useMutation<{ removed: boolean }, Error, string>({
+    mutationFn: (pendingId: string) =>
+      api<{ removed: boolean }>(`/chat/${sessionId}/pending/${pendingId}`, { method: "DELETE" }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["chat"] });
     }
   });
 }

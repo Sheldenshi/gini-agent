@@ -853,6 +853,35 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     }
   },
   {
+    // User-confirmation affordance. The agent calls this BEFORE an
+    // irreversible action that goes to another person (sending or replying
+    // to a message/email, posting a reply in a web app, submitting or
+    // purchasing on the user's behalf). It surfaces an inline Confirm/Cancel
+    // card in the web chat; the task pauses on a confirmation.request
+    // SetupRequest and resumes with the user's decision. Like ask_user it is
+    // a SetupRequest, so it pauses even under approvalMode "yolo" — yolo
+    // authorizes operational/reversible work, not speaking in the user's
+    // voice to others. Always-on (like request_connector / ask_user): the
+    // model needs this path even on a fresh instance with no toolsets toggled.
+    // See docs/adr/user-confirmation-primitive.md.
+    toolset: "core",
+    displayLabel: "Request confirmation",
+    type: "function",
+    function: {
+      name: "request_confirmation",
+      description: "Ask the user to confirm before an irreversible action that goes to another person — sending or replying to a message or email, posting a reply in a web app, submitting or purchasing on their behalf. The user sees an inline Confirm/Cancel card in chat; the task pauses until they decide, then resumes with { confirmed: true } (do the action) or { confirmed: false } (don't — ask what to change). This fires even when you are otherwise auto-approved (yolo): yolo authorizes operational, reversible work, NOT speaking in the user's voice to others. EXCEPTION: if the user already gave a clear, specific go-ahead for THIS action in the conversation (\"send it\", \"reply yes\", \"you can submit\"), do NOT call this — just execute. This is for consent to send content the user has ALREADY approved; it is never a license to fabricate what they would say — when you lack the substance, ask for it as a normal question instead. Do NOT use this for risk-gated operational actions (those already go through the authorization flow) or for picking between options (use ask_user).",
+      parameters: {
+        type: "object",
+        properties: {
+          summary: { type: "string", description: "One human-readable line stating what will happen if confirmed (e.g. \"Send this reply to Dana in the project thread\"). Shown as the card headline." },
+          details: { type: "string", description: "Optional — the actual content the user is consenting to (the message body, the recipient, the order summary), shown in an expandable section so they can review exactly what goes out." },
+          confirmLabel: { type: "string", description: "Optional label for the confirm button (e.g. \"Send\", \"Submit\", \"Purchase\"). Defaults to \"Confirm\"." }
+        },
+        required: ["summary"]
+      }
+    }
+  },
+  {
     // Browser-fill-secrets affordance. When the agent's browser tool
     // reaches a login, checkout, or other input form whose values must
     // come from the user (passwords, OTPs, MFA codes, payment-card
@@ -2243,6 +2272,13 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     // no toolsets toggled, and it's a meta-tool with no side effects
     // beyond pausing on a user-actor card.
     if (tool.function.name === "ask_user") return true;
+    // request_confirmation is the in-chat affordance for an inline
+    // Confirm/Cancel card before an irreversible third-party-facing
+    // action. Always-on for the same reason as ask_user: the agent must
+    // be able to ask for consent on a fresh instance with no toolsets
+    // toggled, and it's a meta-tool with no side effects beyond pausing
+    // on a user-actor card (it pauses even under approvalMode "yolo").
+    if (tool.function.name === "request_confirmation") return true;
     // browser_fill_secrets is the in-chat affordance for credential
     // entry on the agent's browser tab. Always-on for the same
     // reason as request_connector: a fresh instance with no toolsets
@@ -2658,6 +2694,8 @@ export function chatBlockArgsPreviewFor(
       return truncatePreview(previewValue(safe.provider));
     case "ask_user":
       return truncatePreview(previewValue(safe.question));
+    case "request_confirmation":
+      return truncatePreview(previewValue(safe.summary));
     case "request_messaging_bridge":
       return truncatePreview(previewValue(safe.kind));
     case "list_messaging_bridges":

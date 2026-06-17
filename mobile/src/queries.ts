@@ -17,7 +17,9 @@ import type {
   ChatSession,
   InboxThreadSummary,
   JobRecord,
+  RunRecord,
   RuntimeStatus,
+  SetupRequest,
   Task,
   ThreadSummary
 } from "./types";
@@ -224,6 +226,36 @@ export function useJobs(agentId: string | null | "all") {
       ),
     enabled: agentId !== null,
     refetchInterval: 30_000
+  });
+}
+
+// Pending and resolved SetupRequests for the instance. The mobile
+// confirmation card (BlockSetupRequested, action "confirmation.request")
+// reads this to know whether its request is still pending and to pull the
+// trusted payload (details, confirmLabel) — the setup_requested block only
+// carries {setupRequestId, action, summary}. Mirrors web useSetupRequests.
+// A slow poll picks up a resolution made from the web client; the card's
+// own Confirm/Cancel mutations invalidate this key for the immediate flip.
+export function useSetupRequests() {
+  return useQuery<SetupRequest[]>({
+    queryKey: ["setup-requests"],
+    queryFn: () => api<SetupRequest[]>("/setup-requests"),
+    refetchInterval: 30_000
+  });
+}
+
+// Run records for one session — used to mark job-delivered chat messages
+// with a "from <job name>" badge. GET /chat/:id returns the session's full
+// run list (incl. kind/jobId); we select just `runs` and join jobId → name
+// against the jobs list at the call site. The stream hook only carries
+// runIds, so this is the cheapest source of the kind/jobId join.
+export function useChatRuns(sessionId: string | null) {
+  return useQuery<{ runs: RunRecord[] }, Error, RunRecord[]>({
+    queryKey: ["chat-runs", sessionId],
+    queryFn: () => api<{ runs: RunRecord[] }>(`/chat/${sessionId}`),
+    enabled: Boolean(sessionId),
+    refetchInterval: 30_000,
+    select: (detail) => detail.runs ?? []
   });
 }
 
@@ -833,15 +865,20 @@ export interface SendMessageInput {
   audio?: { id: string; mimeType: string; size: number; durationMs?: number };
 }
 
+// Run-now responses carry { taskId }; enqueued ones carry { queued, pendingId }.
+// The server decides based on whether a turn is already in flight; the client
+// treats both as success (the transcript / pill updates via the chat SSE frame).
+export type SendMessageResult = { taskId?: string; queued?: boolean; pendingId?: string };
+
 export function useSendMessage(sessionId: string | null) {
   const qc = useQueryClient();
-  return useMutation<{ taskId: string }, Error, SendMessageInput>({
+  return useMutation<SendMessageResult, Error, SendMessageInput>({
     mutationFn: ({ content, images, audio }: SendMessageInput) => {
       if (!sessionId) throw new Error("No session selected");
       const body: Record<string, unknown> = { content, client: "mobile" };
       if (images && images.length > 0) body.images = images;
       if (audio) body.audio = audio;
-      return api<{ taskId: string }>(`/chat/${sessionId}/messages`, {
+      return api<SendMessageResult>(`/chat/${sessionId}/messages`, {
         method: "POST",
         body: JSON.stringify(body)
       });
@@ -865,6 +902,26 @@ export function useCancelTask() {
   const qc = useQueryClient();
   return useMutation<Task, Error, string>({
     mutationFn: (taskId: string) => api<Task>(`/tasks/${taskId}/cancel`, { method: "POST" }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["chat"] });
+      qc.invalidateQueries({ queryKey: ["chats"] });
+    }
+  });
+}
+
+// Remove a queued follow-up message. The pending list is server truth and
+// streams over the chat_session SSE frame, so this just fires the DELETE —
+// the frame drains the row (ADR chat-message-queue.md). Response is
+// { removed: true } | 404 (already drained/removed).
+export function useRemovePendingChatMessage(sessionId: string | null) {
+  const qc = useQueryClient();
+  return useMutation<{ removed: boolean }, Error, string>({
+    mutationFn: (pendingId: string) => {
+      if (!sessionId) throw new Error("No session selected");
+      return api<{ removed: boolean }>(`/chat/${sessionId}/pending/${pendingId}`, {
+        method: "DELETE"
+      });
+    },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["chat"] });
       qc.invalidateQueries({ queryKey: ["chats"] });

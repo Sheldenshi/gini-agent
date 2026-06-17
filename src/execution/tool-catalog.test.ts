@@ -83,7 +83,7 @@ function stateWithToolsets(toolsets: ToolsetRecord[]): RuntimeState {
     mcpServers: [], messagingBridges: [], importReports: [], agents: [],
     activeAgentId: undefined, relays: [], notifications: [], emailWatchers: [], events: [],
     jobRuns: [], chatSessions: [], chatMessages: [], messagingMessages: [],
-    runs: [], planSteps: []
+    runs: [], planSteps: [], usageLedger: []
   };
 }
 
@@ -123,6 +123,12 @@ const ALWAYS_ON = new Set([
   // offering setup-vs-alternative choices before connector setup — must
   // work on a fresh instance with no toolsets toggled.
   "ask_user",
+  // request_confirmation is the inline Confirm/Cancel meta-tool (the
+  // confirmation.request SetupRequest). Always-on like ask_user: the agent
+  // must be able to ask for consent before an irreversible third-party-facing
+  // action on a fresh instance with no toolsets toggled, and it pauses even
+  // under approvalMode "yolo".
+  "request_confirmation",
   // browser_fill_secrets is the meta-tool path for asking the user
   // to type a value into a DOM field on the agent's browser tab. It
   // never types anything itself (it just renders a chat card), so

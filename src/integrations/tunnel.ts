@@ -650,6 +650,25 @@ function relayReadyTimeoutMs(): number {
   return Number.isFinite(v) && v > 0 ? v : 45_000;
 }
 
+// Optional settle a gini-relay RESUME waits, after this process owns the gateway
+// port, before registering its frpc proxy. A same-instance restart reuses the
+// same deviceId/subdomain, and the relay enforces one proxy per device (no evict
+// hook) — so if the successor's NewProxy lands before the prior process's frpc
+// control connection has dropped server-side, frps rejects the duplicate and the
+// tunnel flaps until auto-reconnect retries. A brief settle lets the old
+// registration clear first. Defaults to 0 (no delay): the graceful path already
+// severs the old frpc via stopAllTunnels before the port frees, and the relay URL
+// is a remote client's only channel to watch a restart finish, so adding latency
+// by default would regress that. Operators on flaky setups raise it; a
+// non-graceful old exit (crash/SIGKILL, no drain) is still only recovered by
+// auto-reconnect. Relay-resume only — manual providers mint fresh subdomains
+// (ngrok/cloudflared) or are childless+machine-global (tailscale), so no
+// same-subdomain collision exists for them.
+function relayRegistrationSettleMs(): number {
+  const v = Number(process.env.GINI_TUNNEL_RELAY_SETTLE_MS);
+  return Number.isFinite(v) && v > 0 ? v : 0;
+}
+
 export function makeDefaultDeps(): TunnelDeps {
   return {
     loginUrl: realLoginUrl,
@@ -1499,7 +1518,7 @@ async function runConnect(
   config: RuntimeConfig,
   provider: TunnelProviderId,
   sup: Supervisor,
-  opts: { reuseOnly?: boolean; gatewayReady?: Promise<void> } = {}
+  opts: { reuseOnly?: boolean; gatewayReady?: Promise<void>; settleMs?: number } = {}
 ): Promise<void> {
   // This run "owns" the instance only while its supervisor entry is the current
   // one. A cancel/disconnect (teardown deletes the entry) or a newer concurrent
@@ -1539,6 +1558,13 @@ async function runConnect(
       }
     } else if (opts.gatewayReady && port === config.port) {
       await opts.gatewayReady;
+      // Optional resume settle: let a prior process's frpc relay registration
+      // drop server-side before we register the same deviceId/subdomain, so the
+      // successor's NewProxy doesn't collide with the duplicate proxy_name frps
+      // still holds. No-op by default (settleMs 0). Skipped for the override-port
+      // branch below, which already polls the port's identity.
+      const settleMs = opts.settleMs ?? 0;
+      if (settleMs > 0) await Bun.sleep(settleMs);
     } else {
       overrideProbeFailed = !(await waitForLocalPort(config, port, isCurrent));
     }
@@ -2179,7 +2205,13 @@ export async function reconcileTunnelOnStartup(
     sup.reconnecting = true;
     sup.settled = isManualProviderId(provider.id)
       ? runManualConnect(config, provider.id, sup, { resume: true, gatewayReady: opts.gatewayReady })
-      : runConnect(config, provider.id, sup, { reuseOnly: true, gatewayReady: opts.gatewayReady });
+      : runConnect(config, provider.id, sup, {
+          reuseOnly: true,
+          gatewayReady: opts.gatewayReady,
+          // Only the relay reuses a stable per-instance subdomain, so the
+          // duplicate-registration settle applies here, not to manual drivers.
+          settleMs: relayRegistrationSettleMs()
+        });
   }
   return next;
 }

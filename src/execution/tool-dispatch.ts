@@ -24,7 +24,8 @@ import {
   isTerminalTaskStatus,
   mutateState,
   now,
-  readState
+  readState,
+  recordUsage
 } from "../state";
 import { accountSelectionNeeded, addEmailWatcher, clearEmailWatcherObjective, listEmailWatchers, removeEmailWatcher, setEmailTriageEnabled, setEmailWatcherEnabled, setEmailWatcherObjective } from "../state/email-watchers";
 import { ApprovalRaceLostError, ApprovedActionFailedError, TaskAlreadyTerminalError, cancelTask, findTask, resolveAuthorization, runTerminalCommand } from "../agent";
@@ -271,6 +272,8 @@ async function dispatchToolCallInner(
       return await requestConnectorTool(config, taskId, toolCallId, args, messageHistory);
     case "ask_user":
       return await askUserTool(config, taskId, toolCallId, args);
+    case "request_confirmation":
+      return await requestConfirmationTool(config, taskId, toolCallId, args);
     case "browser_fill_secrets":
       return await browserFillSecretsTool(config, taskId, toolCallId, args);
     case "request_messaging_bridge":
@@ -728,8 +731,10 @@ async function accumulateBrowserVisionCost(
   ) {
     return;
   }
+  let visionAgentId: string | undefined;
   await mutateState(config.instance, (state: RuntimeState) => {
     const item = findTask(state, taskId);
+    visionAgentId = item.agentId;
     const sum = (a: number | undefined, b: number | undefined): number | undefined => {
       if (a === undefined && b === undefined) return undefined;
       return (a ?? 0) + (b ?? 0);
@@ -745,6 +750,22 @@ async function accumulateBrowserVisionCost(
     };
     item.updatedAt = now();
   });
+  // Also record this out-of-band vision spend into the durable usage ledger
+  // (the home chart's sole source). The same call folds into task.cost above
+  // for the live per-turn display; the chart never sums task.cost, so there is
+  // no double count.
+  void recordUsage(
+    config.instance,
+    { source: "vision", taskId, agentId: visionAgentId },
+    {
+      provider: increment.provider ?? "",
+      model: increment.model ?? "",
+      inputTokens: increment.inputTokens,
+      outputTokens: increment.outputTokens,
+      totalTokens: increment.totalTokens,
+      estimatedUsd: increment.estimatedUsd
+    }
+  ).catch(() => {});
 }
 
 // Classify a host string as one of: loopback (127/8, ::1, "localhost",
@@ -4167,6 +4188,94 @@ async function askUserTool(
       type: "approval",
       message: "User choice requested (chat-task)",
       data: { approvalId: approval.id, question, toolCallId }
+    });
+    return approval.id;
+  });
+  return { kind: "pending", approvalId };
+}
+
+// request_confirmation tool. Mints a confirmation.request SetupRequest whose
+// payload carries the summary + optional details + confirm-button label. The
+// chat-task loop's pending handler emits a setup_requested block and the web
+// chat renders the inline Confirm/Cancel card. POST
+// /api/setup-requests/<id>/complete (Confirm) resumes the loop with tool
+// result {confirmed:true}; /cancel (Cancel) resumes with {confirmed:false} —
+// an unambiguous boolean, not a generic "skipped" string. Modeled on
+// askUserTool: same surface guard, no approval_reason bubble (the summary IS
+// the card content). Because it is a SetupRequest it pauses the task even
+// under approvalMode "yolo" — SetupRequests never call resolveApprovalPolicy.
+// See docs/adr/user-confirmation-primitive.md.
+async function requestConfirmationTool(
+  config: RuntimeConfig,
+  taskId: string,
+  toolCallId: string,
+  args: Record<string, unknown>
+): Promise<DispatchResult> {
+  const summary = typeof args.summary === "string" ? args.summary.trim() : "";
+  if (!summary) {
+    return {
+      kind: "sync",
+      result: JSON.stringify({ ok: false, error: "request_confirmation needs a non-empty `summary` string describing what will happen if confirmed." })
+    };
+  }
+  const details = typeof args.details === "string" && args.details.trim().length > 0
+    ? args.details.trim()
+    : undefined;
+  const confirmLabel = typeof args.confirmLabel === "string" && args.confirmLabel.trim().length > 0
+    ? args.confirmLabel.trim()
+    : "Confirm";
+
+  // Surface guard — same rationale as askUserTool. The Confirm/Cancel card is
+  // React UI rendered only in the web chat; a task running over a messaging
+  // bridge or in a headless job session would park in waiting_approval with no
+  // way to confirm. Fail synchronously so the agent does NOT proceed with the
+  // irreversible action — it should ask for the go-ahead as a regular message
+  // instead and continue from the user's reply.
+  const surfaceState = readState(config.instance);
+  const surfaceTask = findTask(surfaceState, taskId);
+  const surfaceSession = surfaceTask.chatSessionId
+    ? surfaceState.chatSessions.find((s) => s.id === surfaceTask.chatSessionId)
+    : undefined;
+  const surfaceKind = surfaceSession?.source?.kind ?? surfaceSession?.outboundMirror?.kind;
+  if (!surfaceSession || surfaceSession.origin === "job" || surfaceKind === "telegram" || surfaceKind === "discord") {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: "The confirmation card only renders in a web chat session — this task isn't attached to one. Do NOT proceed with the irreversible action: ask the user for an explicit go-ahead as a regular message and continue from their reply."
+      })
+    };
+  }
+
+  const approvalId = await mutateState(config.instance, (mutable: RuntimeState) => {
+    const item = findTask(mutable, taskId);
+    if (isTerminalTaskStatus(item.status)) {
+      throw new TaskAlreadyTerminalError(taskId, item.status);
+    }
+    const approval = createSetupRequest(mutable, {
+      taskId: item.id,
+      action: "confirmation.request",
+      // target = summary so the setup.requested / setup.completed audit rows
+      // (and the setup_requested block summary) record WHAT was confirmed. The
+      // full `details` the user consents to lives verbatim in payload (durable
+      // state), so the consent is auditable end-to-end; a short digest also
+      // rides in the trace below.
+      target: summary,
+      reason: summary,
+      payload: { summary, ...(details ? { details } : {}), confirmLabel, toolCallId }
+    });
+    item.approvalIds.push(approval.id);
+    item.updatedAt = now();
+    appendTrace(config.instance, item.id, {
+      type: "approval",
+      message: "User confirmation requested (chat-task)",
+      data: {
+        approvalId: approval.id,
+        summary,
+        confirmLabel,
+        toolCallId,
+        ...(details ? { detailsDigest: details.slice(0, 200) } : {})
+      }
     });
     return approval.id;
   });

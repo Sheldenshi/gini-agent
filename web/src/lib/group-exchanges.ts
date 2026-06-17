@@ -1,16 +1,28 @@
-import type { ChatBlock, ToolCallBlock } from "@runtime/types";
+import type { AssistantTextBlock, ChatBlock, ToolCallBlock } from "@runtime/types";
 
-// Render-time view of the chat block stream. Tool calls inside a
-// completed exchange (user_text → final non-streaming assistant_text)
-// collapse to a single "tool_group" item; everything else passes
-// through as the raw block. In-flight exchanges keep their tool calls
-// inline so the user sees progress as it streams.
+// One entry in a collapsed exchange's "process": either a tool call or a
+// piece of pre-tool narration the model emitted between tools. Steps keep
+// exchange order so the expanded view replays the turn chronologically.
+export type ProcessStep =
+  | { kind: "tool_call"; block: ToolCallBlock }
+  | { kind: "narration"; block: AssistantTextBlock };
+
+// Render-time view of the chat block stream. In a completed exchange
+// (user_text → final non-streaming assistant_text), the tool calls AND
+// the per-iteration narration the model emitted between them collapse
+// into a single "tool_group" item, leaving only the final answer as a
+// standalone bubble; everything else passes through as the raw block.
+// In-flight exchanges keep their tool calls and narration inline so the
+// user sees progress as it streams.
 export type ChatRenderItem =
   | { kind: "block"; block: ChatBlock }
-  | { kind: "tool_group"; id: string; calls: ToolCallBlock[] }
+  | { kind: "tool_group"; id: string; calls: ToolCallBlock[]; steps: ProcessStep[] }
   | { kind: "file_artifact"; id: string; files: { path: string; toolName: string }[] };
 
-export function groupExchanges(blocks: ChatBlock[]): ChatRenderItem[] {
+export function groupExchanges(
+  blocks: ChatBlock[],
+  terminalTaskIds: ReadonlySet<string> = new Set()
+): ChatRenderItem[] {
   const items: ChatRenderItem[] = [];
   // Partition blocks into exchanges, then collapse each. An exchange is the
   // set of blocks sharing one taskId — a single agent turn or job cycle. A
@@ -44,35 +56,68 @@ export function groupExchanges(blocks: ChatBlock[]): ChatRenderItem[] {
       exchanges[existing]!.push(b);
     }
   }
-  for (const exchange of exchanges) appendExchange(items, exchange);
+  for (const exchange of exchanges) appendExchange(items, exchange, terminalTaskIds);
   return items;
 }
 
-function appendExchange(items: ChatRenderItem[], exchange: ChatBlock[]) {
-  if (!isExchangeComplete(exchange)) {
+function appendExchange(items: ChatRenderItem[], exchange: ChatBlock[], terminalTaskIds: ReadonlySet<string>) {
+  if (!isExchangeComplete(exchange, terminalTaskIds)) {
     for (const b of exchange) items.push({ kind: "block", block: b });
     return;
   }
   const calls: ToolCallBlock[] = [];
-  let firstCallIdx = -1;
-  for (let i = 0; i < exchange.length; i++) {
-    const b = exchange[i]!;
-    if (b.kind === "tool_call") {
-      if (firstCallIdx === -1) firstCallIdx = i;
-      calls.push(b);
-    }
+  for (const b of exchange) {
+    if (b.kind === "tool_call") calls.push(b);
   }
   if (calls.length === 0) {
     for (const b of exchange) items.push({ kind: "block", block: b });
     return;
   }
-  for (let i = 0; i < firstCallIdx; i++) {
+  // The final answer is the LAST assistant_text in a completed exchange,
+  // but only when it comes AFTER the last tool call; every earlier
+  // assistant_text is pre-tool narration. A terminal run that stopped on a
+  // tool call (no closing answer) has its last assistant_text before that
+  // call, so finalAnswerIdx stays -1 and every narration folds into the
+  // collapsed group rather than rendering as a standalone bubble.
+  let lastToolCallIdx = -1;
+  for (let i = exchange.length - 1; i >= 0; i--) {
+    if (exchange[i]!.kind === "tool_call") {
+      lastToolCallIdx = i;
+      break;
+    }
+  }
+  let finalAnswerIdx = -1;
+  for (let i = exchange.length - 1; i >= 0; i--) {
+    if (exchange[i]!.kind === "assistant_text") {
+      if (i > lastToolCallIdx) finalAnswerIdx = i;
+      break;
+    }
+  }
+  // Build the ordered process: tool calls and non-final narration in
+  // exchange order. The group renders at the first process step's
+  // position (groupIdx), so a leading narration line collapses into the
+  // group rather than rendering above it.
+  const steps: ProcessStep[] = [];
+  let groupIdx = -1;
+  for (let i = 0; i < exchange.length; i++) {
+    const b = exchange[i]!;
+    if (b.kind === "tool_call") {
+      steps.push({ kind: "tool_call", block: b });
+    } else if (b.kind === "assistant_text" && i !== finalAnswerIdx) {
+      steps.push({ kind: "narration", block: b });
+    } else {
+      continue;
+    }
+    if (groupIdx === -1) groupIdx = i;
+  }
+  for (let i = 0; i < groupIdx; i++) {
     items.push({ kind: "block", block: exchange[i]! });
   }
-  items.push({ kind: "tool_group", id: `group-${calls[0]!.id}`, calls });
-  for (let i = firstCallIdx + 1; i < exchange.length; i++) {
+  items.push({ kind: "tool_group", id: `group-${calls[0]!.id}`, calls, steps });
+  for (let i = groupIdx + 1; i < exchange.length; i++) {
     const b = exchange[i]!;
     if (b.kind === "tool_call" || b.kind === "tool_result") continue;
+    if (b.kind === "assistant_text" && i !== finalAnswerIdx) continue;
     items.push({ kind: "block", block: b });
   }
   // Group every successfully generated file into one always-visible card so
@@ -94,7 +139,12 @@ function appendExchange(items: ChatRenderItem[], exchange: ChatBlock[]) {
   }
 }
 
-function isExchangeComplete(exchange: ChatBlock[]): boolean {
+function isExchangeComplete(exchange: ChatBlock[], terminalTaskIds: ReadonlySet<string>): boolean {
+  // A terminal run (carries a "Completed" phase, dropped before grouping) is
+  // complete even when it stopped on a tool call with no closing answer, so
+  // fold it instead of dumping every block inline as if it were in-flight.
+  const taskId = exchange.find((b) => b.taskId !== undefined)?.taskId;
+  if (taskId !== undefined && terminalTaskIds.has(taskId)) return true;
   for (let i = exchange.length - 1; i >= 0; i--) {
     const b = exchange[i]!;
     if (b.kind === "phase" || b.kind === "tool_result" || b.kind === "system_note") continue;

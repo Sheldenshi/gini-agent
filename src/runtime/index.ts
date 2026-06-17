@@ -1,7 +1,7 @@
 import { existsSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import type { ApprovalMode, Instance, RuntimeConfig } from "../types";
 import { configPath, ensureDir, hasPreFlipMigrationMarker, instanceRoot, instancesRoot, writeRuntimeConfig } from "../paths";
-import { mutateState, readState, seedDefaultAgentFromRuntimeConfig, taskCounts } from "../state";
+import { backfillUsageLedgerOnce, mutateState, readState, seedDefaultAgentFromRuntimeConfig, taskCounts } from "../state";
 import { addAudit } from "../state/audit";
 import { appendLog } from "../state/trace";
 import { resolveEffectiveContext } from "../execution/effective-context";
@@ -170,6 +170,11 @@ export async function install(config: RuntimeConfig): Promise<void> {
   // resolveEffectiveContext call sees the unseeded agent and falls
   // back to config.provider — both are safe.
   void seedDefaultAgentFromRuntimeConfig(config);
+  // One-time historical seed of the usage ledger from existing terminal
+  // task.cost rows, so an instance upgrading to the ledger shows its chat
+  // history instead of a blank chart. Fire-and-forget + run-once guarded.
+  // See ADR usage-accounting.md.
+  void backfillUsageLedgerOnce(config.instance);
 }
 
 export async function resetInstance(config: RuntimeConfig): Promise<void> {

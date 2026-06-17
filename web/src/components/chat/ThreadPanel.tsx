@@ -83,7 +83,23 @@ export function ThreadPanel({
     return map;
   }, [blocks]);
 
-  const renderItems = useMemo<ChatRenderItem[]>(() => groupExchanges(visibleBlocks), [visibleBlocks]);
+  // Terminal runs whose "Completed" phase is filtered out before grouping.
+  // groupExchanges folds these even when they ended on a tool call with no
+  // closing answer. Scope to "Completed" only so failures still surface inline.
+  const terminalTaskIds = useMemo(
+    () =>
+      new Set(
+        blocks
+          .filter((b) => b.kind === "phase" && b.label === "Completed" && b.taskId)
+          .map((b) => b.taskId!)
+      ),
+    [blocks]
+  );
+
+  const renderItems = useMemo<ChatRenderItem[]>(
+    () => groupExchanges(visibleBlocks, terminalTaskIds),
+    [visibleBlocks, terminalTaskIds]
+  );
 
   // In-flight detection over the thread's block stream — mirrors the main
   // chat. Yields the running turn's task id so the composer's stop button can
@@ -178,7 +194,7 @@ export function ThreadPanel({
                 if (item.kind === "tool_group") {
                   return (
                     <li key={item.id}>
-                      <BlockToolCallsCollapsed calls={item.calls} resultsByCallId={toolResultsByCallId} />
+                      <BlockToolCallsCollapsed calls={item.calls} steps={item.steps} resultsByCallId={toolResultsByCallId} />
                     </li>
                   );
                 }

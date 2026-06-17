@@ -1843,3 +1843,130 @@ describe("ask_user dispatch", () => {
     expect(readState(instance).setupRequests.filter((a) => a.taskId === task.id).length).toBe(0);
   });
 });
+
+describe("request_confirmation dispatch", () => {
+  test("rejects a missing summary with a sync error and mints no card", async () => {
+    const instance = `confirm-nosummary-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const taskId = await newTask(config);
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "request_confirmation",
+      "call_c",
+      JSON.stringify({ details: "the body" })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      const parsed = JSON.parse(result.result);
+      expect(parsed.ok).toBe(false);
+      expect(parsed.error).toContain("summary");
+    }
+    expect(readState(instance).setupRequests.filter((a) => a.taskId === taskId).length).toBe(0);
+  });
+
+  test("valid call mints a pending confirmation.request SetupRequest carrying summary/details/confirmLabel/toolCallId", async () => {
+    const instance = `confirm-pending-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const taskId = await newTask(config);
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "request_confirmation",
+      "call_confirm",
+      JSON.stringify({
+        summary: "Send this reply to Dana in the project thread",
+        details: "Hi Dana — looks great, ship it.",
+        confirmLabel: "Send"
+      })
+    );
+    expect(result.kind).toBe("pending");
+    if (result.kind === "pending") {
+      const state = readState(instance);
+      const approval = state.setupRequests.find((a) => a.id === result.approvalId);
+      expect(approval).toBeDefined();
+      expect(approval!.action).toBe("confirmation.request");
+      expect(approval!.status).toBe("pending");
+      // summary doubles as reason + target so the setup_requested block summary
+      // and the audit rows read as the summary itself.
+      expect(approval!.reason).toBe("Send this reply to Dana in the project thread");
+      expect(approval!.target).toBe("Send this reply to Dana in the project thread");
+      expect(approval!.payload.summary).toBe("Send this reply to Dana in the project thread");
+      expect(approval!.payload.details).toBe("Hi Dana — looks great, ship it.");
+      expect(approval!.payload.confirmLabel).toBe("Send");
+      expect(approval!.payload.toolCallId).toBe("call_confirm");
+    }
+  });
+
+  test("defaults confirmLabel to Confirm and omits details when not given", async () => {
+    const instance = `confirm-defaults-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const taskId = await newTask(config);
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "request_confirmation",
+      "call_default",
+      JSON.stringify({ summary: "Post this reply on the GitHub issue" })
+    );
+    expect(result.kind).toBe("pending");
+    if (result.kind === "pending") {
+      const approval = readState(instance).setupRequests.find((a) => a.id === result.approvalId);
+      expect(approval!.payload.confirmLabel).toBe("Confirm");
+      expect(approval!.payload.details).toBeUndefined();
+    }
+  });
+
+  test("surface guard: rejects a telegram-sourced session synchronously", async () => {
+    const instance = `confirm-tg-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const task = createTask(config.instance, "telegram confirm test");
+    await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "telegram session");
+      session.source = { kind: "telegram", bridgeId: "b1", chatId: 1, target: "t" };
+      task.chatSessionId = session.id;
+      upsertTask(state, task);
+    });
+    const result = await dispatchToolCall(
+      config,
+      task.id,
+      "request_confirmation",
+      "call_tg",
+      JSON.stringify({ summary: "Send the reply" })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      const parsed = JSON.parse(result.result);
+      expect(parsed.ok).toBe(false);
+      // The error must tell the agent NOT to proceed with the irreversible action.
+      expect(parsed.error).toContain("Do NOT proceed");
+    }
+    expect(readState(instance).setupRequests.filter((a) => a.taskId === task.id).length).toBe(0);
+  });
+
+  test("surface guard: rejects a session whose only surface is an outbound mirror", async () => {
+    const instance = `confirm-mirror-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const task = createTask(config.instance, "mirror confirm test");
+    await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "job session");
+      session.outboundMirror = { kind: "telegram", bridgeId: "b1", chatId: 1, target: "t" };
+      task.chatSessionId = session.id;
+      upsertTask(state, task);
+    });
+    const result = await dispatchToolCall(
+      config,
+      task.id,
+      "request_confirmation",
+      "call_mirror",
+      JSON.stringify({ summary: "Send the reply" })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      const parsed = JSON.parse(result.result);
+      expect(parsed.ok).toBe(false);
+      expect(parsed.error).toContain("Do NOT proceed");
+    }
+    expect(readState(instance).setupRequests.filter((a) => a.taskId === task.id).length).toBe(0);
+  });
+});

@@ -27,6 +27,7 @@ import { AgentAvatar } from "@/src/components/chat/AgentAvatar";
 import { BlockRenderer } from "@/src/components/chat/BlockRenderer";
 import { BlockToolCallsCollapsed } from "@/src/components/chat/BlockToolCallsCollapsed";
 import { GeneratedFilesCard } from "@/src/components/chat/GeneratedFilesCard";
+import { QueuedMessages } from "@/src/components/chat/QueuedMessages";
 import { ReplyInThreadPill, ThreadRepliesChip } from "@/src/components/chat/ThreadChip";
 import { VoiceRecorder, type VoiceRef } from "@/src/components/chat/VoiceRecorder";
 import { chatListTime, jobCadence, relativeTime } from "@/src/format";
@@ -36,8 +37,10 @@ import {
   isTaskInFlight,
   useAgents,
   useCancelTask,
+  useChatRuns,
   useChatStream,
   useJobs,
+  useRemovePendingChatMessage,
   useSendMessage,
   useThreads,
   useVoiceStatus
@@ -137,6 +140,16 @@ function findInFlightTaskId(blocks: ChatBlock[]): string | null {
   return null;
 }
 
+// The job name a render item was delivered by, or undefined for ordinary
+// conversation. A file_artifact card has no runId of its own, so the caller
+// carries the preceding run's name forward to it (it always trails its run's
+// tool group). `tool_group` reads its first call's runId; `block` its own.
+function itemJobName(item: ChatRenderItem, runIdToJobName: Map<string, string>): string | undefined {
+  if (item.kind === "tool_group") return item.calls[0]?.runId ? runIdToJobName.get(item.calls[0].runId) : undefined;
+  if (item.kind === "block") return item.block.runId ? runIdToJobName.get(item.block.runId) : undefined;
+  return undefined;
+}
+
 // Single-agent chat: an agent header, a Messages / Threads / Jobs tab
 // bar, and the active tab's content. Messages reuses the existing block
 // pipeline (filtered to the main chat — threaded blocks live in the
@@ -150,6 +163,7 @@ export default function ChatDetailScreen() {
   const send = useSendMessage(sessionId ?? null);
   const voice = useVoiceStatus();
   const cancel = useCancelTask();
+  const removePending = useRemovePendingChatMessage(sessionId ?? null);
   const agents = useAgents();
   const qc = useQueryClient();
 
@@ -250,13 +264,73 @@ export default function ChatDetailScreen() {
     return map;
   }, [list]);
 
-  const renderItems = useMemo<ChatRenderItem[]>(
-    () => groupExchanges(visible),
-    [visible]
+  // Terminal runs whose "Completed" phase is filtered out before grouping.
+  // groupExchanges folds these even when they ended on a tool call with no
+  // closing answer. Scope to "Completed" only so failures still surface inline.
+  const terminalTaskIds = useMemo(
+    () =>
+      new Set(
+        list
+          .filter((b) => b.kind === "phase" && b.label === "Completed" && b.taskId)
+          .map((b) => b.taskId!)
+      ),
+    [list]
   );
+
+  const renderItems = useMemo<ChatRenderItem[]>(
+    () => groupExchanges(visible, terminalTaskIds),
+    [visible, terminalTaskIds]
+  );
+
+  // Map a job run's runId → its job name so messages delivered by a scheduled
+  // job render with a "from <job name>" badge. The session detail carries the
+  // full run records (kind/jobId); the jobs list resolves jobId → name. The
+  // name lookup uses the UNSCOPED jobs list (not the per-agent `jobs` above):
+  // a job owned by a different agent can still deliver into this session, so
+  // scoping the name join to this agent would drop its badge.
+  const chatRuns = useChatRuns(sessionId ?? null);
+  const allJobs = useJobs("all");
+  const runIdToJobName = useMemo(() => {
+    const jobNameById = new Map((allJobs.data ?? []).map((j) => [j.id, j.name]));
+    const map = new Map<string, string>();
+    for (const run of chatRuns.data ?? []) {
+      if (run.kind !== "job" || !run.jobId) continue;
+      const name = jobNameById.get(run.jobId);
+      if (name) map.set(run.id, name);
+    }
+    return map;
+  }, [chatRuns.data, allJobs.data]);
+
+  // Segment the render items into consecutive runs sharing one job name (a
+  // file_artifact card inherits the preceding item's name since it trails its
+  // run's tool group). Each segment with a jobName renders inside one bordered
+  // container with a single "from <job name>" header; segments without one
+  // render exactly as before.
+  const itemSegments = useMemo(() => {
+    const segments: { jobName?: string; items: ChatRenderItem[] }[] = [];
+    let lastJobName: string | undefined;
+    for (const item of renderItems) {
+      const ownJobName = itemJobName(item, runIdToJobName);
+      const jobName = ownJobName ?? (item.kind === "file_artifact" ? lastJobName : undefined);
+      lastJobName = item.kind === "file_artifact" ? lastJobName : ownJobName;
+      const tail = segments[segments.length - 1];
+      if (tail && tail.jobName === jobName) tail.items.push(item);
+      else segments.push({ jobName, items: [item] });
+    }
+    return segments;
+  }, [renderItems, runIdToJobName]);
 
   const inFlight = useMemo(() => isTaskInFlight(list), [list]);
   const inFlightTaskId = useMemo(() => findInFlightTaskId(list), [list]);
+
+  // Server-side queue of follow-up messages submitted while a turn is in
+  // flight. Delivered live on the session record via the chat_session SSE
+  // frame (applySession) and reset with the session on switch. The pill above
+  // the composer renders from this; it drains FIFO one-per-turn server-side.
+  const pendingMessages = useMemo(
+    () => stream.session?.pendingMessages ?? [],
+    [stream.session]
+  );
 
   const lastAssistantUpdatedAt = useMemo(() => {
     for (let i = list.length - 1; i >= 0; i -= 1) {
@@ -304,12 +378,19 @@ export default function ChatDetailScreen() {
   );
   const anyUploading = images.some((image) => image.status === "uploading");
   const showSendBusy = send.isPending || inFlight;
-  const sendDisabled =
-    (!trimmed && readyImages.length === 0) || showSendBusy || anyUploading || !sessionId || voiceBusy;
+  const hasContent = Boolean(trimmed) || readyImages.length > 0;
+  // Submission is allowed even while a turn is in flight — the message is
+  // queued server-side (ADR chat-message-queue.md). It gates only on having
+  // content, nothing uploading, a session, and no voice recording in progress.
+  const canSubmit = hasContent && !anyUploading && !!sessionId && !voiceBusy;
+  // The Send button only shows/enables when idle; it stays gated on content.
+  const sendDisabled = !canSubmit || showSendBusy;
   const canStop = Boolean(inFlightTaskId) && !cancel.isPending;
 
   const submit = () => {
-    if (sendDisabled) return;
+    // Don't gate on busy: successive submits while a turn runs each POST so they
+    // queue in order server-side (the server serializes run-vs-queue).
+    if (!canSubmit) return;
     pinnedToBottomRef.current = true;
     setAtBottom(true);
     send.mutate(
@@ -489,6 +570,60 @@ export default function ChatDetailScreen() {
     scrollRef.current?.scrollToEnd({ animated: true });
   };
 
+  // Render one chat item. Shared by the plain transcript and the job-grouped
+  // containers so job-delivered messages render identically except for their
+  // wrapper.
+  const renderItem = (item: ChatRenderItem) => {
+    if (item.kind === "tool_group") {
+      return (
+        <BlockToolCallsCollapsed
+          key={item.id}
+          calls={item.calls}
+          steps={item.steps}
+          resultsByCallId={toolResultsByCallId}
+        />
+      );
+    }
+    if (item.kind === "file_artifact") {
+      return <GeneratedFilesCard key={item.id} files={item.files} />;
+    }
+    // A thread can branch off either an assistant reply (the user's own
+    // "Reply in thread") or the user's message (an agent-routed turn), so look
+    // up a chip for both. Render the block then the inline "N replies" chip
+    // beneath it. A finished assistant reply with no thread yet shows the
+    // "Reply in thread" pill so the user can start one.
+    const block = item.block;
+    const thread =
+      block.kind === "assistant_text" || block.kind === "user_text"
+        ? threadByParentBlock.get(block.id)
+        : undefined;
+    const canStartThread = block.kind === "assistant_text" && !block.streaming && !thread;
+    return (
+      <View key={block.id}>
+        <BlockRenderer
+          block={block}
+          toolResult={block.kind === "tool_call" ? toolResultsByCallId.get(block.callId) : undefined}
+        />
+        {thread ? (
+          <View style={styles.threadChipWrap}>
+            <ThreadRepliesChip
+              replyCount={thread.replyCount}
+              lastReplyAt={thread.lastReplyAt}
+              // User messages are right-aligned, so align the chip to the
+              // message it branched from.
+              align={block.kind === "user_text" ? "end" : "start"}
+              onPress={() => router.push(`/chat/${sessionId}/thread/${thread.threadId}`)}
+            />
+          </View>
+        ) : canStartThread ? (
+          <View style={styles.threadChipWrap}>
+            <ReplyInThreadPill onPress={() => openNewThread(sessionId, block)} />
+          </View>
+        ) : null}
+      </View>
+    );
+  };
+
   if (unauthorized) return null;
 
   return (
@@ -575,67 +710,19 @@ export default function ChatDetailScreen() {
               }}
             >
               {visible.length > 0 ? (
-                renderItems.map((item) => {
-                  if (item.kind === "tool_group") {
-                    return (
-                      <BlockToolCallsCollapsed
-                        key={item.id}
-                        calls={item.calls}
-                        resultsByCallId={toolResultsByCallId}
-                      />
-                    );
-                  }
-                  if (item.kind === "file_artifact") {
-                    return <GeneratedFilesCard key={item.id} files={item.files} />;
-                  }
-                  // A thread can branch off either an assistant reply (the
-                  // user's own "Reply in thread") or the user's message (an
-                  // agent-routed turn), so look up a chip for both. Render the
-                  // block then the inline "N replies" chip beneath it. A
-                  // finished assistant reply with no thread yet shows the
-                  // "Reply in thread" pill so the user can start one.
-                  const block = item.block;
-                  const thread =
-                    block.kind === "assistant_text" || block.kind === "user_text"
-                      ? threadByParentBlock.get(block.id)
-                      : undefined;
-                  const canStartThread =
-                    block.kind === "assistant_text" && !block.streaming && !thread;
-                  return (
-                    <View key={block.id}>
-                      <BlockRenderer
-                        block={block}
-                        toolResult={
-                          block.kind === "tool_call"
-                            ? toolResultsByCallId.get(block.callId)
-                            : undefined
-                        }
-                      />
-                      {thread ? (
-                        <View style={styles.threadChipWrap}>
-                          <ThreadRepliesChip
-                            replyCount={thread.replyCount}
-                            lastReplyAt={thread.lastReplyAt}
-                            // User messages are right-aligned, so align the
-                            // chip to the message it branched from.
-                            align={block.kind === "user_text" ? "end" : "start"}
-                            onPress={() =>
-                              router.push(
-                                `/chat/${sessionId}/thread/${thread.threadId}`
-                              )
-                            }
-                          />
-                        </View>
-                      ) : canStartThread ? (
-                        <View style={styles.threadChipWrap}>
-                          <ReplyInThreadPill
-                            onPress={() => openNewThread(sessionId, block)}
-                          />
-                        </View>
-                      ) : null}
+                itemSegments.map((segment, segmentIndex) =>
+                  segment.jobName ? (
+                    // Job-delivered messages: one light-blue left-bordered
+                    // container with a single "from <job name>" subtitle so
+                    // they're distinguishable from the user's own turn.
+                    <View key={`job-${segmentIndex}`} style={styles.jobRun}>
+                      <Text style={styles.jobRunLabel}>from {segment.jobName}</Text>
+                      {segment.items.map(renderItem)}
                     </View>
-                  );
-                })
+                  ) : (
+                    segment.items.map(renderItem)
+                  )
+                )
               ) : !voicePending ? (
                 <View style={styles.emptyChat}>
                   <Text style={styles.emptyChatText}>What can I help with?</Text>
@@ -684,6 +771,16 @@ export default function ChatDetailScreen() {
         {/* Composer — shared across tabs; sending always posts to the
             main chat. */}
         <View style={styles.inputBar}>
+          <QueuedMessages
+            pending={pendingMessages}
+            onRemove={(pendingId) =>
+              removePending.mutate(pendingId, {
+                onError: (err) => {
+                  Alert.alert("Couldn't remove", err.message);
+                }
+              })
+            }
+          />
           {images.length > 0 ? (
             <ScrollView
               horizontal
@@ -776,23 +873,39 @@ export default function ChatDetailScreen() {
               accessibilityLabel="Message input"
             />
             {canStop ? (
-              <Pressable
-                onPress={stopTask}
-                disabled={cancel.isPending}
-                style={[
-                  styles.sendButton,
-                  styles.stopButton,
-                  cancel.isPending && styles.sendButtonDisabled
-                ]}
-                accessibilityRole="button"
-                accessibilityLabel="Stop response"
-              >
-                {cancel.isPending ? (
-                  <ActivityIndicator color={theme.buttonText} />
-                ) : (
-                  <Feather name="square" size={16} color={theme.buttonText} />
-                )}
-              </Pressable>
+              <>
+                {canSubmit ? (
+                  <Pressable
+                    onPress={submit}
+                    style={[styles.sendButton, styles.queueButton]}
+                    accessibilityRole="button"
+                    accessibilityLabel="Queue message"
+                  >
+                    {send.isPending ? (
+                      <ActivityIndicator color={theme.buttonText} />
+                    ) : (
+                      <Feather name="arrow-up" size={22} color={theme.buttonText} />
+                    )}
+                  </Pressable>
+                ) : null}
+                <Pressable
+                  onPress={stopTask}
+                  disabled={cancel.isPending}
+                  style={[
+                    styles.sendButton,
+                    styles.stopButton,
+                    cancel.isPending && styles.sendButtonDisabled
+                  ]}
+                  accessibilityRole="button"
+                  accessibilityLabel="Stop response"
+                >
+                  {cancel.isPending ? (
+                    <ActivityIndicator color={theme.buttonText} />
+                  ) : (
+                    <Feather name="square" size={16} color={theme.buttonText} />
+                  )}
+                </Pressable>
+              </>
             ) : !voiceBusy && (trimmed || readyImages.length > 0 || Platform.OS !== "ios") ? (
               <Pressable
                 onPress={submit}
@@ -1052,6 +1165,23 @@ const styles = StyleSheet.create({
     gap: 16
   },
   threadChipWrap: { marginTop: 8 },
+  // Job-delivered run container: light-blue left border + faint tint so a
+  // scheduled job's messages stand apart from the user's own conversation.
+  jobRun: {
+    gap: 16,
+    paddingLeft: 12,
+    paddingVertical: 8,
+    borderLeftWidth: 2,
+    borderLeftColor: theme.accent,
+    backgroundColor: "#EAF3FF",
+    borderTopRightRadius: 8,
+    borderBottomRightRadius: 8
+  },
+  jobRunLabel: {
+    color: theme.muted,
+    fontFamily: family("HankenGrotesk", 600),
+    fontSize: 12
+  },
   emptyChat: {
     flex: 1,
     minHeight: 240,
@@ -1286,6 +1416,7 @@ const styles = StyleSheet.create({
   },
   sendButtonDisabled: { backgroundColor: theme.buttonDisabled },
   stopButton: { backgroundColor: theme.danger },
+  queueButton: { marginRight: 8 },
 
   voicePendingRow: { alignSelf: "flex-end", maxWidth: "80%" },
   voicePendingBubble: {

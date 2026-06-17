@@ -136,6 +136,23 @@ export function BlockSetupRequested({ block }: { block: SetupRequestedBlock }) {
     onError: (error: Error) => toast.error(error.message)
   });
 
+  // confirmation.request Confirm: POST an empty body to /complete, which
+  // resumes the chat-task loop with {confirmed:true} so the agent performs
+  // the irreversible action. Cancel reuses the shared `cancel` mutation,
+  // which resumes with {confirmed:false}. See
+  // docs/adr/user-confirmation-primitive.md.
+  const confirmSubmit = useMutation({
+    mutationFn: async () =>
+      api<{ ok: boolean }>(`/setup-requests/${block.setupRequestId}/complete`, {
+        method: "POST",
+        body: JSON.stringify({})
+      }),
+    onSuccess: () => {
+      invalidate(["setup-requests", "approvals", "tasks", "task", "chat", "threads", "threads-inbox", "events", "audit"]);
+    },
+    onError: (error: Error) => toast.error(error.message)
+  });
+
   const isBrowserConnect = block.action === "browser.connect";
   const isConnectorRequest = block.action === "connector.request";
   const isBrowserFillSecret = block.action === "browser.fill_secret";
@@ -144,6 +161,7 @@ export function BlockSetupRequested({ block }: { block: SetupRequestedBlock }) {
   const isMessagingApprovePairing = block.action === "messaging.approve_pairing";
   const isMessagingRemoveBridge = block.action === "messaging.remove_bridge";
   const isChatChoice = block.action === "chat.choice";
+  const isConfirmationRequest = block.action === "confirmation.request";
 
   const providerId = isConnectorRequest && setup ? String(setup.payload?.provider ?? "") : "";
   const providerLabel = isConnectorRequest && setup
@@ -196,6 +214,17 @@ export function BlockSetupRequested({ block }: { block: SetupRequestedBlock }) {
   const choiceOptions: ChoiceOption[] = isChatChoice && setup
     ? parseChoiceOptions(setup.payload?.options)
     : [];
+
+  // === confirmation.request card state ===
+  // Optional details + confirm label come from the TRUSTED setup payload the
+  // dispatcher minted. The summary renders via displaySummary / block.summary.
+  const confirmationDetails = isConfirmationRequest && setup && typeof setup.payload?.details === "string"
+    ? (setup.payload.details as string)
+    : "";
+  const confirmationLabel = isConfirmationRequest && setup && typeof setup.payload?.confirmLabel === "string"
+    && (setup.payload.confirmLabel as string).trim().length > 0
+    ? (setup.payload.confirmLabel as string)
+    : "Confirm";
 
   // === messaging.add_bridge card state ===
   const bridgeKind = isMessagingAddBridge && setup
@@ -573,13 +602,22 @@ export function BlockSetupRequested({ block }: { block: SetupRequestedBlock }) {
                 : setup.status === "cancelled"
                   ? `Skipped. (${block.summary})`
                   : block.summary
-              : block.summary;
+              : !isPending && setup && isConfirmationRequest
+                // Confirm is a /complete, Cancel a /cancel — so completed =
+                // confirmed and cancelled = declined. The resolved card states
+                // the decision plainly.
+                ? setup.status === "completed"
+                  ? `Confirmed. (${block.summary})`
+                  : setup.status === "cancelled"
+                    ? `Cancelled. (${block.summary})`
+                    : block.summary
+                : block.summary;
 
   return (
     <div className={cardClass}>
       <div className="flex flex-wrap items-center gap-2">
         <span className="font-mono text-xs text-foreground">
-          {isBrowserConnect ? "Connect to agent's browser" : isSkillGrant ? "Grant skill access" : isChatChoice ? "Question" : block.action}
+          {isBrowserConnect ? "Connect to agent's browser" : isSkillGrant ? "Grant skill access" : isChatChoice ? "Question" : isConfirmationRequest ? "Confirmation" : block.action}
         </span>
         {!isPending && setup ? <StatusPill value={setup.status} /> : null}
         <button
@@ -797,6 +835,17 @@ export function BlockSetupRequested({ block }: { block: SetupRequestedBlock }) {
           skipPending={cancel.isPending}
         />
       ) : null}
+      {/* confirmation.request: the summary renders above (displaySummary); the
+          actual content the user is consenting to is shown in a native
+          disclosure so they can review exactly what goes out before confirming. */}
+      {isConfirmationRequest && isPending && confirmationDetails ? (
+        <details className="mt-2 rounded-md border border-border bg-background/40 px-2 py-1.5 text-xs">
+          <summary className="cursor-pointer select-none text-muted-foreground">Review details</summary>
+          <pre className="mt-1.5 max-h-48 overflow-auto whitespace-pre-wrap break-words font-sans text-[11px] text-foreground">
+            {confirmationDetails}
+          </pre>
+        </details>
+      ) : null}
       {/* chat.choice owns its own Submit/Skip row inside ChoiceCard. */}
       <div className={isPending && !isChatChoice ? "mt-2 flex gap-2" : "hidden"}>
         {isBrowserConnect ? (
@@ -953,6 +1002,24 @@ export function BlockSetupRequested({ block }: { block: SetupRequestedBlock }) {
               size="sm"
               variant="outline"
               disabled={cancel.isPending || !isPending}
+              onClick={() => cancel.mutate()}
+            >
+              Cancel
+            </Button>
+          </>
+        ) : isConfirmationRequest ? (
+          <>
+            <Button
+              size="sm"
+              disabled={confirmSubmit.isPending || cancel.isPending || !isPending || !setup}
+              onClick={() => confirmSubmit.mutate()}
+            >
+              {confirmationLabel}
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={confirmSubmit.isPending || cancel.isPending || !isPending}
               onClick={() => cancel.mutate()}
             >
               Cancel

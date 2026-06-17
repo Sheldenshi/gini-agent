@@ -34,7 +34,7 @@ import { browserTracesDir, downloadsDir, instanceRoot } from "../paths";
 import { launchPersistentChrome } from "./chrome-discovery";
 import { generateAuxText, generateVisionAnalysis } from "../provider";
 import { resolveImageByteLimit, resolveProviderModality } from "../provider-capabilities";
-import { addAudit, assertInsideWorkspace, mutateState, readState } from "../state";
+import { addAudit, assertInsideWorkspace, mutateState, readState, recordUsage } from "../state";
 import { sanitizeUrlForAuditTarget } from "../execution/browser-fill-secrets-types";
 import type { BrowserConnectionRecord, BrowserDomainPolicy, Instance, RuntimeConfig } from "../types";
 
@@ -1648,6 +1648,7 @@ async function summarizeSnapshotRemainder(config: RuntimeConfig, remainder: stri
       user: remainder.slice(0, SNAPSHOT_SUMMARY_INPUT_CAP),
       maxTokens: SNAPSHOT_SUMMARY_MAX_TOKENS
     });
+    void recordUsage(config.instance, { source: "aux" }, result.cost).catch(() => {});
     const summary = result.text.trim();
     return summary.length > 0 ? summary : undefined;
   } catch {

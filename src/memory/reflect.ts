@@ -29,7 +29,8 @@ import {
   ensureDefaultBank,
   getBank,
   insertMemoryUnit,
-  mutateState
+  mutateState,
+  recordUsage
 } from "../state";
 import { generateStructured, generateTaskSummary } from "../provider";
 import { getEmbeddingProvider } from "../embeddings";
@@ -84,6 +85,7 @@ export async function reflect(config: RuntimeConfig, input: ReflectInput): Promi
   // local/openrouter).
   const userPrompt = `${systemMessage}\n\nQuestion: ${input.query}\n\nProvide your response.`;
   const generated = await generateTaskSummary(config, userPrompt, undefined, undefined, providerOverride, input.sourceTaskId);
+  void recordUsage(instance, { source: "memory", agentId: input.agentId, taskId: input.sourceTaskId }, generated.cost).catch(() => {});
 
   // 4. Extract opinions.
   const opinionStub = await generateStructured(config, {
@@ -93,6 +95,7 @@ export async function reflect(config: RuntimeConfig, input: ReflectInput): Promi
     validator: opinionExtractionValidator,
     echoTag: "opinion-formation"
   }, providerOverride);
+  void recordUsage(instance, { source: "memory", agentId: input.agentId, taskId: input.sourceTaskId }, opinionStub.cost).catch(() => {});
   const extracted = opinionStub.data.opinions ?? [];
   const insertedOpinions = await persistOpinions(config, bankId, input.agentId, extracted, input.sourceTaskId);
 

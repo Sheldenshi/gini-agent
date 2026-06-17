@@ -16,13 +16,15 @@ import {
   useInvalidate,
   useSetupRequests,
   useStatus,
-  useTasks
+  useTasks,
+  useUsage
 } from "@/lib/queries";
+import { TokenUsageChart } from "./_components/TokenUsageChart";
 import type { Authorization, SetupRequest } from "@runtime/types";
 
 const HOME_APPROVAL_LIMIT = 3;
 
-const DAY_MS = 24 * 60 * 60 * 1000;
+const TOKEN_HISTORY_DAYS = 14;
 
 export default function HomePage() {
   const status = useStatus();
@@ -78,24 +80,11 @@ export default function HomePage() {
   const pendingTotal = pendingAuth.length + pendingSetup.length;
   const recent = (events.data ?? []).slice().reverse().slice(0, 8);
 
-  // "Today's cost" = sum of estimatedUsd on tasks updated in the last 24h.
-  // The runtime tracks cost on Task and JobRun; we sum across recent tasks
-  // because tasks are the unit users submit, and job runs roll up into tasks
-  // anyway via taskId. Using a 24h rolling cutoff (vs midnight) keeps it
-  // stable across timezones and feels right for a control plane.
-  const todaysCost = useMemo(() => {
-    const cutoff = Date.now() - DAY_MS;
-    let usd = 0;
-    let counted = 0;
-    for (const task of tasks.data ?? []) {
-      if (!task.cost?.estimatedUsd) continue;
-      const at = Date.parse(task.updatedAt);
-      if (Number.isNaN(at) || at < cutoff) continue;
-      usd += task.cost.estimatedUsd;
-      counted += 1;
-    }
-    return { usd, counted };
-  }, [tasks.data]);
+  // Daily token consumption (input vs output, plus USD) over the trailing
+  // window, read from the server-side usage ledger via /api/usage. The ledger
+  // captures every generative call — chat, jobs, subagents, memory, titles,
+  // vision — not just what lands on task.cost, and survives task pruning.
+  const usage = useUsage(TOKEN_HISTORY_DAYS);
 
   return (
     <>
@@ -107,23 +96,7 @@ export default function HomePage() {
           <Stat title="Pending approvals" value={String(pendingTotal)} sub={pendingTotal > 0 ? "needs review" : "all clear"} />
         </div>
 
-        <div className="grid gap-3 md:grid-cols-2">
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-sm">Today&apos;s cost</CardTitle>
-              <CardDescription>Estimated USD across tasks updated in the last 24h</CardDescription>
-            </CardHeader>
-            <CardContent>
-              <p className="text-2xl font-semibold">${todaysCost.usd.toFixed(4)}</p>
-              <p className="text-xs text-muted-foreground">{todaysCost.counted} tasks with cost data</p>
-            </CardContent>
-          </Card>
-          {/* "Memory changes needing review" card removed alongside the
-              state.memories consolidation — pinned-memory proposals no
-              longer exist as a surface. USER.md / SOUL.md / Hindsight are
-              the three memory surfaces now. See ADR
-              runtime-identity-files.md. */}
-        </div>
+        <TokenUsageChart days={usage.data ?? []} />
 
         {pendingAuth.length > 0 ? (
           <Card>

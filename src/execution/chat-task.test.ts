@@ -73,6 +73,21 @@ import {
 import type { ToolCatalogTool } from "./tool-catalog";
 import type { EffectiveContext } from "./effective-context";
 
+// These tests submit on idle sessions, which always run immediately. Narrow
+// the submit union to the run-now branch so the existing `.taskId` reads stay
+// typed (a queued result here is a test-setup bug). See ADR
+// chat-message-queue.md.
+async function submitChatMessage(
+  config: RuntimeConfig,
+  sessionId: string,
+  input: Record<string, unknown>
+): Promise<{ sessionId: string; runId: string; taskId: string; status: Task["status"] }> {
+  const { submitChatMessage: submitChatMessageRaw } = await import("./chat");
+  const result = await submitChatMessageRaw(config, sessionId, input);
+  if ("queued" in result) throw new Error("expected run-now submission, got queued");
+  return result;
+}
+
 let scratchHome: string;
 let prevHome: string | undefined;
 let prevEmbedding: string | undefined;
@@ -1854,7 +1869,7 @@ describe("chat-task loop", () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
     const config = buildConfig(workspaceRoot, "chat-task-surface");
     const provider = normalizeProvider(config.provider);
-    const { submitChatMessage, createChat } = await import("./chat");
+    const { createChat } = await import("./chat");
     const session = await createChat(config, { title: "Surface probe" });
 
     // Turn 1 from the web, turn 2 from the phone — the same session can
@@ -1908,7 +1923,6 @@ describe("chat-task loop", () => {
     });
 
     setEchoToolCallingResponse({ provider, text: "ok", toolCalls: [], finishReason: "stop" });
-    const { submitChatMessage } = await import("./chat");
     const submitted = await submitChatMessage(config, sessionId, { content: "bridge turn" });
     expect((await waitForTerminal(config, submitted.taskId)).status).toBe("completed");
 
@@ -1926,7 +1940,7 @@ describe("chat-task loop", () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
     const config = buildConfig(workspaceRoot, "chat-task-surface-unknown");
     const provider = normalizeProvider(config.provider);
-    const { submitChatMessage, createChat } = await import("./chat");
+    const { createChat } = await import("./chat");
     const session = await createChat(config, { title: "Unknown surface probe" });
 
     setEchoToolCallingResponse({ provider, text: "ok", toolCalls: [], finishReason: "stop" });
@@ -2364,7 +2378,6 @@ describe("chat-task loop", () => {
       finishReason: "stop"
     });
 
-    const { submitChatMessage } = await import("./chat");
     const submitted = await submitChatMessage(config, session.id, { content: "what does hello.md say?" });
     const finished = await waitForTerminal(config, submitted.taskId);
     expect(finished.status).toBe("completed");
@@ -2441,7 +2454,6 @@ describe("chat-task loop", () => {
       finishReason: "stop"
     });
 
-    const { submitChatMessage } = await import("./chat");
     const submitted = await submitChatMessage(config, session.id, { content: "write out.txt" });
     const paused = await waitForTerminal(config, submitted.taskId);
     expect(paused.status).toBe("waiting_approval");
@@ -2499,7 +2511,6 @@ describe("chat-task loop", () => {
       finishReason: "stop"
     });
 
-    const { submitChatMessage } = await import("./chat");
     const submitted = await submitChatMessage(config, session.id, { content: "write out2.txt" });
     const paused = await waitForTerminal(config, submitted.taskId);
     expect(paused.status).toBe("waiting_approval");
@@ -2552,7 +2563,6 @@ describe("chat-task loop", () => {
       finishReason: "tool_calls"
     });
 
-    const { submitChatMessage } = await import("./chat");
     const submitted = await submitChatMessage(config, session.id, { content: "search the web" });
     const paused = await waitForTerminal(config, submitted.taskId);
     expect(paused.status).toBe("waiting_approval");
@@ -2598,7 +2608,6 @@ describe("chat-task loop", () => {
       finishReason: "tool_calls"
     });
 
-    const { submitChatMessage } = await import("./chat");
     const submitted = await submitChatMessage(config, session.id, { content: "search the web for the best cafe" });
     const paused = await waitForTerminal(config, submitted.taskId);
     expect(paused.status).toBe("waiting_approval");
@@ -2648,7 +2657,6 @@ describe("chat-task loop", () => {
       finishReason: "stop"
     });
 
-    const { submitChatMessage } = await import("./chat");
     const submitted = await submitChatMessage(config, session.id, { content: "what is the weather in sf today" });
     const paused = await waitForTerminal(config, submitted.taskId);
     expect(paused.status).toBe("waiting_approval");
@@ -2729,7 +2737,6 @@ describe("chat-task loop", () => {
       finishReason: "tool_calls"
     });
 
-    const { submitChatMessage } = await import("./chat");
     const submitted = await submitChatMessage(config, session.id, { content: "find the best cafe" });
     const paused = await waitForTerminal(config, submitted.taskId);
     expect(paused.status).toBe("waiting_approval");
@@ -2789,7 +2796,6 @@ describe("chat-task loop", () => {
       finishReason: "stop"
     });
 
-    const { submitChatMessage } = await import("./chat");
     const submitted = await submitChatMessage(config, session.id, { content: "export my notes" });
     const paused = await waitForTerminal(config, submitted.taskId);
     expect(paused.status).toBe("waiting_approval");
@@ -2822,6 +2828,117 @@ describe("chat-task loop", () => {
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
 
+  test("request_confirmation pauses the turn with a confirmation.request setup card and no reason bubble", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-blocks-confirm");
+    const provider = normalizeProvider(config.provider);
+
+    const session = await mutateState(config.instance, (state) =>
+      createChatSession(state, "block-confirm", undefined, "agent_c")
+    );
+
+    const summary = "Send this reply to Dana in the project thread";
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        {
+          id: "call_c",
+          type: "function",
+          function: {
+            name: "request_confirmation",
+            arguments: JSON.stringify({ summary, details: "Hi Dana — ship it.", confirmLabel: "Send" })
+          }
+        }
+      ],
+      finishReason: "tool_calls"
+    });
+
+    const submitted = await submitChatMessage(config, session.id, { content: "reply to Dana that it's good" });
+    const paused = await waitForTerminal(config, submitted.taskId);
+    expect(paused.status).toBe("waiting_approval");
+
+    const setup = readState(config.instance).setupRequests.find((s) => s.taskId === submitted.taskId);
+    expect(setup?.action).toBe("confirmation.request");
+    expect(setup?.payload.summary).toBe(summary);
+    expect(setup?.payload.confirmLabel).toBe("Send");
+
+    const { listChatBlocks } = await import("../state");
+    const blocks = listChatBlocks(config.instance, session.id);
+    const setupBlock = blocks.find((b) => b.kind === "setup_requested");
+    if (setupBlock?.kind === "setup_requested") {
+      expect(setupBlock.action).toBe("confirmation.request");
+      // The summary IS the block summary — that's what transcripts show.
+      expect(setupBlock.summary).toBe(summary);
+    } else {
+      throw new Error("missing setup_requested block");
+    }
+    // Like chat.choice, no assistant bubble accompanies the card — the summary
+    // lives in the card itself.
+    expect(blocks.some((b) => b.kind === "assistant_text")).toBe(false);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("confirmation.request cancel resumes the chat loop with {confirmed:false}", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-blocks-confirm-cancel");
+    const provider = normalizeProvider(config.provider);
+
+    const session = await mutateState(config.instance, (state) =>
+      createChatSession(state, "block-confirm-cancel", undefined, "agent_c")
+    );
+
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        {
+          id: "call_c",
+          type: "function",
+          function: {
+            name: "request_confirmation",
+            arguments: JSON.stringify({ summary: "Send the reply to Dana" })
+          }
+        }
+      ],
+      finishReason: "tool_calls"
+    });
+    setEchoToolCallingResponse({
+      provider,
+      text: "Okay, I won't send it. What should I change?",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const submitted = await submitChatMessage(config, session.id, { content: "reply to Dana" });
+    const paused = await waitForTerminal(config, submitted.taskId);
+    expect(paused.status).toBe("waiting_approval");
+
+    const setup = readState(config.instance).setupRequests.find((s) => s.taskId === submitted.taskId);
+    expect(setup?.action).toBe("confirmation.request");
+
+    await resolveSetupRequest(config, setup!.id, "cancel", { actor: "user" });
+
+    let finished = readState(config.instance).tasks.find((t) => t.id === submitted.taskId);
+    const deadline = Date.now() + 5000;
+    while (finished?.status !== "completed" && Date.now() < deadline) {
+      await Bun.sleep(20);
+      finished = readState(config.instance).tasks.find((t) => t.id === submitted.taskId);
+    }
+    // Cancel must resume the loop, NOT fail the task.
+    expect(finished?.status).toBe("completed");
+    expect(finished?.summary).toBe("Okay, I won't send it. What should I change?");
+
+    const { listChatBlocks } = await import("../state");
+    const blocks = listChatBlocks(config.instance, session.id);
+    // The model receives an unambiguous boolean from the cancel.
+    expect(blocks.some((b) => b.kind === "tool_result" && b.preview.includes('"confirmed":false'))).toBe(true);
+    expect(readState(config.instance).setupRequests.find((s) => s.id === setup!.id)?.status).toBe("cancelled");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
   test("emits parallel tool_calls with distinct callIds and ordinals", async () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
     writeFileSync(join(workspaceRoot, "a.md"), "alpha");
@@ -2849,7 +2966,6 @@ describe("chat-task loop", () => {
       finishReason: "stop"
     });
 
-    const { submitChatMessage } = await import("./chat");
     const submitted = await submitChatMessage(config, session.id, { content: "read both" });
     const finished = await waitForTerminal(config, submitted.taskId);
     expect(finished.status).toBe("completed");
@@ -2924,7 +3040,6 @@ describe("chat-task loop", () => {
       finishReason: "stop"
     });
 
-    const { submitChatMessage } = await import("./chat");
     const submitted = await submitChatMessage(config, session.id, { content: "say hi" });
     const finished = await waitForTerminal(config, submitted.taskId);
     expect(finished.status).toBe("completed");
@@ -2980,7 +3095,6 @@ describe("chat-task loop", () => {
       finishReason: "stop"
     });
 
-    const { submitChatMessage } = await import("./chat");
     const submitted = await submitChatMessage(config, session.id, { content: "hi" });
     await waitForTerminal(config, submitted.taskId);
 
@@ -3008,7 +3122,7 @@ describe("chat-task loop", () => {
     const issueResult = JSON.stringify({ ok: true, issueId: "ISSUE-4242" });
     writeFileSync(fixturePath, issueResult);
 
-    const { createChat, submitChatMessage, syncChatTaskResult } = await import("./chat");
+    const { createChat, syncChatTaskResult } = await import("./chat");
     const session = await createChat(config, { title: "Issue thread" });
 
     // Turn 1: read the file (returns the issue id), then a final answer.
@@ -3076,7 +3190,7 @@ describe("chat-task loop", () => {
     const provider = normalizeProvider(config.provider);
     const fixturePath = join(workspaceRoot, "state.txt");
 
-    const { createChat, submitChatMessage, syncChatTaskResult } = await import("./chat");
+    const { createChat, syncChatTaskResult } = await import("./chat");
     const session = await createChat(config, { title: "Dup-id thread" });
 
     // Turn 1: read the file (content "FIRST"), reusing the colliding id.
@@ -3172,7 +3286,7 @@ describe("chat-task loop", () => {
     });
     await setSkillStatus(config, skill.id, "enabled");
 
-    const { createChat, submitChatMessage, syncChatTaskResult } = await import("./chat");
+    const { createChat, syncChatTaskResult } = await import("./chat");
     const session = await createChat(config, { title: "Skill thread" });
 
     // Turn 1: read the skill, then answer.
@@ -3223,7 +3337,7 @@ describe("chat-task loop", () => {
     const config = buildConfig(workspaceRoot, "chat-task-transcript-gated");
     const provider = normalizeProvider(config.provider);
 
-    const { createChat, submitChatMessage, syncChatTaskResult } = await import("./chat");
+    const { createChat, syncChatTaskResult } = await import("./chat");
     const session = await createChat(config, { title: "Gated thread" });
 
     // Turn 1: request a file write (approval-gated), then answer after resume.
@@ -3317,7 +3431,7 @@ describe("chat-task loop", () => {
     const config = buildConfig(workspaceRoot, "chat-task-transcript-gated-reason");
     const provider = normalizeProvider(config.provider);
 
-    const { createChat, submitChatMessage, syncChatTaskResult } = await import("./chat");
+    const { createChat, syncChatTaskResult } = await import("./chat");
     const session = await createChat(config, { title: "Connector thread" });
 
     // Turn 1: request_connector (approval-gated) for a provider with no
@@ -4061,7 +4175,6 @@ describe("chat-task loop", () => {
     const session = await mutateState(config.instance, (state) =>
       createChatSession(state, "Overflow chat")
     );
-    const { submitChatMessage } = await import("./chat");
 
     // Every attempt of the turn's model call overflows (3 total attempts).
     setEchoToolCallingFailure(OVERFLOW_MESSAGE);
@@ -4228,12 +4341,14 @@ describe("chat-task loop", () => {
     });
 
     // Twelve tool-call turns reading DISTINCT files (so no loop-breaker
-    // trips), each result ~3.4k chars — elidable (>200 chars) but the total
+    // trips), each result ~3k chars — elidable (>200 chars) but the total
     // stays under every estimate-driven threshold. Only the LAST response
     // reports usage; the resulting calibration gap forces the pre-call trim
-    // ahead of the 13th call.
+    // ahead of the 13th call. The per-read filler is sized so the accumulated
+    // transcript sits below the chars/4 high-water mark given the always-on
+    // tool-schema floor and system-prompt slice.
     for (let i = 0; i < 12; i++) {
-      writeFileSync(join(workspaceRoot, `chunk${i}.md`), `chunk-${i} `.repeat(411));
+      writeFileSync(join(workspaceRoot, `chunk${i}.md`), `chunk-${i} `.repeat(380));
       setEchoToolCallingResponse({
         provider,
         text: "",
@@ -4478,7 +4593,6 @@ describe("chat-task loop", () => {
     const session = await mutateState(config.instance, (state) =>
       createChatSession(state, "stream-exhaust")
     );
-    const { submitChatMessage } = await import("./chat");
 
     // Every attempt streams partial text before throwing the overflow.
     setEchoToolCallingFailure(OVERFLOW_MESSAGE, { streamTextBeforeFailure: "DISCARDED-PARTIAL " });
@@ -4518,7 +4632,6 @@ describe("chat-task loop", () => {
     const session = await mutateState(config.instance, (state) =>
       createChatSession(state, "partial-exit")
     );
-    const { submitChatMessage } = await import("./chat");
 
     // Turn 1 completes normally with a distinctive answer.
     setEchoToolCallingResponse({ provider, text: "PRIOR-TURN-ANSWER", toolCalls: [], finishReason: "stop" });
@@ -4604,7 +4717,6 @@ describe("chat-task loop", () => {
     const session = await mutateState(config.instance, (state) =>
       createChatSession(state, "partial-nonstream")
     );
-    const { submitChatMessage } = await import("./chat");
 
     writeFileSync(join(workspaceRoot, "note.md"), "note content");
     // Whole-string response (no deltas) narrating before a tool call, then
@@ -4659,7 +4771,6 @@ describe("chat-task loop", () => {
     const session = await mutateState(config.instance, (state) =>
       createChatSession(state, "stream-reset")
     );
-    const { submitChatMessage } = await import("./chat");
 
     writeFileSync(join(workspaceRoot, "note.md"), "note content");
     // Attempt 1 streams partial text, then fails with overflow. The retry
@@ -5078,14 +5189,14 @@ describe("chat-task loop", () => {
     // live always-on catalog size (cleared in afterEach).
     __setBaseToolCatalogForTests(FIXED_COMPACTION_CATALOG);
 
-    // Twelve modest reads (~910 tokens each). With echo reporting no usage the
+    // Twelve modest reads (~880 tokens each). With echo reporting no usage the
     // calibration gap stays 0, so the only trim trigger is the chars/4 live
     // budget — and the accumulated transcript stays well under it (the budget
-    // is 32,000 − 1,600 reserve − ~12,487 floor [12,207 pinned catalog + the
-    // system-prompt slice] = ~17,913 tokens), so no
+    // is 32,000 − 1,600 reserve − ~12,739 floor [12,207 pinned catalog + the
+    // system-prompt slice] ≈ 17,661 tokens), so no
     // elision and no proactive compaction ever engages.
     for (let i = 0; i < 12; i++) {
-      await seedBulkSkill(config, `chunk-skill-${i}`, `chunk-${i} ${"x".repeat(3_630)}`);
+      await seedBulkSkill(config, `chunk-skill-${i}`, `chunk-${i} ${"x".repeat(3_510)}`);
       setEchoToolCallingResponse({
         provider,
         text: "",
@@ -5776,7 +5887,7 @@ describe("buildInactiveSkillsBlock", () => {
       mcpServers: [], messagingBridges: [], importReports: [], agents: [],
       activeAgentId: undefined, relays: [], notifications: [], emailWatchers: [], events: [],
       jobRuns: [], chatSessions: [], chatMessages: [], messagingMessages: [],
-      runs: [], planSteps: []
+      runs: [], planSteps: [], usageLedger: []
     };
   }
 
@@ -5887,7 +5998,7 @@ describe("buildMcpServersBlock", () => {
       mcpServers: servers, messagingBridges: [], importReports: [], agents: [],
       activeAgentId: undefined, relays: [], notifications: [], emailWatchers: [], events: [],
       jobRuns: [], chatSessions: [], chatMessages: [], messagingMessages: [],
-      runs: [], planSteps: []
+      runs: [], planSteps: [], usageLedger: []
     };
   }
 

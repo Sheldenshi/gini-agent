@@ -8,12 +8,11 @@ import {
   StyleSheet,
   Text,
   TextInput,
-  TouchableOpacity,
-  View
+  TouchableOpacity
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import * as Device from "expo-device";
-import { normalizeBaseUrl, readCachedCredentials, saveCredentials } from "@/src/auth";
+import { normalizeBaseUrl, saveCredentials } from "@/src/auth";
 import { QrScanner } from "@/src/components/QrScanner";
 import { createPairingClient, PairingError, type PairingClient } from "@/src/pairing";
 import {
@@ -22,7 +21,7 @@ import {
   readCachedPendingPair,
   savePendingPair
 } from "@/src/pending-pair";
-import { isGatewaySwitch, isPairableHost } from "@/src/relay-link";
+import { isPairableHost } from "@/src/relay-link";
 import { family, theme } from "@/src/theme";
 
 // The device-side pairing screen — the mirror of web/src/app/pair/page.tsx for
@@ -34,7 +33,6 @@ import { family, theme } from "@/src/theme";
 
 type Phase =
   | "input" // no relay yet — ask for a link
-  | "confirm" // a deep link would switch an already-paired gateway — confirm first
   | "creating"
   | "create-error"
   | "pending"
@@ -49,8 +47,6 @@ type Phase =
 // device within a couple of seconds.
 const POLL_INTERVAL_MS = 2000;
 
-// Display host for a stored/incoming URL (the parsed host is un-spoofable, unlike
-// raw link text). Empty string when absent/unparseable.
 // Best-effort human label for this device (e.g. "iPhone 16 Pro") sent on create
 // so the operator's approval row shows it instead of "Unknown device". The
 // gateway sanitizes it and falls back to a User-Agent label when absent, so a
@@ -59,6 +55,9 @@ function deviceLabel(): string | undefined {
   return Device.modelName ?? Device.deviceName ?? undefined;
 }
 
+// Parsed host of a URL, used to compare a persisted breadcrumb's origin against
+// the incoming relay param. Empty string when absent; the raw value when
+// unparseable (two unparseable values then only match if byte-identical).
 function hostOf(url: string | null | undefined): string {
   if (!url) return "";
   try {
@@ -76,16 +75,9 @@ export default function PairScreen() {
   // mint a fresh one.
   const resumeParam = Array.isArray(params.resume) ? params.resume[0] : params.resume;
 
-  // A deep link to a relay host that differs from an already-stored gateway must
-  // be confirmed (a silent switch could repoint the app to an attacker's relay);
-  // a first-time pair or a same-host re-pair starts straight away.
-  const [phase, setPhase] = useState<Phase>(() => {
-    if (!relayParam) return "input";
-    return isGatewaySwitch(readCachedCredentials()?.baseUrl, relayParam) ? "confirm" : "creating";
-  });
-  const [pendingOrigin, setPendingOrigin] = useState<string | null>(() =>
-    relayParam && isGatewaySwitch(readCachedCredentials()?.baseUrl, relayParam) ? relayParam : null
-  );
+  // A deep link carrying a relay origin starts the handshake immediately; with no
+  // relay we drop to the manual paste screen.
+  const [phase, setPhase] = useState<Phase>(() => (relayParam ? "creating" : "input"));
   const [linkInput, setLinkInput] = useState("");
   const [code, setCode] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -115,11 +107,10 @@ export default function PairScreen() {
   }, []);
 
   // Best-effort cancel the CURRENT attempt's server request. Used wherever an
-  // attempt is superseded or torn down (start of a new attempt, cancel, the
-  // gateway-switch confirm, unmount) so a pending request doesn't linger
-  // server-side — the pending cap is instance-global, so orphans from rapid
-  // retries could otherwise 429 a later legitimate create. Reads the live refs,
-  // so call it BEFORE clearing them.
+  // attempt is superseded or torn down (start of a new attempt, cancel, unmount)
+  // so a pending request doesn't linger server-side — the pending cap is
+  // instance-global, so orphans from rapid retries could otherwise 429 a later
+  // legitimate create. Reads the live refs, so call it BEFORE clearing them.
   const cancelActiveRequest = useCallback(() => {
     const client = clientRef.current;
     const request = requestRef.current;
@@ -230,26 +221,8 @@ export default function PairScreen() {
         }
       }
     }
-    // Switching an already-paired app to a different relay host needs explicit
-    // confirmation; a first-time or same-host pair auto-starts.
-    if (isGatewaySwitch(readCachedCredentials()?.baseUrl, relayParam)) {
-      // Invalidate any in-flight prior attempt so it can't complete and save
-      // credentials behind the confirm screen: bump the generation (its
-      // poll/claim closures bail), stop polling, best-effort cancel its server
-      // request, and drop its refs.
-      genRef.current += 1;
-      stopPolling();
-      cancelActiveRequest();
-      clientRef.current = null;
-      requestRef.current = null;
-      // A switch to a different relay supersedes any persisted breadcrumb.
-      void clearPendingPair();
-      setPendingOrigin(relayParam);
-      setPhase("confirm");
-      return;
-    }
     void start(relayParam);
-  }, [relayParam, resumeParam, start, stopPolling, cancelActiveRequest]);
+  }, [relayParam, resumeParam, start]);
 
   // Component-wide unmount cleanup, installed regardless of entry path (manual
   // paste OR deep link). Bumps the generation so any in-flight create/poll/claim
@@ -354,9 +327,9 @@ export default function PairScreen() {
       try {
         const token = await client.claim(request.id, request.secret);
         // Do NOT persist a superseded attempt's token. If the generation moved on
-        // (a new attempt started, the confirm phase took over, or the screen
-        // unmounted), bail BEFORE saving so a stale/late claim can't silently
-        // repoint the app to that attempt's gateway. The cost is a rare orphaned
+        // (a new attempt started, the user cancelled, or the screen unmounted),
+        // bail BEFORE saving so a stale/late claim can't silently repoint the app
+        // to that attempt's gateway. The cost is a rare orphaned
         // active device row when an unmount races a successful claim — bounded and
         // self-healing (the row carries a TTL and its one-time token was discarded,
         // so it's an unused session the server expires).
@@ -405,16 +378,20 @@ export default function PairScreen() {
   );
 
   const cancel = useCallback(() => {
-    // Move to the terminal state and drop the refs SYNCHRONOUSLY, before the
-    // network round-trip: instant cancelled feedback, and no queued transition can
-    // claim once the generation is bumped and the refs are gone. The server cancel
-    // is best-effort (the request may already be terminal).
+    // Tear down the attempt SYNCHRONOUSLY before the network round-trip: bump the
+    // generation so no queued poll/claim can fire, stop polling, best-effort cancel
+    // the server request, and drop the refs. Then leave /pair entirely — clear the
+    // resume breadcrumb (so the auth gate doesn't bounce us straight back here) and
+    // route through the gate, which lands an already-paired device on /channels and
+    // an unpaired one on /setup. Cancelling drops the user back into the app they
+    // were already in rather than onto a dead-end "cancelled" card.
     genRef.current += 1;
     stopPolling();
     cancelActiveRequest();
     clientRef.current = null;
     requestRef.current = null;
-    setPhase("cancelled");
+    void clearPendingPair();
+    router.replace("/");
   }, [stopPolling, cancelActiveRequest]);
 
   const retry = useCallback(() => {
@@ -424,18 +401,8 @@ export default function PairScreen() {
       setPhase("input");
       return;
     }
-    // Re-apply the gateway-switch gate so "Not now" → "Try again" can't bypass the
-    // confirmation when the link's host differs from the stored gateway.
-    if (isGatewaySwitch(readCachedCredentials()?.baseUrl, relayParam)) {
-      setPendingOrigin(relayParam);
-      setPhase("confirm");
-      return;
-    }
     void start(relayParam);
   }, [relayParam, start]);
-
-  const confirmHost = hostOf(pendingOrigin);
-  const currentHost = hostOf(readCachedCredentials()?.baseUrl);
 
   return (
     <SafeAreaView style={styles.safe} edges={["bottom"]}>
@@ -445,52 +412,13 @@ export default function PairScreen() {
         style={styles.flex}
       >
         <ScrollView contentContainerStyle={styles.scroll} keyboardShouldPersistTaps="handled">
-          <Text style={styles.heading}>
-            {phase === "confirm" ? "Switch gateway?" : "Pair this device"}
+          <Text style={styles.heading}>Pair this device</Text>
+          <Text style={styles.subhead}>
+            A code appears below. Approve it on the computer where Gini is signed
+            in, and this device connects.
           </Text>
-          {phase === "confirm" ? null : (
-            <Text style={styles.subhead}>
-              A code appears below. Approve it on the computer where Gini is signed
-              in, and this device connects.
-            </Text>
-          )}
 
-          {phase === "confirm" ? (
-            <>
-              <Text style={styles.subhead}>
-                Continue only if you opened this link yourself.
-              </Text>
-
-              <View style={styles.hostBlock}>
-                <Text style={styles.hostLabel}>New connection</Text>
-                <View style={styles.hostChip}>
-                  <Text style={styles.hostChipText}>{confirmHost}</Text>
-                </View>
-              </View>
-
-              {currentHost ? (
-                <View style={styles.hostBlock}>
-                  <Text style={styles.hostLabel}>Replaces</Text>
-                  <View style={[styles.hostChip, styles.hostChipMuted]}>
-                    <Text style={styles.hostChipText}>{currentHost}</Text>
-                  </View>
-                </View>
-              ) : null}
-
-              <TouchableOpacity
-                onPress={() => {
-                  const origin = pendingOrigin;
-                  if (origin) void start(origin);
-                }}
-                style={styles.button}
-              >
-                <Text style={styles.buttonText}>Connect</Text>
-              </TouchableOpacity>
-              <TouchableOpacity onPress={() => setPhase("cancelled")} style={styles.ghostButton}>
-                <Text style={styles.ghostButtonText}>Not now</Text>
-              </TouchableOpacity>
-            </>
-          ) : phase === "input" ? (
+          {phase === "input" ? (
             <>
               <Text style={styles.label}>Gini link</Text>
               <TextInput
@@ -615,37 +543,6 @@ const styles = StyleSheet.create({
     fontSize: 14,
     lineHeight: 20,
     marginBottom: 8
-  },
-  hostBlock: {
-    gap: 6
-  },
-  hostLabel: {
-    color: theme.muted,
-    fontFamily: family("HankenGrotesk", 600),
-    fontSize: 12,
-    letterSpacing: 0.4,
-    textTransform: "uppercase"
-  },
-  // Contain the long relay subdomain in a padded, bordered chip so it wraps
-  // cleanly inside the box instead of breaking mid-token across the sentence.
-  hostChip: {
-    borderWidth: 1,
-    borderColor: theme.inputBorder,
-    borderRadius: 10,
-    backgroundColor: theme.codeChipBg,
-    paddingHorizontal: 14,
-    paddingVertical: 12
-  },
-  // The outgoing host is secondary context, so soften its chip with the plain
-  // surface fill while keeping the same border.
-  hostChipMuted: {
-    backgroundColor: theme.bg
-  },
-  hostChipText: {
-    color: theme.codeChipText,
-    fontFamily: family("JetBrainsMono"),
-    fontSize: 14,
-    lineHeight: 20
   },
   label: {
     color: theme.text,

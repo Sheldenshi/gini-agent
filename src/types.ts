@@ -515,6 +515,10 @@ export interface AuthorizationRequestedBlock extends ChatBlockBase {
 //     Submit POSTs `{ choice: { label } }` or `{ choice: { other } }` to
 //     /complete; Skip POSTs to /cancel, which resumes the loop with a skip
 //     fallback instead of failing the task.
+//   - `confirmation.request` → inline Confirm/Cancel card (request_confirmation
+//     tool). The payload carries { summary, details?, confirmLabel, toolCallId }.
+//     Confirm POSTs `{}` to /complete → resume with tool result
+//     {confirmed:true}; Cancel POSTs to /cancel → resume with {confirmed:false}.
 // Cancel always POSTs to /api/setup-requests/<id>/cancel.
 export interface SetupRequestedBlock extends ChatBlockBase {
   kind: "setup_requested";
@@ -707,6 +711,17 @@ export interface RuntimeState {
   emailTriageAgents?: string[];
   events: RuntimeEvent[];
   jobRuns: JobRunRecord[];
+  // Durable per-day token-usage rollup across every generative provider call
+  // (chat, jobs, subagents, memory, titles, vision, …). Written by recordUsage
+  // and read by the home usage chart, so the chart survives task pruning and
+  // captures spend that never lands on a task. Legacy states omit it (healed
+  // to []). See ADR usage-accounting.md.
+  usageLedger: UsageLedgerEntry[];
+  // Run-once marker (ISO timestamp) for the one-time backfill that seeds the
+  // usage ledger from existing terminal task.cost rows on first boot after the
+  // ledger shipped. Once set, the backfill is skipped so it never duplicates.
+  // Legacy/new states omit it until the backfill runs. See ADR usage-accounting.md.
+  usageLedgerBackfilledAt?: string;
   chatSessions: ChatSessionRecord[];
   chatMessages: ChatMessageRecord[];
   messagingMessages: MessagingMessageRecord[];
@@ -1028,6 +1043,23 @@ export interface ChatSessionRecord {
   // "skill-review" marks the dedicated channel the daily skill-learning review
   // posts its digest into (ADR skill-learning-from-outcomes.md).
   feature?: "email-watch" | "skill-review";
+  // FIFO queue of messages submitted while a chat turn is already in flight
+  // for this session. The gateway is the source of truth: a new POST while a
+  // task runs is enqueued here instead of starting a concurrent task, and the
+  // next entry auto-dispatches when the current turn ends (ADR
+  // chat-message-queue.md). Optional, so existing persisted state stays valid.
+  pendingMessages?: PendingChatMessage[];
+}
+
+// A chat message held in the per-session queue while a turn is in flight.
+// Audio is intentionally absent: a voice message is transcribed to `content`
+// at prepare time, so only the resulting text + image refs are queued.
+export interface PendingChatMessage {
+  id: string;
+  content: string;
+  images?: ImageAttachment[];
+  clientSurface?: ChatClientSurface;
+  createdAt: string;
 }
 
 // `lastInboundMessageId` is the most recent originating-message id the
@@ -1616,7 +1648,18 @@ export type SetupRequestAction =
   // option, {choice:{other}} for the freeform answer) and /cancel is the Skip
   // affordance, which resumes the loop with a skip fallback rather than
   // failing the task. See docs/adr/user-choice-prompt.md.
-  | "chat.choice";
+  | "chat.choice"
+  // confirmation.request — the request_confirmation tool's inline
+  // Confirm/Cancel card. The agent calls it before an irreversible action
+  // that goes to another person (send/reply a message, post a reply in a web
+  // app, submit/purchase on the user's behalf). The payload carries
+  // { summary, details?, confirmLabel, toolCallId }; /complete resumes the
+  // loop with tool result {confirmed:true} and /cancel resumes with
+  // {confirmed:false} — never a "skip" string, so the model gets an
+  // unambiguous boolean. Like chat.choice it is a SetupRequest, so it pauses
+  // the task even under approvalMode "yolo". See
+  // docs/adr/user-confirmation-primitive.md.
+  | "confirmation.request";
 
 export interface SetupRequest {
   id: string;
@@ -1933,6 +1976,49 @@ export interface CostRecord {
   outputTokens?: number;
   totalTokens?: number;
   estimatedUsd?: number;
+}
+
+// What kind of work spent the tokens. Kept deliberately small so the usage
+// chart can segment by it; finer-grained call sites (memory retain vs reflect,
+// vision_query vs browser_vision) collapse into one bucket here.
+export type UsageSource =
+  | "chat"
+  | "job"
+  | "subagent"
+  | "memory"
+  | "chat-title"
+  | "vision"
+  | "aux"
+  | "imperative"
+  | "other";
+
+// Attribution passed by a caller into a generative provider entry point so the
+// usage ledger can tag the recorded spend. Only `source` is required; the ids
+// enable per-agent/-task/-job breakdowns. A call site that passes no context at
+// all is simply not recorded (keeps existing callers/tests side-effect free).
+export interface UsageContext {
+  source: UsageSource;
+  agentId?: string;
+  taskId?: string;
+  jobId?: string;
+  subagentId?: string;
+}
+
+// One durable, append-rolled-up usage bucket. Keyed by (day, source, agentId,
+// provider, model); recordUsage sums token counts, USD, and call count into the
+// matching bucket. `day` is a local-calendar YYYY-MM-DD so the home chart reads
+// pre-bucketed server-authoritative daily totals that survive task pruning.
+export interface UsageLedgerEntry {
+  day: string;
+  source: UsageSource;
+  agentId?: string;
+  provider: string;
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  estimatedUsd: number;
+  calls: number;
 }
 
 export interface ConnectorSecretRef {

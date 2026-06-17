@@ -365,7 +365,10 @@ describe("messaging telegram wiring", () => {
     const found = findTelegramChatSession(config, bridge.id, 555);
     expect(found?.id).toBe(telegramSessions[0]!.id);
 
-    // Both user turns landed in the same session.
+    // Both user turns landed in the same session. Messaging bypasses the
+    // interactive-client queue (ADR chat-message-queue.md), so each inbound
+    // message runs its own task immediately and its user row is present
+    // synchronously — no drain to wait on.
     const userMessages = readState(config.instance).chatMessages.filter(
       (m) => m.sessionId === telegramSessions[0]!.id && m.role === "user"
     );
@@ -1326,6 +1329,9 @@ describe("messaging discord wiring", () => {
     const found = findDiscordChatSession(config, bridge.id, "chan-1");
     expect(found?.id).toBe(discordSessions[0]!.id);
 
+    // Messaging bypasses the interactive-client queue (ADR
+    // chat-message-queue.md): each inbound message runs its own task
+    // immediately, so both user rows are present synchronously.
     const userMessages = readState(config.instance).chatMessages.filter(
       (m) => m.sessionId === discordSessions[0]!.id && m.role === "user"
     );

@@ -81,16 +81,31 @@ function openrouterContextWindowTokens(model: string): number {
   const routedModel = slug.slice(slash + 1);
   if (vendor === "openai") return openaiContextWindowTokens(routedModel);
   if (vendor === "deepseek") return deepseekContextWindowTokens(routedModel);
-  if (vendor === "anthropic") return 200_000;
+  if (vendor === "anthropic") return claudeContextWindowTokens(routedModel);
   if (vendor === "google" && routedModel.startsWith("gemini")) return 1_000_000;
   return FALLBACK_CONTEXT_WINDOW_TOKENS;
 }
 
-// First-party Anthropic Messages API: the Claude family serves a 200K-token
-// context window. An unrecognized id stays conservative on the fallback.
-function anthropicContextWindowTokens(model: string): number {
-  if (/claude/.test(normalizeModel(model))) return 200_000;
+// Claude context window by family. The 1M-token window is GA on Opus 4.6+,
+// Sonnet 4.6, and Fable 5 (first-party API and Amazon Bedrock alike, at
+// standard pricing with no long-context premium); Haiku 4.5 and older or
+// unrecognized Claude ids stay at the 200K window. `slug` is the normalized
+// model id and may carry a Bedrock inference-profile prefix
+// ("us.anthropic.claude-opus-4-8") or arrive bare ("claude-opus-4-8") — both
+// match the family patterns. The minor-version classes ([6-9]|\d\d) keep
+// future point releases (Opus 4.9+) on 1M while leaving 4.5/4.1/4.0 at 200K.
+function claudeContextWindowTokens(slug: string): number {
+  if (/claude-opus-4-(?:[6-9]|\d\d)/.test(slug)) return 1_000_000;
+  if (/claude-sonnet-4-(?:[6-9]|\d\d)/.test(slug)) return 1_000_000;
+  if (/claude-fable-\d/.test(slug)) return 1_000_000;
+  if (/claude/.test(slug)) return 200_000;
   return FALLBACK_CONTEXT_WINDOW_TOKENS;
+}
+
+// First-party Anthropic Messages API. An unrecognized id stays conservative on
+// the fallback (see claudeContextWindowTokens).
+function anthropicContextWindowTokens(model: string): number {
+  return claudeContextWindowTokens(normalizeModel(model));
 }
 
 // Bedrock model ids are cross-region inference profiles, e.g.
@@ -99,7 +114,7 @@ function anthropicContextWindowTokens(model: string): number {
 // (other Bedrock families we don't enumerate) keep the conservative fallback.
 function bedrockContextWindowTokens(model: string): number {
   const slug = normalizeModel(model);
-  if (/anthropic\.claude/.test(slug)) return 200_000;
+  if (/anthropic\.claude/.test(slug)) return claudeContextWindowTokens(slug);
   if (/amazon\.nova-premier/.test(slug)) return 1_000_000;
   if (/amazon\.nova-(pro|lite)/.test(slug)) return 300_000;
   if (/amazon\.nova-micro/.test(slug)) return 128_000;
@@ -260,4 +275,69 @@ export function bedrockSupportsToolUse(model: string): boolean {
 // everything else supports tools + streaming together.
 export function bedrockSupportsStreamingWithTools(model: string): boolean {
   return !/llama4/i.test(model);
+}
+
+export interface ModelPricing {
+  /** USD per 1M input (prompt) tokens. */
+  inputPerMillion: number;
+  /** USD per 1M output (completion) tokens. */
+  outputPerMillion: number;
+}
+
+// Per-model token pricing in USD per million tokens, used by estimateCost to
+// fill CostRecord.estimatedUsd. This is a MAINTAINED list-price table — add a
+// row (with a source in the PR) when a provider/model is added or a price
+// changes. Matched against the normalized model id, so a Bedrock-prefixed id
+// (`anthropic.claude-opus-4-8`) hits the same row as the first-party one. The
+// first match wins, so order specific patterns before broad ones. An
+// unrecognized model returns undefined and contributes 0 USD (tokens are still
+// counted); local/echo/demo providers are intentionally unpriced.
+//
+// Anthropic values verified 2026-05 (input/output $ per MTok): Fable 5 10/50,
+// Opus 4.5–4.8 5/25, Sonnet 4.6 3/15, Haiku 4.5 1/5. OpenAI/DeepSeek rows are
+// public list prices and should be re-verified before relying on the USD
+// figure for billing.
+const MODEL_PRICING: Array<{ match: RegExp; input: number; output: number }> = [
+  // Anthropic / Claude (first-party + Bedrock `anthropic.` prefix).
+  { match: /(^|[.\-/])claude-fable-5(?=$|[-.])/, input: 10, output: 50 },
+  { match: /(^|[.\-/])claude-opus-4-[5678](?=$|[-.])/, input: 5, output: 25 },
+  { match: /(^|[.\-/])claude-opus-4-[01](?=$|[-.])/, input: 15, output: 75 },
+  { match: /(^|[.\-/])claude-3-opus(?=$|[-.])/, input: 15, output: 75 },
+  { match: /(^|[.\-/])claude-sonnet-4-[56](?=$|[-.])/, input: 3, output: 15 },
+  { match: /(^|[.\-/])claude-haiku-4-5(?=$|[-.])/, input: 1, output: 5 },
+  { match: /(^|[.\-/])claude-3-5-haiku(?=$|[-.])/, input: 0.8, output: 4 },
+  // OpenAI / Codex (gpt-5.x served through the codex backend uses gpt-5 pricing).
+  { match: /(^|[.\-/])gpt-5(\.\d+)?-?(mini|nano)(?=$|[-.])/, input: 0.25, output: 2 },
+  { match: /(^|[.\-/])gpt-5(?=$|[-.\d])/, input: 1.25, output: 10 },
+  { match: /(^|[.\-/])gpt-4o-mini(?=$|[-.])/, input: 0.15, output: 0.6 },
+  { match: /(^|[.\-/])gpt-4o(?=$|[-.])/, input: 2.5, output: 10 },
+  // DeepSeek.
+  { match: /(^|[.\-/])deepseek-reasoner(?=$|[-.])/, input: 0.55, output: 2.19 },
+  { match: /(^|[.\-/])deepseek(?=$|[-.])/, input: 0.27, output: 1.1 }
+];
+
+export function resolveModelPricing(provider: ProviderConfig): ModelPricing | undefined {
+  const slug = normalizeModel(provider.model);
+  if (slug.length === 0) return undefined;
+  for (const row of MODEL_PRICING) {
+    if (row.match.test(slug)) return { inputPerMillion: row.input, outputPerMillion: row.output };
+  }
+  return undefined;
+}
+
+/**
+ * Estimate USD for a call given resolved input/output token counts. Returns
+ * undefined when the model is unpriced (so estimatedUsd stays absent rather
+ * than a misleading 0).
+ */
+export function estimateUsd(
+  provider: ProviderConfig,
+  inputTokens: number | undefined,
+  outputTokens: number | undefined
+): number | undefined {
+  const pricing = resolveModelPricing(provider);
+  if (!pricing) return undefined;
+  const input = typeof inputTokens === "number" && Number.isFinite(inputTokens) ? inputTokens : 0;
+  const output = typeof outputTokens === "number" && Number.isFinite(outputTokens) ? outputTokens : 0;
+  return (input * pricing.inputPerMillion + output * pricing.outputPerMillion) / 1_000_000;
 }

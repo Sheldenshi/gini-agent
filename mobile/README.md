@@ -66,10 +66,10 @@ pairing client").
 
 A relay-paired session is a finite-lifetime credential (it inherits the
 relay session TTL, 30 days), so the app re-prompts for pairing once it
-expires — re-open the link to re-pair (a same-host re-pair skips the
-confirmation). The manual token from `gini status` does not expire.
-Opening a link for a *different* gateway than the one you're connected to
-asks you to confirm the switch first.
+expires — re-open the link to re-pair. The manual token from `gini
+status` does not expire. Opening a link — whether for the same gateway or
+a different one — goes straight to the pairing screen; cancelling there
+drops you back into the app you were already connected to.
 
 ## Behavior
 

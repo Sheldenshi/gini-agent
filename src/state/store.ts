@@ -65,6 +65,7 @@ export function createEmptyState(instance: Instance): RuntimeState {
     emailWatchers: [],
     events: [],
     jobRuns: [],
+    usageLedger: [],
     chatSessions: [],
     chatMessages: [],
     messagingMessages: [],
@@ -782,6 +783,57 @@ function matchGenericByEnv(skillEnv: string[], generics: GenericCredential[]): s
   return undefined;
 }
 
+// Archive job channels orphaned by a job deletion that pre-dated removeJob's
+// channel cleanup. A recurring job's dedicated channel (kind:"channel",
+// origin:"job") is surfaced on the Recurring Jobs rails (web sidebar + mobile
+// channels) as long as it isn't archived; a job deleted before removeJob
+// learned to archive its channel left the channel behind, matching the
+// clients' `(kind:"channel" || origin:"job") && !archivedAt` filter with no
+// job to decorate it (issue #369). Stamp `archivedAt` on every such orphan so
+// it leaves the lists — history is preserved and it stays addressable by
+// id/URL, mirroring removeJob/rebindJobDelivery's archive semantics.
+//
+// Scope guards (mirror removeJob): only LIVE channels (skip already-archived),
+// never an email-watch channel (`feature === "email-watch"` — that subsystem
+// owns its channels' lifecycle), and never one any surviving job still
+// delivers into via `chatSessionId` or a fan-out route. Idempotent: once every
+// orphan is archived, a re-run finds nothing (the referenced set and the
+// archived guard both hold). No marker needed — the `!archivedAt` guard makes
+// repeat runs no-ops.
+function archiveOrphanJobChannels(state: RuntimeState): void {
+  if (!Array.isArray(state.chatSessions) || state.chatSessions.length === 0) return;
+  const referenced = new Set<string>();
+  for (const job of state.jobs) {
+    if (job.chatSessionId) referenced.add(job.chatSessionId);
+    for (const route of Object.values(job.routes ?? {})) {
+      if (route.chatSessionId) referenced.add(route.chatSessionId);
+    }
+  }
+  let archived = 0;
+  for (const session of state.chatSessions) {
+    if (session.kind !== "channel") continue;
+    if (session.archivedAt) continue;
+    if (session.feature === "email-watch") continue;
+    if (referenced.has(session.id)) continue;
+    session.archivedAt = now();
+    session.updatedAt = now();
+    archived += 1;
+  }
+  if (archived > 0) {
+    addAudit(
+      state,
+      {
+        actor: "runtime",
+        action: "chat.session.archived",
+        target: state.instance,
+        risk: "low",
+        evidence: { reason: "orphan.job.channel.backfill", archived }
+      },
+      { system: true }
+    );
+  }
+}
+
 // Backfill Task.chatSessionId from the chatMessages join for records that
 // pre-date the field. The Tasks page reads task.chatSessionId directly so it
 // no longer has to pull /state for the chatMessages list — but state files
@@ -1257,6 +1309,7 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
   state.emailWatchers ??= [];
   state.events ??= [];
   state.jobRuns ??= [];
+  state.usageLedger ??= [];
   state.chatSessions ??= [];
   state.chatMessages ??= [];
   state.runs ??= [];
@@ -1280,6 +1333,11 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
       session.kind = "channel";
     }
   }
+  // Archive job channels orphaned by a pre-cleanup job deletion (issue #369).
+  // Runs after the channel-kind backfill above so a legacy `origin:"job"`
+  // session that just gained `kind:"channel"` is in scope, and after
+  // `state.jobs` is defaulted so the surviving-job reference scan is safe.
+  archiveOrphanJobChannels(state);
   for (const run of state.runs) {
     run.planStepIds ??= [];
     run.childRunIds ??= [];

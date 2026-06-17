@@ -61,7 +61,7 @@ Stable local clients use the gateway API:
 
 - `/api/status`, `/api/healthz`, `/api/state`
 - `/api/version`, `/api/update/check`, `/api/update`
-- `/api/tasks`, `/api/chat`, `/api/runs`, `/api/authorizations`, `/api/setup-requests`
+- `/api/tasks`, `/api/usage`, `/api/chat`, `/api/runs`, `/api/authorizations`, `/api/setup-requests`
 - `/api/memory/retain`, `/api/memory/recall`, `/api/memory/reflect`, `/api/memory/units`, `/api/memory/banks`, `/api/memory/migrate`
 - `/api/embedding/status`, `/api/embedding/reembed`, `/api/reranker/status`, `/api/stt/status`
 - `/api/uploads` (POST `image/*` or `audio/*`), `GET /api/uploads/:id`

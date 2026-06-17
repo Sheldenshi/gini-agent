@@ -54,7 +54,7 @@ function stateWithToolsets(toolsets: ToolsetRecord[]): RuntimeState {
     mcpServers: [], messagingBridges: [], importReports: [], agents: [],
     activeAgentId: undefined, relays: [], notifications: [], emailWatchers: [], events: [],
     jobRuns: [], chatSessions: [], chatMessages: [], messagingMessages: [],
-    runs: [], planSteps: []
+    runs: [], planSteps: [], usageLedger: []
   };
 }
 

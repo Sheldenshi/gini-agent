@@ -137,9 +137,11 @@ subagents — rather than adding a new one.
   scheduled-job turn) with nothing to report answers with exactly `[SILENT]` to
   suppress delivery. The legacy message layer already drops that `ChatMessageRecord`;
   because the UI renders chat BLOCKS, the in-flight `assistant_text` block is also
-  retracted when the final text is exactly `[SILENT]` (trailing whitespace tolerated,
-  never content that merely contains the token), so the channel never shows a literal
-  `[SILENT]` row, and the durable-message persistence above skips it identically.
+  retracted when the final text reads as silent — the literal token, or a trailing
+  standalone `[SILENT]` line after a no-op preamble (a leading/inline sentinel like
+  `[SILENT] but here's an update` still delivers; see `src/jobs/silent.ts`) — so the
+  channel never shows a literal `[SILENT]` row, and the durable-message persistence
+  above skips it identically.
 
 ## Trust Boundary
 

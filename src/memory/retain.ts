@@ -41,6 +41,7 @@ import {
   listMemoryUnits,
   mutateState,
   now,
+  recordUsage,
   unitsForEntity,
   upsertObservationUnit
 } from "../state";
@@ -105,6 +106,11 @@ export async function retain(config: RuntimeConfig, input: RetainInput): Promise
     validator: factExtractionValidator,
     echoTag: "fact-extraction"
   }, providerOverride);
+  void recordUsage(
+    instance,
+    { source: "memory", agentId: input.agentId, taskId: input.sourceTaskId },
+    extraction.cost
+  ).catch(() => {});
   const facts = extraction.data.facts ?? [];
 
   // 2. Temporal normalization.
@@ -385,6 +391,7 @@ async function regenerateObservation(
     validator: observationExtractionValidator,
     echoTag: `observation:${entityId}`
   }, providerOverride);
+  void recordUsage(instance, { source: "memory", agentId }, result.cost).catch(() => {});
   const observations = result.data.observations.map((entry) => entry.observation).filter(Boolean);
   if (observations.length === 0) return;
   const summary = observations.join(" ");

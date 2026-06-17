@@ -18,6 +18,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { api, ApiError } from "@/src/api";
 import { clearCredentials } from "@/src/auth";
 import { AgentAvatar } from "@/src/components/chat/AgentAvatar";
+import { NewAgentSheet } from "@/src/components/NewAgentSheet";
 import { chatListTime, jobCadence } from "@/src/format";
 import {
   useAgents,
@@ -66,6 +67,12 @@ export default function ChannelsScreen() {
   // would re-create openAgent and weaken a synchronous double-tap.
   const [openingAgentId, setOpeningAgentId] = useState<string | null>(null);
   const openingRef = useRef(false);
+  // Each home section collapses independently. Agents and Recurring Jobs
+  // open by default (the primary content); Archived stays closed — it's a
+  // tucked-away dropdown beneath the active agent list.
+  const [agentsCollapsed, setAgentsCollapsed] = useState(false);
+  const [jobsCollapsed, setJobsCollapsed] = useState(false);
+  const [archivedCollapsed, setArchivedCollapsed] = useState(true);
 
   const unauthorized =
     agents.error instanceof ApiError && agents.error.status === 401;
@@ -253,93 +260,143 @@ export default function ChannelsScreen() {
             />
           }
         >
-          {/* Agents section — active agents only; archived ones render below. */}
-          <View style={styles.sectionHeader}>
-            <Text style={styles.sectionLabel}>Agents</Text>
+          {/* Agents section — collapsible. Active agents render here; the
+              Archived dropdown nests beneath them. */}
+          <TouchableOpacity
+            style={styles.sectionHeader}
+            onPress={() => setAgentsCollapsed((v) => !v)}
+            activeOpacity={0.6}
+            accessibilityRole="button"
+            accessibilityLabel={agentsCollapsed ? "Expand agents" : "Collapse agents"}
+          >
+            <View style={styles.sectionHeaderLeft}>
+              <Feather
+                name={agentsCollapsed ? "chevron-right" : "chevron-down"}
+                size={16}
+                color="#8A8A90"
+              />
+              <Text style={styles.sectionLabel}>Agents</Text>
+            </View>
             <Text style={styles.sectionCount}>{filteredAgents.length}</Text>
-          </View>
-          {filteredAgents.length === 0 ? (
-            <Text style={styles.emptySub}>
-              {query.trim() ? `No agents match “${query}”` : "No agents yet"}
-            </Text>
-          ) : (
-            filteredAgents.map((agent) =>
-              // The default agent can't be archived server-side, so it renders
-              // as a plain row — offering a guaranteed-fail swipe would be a
-              // dead affordance.
-              agent.id === defaultAgentId ? (
-                <AgentRow
-                  key={agent.id}
-                  agent={agent}
-                  opening={openingAgentId === agent.id}
-                  onPress={() => void openAgent(agent)}
-                />
-              ) : (
-                <SwipeableAgentRow
-                  key={agent.id}
-                  agent={agent}
-                  opening={openingAgentId === agent.id}
-                  onPress={() => void openAgent(agent)}
-                  onArchive={confirmArchive}
-                />
-              )
-            )
-          )}
-
-          {/* Recurring Jobs section — channels */}
-          {channelList.length > 0 ? (
+          </TouchableOpacity>
+          {!agentsCollapsed ? (
             <>
-              <View style={[styles.sectionHeader, styles.jobsHeader]}>
-                <View style={styles.jobsHeaderLeft}>
-                  <Feather name="chevron-down" size={14} color="#8A8A90" />
-                  <Text style={styles.sectionLabel}>Recurring Jobs</Text>
-                </View>
-              </View>
-              {channelList.map((channel) => (
-                <ChannelRow
-                  key={channel.id}
-                  channel={channel}
-                  job={jobBySessionId.get(channel.id)}
-                  unreadCount={unreadCounts[channel.id] ?? 0}
-                />
-              ))}
+              {filteredAgents.length === 0 ? (
+                <Text style={styles.emptySub}>
+                  {query.trim() ? `No agents match “${query}”` : "No agents yet"}
+                </Text>
+              ) : (
+                filteredAgents.map((agent) =>
+                  // The default agent can't be archived server-side, so it renders
+                  // as a plain row — offering a guaranteed-fail swipe would be a
+                  // dead affordance.
+                  agent.id === defaultAgentId ? (
+                    <AgentRow
+                      key={agent.id}
+                      agent={agent}
+                      opening={openingAgentId === agent.id}
+                      onPress={() => void openAgent(agent)}
+                    />
+                  ) : (
+                    <SwipeableAgentRow
+                      key={agent.id}
+                      agent={agent}
+                      opening={openingAgentId === agent.id}
+                      onPress={() => void openAgent(agent)}
+                      onArchive={confirmArchive}
+                    />
+                  )
+                )
+              )}
+
+              {/* Archived dropdown — soft-deleted agents, tucked under the
+                  active list and collapsed by default. Rendered only when at
+                  least one agent is archived. */}
+              {archivedAgents.length > 0 ? (
+                <>
+                  <TouchableOpacity
+                    style={[styles.sectionHeader, styles.archivedHeader]}
+                    onPress={() => setArchivedCollapsed((v) => !v)}
+                    activeOpacity={0.6}
+                    accessibilityRole="button"
+                    accessibilityLabel={
+                      archivedCollapsed ? "Expand archived" : "Collapse archived"
+                    }
+                  >
+                    <View style={styles.sectionHeaderLeft}>
+                      <Feather
+                        name={archivedCollapsed ? "chevron-right" : "chevron-down"}
+                        size={14}
+                        color="#8A8A90"
+                      />
+                      <Text style={styles.archivedLabel}>Archived</Text>
+                    </View>
+                    <Text style={styles.sectionCount}>{archivedAgents.length}</Text>
+                  </TouchableOpacity>
+                  {!archivedCollapsed
+                    ? archivedAgents.map((agent) => (
+                        <ArchivedAgentRow
+                          key={agent.id}
+                          agent={agent}
+                          restoring={
+                            unarchiveMutation.isPending &&
+                            unarchiveMutation.variables === agent.id
+                          }
+                          onRestore={() => restoreAgent(agent)}
+                        />
+                      ))
+                    : null}
+                </>
+              ) : null}
             </>
           ) : null}
 
-          {/* Archived section — soft-deleted agents, dimmed, with one-tap
-              restore. Rendered only when at least one agent is archived. */}
-          {archivedAgents.length > 0 ? (
+          {/* Recurring Jobs section — collapsible channels. */}
+          {channelList.length > 0 ? (
             <>
-              <View style={[styles.sectionHeader, styles.jobsHeader]}>
-                <Text style={styles.sectionLabel}>Archived</Text>
-                <Text style={styles.sectionCount}>{archivedAgents.length}</Text>
-              </View>
-              {archivedAgents.map((agent) => (
-                <ArchivedAgentRow
-                  key={agent.id}
-                  agent={agent}
-                  restoring={
-                    unarchiveMutation.isPending &&
-                    unarchiveMutation.variables === agent.id
-                  }
-                  onRestore={() => restoreAgent(agent)}
-                />
-              ))}
+              <TouchableOpacity
+                style={[styles.sectionHeader, styles.jobsHeader]}
+                onPress={() => setJobsCollapsed((v) => !v)}
+                activeOpacity={0.6}
+                accessibilityRole="button"
+                accessibilityLabel={
+                  jobsCollapsed ? "Expand recurring jobs" : "Collapse recurring jobs"
+                }
+              >
+                <View style={styles.sectionHeaderLeft}>
+                  <Feather
+                    name={jobsCollapsed ? "chevron-right" : "chevron-down"}
+                    size={14}
+                    color="#8A8A90"
+                  />
+                  <Text style={styles.sectionLabel}>Recurring Jobs</Text>
+                </View>
+                <Text style={styles.sectionCount}>{channelList.length}</Text>
+              </TouchableOpacity>
+              {!jobsCollapsed
+                ? channelList.map((channel) => (
+                    <ChannelRow
+                      key={channel.id}
+                      channel={channel}
+                      job={jobBySessionId.get(channel.id)}
+                      unreadCount={unreadCounts[channel.id] ?? 0}
+                    />
+                  ))
+                : null}
             </>
           ) : null}
         </ScrollView>
       )}
 
-      {createOpen ? (
-        <NewAgentInline
-          name={newAgentName}
-          error={newAgentError}
-          creating={createAgent.isPending}
-          onChangeName={setNewAgentName}
-          onSubmit={onSubmitNewAgent}
-          onCancel={() => setCreateOpen(false)}
-        />
-      ) : null}
+      <NewAgentSheet
+        visible={createOpen}
+        name={newAgentName}
+        error={newAgentError}
+        creating={createAgent.isPending}
+        onChangeName={setNewAgentName}
+        onSubmit={onSubmitNewAgent}
+        onCancel={() => setCreateOpen(false)}
+      />
     </SafeAreaView>
   );
 }
@@ -522,77 +579,6 @@ function ChannelRow({
   );
 }
 
-// Lightweight inline name-entry overlay for creating an agent. Anchored
-// to the bottom of the screen above the home indicator so it doesn't
-// fight the list for space.
-function NewAgentInline({
-  name,
-  error,
-  creating,
-  onChangeName,
-  onSubmit,
-  onCancel
-}: {
-  name: string;
-  error: string | null;
-  creating: boolean;
-  onChangeName: (v: string) => void;
-  onSubmit: () => void;
-  onCancel: () => void;
-}) {
-  const submitDisabled = creating || name.trim().length === 0;
-  return (
-    <View style={styles.createOverlay}>
-      <Text style={styles.createTitle}>New agent</Text>
-      <TextInput
-        value={name}
-        onChangeText={onChangeName}
-        placeholder="Agent name"
-        placeholderTextColor={theme.placeholder}
-        autoFocus
-        autoCapitalize="words"
-        autoCorrect={false}
-        returnKeyType="done"
-        onSubmitEditing={() => {
-          if (!submitDisabled) onSubmit();
-        }}
-        editable={!creating}
-        style={styles.createInput}
-        accessibilityLabel="Agent name"
-      />
-      {error ? <Text style={styles.createError}>{error}</Text> : null}
-      <View style={styles.createActions}>
-        <TouchableOpacity
-          onPress={onCancel}
-          disabled={creating}
-          style={[styles.createButton, styles.createCancel]}
-          accessibilityRole="button"
-          accessibilityLabel="Cancel"
-        >
-          <Text style={styles.createCancelText}>Cancel</Text>
-        </TouchableOpacity>
-        <TouchableOpacity
-          onPress={onSubmit}
-          disabled={submitDisabled}
-          style={[
-            styles.createButton,
-            styles.createSubmit,
-            submitDisabled && styles.createButtonDisabled
-          ]}
-          accessibilityRole="button"
-          accessibilityLabel="Create agent"
-        >
-          {creating ? (
-            <ActivityIndicator color={theme.buttonText} />
-          ) : (
-            <Text style={styles.createSubmitText}>Create</Text>
-          )}
-        </TouchableOpacity>
-      </View>
-    </View>
-  );
-}
-
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: theme.bg },
 
@@ -642,11 +628,20 @@ const styles = StyleSheet.create({
     paddingBottom: 8
   },
   jobsHeader: { paddingTop: 18 },
-  jobsHeaderLeft: { flexDirection: "row", alignItems: "center", gap: 6 },
+  sectionHeaderLeft: { flexDirection: "row", alignItems: "center", gap: 6 },
+  // Nested under the active agent list — indented and lighter so it reads as
+  // a sub-dropdown of Agents rather than a top-level section.
+  archivedHeader: { paddingLeft: 8, paddingTop: 6 },
   sectionLabel: {
     color: "#6A6A70",
     fontFamily: family("HankenGrotesk", 700),
     fontSize: 13,
+    letterSpacing: 0.3
+  },
+  archivedLabel: {
+    color: "#8A8A90",
+    fontFamily: family("HankenGrotesk", 600),
+    fontSize: 12,
     letterSpacing: 0.3
   },
   sectionCount: {
@@ -770,66 +765,5 @@ const styles = StyleSheet.create({
     color: theme.accent,
     fontFamily: family("HankenGrotesk", 500),
     fontSize: 14
-  },
-
-  // Create-agent overlay.
-  createOverlay: {
-    position: "absolute",
-    left: 16,
-    right: 16,
-    bottom: 24,
-    backgroundColor: theme.bg,
-    borderRadius: 16,
-    borderWidth: 1,
-    borderColor: theme.inputBorder,
-    padding: 16,
-    gap: 12,
-    shadowColor: "#000",
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.12,
-    shadowRadius: 16,
-    elevation: 8
-  },
-  createTitle: {
-    color: theme.text,
-    fontFamily: family("HankenGrotesk", 700),
-    fontSize: 17
-  },
-  createInput: {
-    backgroundColor: theme.bg,
-    color: theme.text,
-    fontFamily: family("HankenGrotesk", 400),
-    fontSize: 16,
-    paddingHorizontal: 14,
-    paddingVertical: 12,
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: theme.inputBorder
-  },
-  createError: {
-    color: theme.danger,
-    fontFamily: family("HankenGrotesk", 400),
-    fontSize: 13
-  },
-  createActions: { flexDirection: "row", gap: 8 },
-  createButton: {
-    flex: 1,
-    height: 44,
-    borderRadius: 10,
-    alignItems: "center",
-    justifyContent: "center"
-  },
-  createCancel: { backgroundColor: theme.bg, borderWidth: 1, borderColor: theme.inputBorder },
-  createCancelText: {
-    color: theme.text,
-    fontFamily: family("HankenGrotesk", 600),
-    fontSize: 15
-  },
-  createSubmit: { backgroundColor: theme.accent },
-  createSubmitText: {
-    color: theme.buttonText,
-    fontFamily: family("HankenGrotesk", 600),
-    fontSize: 15
-  },
-  createButtonDisabled: { opacity: 0.5 }
+  }
 });

@@ -2911,7 +2911,8 @@ describe("tunnel auto-reconnect", () => {
     "GINI_TUNNEL_RECONNECT_BASE_MS",
     "GINI_TUNNEL_RECONNECT_MAX_MS",
     "GINI_TUNNEL_RELAY_READY_TIMEOUT_MS",
-    "GINI_TUNNEL_SHUTDOWN_DRAIN_MS"
+    "GINI_TUNNEL_SHUTDOWN_DRAIN_MS",
+    "GINI_TUNNEL_RELAY_SETTLE_MS"
   ] as const;
   let prev: Record<string, string | undefined> = {};
 
@@ -3356,5 +3357,123 @@ describe("tunnel auto-reconnect", () => {
     } finally {
       chmodSync(stateDir, 0o700); // restore so afterEach cleanup can remove it
     }
+  });
+
+  // Seed a connected gini-relay record as if the runtime was fronting a tunnel
+  // before this restart (the block has no shared seed helper).
+  async function seedRelayConnected(c: RuntimeConfig): Promise<void> {
+    await mutateState(c.instance, (s) => {
+      s.tunnel = {
+        instance: c.instance,
+        selectedProvider: "gini-relay",
+        status: "connected",
+        url: "https://subdom7.relay.test",
+        subdomain: "subdom7",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z"
+      };
+    });
+  }
+
+  // The relay-registration settle: by default (knob unset) a resume registers
+  // its frpc immediately after the gateway bind — no added delay, buildTunnel
+  // runs once.
+  test("relay resume applies NO settle by default", async () => {
+    let built = 0;
+    setTunnelDeps(deps({ resolveLocalPort: (c) => c.port, buildTunnel: () => { built += 1; return crashableChild(); } }));
+    await seedRelayConnected(config);
+    await reconcileTunnelOnStartup(config, { gatewayReady: Promise.resolve() });
+    await awaitTunnelSettled(config.instance);
+    expect(getTunnel(config).status).toBe("connected");
+    expect(built).toBe(1);
+  });
+
+  // With the knob set, the resume waits for the settle AFTER the gateway bind and
+  // BEFORE building frpc — so a prior process's relay registration can drop first.
+  // Asserted by ordering, not wall-clock: buildTunnel must run only after the
+  // gateway-ready gate AND the settle have both elapsed.
+  test("relay resume waits the configured settle before registering frpc", async () => {
+    process.env.GINI_TUNNEL_RELAY_SETTLE_MS = "40";
+    const ready = Promise.withResolvers<void>();
+    let built = 0;
+    setTunnelDeps(deps({ resolveLocalPort: (c) => c.port, buildTunnel: () => { built += 1; return crashableChild(); } }));
+    await seedRelayConnected(config);
+    await reconcileTunnelOnStartup(config, { gatewayReady: ready.promise });
+    // Gateway not yet bound: nothing built.
+    expect(built).toBe(0);
+    ready.resolve();
+    // The bind resolved, but the settle still gates the build — it must not have
+    // happened in the same microtask flush.
+    for (let i = 0; i < 5; i += 1) await Promise.resolve();
+    expect(built).toBe(0);
+    // After the settle elapses, the rebuild proceeds.
+    await awaitTunnelSettled(config.instance);
+    expect(built).toBe(1);
+    expect(getTunnel(config).status).toBe("connected");
+  });
+
+  // A cancel landing DURING the settle must bail the resume without building or
+  // publishing — the supersede check after the sleep catches it.
+  test("relay resume cancelled during the settle bails without building", async () => {
+    process.env.GINI_TUNNEL_RELAY_SETTLE_MS = "60";
+    let built = 0;
+    setTunnelDeps(deps({ resolveLocalPort: (c) => c.port, buildTunnel: () => { built += 1; return crashableChild(); } }));
+    await seedRelayConnected(config);
+    await reconcileTunnelOnStartup(config, { gatewayReady: Promise.resolve() });
+    const settled = awaitTunnelSettled(config.instance);
+    // Cancel while the resume is parked in the settle sleep.
+    const cancelled = await cancelTunnel(config);
+    expect(cancelled.status).toBe("idle");
+    await settled;
+    expect(built).toBe(0);
+    expect(getTunnel(config).status).toBe("idle");
+  });
+
+  // A manual provider resume must NOT apply the relay settle (it mints a fresh
+  // subdomain / is machine-global, so there is no same-subdomain collision).
+  test("a manual provider resume ignores the relay settle", async () => {
+    process.env.GINI_TUNNEL_RELAY_SETTLE_MS = "10000"; // huge: would stall a relay resume
+    const ready = Promise.withResolvers<void>();
+    let connects = 0;
+    setTunnelDeps(
+      deps({
+        resolveLocalPort: (c) => c.port,
+        drivers: fakeDrivers({
+          tailscale: scriptedDriver({
+            connect: () => { connects += 1; return Promise.resolve({ url: "https://machine.tail-test.ts.net" }); }
+          })
+        })
+      })
+    );
+    await mutateState(config.instance, (s) => {
+      s.tunnel = {
+        instance: config.instance,
+        selectedProvider: "tailscale",
+        status: "connected",
+        url: "https://machine.tail-test.ts.net",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z"
+      };
+    });
+    await reconcileTunnelOnStartup(config, { gatewayReady: ready.promise });
+    ready.resolve();
+    await awaitTunnelSettled(config.instance);
+    // No 10s stall: the manual resume connected promptly, ignoring the relay knob.
+    expect(connects).toBe(1);
+    expect(getTunnel(config).status).toBe("connected");
+  });
+
+  // relayRegistrationSettleMs env parsing: unset/blank/0/negative/NaN -> 0 (no
+  // settle); a positive value is honored. Exercised through the observable resume
+  // behavior — a blank/invalid value must not add a delay.
+  test("an invalid relay-settle env adds no delay (parses to 0)", async () => {
+    process.env.GINI_TUNNEL_RELAY_SETTLE_MS = "not-a-number";
+    let built = 0;
+    setTunnelDeps(deps({ resolveLocalPort: (c) => c.port, buildTunnel: () => { built += 1; return crashableChild(); } }));
+    await seedRelayConnected(config);
+    await reconcileTunnelOnStartup(config, { gatewayReady: Promise.resolve() });
+    await awaitTunnelSettled(config.instance);
+    expect(built).toBe(1);
+    expect(getTunnel(config).status).toBe("connected");
   });
 });
