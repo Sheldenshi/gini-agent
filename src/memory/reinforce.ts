@@ -27,6 +27,7 @@ import {
   appendTrace,
   entityMentionsForUnit,
   listMemoryUnits,
+  recordUsage,
   unitsForEntity,
   updateMemoryUnitConfidence
 } from "../state";
@@ -74,6 +75,7 @@ export async function reinforceOpinionsForUnits(
           validator: opinionAssessmentValidator,
           echoTag: `assess:${opinion.id}`
         }, providerOverride);
+        void recordUsage(instance, { source: "memory", agentId: unit.agentId ?? undefined, taskId: unit.sourceTaskId ?? undefined }, result.cost).catch(() => {});
         const before = opinion.confidence ?? 0.5;
         const after = applyVerdict(before, result.data.verdict);
         if (after !== before) {

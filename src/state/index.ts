@@ -16,6 +16,7 @@ export {
 } from "./store";
 export { appendTrace, readTrace, tracePath, appendLog } from "./trace";
 export { addAudit, appendEvent } from "./audit";
+export { recordUsage, applyUsage, localDayKey } from "./usage";
 export { recordProviderAuthFailure, clearProviderAuthFailureIfPresent } from "./provider-auth";
 export {
   getMemoryDb,

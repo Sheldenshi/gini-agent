@@ -37,6 +37,7 @@ import {
   now,
   readState,
   recordProviderAuthFailure,
+  recordUsage,
   upsertTask
 } from "./state";
 import type { AgentContext } from "./state/audit";
@@ -711,6 +712,7 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
       hindsightUnitsRecalled
     }
   });
+  void recordUsage(config.instance, { source: "imperative", taskId, agentId: task.agentId }, providerResult.cost).catch(() => {});
 
   task = await mutateState(config.instance, (state) => {
     const item = findTask(state, taskId);

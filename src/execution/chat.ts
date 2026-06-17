@@ -15,6 +15,7 @@ import {
   mutateState,
   publishChatSession,
   readState,
+  recordUsage,
   removePendingChatMessage,
   renameChatSession,
   sessionHasInFlightChatTask,
@@ -852,7 +853,7 @@ export async function autoRenameChatAfterTurn(config: RuntimeConfig, sessionId: 
   );
   if (userBlocks.length < AUTO_RENAME_USER_TURNS || assistantBlocks.length < AUTO_RENAME_ASSISTANT_TURNS) return;
 
-  const title = await generateChatTitleFromBlocks(config, blocks);
+  const title = await generateChatTitleFromBlocks(config, blocks, session.agentId);
   if (!title) return;
 
   let renamed = false;
@@ -884,7 +885,8 @@ function isScheduledJobDeliverySession(state: ReturnType<typeof readState>, sess
 
 async function generateChatTitleFromBlocks(
   config: RuntimeConfig,
-  blocks: ChatBlock[]
+  blocks: ChatBlock[],
+  agentId: string | undefined
 ): Promise<string | undefined> {
   const turns = blocks
     .filter((b) => b.kind === "user_text" || (b.kind === "assistant_text" && !b.streaming))
@@ -918,6 +920,7 @@ async function generateChatTitleFromBlocks(
     },
     providerOverrideForRuntime(config)
   );
+  void recordUsage(config.instance, { source: "chat-title", agentId }, result.cost).catch(() => {});
   return result.data.title || undefined;
 }
 

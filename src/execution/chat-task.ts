@@ -25,7 +25,8 @@ import {
   now,
   readState,
   readTrace,
-  recordProviderAuthFailure
+  recordProviderAuthFailure,
+  recordUsage
 } from "../state";
 import { id as makeId } from "../state/ids";
 import { readGoogleAccounts } from "../state/google-accounts";
@@ -83,7 +84,8 @@ import type {
   SubagentRecord,
   Task,
   TaskToolCallState,
-  ToolCallSummary
+  ToolCallSummary,
+  UsageContext
 } from "../types";
 import type { EffectiveContext } from "./effective-context";
 import { updateRunFromTask } from "./runs";
@@ -1807,6 +1809,16 @@ async function runLoop(
   // entry runChatTask hands us the already-resolved EffectiveContext;
   // resumeChatTask omits it so the resume picks up any agent change.
   const effective = inheritedEffective ?? resolveEffectiveContext(state0, config);
+  // Usage-ledger attribution for every model call in this turn. The source
+  // distinguishes a subagent child / scheduled job / ordinary chat by the
+  // task's own provenance; compaction/aux calls override source to "aux".
+  const usageBaseCtx: UsageContext = {
+    source: taskRow?.subagentId || taskRow?.parentTaskId ? "subagent" : taskRow?.jobId ? "job" : "chat",
+    agentId: effective.agentId,
+    taskId,
+    jobId: taskRow?.jobId,
+    subagentId: taskRow?.subagentId
+  };
   // Provider override passed into generateToolCallingResponse / generateAuxText
   // below. We must pass the RESOLVED provider whenever it differs from
   // config.provider — an agent override OR a transient dispatch fallback (the
@@ -2352,6 +2364,7 @@ async function runLoop(
               providerOverride
             );
             accumulatedCost = addCost(accumulatedCost, aux.cost);
+            void recordUsage(config.instance, { ...usageBaseCtx, source: "aux" }, aux.cost).catch(() => {});
             summaryText = aux.text.trim();
           } catch (error) {
             // No usable aux model — compaction is impossible, and pruning
@@ -2501,6 +2514,7 @@ async function runLoop(
     await flushChain;
     await enqueueFlush();
     accumulatedCost = addCost(accumulatedCost, result.cost);
+    void recordUsage(config.instance, usageBaseCtx, result.cost).catch(() => {});
     // Recalibrate the trim budget from the provider's real prompt-token
     // count for this call (when reported). Applies from the NEXT iteration's
     // elision pass onward.
@@ -3385,6 +3399,7 @@ async function runLoop(
       throw error;
     }
     accumulatedCost = addCost(accumulatedCost, summaryResult.cost);
+    void recordUsage(config.instance, usageBaseCtx, summaryResult.cost).catch(() => {});
     // Same clear seam as the main loop: a successful summary call proves the
     // credential works, so drop any persistent needs-reauth record (issue
     // #233). Lock-free check first — no state write on the healthy path.

@@ -24,7 +24,8 @@ import {
   isTerminalTaskStatus,
   mutateState,
   now,
-  readState
+  readState,
+  recordUsage
 } from "../state";
 import { accountSelectionNeeded, addEmailWatcher, clearEmailWatcherObjective, listEmailWatchers, removeEmailWatcher, setEmailTriageEnabled, setEmailWatcherEnabled, setEmailWatcherObjective } from "../state/email-watchers";
 import { ApprovalRaceLostError, ApprovedActionFailedError, TaskAlreadyTerminalError, cancelTask, findTask, resolveAuthorization, runTerminalCommand } from "../agent";
@@ -727,8 +728,10 @@ async function accumulateBrowserVisionCost(
   ) {
     return;
   }
+  let visionAgentId: string | undefined;
   await mutateState(config.instance, (state: RuntimeState) => {
     const item = findTask(state, taskId);
+    visionAgentId = item.agentId;
     const sum = (a: number | undefined, b: number | undefined): number | undefined => {
       if (a === undefined && b === undefined) return undefined;
       return (a ?? 0) + (b ?? 0);
@@ -744,6 +747,22 @@ async function accumulateBrowserVisionCost(
     };
     item.updatedAt = now();
   });
+  // Also record this out-of-band vision spend into the durable usage ledger
+  // (the home chart's sole source). The same call folds into task.cost above
+  // for the live per-turn display; the chart never sums task.cost, so there is
+  // no double count.
+  void recordUsage(
+    config.instance,
+    { source: "vision", taskId, agentId: visionAgentId },
+    {
+      provider: increment.provider ?? "",
+      model: increment.model ?? "",
+      inputTokens: increment.inputTokens,
+      outputTokens: increment.outputTokens,
+      totalTokens: increment.totalTokens,
+      estimatedUsd: increment.estimatedUsd
+    }
+  ).catch(() => {});
 }
 
 // Classify a host string as one of: loopback (127/8, ::1, "localhost",
