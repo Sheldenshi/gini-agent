@@ -8,7 +8,7 @@ The OAuth client Gini uses lives in **your own** Google Cloud project. Your cred
 
 - A Google account. A personal **@gmail.com** works — you do **not** need a paid Google Workspace subscription.
 - **No credit card.** The Google Workspace APIs are free, so there's no billing account and no card on file. This is the exception to Google Cloud's usual rules: most Cloud APIs require billing, but the Workspace ones don't.
-- macOS or Linux. Gini installs the `gws` and `gcloud` command-line tools for you — no package manager required (it uses npm or a checksum-verified download, and Homebrew only if you already have it).
+- macOS or Linux. Gini installs the `gws` and `gcloud` command-line tools for you — no package manager required (it uses `bun`, which ships with Gini, or a checksum-verified download, and Homebrew only if you already have it).
 
 ## How setup works
 

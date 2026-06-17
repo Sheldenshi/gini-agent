@@ -2,7 +2,7 @@
 name: google-workspace-setup
 description: "One-time setup for gws: install, OAuth, scopes, auto-approve."
 license: MIT
-compatibility: "macOS and Linux. Needs a Google account; installs gws via npm or a checksum-verified release binary (Homebrew optional)."
+compatibility: "macOS and Linux. Needs a Google account; installs gws via bun (or a checksum-verified release binary), no package manager required."
 metadata:
   gini:
     version: 3.8.0
@@ -69,16 +69,18 @@ command -v gcloud
 
 ### Install `gws` — pick the first method that fits, in this order
 
-Homebrew is **not** required and is not the first choice. Try the methods top to bottom and stop at the first that works:
+Try the methods top to bottom and stop at the first that works:
 
-1. **npm (preferred when Node 18+ is present).** The `@googleworkspace/cli` package is published by Google with npm provenance, and its install step downloads the matching binary from the canonical GitHub release and verifies its SHA256 before installing:
+1. **`bun add -g` (preferred — `bun` ships with Gini, so it's always present).** The `@googleworkspace/cli` package is published by Google with npm provenance; its `run.js` wrapper lazily downloads the matching binary from the canonical GitHub release on first invocation and **verifies its SHA256 before extracting** (bun blocks the package's postinstall by default, so the fetch happens on first run, not at install — this is expected). The wrapper lands on `$PATH` at `~/.bun/bin/gws`:
 
    ```bash
-   command -v node && node -v   # need v18+
-   npm install -g @googleworkspace/cli
+   bun add -g @googleworkspace/cli
+   gws --version   # triggers the lazy, checksum-verified binary download
    ```
 
-2. **Pre-built release binary (no Node, no Homebrew — works with just `curl`/`tar`/`shasum`).** This is upstream's own recommended method. Resolve the platform target triple, download the binary AND its `.sha256`, and **verify the checksum before installing — abort if it fails**:
+   `npm install -g @googleworkspace/cli` is equivalent (same package, same provenance, fetches at install time) — use it only if `bun` is somehow absent and `node`/`npm` are present.
+
+2. **Pre-built release binary (no `bun`/`npm` at all — works with just `curl`/`tar`/`shasum`).** This is upstream's own recommended method. Resolve the platform target triple, download the binary AND its `.sha256`, and **verify the checksum before installing — abort if it fails**:
 
    ```bash
    case "$(uname -s)-$(uname -m)" in
@@ -108,24 +110,48 @@ Homebrew is **not** required and is not the first choice. Try the methods top to
 
 ### Install `gcloud`
 
-```bash
-# Homebrew, only if brew already exists:
-command -v brew && brew install --cask google-cloud-sdk
+If `brew` is already installed, use it:
 
-# Otherwise (macOS or Linux) — official tarball install, no package manager:
-# https://docs.cloud.google.com/sdk/docs/install-sdk
-# Download google-cloud-cli-<platform>.tar.gz from dl.google.com, extract, run
-# ./google-cloud-sdk/install.sh --quiet, via terminal_exec.
+```bash
+command -v brew && brew install --cask google-cloud-sdk
 ```
+
+Otherwise (macOS or Linux, no package manager) install the official tarball from `dl.google.com` into a stable home (`~/google-cloud-sdk`) and put it on `$PATH` yourself. `install.sh --quiet` does **not** add gcloud to `$PATH` on its own, so we pass `--path-update=false` and append the PATH line explicitly — `terminal_exec` spawns a fresh login shell per command, so a `.zshrc` line written here IS picked up by the next command:
+
+```bash
+case "$(uname -s)-$(uname -m)" in
+  Darwin-arm64)   GCLOUD_ASSET=google-cloud-cli-darwin-arm.tar.gz ;;
+  Darwin-x86_64)  GCLOUD_ASSET=google-cloud-cli-darwin-x86_64.tar.gz ;;
+  Linux-x86_64)   GCLOUD_ASSET=google-cloud-cli-linux-x86_64.tar.gz ;;
+  Linux-aarch64)  GCLOUD_ASSET=google-cloud-cli-linux-arm.tar.gz ;;
+  *) echo "unsupported platform: $(uname -s)-$(uname -m)" >&2; exit 1 ;;
+esac
+curl -fsSL -o "/tmp/$GCLOUD_ASSET" "https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/$GCLOUD_ASSET"
+rm -rf "$HOME/google-cloud-sdk"
+tar -xzf "/tmp/$GCLOUD_ASSET" -C "$HOME"
+"$HOME/google-cloud-sdk/install.sh" --quiet --usage-reporting=false --command-completion=false --path-update=false
+# Put gcloud on PATH for this and future login shells (idempotent).
+LINE='export PATH="$HOME/google-cloud-sdk/bin:$PATH"'
+grep -qxF "$LINE" "$HOME/.zshrc" 2>/dev/null || echo "$LINE" >> "$HOME/.zshrc"
+```
+
+For the rest of this flow, invoke gcloud by its absolute path `"$HOME/google-cloud-sdk/bin/gcloud"` (or rely on the next login shell picking up the `.zshrc` line) so a not-yet-refreshed `$PATH` can't make a bare `gcloud` call fail.
 
 ### Verify and the no-thrash rule
 
 ```bash
 gws --version
-gcloud --version
+# gcloud may not be on PATH yet in the CURRENT shell if you just tarball-installed
+# it; verify by absolute path (the next login shell picks up the .zshrc line):
+"$HOME/google-cloud-sdk/bin/gcloud" --version 2>/dev/null || gcloud --version
 ```
 
-**Do not thrash.** When a method fails, move to the **next method in the list once**, not back to the same dead end. Specifically: do **not** try to install Homebrew, do **not** repeatedly `ls /opt/homebrew/...` probing for a brew that isn't there, do **not** open a PTY to coax an interactive installer, and do **not** web-search for an install command. If all three `gws` methods fail (or `gcloud`'s both fail), STOP and tell the user verbatim what failed plus the single command to run manually — one of the blocks above — then wait. A clean hand-off beats a long loop.
+**Do not thrash.** When a method fails, move to the **next method in the list once**, not back to the same dead end. Specifically:
+
+- Do **not** try to install Homebrew. Its installer requires `sudo` (it creates and chowns `/opt/homebrew` or `/usr/local` on first run), which is an interactive privilege escalation an unattended agent cannot and must not drive — that is exactly why `bun add -g` and the release-binary download are the primary paths.
+- Do **not** repeatedly `ls /opt/homebrew/...` probing for a brew that isn't there, do **not** open a PTY to coax an interactive installer, and do **not** web-search for an install command.
+
+If every `gws` method fails (or both `gcloud` paths fail), STOP and tell the user verbatim what failed plus the single command to run manually — one of the blocks above — then wait. A clean hand-off beats a long loop.
 
 ## Step 3 — Sign in with `gcloud`
 
