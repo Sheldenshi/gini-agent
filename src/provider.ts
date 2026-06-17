@@ -5,7 +5,7 @@ import { buildAgentSystemContext, renderEphemeralContext } from "./system-prompt
 import { loadInstructions, loadSoul, loadUserProfile } from "./runtime/identity-files";
 import { readState } from "./state";
 import { appendTrace } from "./state/trace";
-import { bedrockSupportsStreamingWithTools, bedrockSupportsToolUse, resolveProviderModality } from "./provider-capabilities";
+import { bedrockSupportsStreamingWithTools, bedrockSupportsToolUse, estimateUsd, resolveProviderModality } from "./provider-capabilities";
 import { resolveAwsCredentials, signAwsRequest } from "./aws-sigv4";
 import type { CostRecord, ProviderAuthFailureRecord, ProviderAuthStatus, ProviderCatalogItem, ProviderConfig, ProviderName, ProviderReauthInfo, ProviderResult, RuntimeConfig, SystemNoteAuthError } from "./types";
 
@@ -2013,6 +2013,7 @@ async function callAnthropicStructured<T>(
     data: request.validator.parse(parsed),
     raw: cleaned,
     usage: result.usage,
+    cost: estimateCost(provider, result.usage),
     provider
   };
 }
@@ -2509,6 +2510,7 @@ async function callBedrockStructured<T>(
     data: request.validator.parse(parsed),
     raw: cleaned,
     usage: result.usage,
+    cost: estimateCost(provider, result.usage),
     provider
   };
 }
@@ -2906,6 +2908,7 @@ export interface StructuredResult<T> {
   data: T;
   raw: string;
   usage?: Record<string, unknown>;
+  cost?: CostRecord;
   provider: ProviderConfig;
 }
 
@@ -2965,6 +2968,7 @@ export async function generateStructured<T>(
       data: request.validator.parse(stub ?? {}),
       raw,
       usage: { input_tokens: request.system.length + request.user.length, output_tokens: raw.length },
+      cost: estimateCost(provider, { input_tokens: request.system.length + request.user.length, output_tokens: raw.length }),
       provider
     };
   }
@@ -3050,6 +3054,7 @@ async function callStructuredCodex<T>(
     data: request.validator.parse(parsed),
     raw: cleaned,
     usage: streamed.usage,
+    cost: estimateCost(provider, streamed.usage),
     provider
   };
 }
@@ -3108,6 +3113,7 @@ async function callStructuredChatCompletions<T>(
     data: request.validator.parse(parsed),
     raw: text,
     usage: isRecord(payload.usage) ? payload.usage : undefined,
+    cost: estimateCost(provider, isRecord(payload.usage) ? payload.usage : undefined),
     provider
   };
 }
@@ -3618,7 +3624,7 @@ function estimateCost(provider: ProviderConfig, usage?: Record<string, unknown>)
     inputTokens,
     outputTokens,
     totalTokens,
-    estimatedUsd: undefined
+    estimatedUsd: estimateUsd(provider, inputTokens, outputTokens)
   };
 }
 
