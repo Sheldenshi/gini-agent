@@ -67,6 +67,16 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
+// The shape Expo's winter fetch (the global on device) throws on abort: a
+// FetchError whose name is NOT "AbortError" and whose message is prefixed
+// "fetch failed:". Modeled here so the abort tests reflect device behavior
+// rather than the whatwg-fetch DOMException shape.
+function makeFetchError(): Error {
+  const err = new Error("fetch failed: The operation was aborted.");
+  err.name = "FetchError";
+  return err;
+}
+
 beforeEach(async () => {
   deviceToken = null;
   uploadResult = { status: 200, body: "{}" };
@@ -93,16 +103,14 @@ describe("api() request timeout (issue #396)", () => {
   });
 
   test("a request that never resolves is aborted by the timeout and surfaces ApiError(0)", async () => {
-    // fetch honours the signal: reject with an AbortError when it fires,
-    // mirroring the RN whatwg-fetch polyfill.
+    // On abort, reject with an Expo-winter-fetch-shaped error: a FetchError
+    // whose name is NOT "AbortError" (that's exactly what the device throws).
+    // Classification keys off our own didTimeout flag, not the error name, so
+    // this must still surface ApiError(0) rather than the raw FetchError.
     setFetch(
       (_url, init) =>
         new Promise<Response>((_resolve, reject) => {
-          init?.signal?.addEventListener("abort", () => {
-            const err = new Error("Aborted");
-            err.name = "AbortError";
-            reject(err);
-          });
+          init?.signal?.addEventListener("abort", () => reject(makeFetchError()));
         })
     );
 
@@ -117,14 +125,11 @@ describe("api() request timeout (issue #396)", () => {
     // and streams the body lazily, so a gateway that flushes headers then
     // stalls the body would hang on response.text() forever if the timeout
     // were cleared right after fetch(). Model that: fetch() resolves a
-    // Response whose text() only settles when the abort signal fires.
+    // Response whose text() only settles (with a FetchError, like the device)
+    // when the abort signal fires.
     setFetch((_url, init) => {
       const body = new Promise<string>((_resolve, reject) => {
-        init?.signal?.addEventListener("abort", () => {
-          const e = new Error("Aborted");
-          e.name = "AbortError";
-          reject(e);
-        });
+        init?.signal?.addEventListener("abort", () => reject(makeFetchError()));
       });
       const response = {
         ok: true,
@@ -145,11 +150,7 @@ describe("api() request timeout (issue #396)", () => {
     setFetch(
       (_url, init) =>
         new Promise<Response>((_resolve, reject) => {
-          init?.signal?.addEventListener("abort", () => {
-            const err = new Error("Aborted");
-            err.name = "AbortError";
-            reject(err);
-          });
+          init?.signal?.addEventListener("abort", () => reject(makeFetchError()));
         })
     );
 
@@ -158,10 +159,10 @@ describe("api() request timeout (issue #396)", () => {
     );
     controller.abort();
     const err = await pending;
-    // Not an ApiError(0) timeout — the caller cancelled, so the original
-    // AbortError propagates unchanged.
+    // Our timer never fired (didTimeout false) — the caller cancelled — so
+    // the original error propagates unchanged, NOT wrapped as ApiError(0).
     expect(err).not.toBeInstanceOf(ApiError);
-    expect((err as Error).name).toBe("AbortError");
+    expect((err as Error).message).toContain("aborted");
   });
 
   test("an already-aborted caller signal aborts the request immediately", async () => {
@@ -171,25 +172,18 @@ describe("api() request timeout (issue #396)", () => {
     setFetch((_url, init) => {
       sawAbortedSignal = init?.signal?.aborted === true;
       return new Promise<Response>((_resolve, reject) => {
-        init?.signal?.addEventListener("abort", () => {
-          const err = new Error("Aborted");
-          err.name = "AbortError";
-          reject(err);
-        });
-        if (init?.signal?.aborted) {
-          const err = new Error("Aborted");
-          err.name = "AbortError";
-          reject(err);
-        }
+        init?.signal?.addEventListener("abort", () => reject(makeFetchError()));
+        if (init?.signal?.aborted) reject(makeFetchError());
       });
     });
 
     const err = await api("/agents", { signal: controller.signal }).catch((e) => e);
     expect(sawAbortedSignal).toBe(true);
-    expect((err as Error).name).toBe("AbortError");
+    // Caller already cancelled before the timer → rethrown raw, not ApiError(0).
+    expect(err).not.toBeInstanceOf(ApiError);
   });
 
-  test("a non-AbortError fetch rejection (network failure) propagates unchanged", async () => {
+  test("a non-timeout fetch rejection (network failure) propagates unchanged", async () => {
     setFetch(async () => {
       throw new TypeError("Network request failed");
     });

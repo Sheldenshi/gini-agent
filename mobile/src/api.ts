@@ -129,7 +129,19 @@ export async function api<T = unknown>(path: string, init: ApiOptions = {}): Pro
   const method = (rest.method ?? "GET").toUpperCase();
   const defaultTimeout = method === "GET" ? GET_TIMEOUT_MS : WRITE_TIMEOUT_MS;
   const timeout = timeoutMs ?? defaultTimeout;
-  const timer = setTimeout(() => controller.abort(), timeout);
+  // Track WHY the controller aborted with an explicit flag rather than
+  // sniffing the thrown error's name. The aborted-request error shape is
+  // runtime-specific — RN's whatwg-fetch throws a DOMException named
+  // "AbortError", but Expo's winter fetch (the global on device) throws
+  // its own FetchError that is NOT named "AbortError" — so a name check
+  // would misclassify the timeout on device and let the raw error escape
+  // instead of the tagged ApiError(0). The flag is set only by our timer,
+  // so a caller-initiated cancel never trips it.
+  let didTimeout = false;
+  const timer = setTimeout(() => {
+    didTimeout = true;
+    controller.abort();
+  }, timeout);
   const onCallerAbort = () => controller.abort();
   if (callerSignal) {
     if (callerSignal.aborted) controller.abort();
@@ -153,12 +165,11 @@ export async function api<T = unknown>(path: string, init: ApiOptions = {}): Pro
     }
     return value as T;
   } catch (err) {
-    // A timeout-driven abort (our timer fired while the caller's own
-    // signal, if any, is still live) becomes a tagged transport error so
-    // the query settles into isError instead of staying pending forever.
-    // A caller-initiated abort is a real cancellation — rethrow it as-is
-    // so React Query treats it as a cancelled query, not a failure.
-    if (isAbortError(err) && !callerSignal?.aborted) {
+    // Our timer fired → tagged transport error so the query settles into
+    // isError instead of staying pending forever. A caller-initiated abort
+    // (didTimeout false) is a real cancellation — rethrow as-is so React
+    // Query treats it as a cancelled query, not a failure.
+    if (didTimeout) {
       throw new ApiError(0, `Request to ${path} timed out`);
     }
     throw err;
@@ -166,14 +177,6 @@ export async function api<T = unknown>(path: string, init: ApiOptions = {}): Pro
     clearTimeout(timer);
     if (callerSignal) callerSignal.removeEventListener("abort", onCallerAbort);
   }
-}
-
-// The RN fetch polyfill rejects an aborted request with
-// DOMException("Aborted", "AbortError"); some environments surface a
-// plain Error with the same name. Match on the name so both shapes are
-// recognised without depending on DOMException being defined.
-function isAbortError(err: unknown): boolean {
-  return err instanceof Error && err.name === "AbortError";
 }
 
 function safeParse(text: string): unknown {
