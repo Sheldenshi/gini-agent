@@ -1,8 +1,9 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { rmSync } from "node:fs";
-import { createEmptyState, normalizeState, writeState } from "./store";
+import { readdirSync, rmSync } from "node:fs";
+import { createEmptyState, normalizeState, readState, writeState } from "./store";
 import { readSecret, writeSecret } from "./secrets";
 import { bindingsForCredentials, resolveSkillEnv } from "../integrations/connectors";
+import { instanceRoot } from "../paths";
 import type { ConnectorRecord, RuntimeConfig, RuntimeState, SkillRecord } from "../types";
 
 // Isolated state root so the test never touches ~/.gini.
@@ -990,5 +991,44 @@ describe("normalizeState provider-keyed → typed-named-credential migration", (
     const demo = normalized.connectors.find((c) => c.provider === "demo");
     expect(demo).toBeDefined();
     expect(demo!.type).toBeUndefined();
+  });
+});
+
+const MARKER_TASK = {
+  id: "task_marker",
+  title: "marker",
+  input: "marker",
+  status: "completed",
+  instance: "test-write-atomic",
+  agentId: "agent_default",
+  createdAt: "2026-01-01T00:00:00.000Z",
+  updatedAt: "2026-01-01T00:00:00.000Z",
+  tracePath: "/dev/null",
+  auditIds: [],
+  approvalIds: [],
+  skillIds: []
+} satisfies RuntimeState["tasks"][number];
+
+describe("writeState atomic temp files", () => {
+  // Pin the ENOENT-rename hazard (a duplicate gateway boot racing the
+  // incumbent's writeState on a shared `state.json.tmp`). Each write must use a
+  // per-call temp filename and leave no temp behind, so two overlapping writers
+  // never consume each other's temp and ENOENT on rename.
+  test("round-trips and leaves no temp files behind", () => {
+    const instance = "test-write-atomic";
+    const root = instanceRoot(instance);
+    for (let i = 0; i < 5; i += 1) {
+      const state = createEmptyState(instance);
+      // A marker task survives normalizeState (it only backfills agentId), so
+      // the last write is observable on round-trip.
+      state.tasks = [{ ...MARKER_TASK, title: `write-${i}` }];
+      writeState(instance, state);
+    }
+    // No `*.tmp` files linger in the instance dir — neither the legacy fixed
+    // `state.json.tmp` nor any per-write temp.
+    const lingering = readdirSync(root).filter((name) => name.includes(".tmp"));
+    expect(lingering).toEqual([]);
+    // The last write is the durable state.
+    expect(readState(instance).tasks[0]?.title).toBe("write-4");
   });
 });
