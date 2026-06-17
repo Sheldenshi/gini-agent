@@ -1,4 +1,4 @@
-import { describe, expect, mock, test } from "bun:test";
+import { beforeEach, describe, expect, mock, test } from "bun:test";
 
 // Identity-comparable stand-ins for the native primitives the sheet renders.
 // Tests never mount them; they assert on element.type === Modal etc. and walk
@@ -111,6 +111,13 @@ function render(overrides: Partial<Parameters<typeof NewAgentSheet>[0]> = {}) {
   // Invoke as a plain function (the codebase's component-test convention).
   return (NewAgentSheet as unknown as (p: typeof props) => El)(props);
 }
+
+// Pin the platform before every test so a case that flips it to "android"
+// can't leak that value into a later iOS-behavior assertion if it throws
+// before restoring — mirrors the sibling chat component tests.
+beforeEach(() => {
+  Platform.OS = "ios";
+});
 
 describe("bug #371: New Agent sheet keyboard + backdrop", () => {
   test("wraps its content in a KeyboardAvoidingView so the keyboard can't cover the field", () => {
@@ -233,6 +240,5 @@ describe("New Agent sheet input + submit wiring", () => {
     Platform.OS = "android";
     const kav = flatten(render()).find((n) => n.type === KeyboardAvoidingView);
     expect(kav?.props.behavior).toBeUndefined();
-    Platform.OS = "ios";
   });
 });
