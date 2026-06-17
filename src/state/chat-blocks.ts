@@ -533,17 +533,28 @@ export function taskProducedAssistantText(
   return false;
 }
 
-// Returns the full text of the most recent non-empty assistant_text block
-// in a session, or null when the session has no such block. The push
-// notification-preview endpoint consults this so the iOS Notification
-// Service Extension can show the latest assistant reply on the lock
-// screen. Because it reads the latest row by ordinal (not by task), a
-// notification collapsed onto a single session entry always reflects the
-// newest message even across multiple agent turns. Thread replies are
-// excluded so the preview tracks the main chat the notification deep-links
-// to. Rows are scanned newest-first (ordinal DESC) and the loop stops at
-// the first non-empty text, so it skips trailing whitespace-only blocks —
-// in the common case (newest block is a real reply) that's a single row.
+// Returns the full text of the most recent non-empty, FINALIZED
+// assistant_text block in a session, or null when the session has none.
+// The push notification-preview endpoint consults this so the iOS
+// Notification Service Extension can show the latest assistant reply on
+// the lock screen. Because it reads the latest row by ordinal (not by
+// task), a notification collapsed onto a single session entry always
+// reflects the newest completed message even across multiple agent turns.
+//
+// Only finalized rows (`streaming = false`) are considered: the NSE
+// fetches this asynchronously after a turn's `Completed` push, and by then
+// a *newer* turn may already be mid-stream (a quick user follow-up or a
+// job firing on the same session). Without the finalized filter the
+// preview could surface that newer turn's half-streamed partial text under
+// the older turn's "new message" banner — confusing, even though it would
+// eventually converge. A streaming block carries the full accreted text on
+// every delta and flips to `streaming = false` on its terminal delta, so
+// filtering to finalized rows yields the last *complete* reply.
+//
+// Thread replies are excluded so the preview tracks the main chat the
+// notification deep-links to. Rows are scanned newest-first (ordinal DESC)
+// and the loop stops at the first non-empty text, skipping trailing
+// whitespace-only blocks — in the common case that's a single row.
 export function latestAssistantTextForSession(
   instance: Instance,
   sessionId: string
@@ -553,6 +564,7 @@ export function latestAssistantTextForSession(
     .query<{ payload_json: string }, [string]>(
       `SELECT payload_json FROM chat_blocks
        WHERE session_id = ? AND kind = 'assistant_text' AND thread_id IS NULL
+         AND json_extract(payload_json, '$.streaming') = 0
        ORDER BY ordinal DESC`
     )
     .all(sessionId);

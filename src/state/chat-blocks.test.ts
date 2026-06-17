@@ -629,6 +629,28 @@ describe("chat-blocks persistence", () => {
     expect(latestAssistantTextForSession(instance, "chat_nonexistent")).toBeNull();
   });
 
+  test("latestAssistantTextForSession ignores a newer in-flight (streaming) reply", () => {
+    const instance = "chat-blocks-latest-streaming";
+    const sessionId = "chat_streaming";
+    // Turn N: a finalized reply.
+    insertChatBlock(instance, { kind: "assistant_text", sessionId, text: "completed turn", streaming: false });
+    // Turn N+1: already mid-stream when the NSE fetches the preview for
+    // turn N's completion push. Its partial text must NOT shadow the
+    // finalized turn — the banner would otherwise show a half-streamed
+    // fragment of a different turn under the older turn's "new message".
+    insertChatBlock(instance, { kind: "assistant_text", sessionId, text: "partial in-flight", streaming: true });
+    expect(latestAssistantTextForSession(instance, sessionId)).toBe("completed turn");
+  });
+
+  test("latestAssistantTextForSession returns null when the only reply is still streaming", () => {
+    const instance = "chat-blocks-latest-only-streaming";
+    const sessionId = "chat_only_streaming";
+    insertChatBlock(instance, { kind: "assistant_text", sessionId, text: "still typing", streaming: true });
+    // No finalized reply yet → no preview (the generic banner stands until
+    // the turn completes and its own push lands).
+    expect(latestAssistantTextForSession(instance, sessionId)).toBeNull();
+  });
+
   test("rows persist taskId, runId, and agentId for indexable joins", () => {
     const instance = "chat-blocks-metadata";
     insertChatBlock(instance, {

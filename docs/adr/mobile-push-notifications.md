@@ -56,11 +56,13 @@ The chosen design uses two transports in concert:
   transitions arrive frame-by-frame with `Last-Event-ID` resume on
   reconnect. This is the canonical streaming path while the user is
   watching a chat. See ADR [Chat Block Protocol](./chat-block-protocol.md).
-- **APNs** for wake-ups: `approval_requested` (always) and
-  `phase: Completed | Failed` (only when no active SSE subscription
-  for the credential). Completions fire as `content-available: 1`
-  silent pushes that update the badge count without surfacing an
-  alert; approvals fire as visible alerts with inline action buttons.
+- **APNs** for wake-ups: `authorization_requested` / `setup_requested`
+  (always) and `phase: Completed | Failed` (only when no active SSE
+  subscription for the credential). A `Completed` turn that produced a
+  user-visible message fires a visible alert; a `Completed` with no
+  message and `Failed` fire as `content-available: 1` silent pushes that
+  update the badge without surfacing a banner. Authorization pushes carry
+  inline Approve/Deny action buttons.
 
 ## Trust + privacy
 
@@ -90,7 +92,8 @@ The chosen design uses two transports in concert:
 
 | Event | Push | Rationale |
 | ----- | ---- | --------- |
-| `approval_requested` | Always (alert + inline actions) | The runtime can't make progress without user input; the user may not be in the app. |
+| `authorization_requested` | Always (alert + inline Approve/Deny actions) | The runtime can't make progress without user input; the user may not be in the app. |
+| `setup_requested` | Always (alert, no action buttons — deep-links on tap) | The user must complete a step (sign in, fill a form) in the app; surface it but don't offer approve/deny. |
 | `phase: Completed` AND the task emitted ≥1 non-empty `assistant_text` | Alert ("Gini has a new message" / "Tap to read"), only if no active SSE subscription for the device | Background and scheduled work that produces a real reply is exactly what the user wants to know about. |
 | `phase: Completed` with no `assistant_text` (only tool calls / system notes) | Silent (badge tick), only if no active SSE subscription | Nothing for the user to read — bump the badge so the chat list is accurate, but don't surface a banner. |
 | `phase: Failed` | Silent (badge tick), only if no active SSE subscription | Failure noise shouldn't yell at the user; tapping the chat surfaces the error. |
