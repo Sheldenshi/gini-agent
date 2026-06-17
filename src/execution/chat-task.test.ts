@@ -4230,12 +4230,14 @@ describe("chat-task loop", () => {
     });
 
     // Twelve tool-call turns reading DISTINCT files (so no loop-breaker
-    // trips), each result ~3.4k chars — elidable (>200 chars) but the total
+    // trips), each result ~3k chars — elidable (>200 chars) but the total
     // stays under every estimate-driven threshold. Only the LAST response
     // reports usage; the resulting calibration gap forces the pre-call trim
-    // ahead of the 13th call.
+    // ahead of the 13th call. The per-read filler is sized so the accumulated
+    // transcript sits below the chars/4 high-water mark given the always-on
+    // tool-schema floor and system-prompt slice.
     for (let i = 0; i < 12; i++) {
-      writeFileSync(join(workspaceRoot, `chunk${i}.md`), `chunk-${i} `.repeat(411));
+      writeFileSync(join(workspaceRoot, `chunk${i}.md`), `chunk-${i} `.repeat(380));
       setEchoToolCallingResponse({
         provider,
         text: "",
@@ -5076,14 +5078,14 @@ describe("chat-task loop", () => {
     // live always-on catalog size (cleared in afterEach).
     __setBaseToolCatalogForTests(FIXED_COMPACTION_CATALOG);
 
-    // Twelve modest reads (~910 tokens each). With echo reporting no usage the
+    // Twelve modest reads (~880 tokens each). With echo reporting no usage the
     // calibration gap stays 0, so the only trim trigger is the chars/4 live
     // budget — and the accumulated transcript stays well under it (the budget
-    // is 32,000 − 1,600 reserve − ~12,487 floor [12,207 pinned catalog + the
-    // system-prompt slice] = ~17,913 tokens), so no
+    // is 32,000 − 1,600 reserve − ~12,739 floor [12,207 pinned catalog + the
+    // system-prompt slice] ≈ 17,661 tokens), so no
     // elision and no proactive compaction ever engages.
     for (let i = 0; i < 12; i++) {
-      await seedBulkSkill(config, `chunk-skill-${i}`, `chunk-${i} ${"x".repeat(3_630)}`);
+      await seedBulkSkill(config, `chunk-skill-${i}`, `chunk-${i} ${"x".repeat(3_510)}`);
       setEchoToolCallingResponse({
         provider,
         text: "",
