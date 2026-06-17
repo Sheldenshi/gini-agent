@@ -9,6 +9,7 @@ import { BlockRenderer } from "@/components/chat/BlockRenderer";
 import { BlockToolCallsCollapsed } from "@/components/chat/BlockToolCallsCollapsed";
 import { GeneratedFilesCard } from "@/components/chat/GeneratedFilesCard";
 import { Composer } from "@/components/chat/Composer";
+import { QueuedMessages } from "@/components/chat/QueuedMessages";
 import { AgentChatHeader } from "@/components/chat/AgentChatHeader";
 import { ChannelViewJob } from "@/components/chat/ChannelViewJob";
 import { ChatSearchBox } from "@/components/chat/ChatSearchBox";
@@ -35,6 +36,7 @@ import {
   useChatRuns,
   useChatSessions,
   useInvalidate,
+  useRemovePendingChatMessage,
   useStatus,
   useThreads
 } from "@/lib/queries";
@@ -164,7 +166,10 @@ function ChatSurface({
     [allJobs.data, isChannel, sessionId]
   );
 
-  const { blocks, isLoading: blocksLoading, refetch } = useChatBlocks(sessionId);
+  const { blocks, isLoading: blocksLoading, refetch, pendingMessages } = useChatBlocks(
+    sessionId,
+    session.pendingMessages
+  );
   const threadsQuery = useThreads(sessionId);
   const threads = useMemo(() => threadsQuery.data ?? [], [threadsQuery.data]);
   const { markThreadRead, isThreadUnread } = useThreadReadState(threads);
@@ -219,9 +224,12 @@ function ChatSurface({
     return map;
   }, [threads]);
 
+  // Run-now responses carry { taskId }; enqueued ones carry { queued, pendingId }.
+  // The server decides which based on whether a turn is already in flight; the
+  // client treats both as success (the pill / transcript update via SSE).
   const send = useMutation({
     mutationFn: ({ content, images }: { content: string; images: UploadRef[] }) =>
-      api<{ taskId: string }>(`/chat/${sessionId}/messages`, {
+      api<{ taskId?: string; queued?: boolean; pendingId?: string }>(`/chat/${sessionId}/messages`, {
         method: "POST",
         body: JSON.stringify({ content, client: "web", ...(images.length > 0 ? { images } : {}) })
       }),
@@ -233,11 +241,14 @@ function ChatSurface({
   });
 
   const cancel = useCancelTask();
+  const removePending = useRemovePendingChatMessage(sessionId);
 
   const submit = (images: UploadRef[]) => {
     const trimmed = text.trim();
-    if (send.isPending) return;
     if (!trimmed && images.length === 0) return;
+    // Don't gate on send.isPending: successive Enters while a turn runs must
+    // each POST so they queue in order. The server serializes (run-vs-queue),
+    // so concurrent POSTs are safe.
     send.mutate({ content: trimmed, images });
   };
 
@@ -357,7 +368,7 @@ function ChatSurface({
     if (item.kind === "tool_group") {
       return (
         <li key={item.id}>
-          <BlockToolCallsCollapsed calls={item.calls} resultsByCallId={toolResultsByCallId} />
+          <BlockToolCallsCollapsed calls={item.calls} steps={item.steps} resultsByCallId={toolResultsByCallId} />
         </li>
       );
     }
@@ -493,6 +504,14 @@ function ChatSurface({
 
             <div className="px-6 pb-5 pt-2">
               <div className="mx-auto w-full max-w-3xl">
+                <QueuedMessages
+                  pending={pendingMessages}
+                  onRemove={(pendingId) =>
+                    removePending.mutate(pendingId, {
+                      onError: (error) => toast.error(error.message)
+                    })
+                  }
+                />
                 <Composer
                   value={text}
                   onChange={setText}

@@ -284,6 +284,26 @@ their sessions carry routing state a rebind would orphan. The raw
 `PATCH /api/jobs` path stays permissive and has no `deliverTo`
 semantics.
 
+**Deleting a job archives its dedicated channel.** A channel is a view
+over the job's session, so removing the job leaves the channel with
+nothing to surface. `removeJob` (`src/jobs/index.ts`) therefore stamps
+the channel's `archivedAt` (audited as `chat.session.archived`,
+`reason: "job.removed"`) the same way the `deliverTo:"chat"` rebind
+does — history preserved, still addressable by id/URL, excluded from
+the rails. The guards mirror the rebind path: only a **live**
+(`!archivedAt`) channel, never an email-watch channel
+(`feature === "email-watch"` — that subsystem owns its channels'
+lifecycle), and never one another surviving job still delivers into via
+`chatSessionId` or a fan-out route (raw `POST`/`PATCH /api/jobs` can
+bind several jobs to one channel, so archiving while a sibling still
+fires would hide a live delivery surface). A one-time `normalizeState`
+sweep (`archiveOrphanJobChannels`, `src/state/store.ts`) applies the
+same rule to channels orphaned by deletions that pre-dated this cleanup,
+so a state file carrying a leftover `kind:"channel"` session with no
+owning job is healed on load. This complements Decision D: deleting the
+**agent** detaches its job channels (jobs survive, paused), while
+deleting the **job** archives its channel.
+
 Beyond the channel itself, a finished job run's reply can reach
 messaging bridges two ways (`src/jobs/finalize.ts`): the session's
 origin mirror (`outboundMirror`/`source`, set when the job was created
@@ -503,9 +523,19 @@ Con:
   (resolution by name/id/kind, dedupe against the origin mirror,
   fire-time resolution failure logged without failing the run, and
   `create_job`/`update_job` validation against configured bridges). It
-  also covers chat-bound deferral: a due chat-bound job is skipped (no run,
-  `nextRunAt` unchanged) while its session has a live non-`jobId` turn in
-  flight, and fires on the next tick once that turn is terminal.
+  also covers chat-bound deferral (a due chat-bound job is skipped — no
+  run, `nextRunAt` unchanged — while its session has a live non-`jobId`
+  turn in flight, firing on the next tick once that turn is terminal) and
+  `removeJob`'s channel archive: a deleted job's dedicated channel is
+  archived (history intact), a chat-bound conversation is left untouched,
+  and a channel a sibling job still delivers into is spared until the last
+  job is removed.
+- `bun test src/state/store.test.ts` covers `archiveOrphanJobChannels`:
+  a job channel orphaned by a pre-cleanup deletion is archived (with the
+  legacy `origin:"job"`→`kind:"channel"` backfill running first), a
+  channel a surviving job references via `chatSessionId` or a fan-out
+  route is spared, email-watch / already-archived / plain sessions are
+  never touched, and the sweep is idempotent across repeat normalizes.
 - `bun test src/http.test.ts` smoke-tests the new routes — the
   agent-chat resolver, the three per-session thread routes (including
   create-or-append from a new thread id + `parentBlockId`, the

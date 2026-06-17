@@ -27,6 +27,7 @@ import { AgentAvatar } from "@/src/components/chat/AgentAvatar";
 import { BlockRenderer } from "@/src/components/chat/BlockRenderer";
 import { BlockToolCallsCollapsed } from "@/src/components/chat/BlockToolCallsCollapsed";
 import { GeneratedFilesCard } from "@/src/components/chat/GeneratedFilesCard";
+import { QueuedMessages } from "@/src/components/chat/QueuedMessages";
 import { ReplyInThreadPill, ThreadRepliesChip } from "@/src/components/chat/ThreadChip";
 import { VoiceRecorder, type VoiceRef } from "@/src/components/chat/VoiceRecorder";
 import { chatListTime, jobCadence, relativeTime } from "@/src/format";
@@ -39,6 +40,7 @@ import {
   useChatRuns,
   useChatStream,
   useJobs,
+  useRemovePendingChatMessage,
   useSendMessage,
   useThreads,
   useVoiceStatus
@@ -161,6 +163,7 @@ export default function ChatDetailScreen() {
   const send = useSendMessage(sessionId ?? null);
   const voice = useVoiceStatus();
   const cancel = useCancelTask();
+  const removePending = useRemovePendingChatMessage(sessionId ?? null);
   const agents = useAgents();
   const qc = useQueryClient();
 
@@ -307,6 +310,15 @@ export default function ChatDetailScreen() {
   const inFlight = useMemo(() => isTaskInFlight(list), [list]);
   const inFlightTaskId = useMemo(() => findInFlightTaskId(list), [list]);
 
+  // Server-side queue of follow-up messages submitted while a turn is in
+  // flight. Delivered live on the session record via the chat_session SSE
+  // frame (applySession) and reset with the session on switch. The pill above
+  // the composer renders from this; it drains FIFO one-per-turn server-side.
+  const pendingMessages = useMemo(
+    () => stream.session?.pendingMessages ?? [],
+    [stream.session]
+  );
+
   const lastAssistantUpdatedAt = useMemo(() => {
     for (let i = list.length - 1; i >= 0; i -= 1) {
       const b = list[i]!;
@@ -353,12 +365,19 @@ export default function ChatDetailScreen() {
   );
   const anyUploading = images.some((image) => image.status === "uploading");
   const showSendBusy = send.isPending || inFlight;
-  const sendDisabled =
-    (!trimmed && readyImages.length === 0) || showSendBusy || anyUploading || !sessionId || voiceBusy;
+  const hasContent = Boolean(trimmed) || readyImages.length > 0;
+  // Submission is allowed even while a turn is in flight — the message is
+  // queued server-side (ADR chat-message-queue.md). It gates only on having
+  // content, nothing uploading, a session, and no voice recording in progress.
+  const canSubmit = hasContent && !anyUploading && !!sessionId && !voiceBusy;
+  // The Send button only shows/enables when idle; it stays gated on content.
+  const sendDisabled = !canSubmit || showSendBusy;
   const canStop = Boolean(inFlightTaskId) && !cancel.isPending;
 
   const submit = () => {
-    if (sendDisabled) return;
+    // Don't gate on busy: successive submits while a turn runs each POST so they
+    // queue in order server-side (the server serializes run-vs-queue).
+    if (!canSubmit) return;
     pinnedToBottomRef.current = true;
     setAtBottom(true);
     send.mutate(
@@ -547,6 +566,7 @@ export default function ChatDetailScreen() {
         <BlockToolCallsCollapsed
           key={item.id}
           calls={item.calls}
+          steps={item.steps}
           resultsByCallId={toolResultsByCallId}
         />
       );
@@ -738,6 +758,16 @@ export default function ChatDetailScreen() {
         {/* Composer — shared across tabs; sending always posts to the
             main chat. */}
         <View style={styles.inputBar}>
+          <QueuedMessages
+            pending={pendingMessages}
+            onRemove={(pendingId) =>
+              removePending.mutate(pendingId, {
+                onError: (err) => {
+                  Alert.alert("Couldn't remove", err.message);
+                }
+              })
+            }
+          />
           {images.length > 0 ? (
             <ScrollView
               horizontal
@@ -830,23 +860,39 @@ export default function ChatDetailScreen() {
               accessibilityLabel="Message input"
             />
             {canStop ? (
-              <Pressable
-                onPress={stopTask}
-                disabled={cancel.isPending}
-                style={[
-                  styles.sendButton,
-                  styles.stopButton,
-                  cancel.isPending && styles.sendButtonDisabled
-                ]}
-                accessibilityRole="button"
-                accessibilityLabel="Stop response"
-              >
-                {cancel.isPending ? (
-                  <ActivityIndicator color={theme.buttonText} />
-                ) : (
-                  <Feather name="square" size={16} color={theme.buttonText} />
-                )}
-              </Pressable>
+              <>
+                {canSubmit ? (
+                  <Pressable
+                    onPress={submit}
+                    style={[styles.sendButton, styles.queueButton]}
+                    accessibilityRole="button"
+                    accessibilityLabel="Queue message"
+                  >
+                    {send.isPending ? (
+                      <ActivityIndicator color={theme.buttonText} />
+                    ) : (
+                      <Feather name="arrow-up" size={22} color={theme.buttonText} />
+                    )}
+                  </Pressable>
+                ) : null}
+                <Pressable
+                  onPress={stopTask}
+                  disabled={cancel.isPending}
+                  style={[
+                    styles.sendButton,
+                    styles.stopButton,
+                    cancel.isPending && styles.sendButtonDisabled
+                  ]}
+                  accessibilityRole="button"
+                  accessibilityLabel="Stop response"
+                >
+                  {cancel.isPending ? (
+                    <ActivityIndicator color={theme.buttonText} />
+                  ) : (
+                    <Feather name="square" size={16} color={theme.buttonText} />
+                  )}
+                </Pressable>
+              </>
             ) : !voiceBusy && (trimmed || readyImages.length > 0 || Platform.OS !== "ios") ? (
               <Pressable
                 onPress={submit}
@@ -1357,6 +1403,7 @@ const styles = StyleSheet.create({
   },
   sendButtonDisabled: { backgroundColor: theme.buttonDisabled },
   stopButton: { backgroundColor: theme.danger },
+  queueButton: { marginRight: 8 },
 
   voicePendingRow: { alignSelf: "flex-end", maxWidth: "80%" },
   voicePendingBubble: {

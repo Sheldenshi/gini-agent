@@ -23,6 +23,7 @@ import { ApiError, uploadImage, type UploadRef } from "@/src/api";
 import { AttachmentSheet } from "@/src/components/AttachmentSheet";
 import { AgentAvatar, agentSwatch } from "@/src/components/chat/AgentAvatar";
 import { BlockRenderer } from "@/src/components/chat/BlockRenderer";
+import { BlockThinking } from "@/src/components/chat/BlockThinking";
 import { GeneratedFilesCard } from "@/src/components/chat/GeneratedFilesCard";
 import { groupExchanges, type ChatRenderItem } from "@/src/group-exchanges";
 import {
@@ -399,15 +400,21 @@ export default function ThreadViewScreen() {
                 renderItems.map((item) => {
                   if (item.kind === "tool_group") {
                     // tool_group items only appear after groupExchanges
-                    // folds a completed exchange; render each call inline
-                    // via BlockRenderer to keep the thread surface simple.
-                    return item.calls.map((call) => (
-                      <BlockRenderer
-                        key={call.id}
-                        block={call}
-                        toolResult={toolResultsByCallId.get(call.callId)}
-                      />
-                    ));
+                    // folds a completed exchange; replay the process
+                    // inline — tool calls via BlockRenderer, the model's
+                    // pre-tool narration as a "Thinking" row — to keep
+                    // the thread surface in parity with the main chat.
+                    return item.steps.map((step) =>
+                      step.kind === "tool_call" ? (
+                        <BlockRenderer
+                          key={step.block.id}
+                          block={step.block}
+                          toolResult={toolResultsByCallId.get(step.block.callId)}
+                        />
+                      ) : (
+                        <BlockThinking key={step.block.id} block={step.block} />
+                      )
+                    );
                   }
                   if (item.kind === "file_artifact") {
                     return <GeneratedFilesCard key={item.id} files={item.files} />;

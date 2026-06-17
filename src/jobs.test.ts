@@ -16,7 +16,7 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync, rmSync } from "node:fs";
 import "./hooks/builtins"; // populates the registry so create_job's preRunHook resolves isKnownHook("skill-script")
 import { createHandler } from "./http";
-import { runDueJobs, runJobNow } from "./jobs";
+import { removeJob, runDueJobs, runJobNow } from "./jobs";
 import { advanceCronNextRunAt, createScheduledJob, rebindJobDelivery, updateJob } from "./jobs/index";
 import { createChatMessage, createTask, mutateState, readState, upsertTask } from "./state";
 import { dispatchToolCall } from "./execution/tool-dispatch";
@@ -236,6 +236,117 @@ describe("cron lifecycle", () => {
     // The /api/job-runs listing also shouldn't include them.
     const allRuns = await call(handler, config, "/api/job-runs");
     expect(allRuns.filter((run: { jobId: string }) => run.jobId === job.id)).toHaveLength(0);
+  });
+
+  test("removeJob archives the job's dedicated channel so it leaves the rails (issue #369)", async () => {
+    const config = testConfig("jobs-remove-archives-channel");
+
+    // A job with its own dedicated channel — the shape create_job's default
+    // deliverTo:"channel" produces (kind:"channel", origin:"job").
+    const job = await createScheduledJob(config, {
+      name: "news-watch",
+      prompt: "Check news.",
+      intervalSeconds: 600,
+      createDedicatedSession: { title: "news-watch" }
+    });
+    const channelId = job.chatSessionId!;
+    expect(channelId).toBeString();
+    // A delivered fire's message must survive the archive (history intact).
+    await mutateState(config.instance, (state) => {
+      createChatMessage(state, { sessionId: channelId, role: "assistant", content: "No major news this cycle." });
+    });
+
+    await removeJob(config, job.id);
+
+    const state = readState(config.instance);
+    // The job is gone, but the channel is archived in place — still present,
+    // history intact, archivedAt stamped so it leaves the Recurring Jobs rails.
+    expect(state.jobs.find((j) => j.id === job.id)).toBeUndefined();
+    const channel = state.chatSessions.find((s) => s.id === channelId);
+    expect(channel).toBeDefined();
+    expect(channel?.archivedAt).toBeString();
+    expect(channel?.messageIds).toHaveLength(1);
+    expect(
+      state.audit.some((e) => e.action === "chat.session.archived" && e.target === channelId)
+    ).toBe(true);
+    // The job.removed audit records which channel it archived.
+    const removed = state.audit.find((e) => e.action === "job.removed" && e.target === job.id);
+    expect(removed?.evidence?.archivedSessionId).toBe(channelId);
+  });
+
+  test("removeJob leaves a chat-bound (non-channel) session untouched", async () => {
+    const config = testConfig("jobs-remove-keeps-chat");
+
+    // Seed a plain conversation session, then bind a job's delivery to it
+    // (the deliverTo:"chat" shape — JobRecord.chatSessionId points at a
+    // normal agent chat, not a dedicated channel).
+    const sessionId = "session_plain_chat";
+    await mutateState(config.instance, (state) => {
+      state.chatSessions.unshift({
+        id: sessionId,
+        instance: state.instance,
+        title: "My chat",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        messageIds: [],
+        taskIds: [],
+        runIds: []
+      });
+    });
+    const job = await createScheduledJob(config, {
+      name: "in-chat-reminder",
+      prompt: "Remind me.",
+      intervalSeconds: 600,
+      chatSessionId: sessionId
+    });
+
+    await removeJob(config, job.id);
+
+    const state = readState(config.instance);
+    const session = state.chatSessions.find((s) => s.id === sessionId);
+    // The user's conversation is never job-owned — it must NOT be archived.
+    expect(session).toBeDefined();
+    expect(session?.archivedAt).toBeUndefined();
+    expect(state.audit.some((e) => e.action === "chat.session.archived")).toBe(false);
+    const removed = state.audit.find((e) => e.action === "job.removed" && e.target === job.id);
+    expect(removed?.evidence?.archivedSessionId).toBeUndefined();
+  });
+
+  test("removeJob does not archive a channel another job still delivers into", async () => {
+    const config = testConfig("jobs-remove-shared-channel");
+
+    // First job mints a dedicated channel.
+    const jobA = await createScheduledJob(config, {
+      name: "briefing-a",
+      prompt: "A.",
+      intervalSeconds: 600,
+      createDedicatedSession: { title: "shared-briefing" }
+    });
+    const channelId = jobA.chatSessionId!;
+    // A second job is bound to the SAME channel (bindable via the
+    // chatSessionId input — raw POST/PATCH /api/jobs allows it).
+    const jobB = await createScheduledJob(config, {
+      name: "briefing-b",
+      prompt: "B.",
+      intervalSeconds: 600,
+      chatSessionId: channelId
+    });
+    expect(jobB.chatSessionId).toBe(channelId);
+
+    await removeJob(config, jobA.id);
+
+    const state = readState(config.instance);
+    // jobB still delivers into the channel, so archiving it would hide a live
+    // delivery surface — the channel stays active.
+    const channel = state.chatSessions.find((s) => s.id === channelId);
+    expect(channel?.archivedAt).toBeUndefined();
+    expect(state.audit.some((e) => e.action === "chat.session.archived" && e.target === channelId)).toBe(false);
+
+    // Removing the LAST job bound to it now archives the channel.
+    await removeJob(config, jobB.id);
+    const after = readState(config.instance);
+    expect(after.chatSessions.find((s) => s.id === channelId)?.archivedAt).toBeString();
+    expect(after.audit.some((e) => e.action === "chat.session.archived" && e.target === channelId)).toBe(true);
   });
 
   test("replay after the underlying job was removed returns 404", async () => {

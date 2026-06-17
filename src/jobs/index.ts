@@ -2132,6 +2132,46 @@ export async function removeJob(config: RuntimeConfig, jobId: string, parentTask
         removedRuns += 1;
       }
     }
+    // Archive the job's dedicated channel so it stops cluttering the
+    // Recurring Jobs rails (web sidebar + mobile channels) once the job
+    // that fed it is gone — otherwise the channel keeps matching the
+    // clients' `(kind:"channel" || origin:"job") && !archivedAt` filter
+    // with no job left to decorate it. Mirrors rebindJobDelivery's
+    // deliverTo:"chat" archive: history is preserved and the session stays
+    // addressable by id/URL, it just leaves the lists. Same guards as that
+    // path — only a LIVE channel (already-archived re-stamping would lie
+    // about when it left the lists), never an email-watch channel (the
+    // email-watch subsystem owns those via its own delete/heal paths), and
+    // never one another job still delivers into via its chatSessionId or a
+    // fan-out route (raw POST/PATCH /api/jobs can bind several jobs to one
+    // channel; archiving would hide their live delivery surface).
+    let archivedSessionId: string | undefined;
+    const channel = job.chatSessionId !== undefined
+      ? state.chatSessions.find((s) => s.id === job.chatSessionId)
+      : undefined;
+    if (channel && channel.kind === "channel" && !channel.archivedAt && channel.feature !== "email-watch") {
+      const shared = state.jobs.some(
+        (other) =>
+          other.chatSessionId === channel.id ||
+          Object.values(other.routes ?? {}).some((route) => route.chatSessionId === channel.id)
+      );
+      if (!shared) {
+        channel.archivedAt = now();
+        channel.updatedAt = now();
+        archivedSessionId = channel.id;
+        addAudit(
+          state,
+          {
+            actor: "user",
+            action: "chat.session.archived",
+            target: channel.id,
+            risk: "low",
+            evidence: { jobId: job.id, reason: "job.removed" }
+          },
+          { jobId: job.id, agentId: job.agentId }
+        );
+      }
+    }
     addAudit(
       state,
       {
@@ -2139,7 +2179,7 @@ export async function removeJob(config: RuntimeConfig, jobId: string, parentTask
         action: "job.removed",
         target: job.id,
         risk: "medium",
-        evidence: { removedRuns }
+        evidence: { removedRuns, ...(archivedSessionId ? { archivedSessionId } : {}) }
       },
       { jobId: job.id, agentId: job.agentId }
     );

@@ -70,7 +70,35 @@ export interface ChatSession {
   // Archived marker (absent = active). Archived sessions keep their history
   // and stay directly addressable, but are excluded from session lists.
   archivedAt?: string;
+  // Follow-up messages queued server-side while a turn is in flight. Drains
+  // FIFO one-per-turn; the "N Queued" pill above the composer renders from
+  // this. Kept live by the chat_session SSE frame. See ADR
+  // chat-message-queue.md.
+  pendingMessages?: PendingChatMessage[];
 }
+
+// A chat message held in the per-session queue while a turn is in flight.
+// Mirrors the runtime `PendingChatMessage` (src/types.ts) — we keep only the
+// fields the pill reads. `images` carries upload refs (id + mimeType + size);
+// the pill shows a count/indicator, not the bytes. Audio is intentionally
+// absent: a voice message is transcribed to `content` at prepare time.
+export interface PendingChatMessage {
+  id: string;
+  content: string;
+  images?: { id: string; mimeType: string; size: number }[];
+  clientSurface?: ChatClientSurface;
+  createdAt: string;
+}
+
+// Client surface a queued message was sent from. Mirrors the runtime
+// `ChatClientSurface`; carried through on the pending record but not rendered.
+export type ChatClientSurface =
+  | "web"
+  | "mobile"
+  | "cli"
+  | "telegram"
+  | "discord"
+  | "openclaw";
 
 export type ChatRole = "user" | "assistant" | "system" | "tool";
 

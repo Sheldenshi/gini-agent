@@ -3,6 +3,8 @@
 import { useState } from "react";
 import { ChevronRight } from "lucide-react";
 import type { ToolCallBlock, ToolResultBlock } from "@runtime/types";
+import type { ProcessStep } from "@/lib/group-exchanges";
+import { BlockThinking } from "./BlockThinking";
 import { BlockToolCall } from "./BlockToolCall";
 import { iconForTool } from "./tool-icons";
 
@@ -10,13 +12,17 @@ import { iconForTool } from "./tool-icons";
 // exchange (user_text → final assistant_text). The trailing icon strip
 // shows one glyph per *unique* tool category invoked, so a user can
 // glance at the row and know whether the assistant touched files, ran
-// shell commands, hit the browser, etc., without expanding.
+// shell commands, hit the browser, etc., without expanding. Expanding
+// replays the turn's process — tool calls and the model's pre-tool
+// narration — in chronological order.
 
 export function BlockToolCallsCollapsed({
   calls,
+  steps,
   resultsByCallId
 }: {
   calls: ToolCallBlock[];
+  steps: ProcessStep[];
   resultsByCallId: Map<string, ToolResultBlock>;
 }) {
   const [expanded, setExpanded] = useState(false);
@@ -60,9 +66,16 @@ export function BlockToolCallsCollapsed({
       </button>
       {expanded ? (
         <ul className="flex flex-col gap-1.5 pl-[27px]">
-          {calls.map((call) => (
-            <li key={call.id}>
-              <BlockToolCall block={call} result={resultsByCallId.get(call.callId)} />
+          {steps.map((step) => (
+            <li key={step.block.id}>
+              {step.kind === "tool_call" ? (
+                <BlockToolCall
+                  block={step.block}
+                  result={resultsByCallId.get(step.block.callId)}
+                />
+              ) : (
+                <BlockThinking block={step.block} />
+              )}
             </li>
           ))}
         </ul>

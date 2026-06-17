@@ -73,6 +73,21 @@ import {
 import type { ToolCatalogTool } from "./tool-catalog";
 import type { EffectiveContext } from "./effective-context";
 
+// These tests submit on idle sessions, which always run immediately. Narrow
+// the submit union to the run-now branch so the existing `.taskId` reads stay
+// typed (a queued result here is a test-setup bug). See ADR
+// chat-message-queue.md.
+async function submitChatMessage(
+  config: RuntimeConfig,
+  sessionId: string,
+  input: Record<string, unknown>
+): Promise<{ sessionId: string; runId: string; taskId: string; status: Task["status"] }> {
+  const { submitChatMessage: submitChatMessageRaw } = await import("./chat");
+  const result = await submitChatMessageRaw(config, sessionId, input);
+  if ("queued" in result) throw new Error("expected run-now submission, got queued");
+  return result;
+}
+
 let scratchHome: string;
 let prevHome: string | undefined;
 let prevEmbedding: string | undefined;
@@ -1854,7 +1869,7 @@ describe("chat-task loop", () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
     const config = buildConfig(workspaceRoot, "chat-task-surface");
     const provider = normalizeProvider(config.provider);
-    const { submitChatMessage, createChat } = await import("./chat");
+    const { createChat } = await import("./chat");
     const session = await createChat(config, { title: "Surface probe" });
 
     // Turn 1 from the web, turn 2 from the phone — the same session can
@@ -1908,7 +1923,6 @@ describe("chat-task loop", () => {
     });
 
     setEchoToolCallingResponse({ provider, text: "ok", toolCalls: [], finishReason: "stop" });
-    const { submitChatMessage } = await import("./chat");
     const submitted = await submitChatMessage(config, sessionId, { content: "bridge turn" });
     expect((await waitForTerminal(config, submitted.taskId)).status).toBe("completed");
 
@@ -1926,7 +1940,7 @@ describe("chat-task loop", () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
     const config = buildConfig(workspaceRoot, "chat-task-surface-unknown");
     const provider = normalizeProvider(config.provider);
-    const { submitChatMessage, createChat } = await import("./chat");
+    const { createChat } = await import("./chat");
     const session = await createChat(config, { title: "Unknown surface probe" });
 
     setEchoToolCallingResponse({ provider, text: "ok", toolCalls: [], finishReason: "stop" });
@@ -2364,7 +2378,6 @@ describe("chat-task loop", () => {
       finishReason: "stop"
     });
 
-    const { submitChatMessage } = await import("./chat");
     const submitted = await submitChatMessage(config, session.id, { content: "what does hello.md say?" });
     const finished = await waitForTerminal(config, submitted.taskId);
     expect(finished.status).toBe("completed");
@@ -2441,7 +2454,6 @@ describe("chat-task loop", () => {
       finishReason: "stop"
     });
 
-    const { submitChatMessage } = await import("./chat");
     const submitted = await submitChatMessage(config, session.id, { content: "write out.txt" });
     const paused = await waitForTerminal(config, submitted.taskId);
     expect(paused.status).toBe("waiting_approval");
@@ -2499,7 +2511,6 @@ describe("chat-task loop", () => {
       finishReason: "stop"
     });
 
-    const { submitChatMessage } = await import("./chat");
     const submitted = await submitChatMessage(config, session.id, { content: "write out2.txt" });
     const paused = await waitForTerminal(config, submitted.taskId);
     expect(paused.status).toBe("waiting_approval");
@@ -2552,7 +2563,6 @@ describe("chat-task loop", () => {
       finishReason: "tool_calls"
     });
 
-    const { submitChatMessage } = await import("./chat");
     const submitted = await submitChatMessage(config, session.id, { content: "search the web" });
     const paused = await waitForTerminal(config, submitted.taskId);
     expect(paused.status).toBe("waiting_approval");
@@ -2598,7 +2608,6 @@ describe("chat-task loop", () => {
       finishReason: "tool_calls"
     });
 
-    const { submitChatMessage } = await import("./chat");
     const submitted = await submitChatMessage(config, session.id, { content: "search the web for the best cafe" });
     const paused = await waitForTerminal(config, submitted.taskId);
     expect(paused.status).toBe("waiting_approval");
@@ -2648,7 +2657,6 @@ describe("chat-task loop", () => {
       finishReason: "stop"
     });
 
-    const { submitChatMessage } = await import("./chat");
     const submitted = await submitChatMessage(config, session.id, { content: "what is the weather in sf today" });
     const paused = await waitForTerminal(config, submitted.taskId);
     expect(paused.status).toBe("waiting_approval");
@@ -2729,7 +2737,6 @@ describe("chat-task loop", () => {
       finishReason: "tool_calls"
     });
 
-    const { submitChatMessage } = await import("./chat");
     const submitted = await submitChatMessage(config, session.id, { content: "find the best cafe" });
     const paused = await waitForTerminal(config, submitted.taskId);
     expect(paused.status).toBe("waiting_approval");
@@ -2789,7 +2796,6 @@ describe("chat-task loop", () => {
       finishReason: "stop"
     });
 
-    const { submitChatMessage } = await import("./chat");
     const submitted = await submitChatMessage(config, session.id, { content: "export my notes" });
     const paused = await waitForTerminal(config, submitted.taskId);
     expect(paused.status).toBe("waiting_approval");
@@ -2849,7 +2855,6 @@ describe("chat-task loop", () => {
       finishReason: "stop"
     });
 
-    const { submitChatMessage } = await import("./chat");
     const submitted = await submitChatMessage(config, session.id, { content: "read both" });
     const finished = await waitForTerminal(config, submitted.taskId);
     expect(finished.status).toBe("completed");
@@ -2924,7 +2929,6 @@ describe("chat-task loop", () => {
       finishReason: "stop"
     });
 
-    const { submitChatMessage } = await import("./chat");
     const submitted = await submitChatMessage(config, session.id, { content: "say hi" });
     const finished = await waitForTerminal(config, submitted.taskId);
     expect(finished.status).toBe("completed");
@@ -2980,7 +2984,6 @@ describe("chat-task loop", () => {
       finishReason: "stop"
     });
 
-    const { submitChatMessage } = await import("./chat");
     const submitted = await submitChatMessage(config, session.id, { content: "hi" });
     await waitForTerminal(config, submitted.taskId);
 
@@ -3008,7 +3011,7 @@ describe("chat-task loop", () => {
     const issueResult = JSON.stringify({ ok: true, issueId: "ISSUE-4242" });
     writeFileSync(fixturePath, issueResult);
 
-    const { createChat, submitChatMessage, syncChatTaskResult } = await import("./chat");
+    const { createChat, syncChatTaskResult } = await import("./chat");
     const session = await createChat(config, { title: "Issue thread" });
 
     // Turn 1: read the file (returns the issue id), then a final answer.
@@ -3076,7 +3079,7 @@ describe("chat-task loop", () => {
     const provider = normalizeProvider(config.provider);
     const fixturePath = join(workspaceRoot, "state.txt");
 
-    const { createChat, submitChatMessage, syncChatTaskResult } = await import("./chat");
+    const { createChat, syncChatTaskResult } = await import("./chat");
     const session = await createChat(config, { title: "Dup-id thread" });
 
     // Turn 1: read the file (content "FIRST"), reusing the colliding id.
@@ -3172,7 +3175,7 @@ describe("chat-task loop", () => {
     });
     await setSkillStatus(config, skill.id, "enabled");
 
-    const { createChat, submitChatMessage, syncChatTaskResult } = await import("./chat");
+    const { createChat, syncChatTaskResult } = await import("./chat");
     const session = await createChat(config, { title: "Skill thread" });
 
     // Turn 1: read the skill, then answer.
@@ -3223,7 +3226,7 @@ describe("chat-task loop", () => {
     const config = buildConfig(workspaceRoot, "chat-task-transcript-gated");
     const provider = normalizeProvider(config.provider);
 
-    const { createChat, submitChatMessage, syncChatTaskResult } = await import("./chat");
+    const { createChat, syncChatTaskResult } = await import("./chat");
     const session = await createChat(config, { title: "Gated thread" });
 
     // Turn 1: request a file write (approval-gated), then answer after resume.
@@ -3317,7 +3320,7 @@ describe("chat-task loop", () => {
     const config = buildConfig(workspaceRoot, "chat-task-transcript-gated-reason");
     const provider = normalizeProvider(config.provider);
 
-    const { createChat, submitChatMessage, syncChatTaskResult } = await import("./chat");
+    const { createChat, syncChatTaskResult } = await import("./chat");
     const session = await createChat(config, { title: "Connector thread" });
 
     // Turn 1: request_connector (approval-gated) for a provider with no
@@ -4061,7 +4064,6 @@ describe("chat-task loop", () => {
     const session = await mutateState(config.instance, (state) =>
       createChatSession(state, "Overflow chat")
     );
-    const { submitChatMessage } = await import("./chat");
 
     // Every attempt of the turn's model call overflows (3 total attempts).
     setEchoToolCallingFailure(OVERFLOW_MESSAGE);
@@ -4478,7 +4480,6 @@ describe("chat-task loop", () => {
     const session = await mutateState(config.instance, (state) =>
       createChatSession(state, "stream-exhaust")
     );
-    const { submitChatMessage } = await import("./chat");
 
     // Every attempt streams partial text before throwing the overflow.
     setEchoToolCallingFailure(OVERFLOW_MESSAGE, { streamTextBeforeFailure: "DISCARDED-PARTIAL " });
@@ -4518,7 +4519,6 @@ describe("chat-task loop", () => {
     const session = await mutateState(config.instance, (state) =>
       createChatSession(state, "partial-exit")
     );
-    const { submitChatMessage } = await import("./chat");
 
     // Turn 1 completes normally with a distinctive answer.
     setEchoToolCallingResponse({ provider, text: "PRIOR-TURN-ANSWER", toolCalls: [], finishReason: "stop" });
@@ -4604,7 +4604,6 @@ describe("chat-task loop", () => {
     const session = await mutateState(config.instance, (state) =>
       createChatSession(state, "partial-nonstream")
     );
-    const { submitChatMessage } = await import("./chat");
 
     writeFileSync(join(workspaceRoot, "note.md"), "note content");
     // Whole-string response (no deltas) narrating before a tool call, then
@@ -4659,7 +4658,6 @@ describe("chat-task loop", () => {
     const session = await mutateState(config.instance, (state) =>
       createChatSession(state, "stream-reset")
     );
-    const { submitChatMessage } = await import("./chat");
 
     writeFileSync(join(workspaceRoot, "note.md"), "note content");
     // Attempt 1 streams partial text, then fails with overflow. The retry

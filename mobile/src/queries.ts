@@ -849,15 +849,20 @@ export interface SendMessageInput {
   audio?: { id: string; mimeType: string; size: number; durationMs?: number };
 }
 
+// Run-now responses carry { taskId }; enqueued ones carry { queued, pendingId }.
+// The server decides based on whether a turn is already in flight; the client
+// treats both as success (the transcript / pill updates via the chat SSE frame).
+export type SendMessageResult = { taskId?: string; queued?: boolean; pendingId?: string };
+
 export function useSendMessage(sessionId: string | null) {
   const qc = useQueryClient();
-  return useMutation<{ taskId: string }, Error, SendMessageInput>({
+  return useMutation<SendMessageResult, Error, SendMessageInput>({
     mutationFn: ({ content, images, audio }: SendMessageInput) => {
       if (!sessionId) throw new Error("No session selected");
       const body: Record<string, unknown> = { content, client: "mobile" };
       if (images && images.length > 0) body.images = images;
       if (audio) body.audio = audio;
-      return api<{ taskId: string }>(`/chat/${sessionId}/messages`, {
+      return api<SendMessageResult>(`/chat/${sessionId}/messages`, {
         method: "POST",
         body: JSON.stringify(body)
       });
@@ -881,6 +886,26 @@ export function useCancelTask() {
   const qc = useQueryClient();
   return useMutation<Task, Error, string>({
     mutationFn: (taskId: string) => api<Task>(`/tasks/${taskId}/cancel`, { method: "POST" }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["chat"] });
+      qc.invalidateQueries({ queryKey: ["chats"] });
+    }
+  });
+}
+
+// Remove a queued follow-up message. The pending list is server truth and
+// streams over the chat_session SSE frame, so this just fires the DELETE —
+// the frame drains the row (ADR chat-message-queue.md). Response is
+// { removed: true } | 404 (already drained/removed).
+export function useRemovePendingChatMessage(sessionId: string | null) {
+  const qc = useQueryClient();
+  return useMutation<{ removed: boolean }, Error, string>({
+    mutationFn: (pendingId: string) => {
+      if (!sessionId) throw new Error("No session selected");
+      return api<{ removed: boolean }>(`/chat/${sessionId}/pending/${pendingId}`, {
+        method: "DELETE"
+      });
+    },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["chat"] });
       qc.invalidateQueries({ queryKey: ["chats"] });

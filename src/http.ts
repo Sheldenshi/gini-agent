@@ -107,7 +107,7 @@ import { cookieValue, serializeCookie } from "./lib/cookies";
 import { RateLimiter } from "./lib/rate-limit";
 import { getSetupStatus, removeSetupProvider, setSetupProvider } from "./runtime/setup-api";
 import { createSkillFromInput, getSkill, grantConnectorToSkill, installSkillFromBody, listSkills, reloadSkills, rollbackSkill, searchSkills, setSkillStatus, testSkill, updateSkill, validateSkills } from "./capabilities/skills";
-import { createChat, deleteChat, getChatSession, getOrCreateAgentChat, listChatSessions, renameChat, submitChatMessage, submitThreadReply, syncChatTaskResult } from "./execution/chat";
+import { createChat, deleteChat, getChatSession, getOrCreateAgentChat, listChatSessions, removePendingChatMessageById, renameChat, submitChatMessage, submitThreadReply, syncChatTaskResult } from "./execution/chat";
 import { sttStatus } from "./stt";
 import { resumeChatTask } from "./execution/chat-task";
 import { persistConnectOutcome, safeResume } from "./execution/safe-resume";
@@ -286,6 +286,12 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["DELETE", /^\/api\/chat\/([^/]+)$/, async (_request, params) => { await deleteChat(config, params[0]); return json({ ok: true }); }],
     ["PATCH", /^\/api\/chat\/([^/]+)$/, async (request, params) => json(await renameChat(config, params[0], await body(request)))],
     ["POST", /^\/api\/chat\/([^/]+)\/messages$/, async (request, params) => json(await submitChatMessage(config, params[0], await body(request)), 201)],
+    // Drop a queued (not-yet-dispatched) message from the session's pending
+    // queue (ADR chat-message-queue.md). 404 when the id isn't queued.
+    ["DELETE", /^\/api\/chat\/([^/]+)\/pending\/([^/]+)$/, async (_request, params) => {
+      const removed = await removePendingChatMessageById(config, params[0], params[1]);
+      return removed ? json({ removed: true }) : json({ error: "Pending message not found" }, 404);
+    }],
     // Resolves (or lazily creates) the single canonical chat session for an
     // agent — the one-chat-per-agent IA. Stable across calls for the same
     // agent id.

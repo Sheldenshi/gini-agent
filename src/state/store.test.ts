@@ -504,6 +504,129 @@ describe("dropDeadMemoryImprovements", () => {
   });
 });
 
+describe("archiveOrphanJobChannels (issue #369)", () => {
+  // Append a chat session record onto a state with the fields normalizeState
+  // and the sweep read. `id` doubles as a discriminator across cases.
+  function pushSession(
+    state: RuntimeState,
+    overrides: Partial<RuntimeState["chatSessions"][number]> & { id: string }
+  ) {
+    state.chatSessions.push({
+      instance: state.instance,
+      title: overrides.id,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      messageIds: [],
+      taskIds: [],
+      runIds: [],
+      ...overrides
+    });
+  }
+
+  test("archives a job channel orphaned by a pre-cleanup deletion (no surviving job references it)", () => {
+    const state = createEmptyState("orphan-channel-archive");
+    // The exact shape from issue #369: a channel left behind after its job
+    // was deleted — kind:"channel", origin:"job", not archived, and no job
+    // in state points at it.
+    pushSession(state, { id: "chat_orphan", kind: "channel", origin: "job" });
+
+    const normalized = normalizeState(state.instance, state);
+
+    const channel = normalized.chatSessions.find((s) => s.id === "chat_orphan");
+    expect(channel?.archivedAt).toBeString();
+    const audit = normalized.audit.find(
+      (e) => e.action === "chat.session.archived" && e.evidence?.reason === "orphan.job.channel.backfill"
+    );
+    expect(audit).toBeDefined();
+    expect(audit?.evidence?.archived).toBe(1);
+  });
+
+  test("backfills kind on a legacy origin:job session before sweeping it", () => {
+    const state = createEmptyState("orphan-channel-legacy-kind");
+    // A legacy session predating the chats-IA `kind` field: only origin:"job"
+    // is set. normalizeState backfills kind:"channel" first, so the sweep
+    // still catches it.
+    pushSession(state, { id: "chat_legacy", origin: "job" });
+
+    const normalized = normalizeState(state.instance, state);
+
+    const channel = normalized.chatSessions.find((s) => s.id === "chat_legacy");
+    expect(channel?.kind).toBe("channel");
+    expect(channel?.archivedAt).toBeString();
+  });
+
+  test("leaves a channel a surviving job still delivers into (chatSessionId or fan-out route)", () => {
+    const state = createEmptyState("orphan-channel-referenced");
+    pushSession(state, { id: "chat_bound", kind: "channel", origin: "job" });
+    pushSession(state, { id: "chat_routed", kind: "channel", origin: "job" });
+    const at = "2026-01-01T00:00:00.000Z";
+    state.jobs.push({
+      id: "job_bound",
+      instance: state.instance,
+      agentId: "agent_default",
+      name: "bound",
+      prompt: "x",
+      intervalSeconds: 600,
+      status: "active",
+      nextRunAt: at,
+      deliveryTargets: [],
+      context: [],
+      retryLimit: 0,
+      timeoutSeconds: 600,
+      runIds: [],
+      taskIds: [],
+      runCount: 0,
+      missedRuns: 0,
+      createdAt: at,
+      updatedAt: at,
+      chatSessionId: "chat_bound",
+      routes: { alerts: { chatSessionId: "chat_routed" } }
+    });
+
+    const normalized = normalizeState(state.instance, state);
+
+    // Both referenced channels stay active — a live job still delivers into them.
+    expect(normalized.chatSessions.find((s) => s.id === "chat_bound")?.archivedAt).toBeUndefined();
+    expect(normalized.chatSessions.find((s) => s.id === "chat_routed")?.archivedAt).toBeUndefined();
+    expect(normalized.audit.some((e) => e.evidence?.reason === "orphan.job.channel.backfill")).toBe(false);
+  });
+
+  test("never touches email-watch channels or already-archived/plain sessions", () => {
+    const state = createEmptyState("orphan-channel-excluded");
+    // Email-watch channels are owned by the email-watch subsystem's own
+    // delete/heal paths — out of scope for this sweep even when orphaned.
+    pushSession(state, { id: "chat_emailwatch", kind: "channel", origin: "job", feature: "email-watch" });
+    // Already archived — re-stamping would lie about when it left the lists.
+    pushSession(state, { id: "chat_already", kind: "channel", origin: "job", archivedAt: "2026-05-01T00:00:00.000Z" });
+    // A plain agent chat (no channel kind) must never be archived.
+    pushSession(state, { id: "chat_plain", kind: "agent" });
+
+    const normalized = normalizeState(state.instance, state);
+
+    expect(normalized.chatSessions.find((s) => s.id === "chat_emailwatch")?.archivedAt).toBeUndefined();
+    // Untouched: the pre-existing archivedAt timestamp is preserved verbatim.
+    expect(normalized.chatSessions.find((s) => s.id === "chat_already")?.archivedAt).toBe("2026-05-01T00:00:00.000Z");
+    expect(normalized.chatSessions.find((s) => s.id === "chat_plain")?.archivedAt).toBeUndefined();
+    expect(normalized.audit.some((e) => e.evidence?.reason === "orphan.job.channel.backfill")).toBe(false);
+  });
+
+  test("is idempotent — a second normalize archives nothing new", () => {
+    const state = createEmptyState("orphan-channel-idempotent");
+    pushSession(state, { id: "chat_orphan", kind: "channel", origin: "job" });
+
+    const once = normalizeState(state.instance, state);
+    const stamped = once.chatSessions.find((s) => s.id === "chat_orphan")?.archivedAt;
+    expect(stamped).toBeString();
+
+    const twice = normalizeState(state.instance, once);
+    // Same timestamp, no second archive audit.
+    expect(twice.chatSessions.find((s) => s.id === "chat_orphan")?.archivedAt).toBe(stamped);
+    expect(
+      twice.audit.filter((e) => e.evidence?.reason === "orphan.job.channel.backfill").length
+    ).toBe(1);
+  });
+});
+
 describe("normalizeState approval -> authorization/setup-request migration", () => {
   test("partitions a legacy approvals array by action", () => {
     const at = new Date().toISOString();

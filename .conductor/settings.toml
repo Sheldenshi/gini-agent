@@ -1,0 +1,6 @@
+"$schema" = "https://conductor.build/schemas/settings.repo.schema.json"
+
+[scripts]
+archive = "instance=$(basename \"$PWD\"); tmux kill-session -t \"gini-$instance\" 2>/dev/null || true; bun run gini uninstall --instance \"$instance\" && rm -rf node_modules \"$HOME/.claude/projects/$(echo \"$PWD\" | sed 's|/|-|g')\""
+run = "instance=$(basename \"$PWD\"); session=\"gini-$instance\"; tmux new-session -A -s \"$session\" \"bun run gini run --instance $instance\""
+setup = "instance=$(basename \"$PWD\"); bun i && GINI_PROVIDER=codex GINI_MODEL=gpt-5.5 bun run gini install --instance \"$instance\""
