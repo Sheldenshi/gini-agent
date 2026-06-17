@@ -69,8 +69,8 @@ command -v gcloud
 
 ### Install `gws` — first method that fits, in priority order
 
-1. **Pre-built release binary (preferred).** A self-contained native executable from the canonical Releases page — no `node`/`bun`/runtime needed, so it's the most robust on a fresh host. Download the asset for the platform target triple AND its `.sha256`, **verify the checksum, abort on mismatch**, then place the binary in `~/.local/bin`.
-2. **`bun add -g @googleworkspace/cli`** — only when `node` is also on `$PATH`. `bun` ships with Gini, but the installed `gws` is a `#!/usr/bin/env node` wrapper, so without `node` it fails `env: node: No such file or directory`. (`npm install -g` is equivalent when node/npm exist.)
+1. **Pre-built release binary (preferred).** A self-contained native executable from the canonical Releases page. Download the asset for the platform target triple AND its `.sha256`, **verify the checksum, abort on mismatch**, then place the binary in `~/.local/bin`.
+2. **`bun add -g @googleworkspace/cli`** — only when `node` is also on `$PATH`, because the installed `gws` is a `#!/usr/bin/env node` wrapper. (`npm install -g` works the same.)
 3. **`brew install googleworkspace-cli`** — only if `brew` already exists.
 
 ### Install `gcloud`
@@ -80,7 +80,7 @@ command -v gcloud
 
 ### Critical: where the binaries must land
 
-`terminal_exec` runs each command in a non-interactive login shell (`zsh -lc`), which does **not** source `~/.zshrc` — a PATH line written there is ignored. The dir the gateway reliably bakes into `$PATH` is `~/.local/bin`. So any binary installed outside `$PATH` (the gws release binary, the gcloud tarball under `~/google-cloud-sdk/bin`) must be moved or symlinked into `~/.local/bin`; Homebrew installs are already on `$PATH`. Then bare `gws`/`gcloud` resolve in later steps; otherwise use the absolute path.
+`terminal_exec` runs each command in `zsh -lc`, which does **not** source `~/.zshrc`, so a PATH line there is ignored. The gateway bakes `~/.local/bin` into `$PATH`, so any binary installed elsewhere (the gws release binary, the gcloud tarball under `~/google-cloud-sdk/bin`) must be moved or symlinked there; Homebrew installs are already on `$PATH`. Then bare `gws`/`gcloud` resolve in later steps.
 
 ### Verify
 
@@ -91,7 +91,7 @@ gcloud --version
 
 **Do not thrash.** When a method fails, move to the **next method in the list once**, not back to the same dead end. Specifically:
 
-- Do **not** try to install Homebrew. Its installer requires `sudo` (it creates and chowns `/opt/homebrew` or `/usr/local` on first run), which is an interactive privilege escalation an unattended agent cannot and must not drive — that is exactly why the release binary is the primary path.
+- Do **not** try to install Homebrew. Its installer requires `sudo`, an interactive privilege escalation an unattended agent cannot drive — which is why the release binary is the primary path.
 - Do **not** repeatedly `ls /opt/homebrew/...` probing for a brew that isn't there, do **not** open a PTY to coax an interactive installer, and do **not** web-search for an install command.
 
 If every `gws` method fails (or both `gcloud` paths fail), STOP and tell the user verbatim what failed plus the single command to run manually — the preferred method for their platform — then wait. A clean hand-off beats a long loop.
