@@ -70,13 +70,19 @@ export interface NativeBridge {
   appleSharedContainers: Record<string, unknown>;
 }
 
-// Lazy-require the native modules and shape them into a NativeBridge.
-// Throws in non-RN bundles (caught by the resolver). `req` is injectable
-// so the assembly logic is testable without loading the real native
-// modules; production uses the module's own require.
-export function loadNativeBridge(req: (id: string) => unknown = require): NativeBridge {
-  const { Platform } = req("react-native") as { Platform: { OS: string } };
-  const { File, Paths } = req("expo-file-system") as {
+// Shapes the native modules into a NativeBridge. The two requires MUST be
+// literal `require("react-native")` / `require("expo-file-system")` calls:
+// Metro bundles a module only when its static analysis sees a literal
+// require on the real `require` identifier. An aliased/injected requirer
+// (e.g. `req("react-native")`) is invisible to Metro, so the module is
+// never registered and throws "Requiring unknown module" at runtime —
+// which silently breaks the whole App Group write. Tests don't need to
+// run this function; they exercise defaultResolveSharedFile with a fake
+// bridge instead, so there's no reason to make the requires injectable.
+// Throws in non-RN bundles (caught by the resolver).
+export function loadNativeBridge(): NativeBridge {
+  const { Platform } = require("react-native") as { Platform: { OS: string } };
+  const { File, Paths } = require("expo-file-system") as {
     File: new (dir: unknown, name: string) => SharedFile;
     Paths: { appleSharedContainers: Record<string, unknown> };
   };

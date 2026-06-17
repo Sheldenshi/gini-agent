@@ -29,6 +29,14 @@
 // case it's the generic "Tap to read" banner, exactly as before.
 
 import UserNotifications
+import os
+
+// Subsystem/category for unified-logging diagnostics. Stream on a tethered
+// device with:  log stream --predicate 'subsystem == "ai.lilaclabs.gini.nse"' --info
+// or filter Console.app by the ApprovalNotificationService process. These
+// lines make every NSE decision (invoked / creds / fetch status) visible;
+// the NSE is otherwise silent and every fallback looks identical.
+private let nseLog = Logger(subsystem: "ai.lilaclabs.gini.nse", category: "enrich")
 
 class NotificationService: UNNotificationServiceExtension {
     var contentHandler: ((UNNotificationContent) -> Void)?
@@ -71,6 +79,7 @@ class NotificationService: UNNotificationServiceExtension {
 
         guard let bestAttempt = bestAttemptContent else {
             // Couldn't get a mutable copy — surface the unchanged content.
+            nseLog.error("no mutable copy of content; delivering as-sent")
             contentHandler(request.content)
             return
         }
@@ -78,6 +87,7 @@ class NotificationService: UNNotificationServiceExtension {
         // Routing fields are nested under `body` in the push payload.
         let routing = bestAttempt.userInfo["body"] as? [String: Any]
         let event = routing?["event"] as? String
+        nseLog.info("didReceive event=\(event ?? "nil", privacy: .public) hasBody=\(routing != nil, privacy: .public)")
 
         // Attach the approval category up front so the action buttons show
         // even if the enrichment fetch never completes.
@@ -86,22 +96,35 @@ class NotificationService: UNNotificationServiceExtension {
         }
 
         // Only the alert events have a preview to fetch. Anything else (or
-        // a malformed payload) falls through to the as-sent banner.
-        guard
-            let event = event,
-            Self.enrichableEvents.contains(event),
-            let sessionId = routing?["sessionId"] as? String,
-            let creds = Self.loadSharedCredentials(),
-            let url = Self.previewURL(
-                baseUrl: creds.baseUrl,
-                event: event,
-                sessionId: sessionId,
-                approvalId: routing?["approvalId"] as? String
-            )
-        else {
+        // a malformed payload) falls through to the as-sent banner. Each
+        // precondition is checked separately so the log names the exact
+        // reason enrichment was skipped.
+        guard let event = event, Self.enrichableEvents.contains(event) else {
+            nseLog.info("skip enrich: event not enrichable (\(event ?? "nil", privacy: .public))")
             deliver(bestAttempt)
             return
         }
+        guard let sessionId = routing?["sessionId"] as? String else {
+            nseLog.error("skip enrich: missing sessionId in payload body")
+            deliver(bestAttempt)
+            return
+        }
+        guard let creds = Self.loadSharedCredentials() else {
+            nseLog.error("skip enrich: no shared credentials in App Group container")
+            deliver(bestAttempt)
+            return
+        }
+        guard let url = Self.previewURL(
+            baseUrl: creds.baseUrl,
+            event: event,
+            sessionId: sessionId,
+            approvalId: routing?["approvalId"] as? String
+        ) else {
+            nseLog.error("skip enrich: previewURL nil (baseUrl rejected by transport guard or unparseable)")
+            deliver(bestAttempt)
+            return
+        }
+        nseLog.info("fetching preview from \(url.host ?? "?", privacy: .public)\(url.path, privacy: .public)")
 
         var urlRequest = URLRequest(url: url)
         urlRequest.httpMethod = "GET"
@@ -111,11 +134,14 @@ class NotificationService: UNNotificationServiceExtension {
             urlRequest.setValue(deviceToken, forHTTPHeaderField: "X-Device-Token")
         }
 
-        fetchTask = URLSession.shared.dataTask(with: urlRequest) { [weak self] data, response, _ in
+        fetchTask = URLSession.shared.dataTask(with: urlRequest) { [weak self] data, response, error in
             guard let self = self, let bestAttempt = self.bestAttemptContent else { return }
 
-            if let http = response as? HTTPURLResponse,
-               http.statusCode == 200,
+            let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+            if let error = error {
+                nseLog.error("preview fetch error: \(error.localizedDescription, privacy: .public)")
+            }
+            if status == 200,
                let data = data,
                let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                let title = json["title"] as? String,
@@ -123,6 +149,9 @@ class NotificationService: UNNotificationServiceExtension {
                !body.isEmpty {
                 bestAttempt.title = title
                 bestAttempt.body = body
+                nseLog.info("enriched banner from preview (status=200)")
+            } else {
+                nseLog.error("enrich failed: status=\(status, privacy: .public) bytes=\(data?.count ?? 0, privacy: .public); keeping generic banner")
             }
             // On any non-200 / parse failure (including a cancellation
             // error from serviceExtensionTimeWillExpire) we leave the
@@ -138,6 +167,7 @@ class NotificationService: UNNotificationServiceExtension {
         // generic banner beats no banner. cancel() still fires the task's
         // completion handler (with NSURLErrorCancelled), so deliver() must
         // be idempotent to avoid a double content-handler call.
+        nseLog.error("serviceExtensionTimeWillExpire fired (30s budget hit) — delivering best-attempt")
         fetchTask?.cancel()
         if let bestAttempt = bestAttemptContent {
             deliver(bestAttempt)
@@ -156,6 +186,11 @@ class NotificationService: UNNotificationServiceExtension {
         let handler = contentHandler
         contentHandler = nil
         deliverLock.unlock()
+        if handler == nil {
+            nseLog.error("deliver() called but handler already consumed (double-deliver suppressed)")
+        } else {
+            nseLog.info("deliver() handing content to OS")
+        }
         handler?(content)
     }
 
@@ -173,15 +208,23 @@ class NotificationService: UNNotificationServiceExtension {
         guard let containerURL = FileManager.default.containerURL(
             forSecurityApplicationGroupIdentifier: appGroupId
         ) else {
+            nseLog.error("creds: containerURL nil for app group \(appGroupId, privacy: .public) — entitlement not effective in this build")
             return nil
         }
         let fileURL = containerURL.appendingPathComponent(credentialsFilename)
-        guard let data = try? Data(contentsOf: fileURL),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let baseUrl = json["baseUrl"] as? String,
-              let token = json["token"] as? String else {
+        let exists = FileManager.default.fileExists(atPath: fileURL.path)
+        nseLog.info("creds: container=\(containerURL.path, privacy: .public) fileExists=\(exists, privacy: .public)")
+        guard let data = try? Data(contentsOf: fileURL) else {
+            nseLog.error("creds: could not read \(self.credentialsFilename, privacy: .public) (app never wrote it, or no access)")
             return nil
         }
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let baseUrl = json["baseUrl"] as? String,
+              let token = json["token"] as? String else {
+            nseLog.error("creds: file present (\(data.count, privacy: .public) bytes) but JSON/baseUrl/token missing")
+            return nil
+        }
+        nseLog.info("creds: loaded baseUrl host=\(URL(string: baseUrl)?.host ?? "?", privacy: .public) hasDeviceToken=\(json["deviceToken"] != nil, privacy: .public)")
         return SharedCredentials(
             baseUrl: baseUrl,
             token: token,

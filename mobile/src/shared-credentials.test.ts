@@ -157,21 +157,13 @@ describe("defaultResolveSharedFile", () => {
 });
 
 describe("loadNativeBridge", () => {
-  test("shapes the injected native modules into a NativeBridge", () => {
-    class FakeFile implements SharedFile {
-      write(): void {}
-      delete(): void {}
-    }
-    const containers = { [APP_GROUP_ID]: { uri: "file:///shared/" } };
-    const req = (id: string): unknown => {
-      if (id === "react-native") return { Platform: { OS: "ios" } };
-      if (id === "expo-file-system") return { File: FakeFile, Paths: { appleSharedContainers: containers } };
-      throw new Error(`unexpected require: ${id}`);
-    };
-    const bridge = loadNativeBridge(req);
-    expect(bridge.platformOS).toBe("ios");
-    expect(bridge.File).toBe(FakeFile);
-    expect(bridge.appleSharedContainers).toBe(containers);
+  test("throws in a non-RN env (react-native not resolvable under bun:test)", () => {
+    // The production bridge uses literal require("react-native") — which
+    // Metro must see statically to bundle it, and which is unavailable
+    // under bun:test. The contract that matters is that the throw is
+    // CAUGHT by defaultResolveSharedFile (verified above), so the bridge
+    // failing to load degrades to a no-op write rather than a crash.
+    expect(() => loadNativeBridge()).toThrow();
   });
 });
 
