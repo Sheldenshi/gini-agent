@@ -1875,8 +1875,8 @@ describe("request_confirmation dispatch", () => {
       "request_confirmation",
       "call_confirm",
       JSON.stringify({
-        summary: "Send this reply to Jen in the Awesomic thread",
-        details: "Hi Jen — looks great, ship it.",
+        summary: "Send this reply to Dana in the project thread",
+        details: "Hi Dana — looks great, ship it.",
         confirmLabel: "Send"
       })
     );
@@ -1889,10 +1889,10 @@ describe("request_confirmation dispatch", () => {
       expect(approval!.status).toBe("pending");
       // summary doubles as reason + target so the setup_requested block summary
       // and the audit rows read as the summary itself.
-      expect(approval!.reason).toBe("Send this reply to Jen in the Awesomic thread");
-      expect(approval!.target).toBe("Send this reply to Jen in the Awesomic thread");
-      expect(approval!.payload.summary).toBe("Send this reply to Jen in the Awesomic thread");
-      expect(approval!.payload.details).toBe("Hi Jen — looks great, ship it.");
+      expect(approval!.reason).toBe("Send this reply to Dana in the project thread");
+      expect(approval!.target).toBe("Send this reply to Dana in the project thread");
+      expect(approval!.payload.summary).toBe("Send this reply to Dana in the project thread");
+      expect(approval!.payload.details).toBe("Hi Dana — looks great, ship it.");
       expect(approval!.payload.confirmLabel).toBe("Send");
       expect(approval!.payload.toolCallId).toBe("call_confirm");
     }

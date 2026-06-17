@@ -97,8 +97,8 @@ async function pauseOnConfirmation(config: RuntimeConfig): Promise<{ taskId: str
         function: {
           name: "request_confirmation",
           arguments: JSON.stringify({
-            summary: "Send this reply to Jen in the Awesomic thread",
-            details: "Hi Jen — looks great, ship it.",
+            summary: "Send this reply to Dana in the project thread",
+            details: "Hi Dana — looks great, ship it.",
             confirmLabel: "Send"
           })
         }
@@ -107,7 +107,7 @@ async function pauseOnConfirmation(config: RuntimeConfig): Promise<{ taskId: str
     finishReason: "tool_calls"
   });
   const session = await mutateState(config.instance, (state) => createChatSession(state, "confirm session"));
-  const submitted = await submitChatMessage(config, session.id, { content: "reply to Jen and tell her it's good to go" });
+  const submitted = await submitChatMessage(config, session.id, { content: "reply to Dana and tell her it's good to go" });
   await waitForTask(config, submitted.taskId, "waiting_approval");
   const setup = readState(config.instance).setupRequests.find(
     (s) => s.taskId === submitted.taskId && s.action === "confirmation.request"
@@ -138,8 +138,8 @@ describe("confirmation.request /complete and /cancel", () => {
     const setup = readState(config.instance).setupRequests.find((s) => s.id === setupId);
     expect(setup?.action).toBe("confirmation.request");
     expect(setup?.status).toBe("pending");
-    expect(setup?.target).toBe("Send this reply to Jen in the Awesomic thread");
-    expect(setup?.payload.details).toBe("Hi Jen — looks great, ship it.");
+    expect(setup?.target).toBe("Send this reply to Dana in the project thread");
+    expect(setup?.payload.details).toBe("Hi Dana — looks great, ship it.");
     expect(setup?.payload.confirmLabel).toBe("Send");
   });
 
@@ -153,7 +153,7 @@ describe("confirmation.request /complete and /cancel", () => {
     // Final model turn after the resume sees the confirmation and "sends".
     setEchoToolCallingResponse({
       provider: normalizeProvider(config.provider),
-      text: "Sent the reply to Jen.",
+      text: "Sent the reply to Dana.",
       toolCalls: [],
       finishReason: "stop"
     });
@@ -163,7 +163,7 @@ describe("confirmation.request /complete and /cancel", () => {
     expect(await response.json()).toEqual({ ok: true });
 
     const finished = await waitForTask(config, taskId, "completed");
-    expect(finished.summary).toBe("Sent the reply to Jen.");
+    expect(finished.summary).toBe("Sent the reply to Dana.");
 
     // The model receives an unambiguous boolean, not a prose/skip string.
     const blocks = listChatBlocks(config.instance, sessionId);

@@ -2837,7 +2837,7 @@ describe("chat-task loop", () => {
       createChatSession(state, "block-confirm", undefined, "agent_c")
     );
 
-    const summary = "Send this reply to Jen in the Awesomic thread";
+    const summary = "Send this reply to Dana in the project thread";
     setEchoToolCallingResponse({
       provider,
       text: "",
@@ -2847,14 +2847,14 @@ describe("chat-task loop", () => {
           type: "function",
           function: {
             name: "request_confirmation",
-            arguments: JSON.stringify({ summary, details: "Hi Jen — ship it.", confirmLabel: "Send" })
+            arguments: JSON.stringify({ summary, details: "Hi Dana — ship it.", confirmLabel: "Send" })
           }
         }
       ],
       finishReason: "tool_calls"
     });
 
-    const submitted = await submitChatMessage(config, session.id, { content: "reply to Jen that it's good" });
+    const submitted = await submitChatMessage(config, session.id, { content: "reply to Dana that it's good" });
     const paused = await waitForTerminal(config, submitted.taskId);
     expect(paused.status).toBe("waiting_approval");
 
@@ -2898,7 +2898,7 @@ describe("chat-task loop", () => {
           type: "function",
           function: {
             name: "request_confirmation",
-            arguments: JSON.stringify({ summary: "Send the reply to Jen" })
+            arguments: JSON.stringify({ summary: "Send the reply to Dana" })
           }
         }
       ],
@@ -2911,7 +2911,7 @@ describe("chat-task loop", () => {
       finishReason: "stop"
     });
 
-    const submitted = await submitChatMessage(config, session.id, { content: "reply to Jen" });
+    const submitted = await submitChatMessage(config, session.id, { content: "reply to Dana" });
     const paused = await waitForTerminal(config, submitted.taskId);
     expect(paused.status).toBe("waiting_approval");
 

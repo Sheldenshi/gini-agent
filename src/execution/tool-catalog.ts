@@ -843,7 +843,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
       parameters: {
         type: "object",
         properties: {
-          summary: { type: "string", description: "One human-readable line stating what will happen if confirmed (e.g. \"Send this reply to Jen in the Awesomic thread\"). Shown as the card headline." },
+          summary: { type: "string", description: "One human-readable line stating what will happen if confirmed (e.g. \"Send this reply to Dana in the project thread\"). Shown as the card headline." },
           details: { type: "string", description: "Optional — the actual content the user is consenting to (the message body, the recipient, the order summary), shown in an expandable section so they can review exactly what goes out." },
           confirmLabel: { type: "string", description: "Optional label for the confirm button (e.g. \"Send\", \"Submit\", \"Purchase\"). Defaults to \"Confirm\"." }
         },
