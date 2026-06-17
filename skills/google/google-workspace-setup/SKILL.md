@@ -2,7 +2,7 @@
 name: google-workspace-setup
 description: "One-time setup for gws: install, OAuth, scopes, auto-approve."
 license: MIT
-compatibility: "macOS and Linux. Needs a Google account; installs gws from a checksum-verified release binary (no package manager required), or via bun/Homebrew when present."
+compatibility: "macOS and Linux. Requires a Google account."
 metadata:
   gini:
     version: 3.8.0
@@ -80,7 +80,7 @@ command -v gcloud
 
 ### Critical: where the binaries must land
 
-`terminal_exec` runs each command in a **non-interactive login shell (`zsh -lc`), which does NOT source `~/.zshrc`.** Writing a PATH line there has no effect on later commands. What the gateway DOES expose is `~/.local/bin` (baked into its process `$PATH`). So both tools must be reachable there: put `gws` in `~/.local/bin`, and symlink `~/.local/bin/gcloud → ~/google-cloud-sdk/bin/gcloud`. After that, bare `gws`/`gcloud` resolve in every later step; otherwise call them by absolute path.
+`terminal_exec` runs each command in a non-interactive login shell (`zsh -lc`), which does **not** source `~/.zshrc` — a PATH line written there is ignored. The dir the gateway reliably bakes into `$PATH` is `~/.local/bin`. So any binary installed outside `$PATH` (the gws release binary, the gcloud tarball under `~/google-cloud-sdk/bin`) must be moved or symlinked into `~/.local/bin`; Homebrew installs are already on `$PATH`. Then bare `gws`/`gcloud` resolve in later steps; otherwise use the absolute path.
 
 ### Verify
 
