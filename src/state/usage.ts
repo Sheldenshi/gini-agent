@@ -1,4 +1,4 @@
-import type { CostRecord, Instance, RuntimeState, UsageContext } from "../types";
+import type { CostRecord, Instance, RuntimeState, UsageContext, UsageLedgerEntry, UsageSource } from "../types";
 import { mutateState } from "./store";
 
 // Local-calendar day key (YYYY-MM-DD) for a timestamp. The home usage chart
@@ -74,4 +74,72 @@ export async function recordUsage(
   await mutateState(instance, (state) => {
     applyUsage(state, context, cost, at);
   });
+}
+
+export interface DaySourceUsage {
+  input: number;
+  output: number;
+  total: number;
+  estimatedUsd: number;
+  calls: number;
+}
+
+export interface DayUsage {
+  /** Local YYYY-MM-DD key. */
+  day: string;
+  /** Local-midnight timestamp (ms) for the client axis. */
+  dayStart: number;
+  input: number;
+  output: number;
+  total: number;
+  estimatedUsd: number;
+  /** Per-source breakdown (chat/job/subagent/memory/…) for tooltips. */
+  bySource: Partial<Record<UsageSource, DaySourceUsage>>;
+}
+
+function dayStartMs(dayKey: string): number {
+  const [y, m, d] = dayKey.split("-").map(Number);
+  return new Date(y, m - 1, d).getTime();
+}
+
+/**
+ * Roll the durable ledger up into `days` per-day buckets ending today (local),
+ * oldest first. Optionally filtered to one agent: entries with no agentId
+ * (shared overhead like title/aux generation) are included in every agent view
+ * so a per-agent total never silently drops real spend.
+ */
+export function buildDailyUsage(
+  ledger: UsageLedgerEntry[],
+  days: number,
+  agentId?: string,
+  now: number = Date.now()
+): DayUsage[] {
+  const today = new Date(now);
+  today.setHours(0, 0, 0, 0);
+  const out: DayUsage[] = [];
+  const indexByDay = new Map<string, number>();
+  for (let i = days - 1; i >= 0; i--) {
+    const d = new Date(today);
+    d.setDate(d.getDate() - i);
+    const day = localDayKey(d.getTime());
+    indexByDay.set(day, out.length);
+    out.push({ day, dayStart: dayStartMs(day), input: 0, output: 0, total: 0, estimatedUsd: 0, bySource: {} });
+  }
+  for (const e of ledger) {
+    if (agentId !== undefined && e.agentId !== undefined && e.agentId !== agentId) continue;
+    const idx = indexByDay.get(e.day);
+    if (idx === undefined) continue;
+    const bucket = out[idx];
+    bucket.input += e.inputTokens;
+    bucket.output += e.outputTokens;
+    bucket.total += e.totalTokens;
+    bucket.estimatedUsd += e.estimatedUsd;
+    const s = (bucket.bySource[e.source] ??= { input: 0, output: 0, total: 0, estimatedUsd: 0, calls: 0 });
+    s.input += e.inputTokens;
+    s.output += e.outputTokens;
+    s.total += e.totalTokens;
+    s.estimatedUsd += e.estimatedUsd;
+    s.calls += e.calls;
+  }
+  return out;
 }

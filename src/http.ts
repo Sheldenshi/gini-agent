@@ -38,7 +38,7 @@ import { runFillSecretConnect } from "./execution/browser-fill-secrets";
 import { runMessagingBridgeConnect } from "./execution/messaging-bridge-connect";
 import { runMessagingPairingConnect } from "./execution/messaging-pairing-connect";
 import { runMessagingRemoveConnect } from "./execution/messaging-remove-connect";
-import { mobileBootstrap, publicState } from "./runtime/views";
+import { dailyUsage, mobileBootstrap, publicState } from "./runtime/views";
 import { checkConnector, createConnector, credentialTemplateForProvider, deleteConnector, firstUngrantedCredential, isSkillActive, updateConnector } from "./integrations/connectors";
 import { gwsSessionStatus } from "./integrations/connectors/gws-session";
 import { listAccountsWithStatus, registerAccount, removeAccount, retagAccount } from "./integrations/connectors/google-accounts";
@@ -567,6 +567,11 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       const agentId = agentIdFilter(request);
       const tasks = readState(config.instance).tasks;
       return json(agentId ? tasks.filter((task) => task.agentId === agentId) : tasks);
+    }],
+    ["GET", /^\/api\/usage$/, (request) => {
+      const agentId = agentIdFilter(request);
+      const days = Number(new URL(request.url).searchParams.get("days") ?? 14);
+      return json(dailyUsage(config, { days: Number.isFinite(days) ? days : 14, agentId: agentId ?? undefined }));
     }],
     ["POST", /^\/api\/tasks$/, async (request) => json(await submitTask(config, String((await body(request)).input ?? "")), 201)],
     ["GET", /^\/api\/search$/, (_request) => json(searchSessions(config, new URL(_request.url).searchParams.get("q") ?? "", Number(new URL(_request.url).searchParams.get("limit") ?? 20)))],
