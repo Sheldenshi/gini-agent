@@ -6,6 +6,7 @@ import "./hooks/builtins"; // registers trusted hook handlers (skill-script) bef
 import { runDueJobs } from "./jobs";
 import { runConnectorReprobe } from "./jobs/connector-reprobe";
 import { runConnectorDetection } from "./jobs/connector-detection";
+import { runDailyReview } from "./learning/daily-review";
 import { syncProviderMcpServers } from "./integrations/mcp-sync";
 import { install } from "./runtime";
 import { migrateIfNeeded } from "./memory";
@@ -438,6 +439,39 @@ const discordDone: Promise<void> = (async function discordReconcileLoop(): Promi
   }
 })();
 
+// Skill-learning daily review loop (ADR skill-learning-from-outcomes.md).
+// Modeled on the connector-reprobe loop: a slow, abortable loop that runs the
+// offline review pass (reflect over recent outcomes, propose bounded skill
+// edits, sample feedback questions, post a digest into the dedicated "Skill
+// review" channel) off the agent-turn path. Default 24h; GINI_SKILL_REVIEW_TICK_MS
+// overrides for testing. runDailyReview no-ops cleanly when there's nothing to
+// review, so a quiet instance just posts nothing.
+const SKILL_REVIEW_TICK_INTERVAL_MS = Number(process.env.GINI_SKILL_REVIEW_TICK_MS ?? 24 * 60 * 60 * 1000);
+let skillReviewStopped = false;
+const skillReviewDone: Promise<void> = (async function skillReviewLoop(): Promise<void> {
+  // Wait one interval before the first run so a fresh boot doesn't immediately
+  // post — the review is a slow background cadence, not a startup task.
+  await sleepUnlessStopping(SKILL_REVIEW_TICK_INTERVAL_MS);
+  while (!skillReviewStopped) {
+    try {
+      const report = await runDailyReview(config);
+      if (report.posted) {
+        appendLog(config.instance, "skill_review.posted", {
+          proposals: report.proposalsCreated,
+          findings: report.findingsCreated,
+          feedbackAsked: report.feedbackAsked
+        });
+      }
+    } catch (error) {
+      appendLog(config.instance, "skill_review.error", {
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+    if (skillReviewStopped) break;
+    await sleepUnlessStopping(SKILL_REVIEW_TICK_INTERVAL_MS);
+  }
+})();
+
 // Guard against concurrent SIGTERMs. launchctl bootout, `kill`, and our
 // own self-signal from src/runtime/autostart-refresh.ts can all arrive
 // in quick succession; we only want to drain + consume the refresh
@@ -461,6 +495,7 @@ async function shutdown(signal: "SIGTERM" | "SIGINT"): Promise<void> {
   reprobeStopped = true;
   telegramStopped = true;
   discordStopped = true;
+  skillReviewStopped = true;
   // Wake every loop out of its inter-tick sleep so it checks the flag and
   // unwinds now instead of sleeping out its full interval.
   beginShutdown();
@@ -511,6 +546,7 @@ async function shutdown(signal: "SIGTERM" | "SIGINT"): Promise<void> {
     Promise.all([
       schedulerDone.catch(() => {}),
       reprobeDone.catch(() => {}),
+      skillReviewDone.catch(() => {}),
       telegramDone.catch(() => {}),
       telegramSupervisor.stopAll().catch(() => {}),
       discordDone.catch(() => {}),

@@ -31,6 +31,7 @@ import {
 import { id as makeId } from "../state/ids";
 import { readGoogleAccounts } from "../state/google-accounts";
 import { ApprovedActionFailedError, findTask, scheduleAutoRetain } from "../agent";
+import { recordObjectiveOutcomes } from "../learning/outcomes";
 import { recall } from "../memory";
 import {
   ProviderAuthError,
@@ -2112,6 +2113,12 @@ async function runLoop(
     if (exhausted.jobId) await finalizeJobRunFromTask(config, exhausted);
     if (exhausted.status === "completed") {
       void scheduleAutoRetain(config, exhausted);
+      // Skill learning tier 1: harvest objective outcomes from the task's
+      // skill.script.invoked audit rows (ADR skill-learning-from-outcomes.md).
+      // The chat-turn terminal path is the real surface, so capture must ride
+      // here alongside auto-retain — agent.ts's completeTask/finishTaskTransition
+      // wiring does not cover the chat completion path. Fire-and-forget.
+      void recordObjectiveOutcomes(config, exhausted);
       if (exhausted.chatSessionId) {
         void autoRenameChatAfterTurn(config, exhausted.chatSessionId).catch((error) => {
           appendLog(config.instance, "chat.auto_title.failed", {
@@ -2659,6 +2666,10 @@ async function runLoop(
       // the model's text stream doesn't retain a cancelled output.
       if (finished.status === "completed") {
         void scheduleAutoRetain(config, finished);
+        // Skill learning tier 1: harvest objective outcomes alongside
+        // auto-retain at the chat-turn terminal (ADR skill-learning-from-outcomes.md).
+        // Fire-and-forget.
+        void recordObjectiveOutcomes(config, finished);
         if (finished.chatSessionId) {
           void autoRenameChatAfterTurn(config, finished.chatSessionId).catch((error) => {
             appendLog(config.instance, "chat.auto_title.failed", {
@@ -3464,6 +3475,12 @@ async function runLoop(
     if (exhausted.jobId) await finalizeJobRunFromTask(config, exhausted);
     if (exhausted.status === "completed") {
       void scheduleAutoRetain(config, exhausted);
+      // Skill learning tier 1: harvest objective outcomes from the task's
+      // skill.script.invoked audit rows (ADR skill-learning-from-outcomes.md).
+      // The chat-turn terminal path is the real surface, so capture must ride
+      // here alongside auto-retain — agent.ts's completeTask/finishTaskTransition
+      // wiring does not cover the chat completion path. Fire-and-forget.
+      void recordObjectiveOutcomes(config, exhausted);
       if (exhausted.chatSessionId) {
         void autoRenameChatAfterTurn(config, exhausted.chatSessionId).catch((error) => {
           appendLog(config.instance, "chat.auto_title.failed", {

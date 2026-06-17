@@ -78,7 +78,7 @@ function stateWithToolsets(toolsets: ToolsetRecord[]): RuntimeState {
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",
     tasks: [], authorizations: [], setupRequests: [], audit: [], skills: [], jobs: [],
-    connectors: [], improvements: [], pairingCodes: [], pairingRequests: [], devices: [],
+    connectors: [], improvements: [], skillOutcomes: [], learningFindings: [], pairingCodes: [], pairingRequests: [], devices: [],
     promotions: [], snapshots: [], tools: [], toolsets, subagents: [],
     mcpServers: [], messagingBridges: [], importReports: [], agents: [],
     activeAgentId: undefined, relays: [], notifications: [], emailWatchers: [], events: [],
@@ -99,6 +99,7 @@ const ALWAYS_ON = new Set([
   // model must be able to answer "what time is it" regardless of toolset state.
   "get_current_time",
   "read_skill",
+  "record_skill_feedback",
   "spawn_subagent",
   "create_job",
   "list_jobs",

@@ -24,6 +24,8 @@ import type {
   RuntimeState,
   SetupRequest,
   SkillRecord,
+  SkillOutcome,
+  LearningFinding,
   SnapshotRecord,
   SubagentRecord,
   Task,
@@ -634,6 +636,67 @@ export function createImprovementProposal(
     },
     item.sourceTaskId ? { taskId: item.sourceTaskId } : { system: true }
   );
+  return item;
+}
+
+// Newest-first ring caps for the skill-learning rows. Bounded so the harvest
+// loop can never grow durable state without limit (same posture as the
+// pairing/audit rings). skillOutcomes is capped PER SKILL, not globally — a
+// global ring lets a high-volume skill evict a quiet skill's history, which
+// would corrupt any per-skill reliability metric (one skill's N depending on
+// another's activity). A generous global ceiling backstops total memory.
+const MAX_SKILL_OUTCOMES_PER_SKILL = 100;
+const MAX_SKILL_OUTCOMES = 5000;
+const MAX_LEARNING_FINDINGS = 500;
+
+// Record one skill-learning outcome (ADR skill-learning-from-outcomes.md).
+// Writes via the caller's mutateState transaction; bounds the ring on insert.
+export function createSkillOutcome(
+  state: RuntimeState,
+  outcome: Omit<SkillOutcome, "id" | "instance" | "createdAt">
+): SkillOutcome {
+  const item: SkillOutcome = {
+    id: id("skillout"),
+    instance: state.instance,
+    createdAt: now(),
+    ...outcome
+  };
+  state.skillOutcomes.unshift(item);
+  // Trim only the inserted row's skill bucket to its per-skill cap (newest-first
+  // order keeps the most recent). Other skills' rows are untouched, so a chatty
+  // skill never crowds out a quiet one. The unattributed bucket (no skillId)
+  // shares one key.
+  const key = item.skillId ?? "";
+  let kept = 0;
+  state.skillOutcomes = state.skillOutcomes.filter((o) => {
+    if ((o.skillId ?? "") !== key) return true;
+    kept += 1;
+    return kept <= MAX_SKILL_OUTCOMES_PER_SKILL;
+  });
+  // Global backstop across all skills.
+  if (state.skillOutcomes.length > MAX_SKILL_OUTCOMES) {
+    state.skillOutcomes = state.skillOutcomes.slice(0, MAX_SKILL_OUTCOMES);
+  }
+  return item;
+}
+
+// Record one non-skill-edit learning finding (environment / credential /
+// model-ignored / bundled-skill). Surfaced in the digest; never auto-actioned.
+export function createLearningFinding(
+  state: RuntimeState,
+  finding: Omit<LearningFinding, "id" | "instance" | "status" | "createdAt">
+): LearningFinding {
+  const item: LearningFinding = {
+    id: id("finding"),
+    instance: state.instance,
+    status: "open",
+    createdAt: now(),
+    ...finding
+  };
+  state.learningFindings.unshift(item);
+  if (state.learningFindings.length > MAX_LEARNING_FINDINGS) {
+    state.learningFindings = state.learningFindings.slice(0, MAX_LEARNING_FINDINGS);
+  }
   return item;
 }
 

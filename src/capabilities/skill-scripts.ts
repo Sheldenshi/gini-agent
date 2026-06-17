@@ -25,6 +25,7 @@ import { spawn } from "bun";
 import type { RuntimeConfig, RuntimeState, SkillRecord } from "../types";
 import { addAudit, appendTrace, mutateState } from "../state";
 import { resolveSkillEnv } from "../integrations/connectors";
+import { redactSecrets } from "../provider";
 import { uploadsDir } from "../paths";
 
 const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000;
@@ -235,7 +236,12 @@ export async function invokeSkillScript(
           ok,
           exitCode,
           stdoutBytes: stdout.length,
-          stderrBytes: stderr.length
+          stderrBytes: stderr.length,
+          // On failure, persist a scrubbed, capped snippet of the reason so the
+          // skill-learning classifier (ADR skill-learning-from-outcomes.md) can
+          // tell an environment/credential fault from a skill defect — byte
+          // counts alone starve the classification. Omitted on success.
+          ...(ok ? {} : { stderrSnippet: redactSecrets(error ?? "").slice(0, 300) })
         }
       },
       ctx

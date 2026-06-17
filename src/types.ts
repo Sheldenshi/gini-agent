@@ -662,6 +662,20 @@ export interface RuntimeState {
   jobs: JobRecord[];
   connectors: ConnectorRecord[];
   improvements: ImprovementProposal[];
+  // Skill-learning outcome rows (ADR skill-learning-from-outcomes.md). One row
+  // per attributable run outcome (a skill script's success/failure, or an
+  // unattributed task failure). Bounded ring, newest-first. Defaulted to [] by
+  // normalizeState so older state files load.
+  skillOutcomes: SkillOutcome[];
+  // Non-skill-edit findings the daily review surfaces but never auto-actions
+  // (environment / credential / model-ignored / bundled-skill). Bounded,
+  // newest-first. Defaulted to [] by normalizeState.
+  learningFindings: LearningFinding[];
+  // ISO timestamp of the last posted "Skill review" digest. The next digest
+  // only re-surfaces proposals/findings created AFTER this, so a standing
+  // (still-unactioned) proposal isn't re-posted every run. Absent until the
+  // first digest posts; normalizeState leaves it as-is (passthrough).
+  lastSkillReviewDigestAt?: string;
   pairingCodes: PairingCode[];
   pairingRequests: PairingRequest[];
   devices: PairedDevice[];
@@ -1026,7 +1040,9 @@ export interface ChatSessionRecord {
   // the shared email-watch session is created and backfilled by the
   // self-heal migration. DISTINCT from `source` (messaging-bridge routing).
   // Optional, so legacy sessions just lack it — no normalizeState backfill.
-  feature?: "email-watch";
+  // "skill-review" marks the dedicated channel the daily skill-learning review
+  // posts its digest into (ADR skill-learning-from-outcomes.md).
+  feature?: "email-watch" | "skill-review";
   // FIFO queue of messages submitted while a chat turn is already in flight
   // for this session. The gateway is the source of truth: a new POST while a
   // task runs is enqueued here instead of starting a concurrent task, and the
@@ -2128,9 +2144,90 @@ export interface ImprovementProposal {
   sourceTraceIds: string[];
   payload: Record<string, unknown>;
   appliedTargetId?: string;
+  // Set when this proposal has been surfaced in a skill-review digest, so it is
+  // never re-posted. A per-item flag (not a timestamp watermark) is collision-free.
+  digestedAt?: string;
   createdAt: string;
   updatedAt: string;
 }
+
+// Skill-learning signal & finding types (ADR skill-learning-from-outcomes.md).
+
+export type OutcomeSignal = "success" | "failure";
+// Where the row came from: "objective" rows are harvested from already-
+// persisted audit/trace at task terminal (free, high-confidence-negative);
+// "user_feedback" rows carry a human verdict captured via record_skill_feedback.
+export type OutcomeSource = "objective" | "user_feedback";
+// How the reflection pass classifies a failure batch. Only `skill_defect`
+// routes to a skill edit; the rest become findings or are dropped.
+export type DefectClass =
+  | "skill_defect"
+  | "environment"
+  | "credential"
+  | "model_ignored"
+  | "transient"
+  | "unknown";
+
+// One row per attributable run outcome. Attribution is via the
+// `skill.script.invoked` audit row (`target: skill.id`); a `failed` task with
+// no script invocation yields one unattributed (`skillId` unset) failure row
+// for the digest's "what didn't work" summary only.
+export interface SkillOutcome {
+  id: string;
+  instance: Instance;
+  taskId: string;
+  agentId?: string;
+  skillId?: string;
+  skillName?: string;
+  scriptName?: string;
+  signal: OutcomeSignal;
+  source: OutcomeSource;
+  exitCode?: number;
+  // Scrubbed (redactSecrets) and capped failure detail. Absent for successes.
+  errorDetail?: string;
+  // True when the attributed skill declares requiredPermissions or the task
+  // carried an approval/side-effecting audit row — i.e. the action mattered.
+  consequential: boolean;
+  // True when an objective signal existed (a script ok/exit, a terminal
+  // status) so the outcome could be judged without asking the human.
+  selfVerifiable: boolean;
+  defectClass?: DefectClass;
+  // Whether the reflection judged the failure attributable to the skill itself
+  // (vs an environment/credential/model cause). Stamped alongside defectClass
+  // when the batch is reviewed; absent until a reflection pass has classified it.
+  attributable?: boolean;
+  // Set once the reflection pass has consumed this row into a proposal/finding.
+  reviewed: boolean;
+  // Set once the daily review has asked the user about this (success) outcome.
+  feedbackPrompted: boolean;
+  createdAt: string;
+}
+
+// A non-skill-edit finding surfaced in the digest and via a read-only
+// endpoint; never auto-actioned.
+export interface LearningFinding {
+  id: string;
+  instance: Instance;
+  agentId?: string;
+  skillId?: string;
+  skillName?: string;
+  kind: "environment" | "credential" | "model_ignored" | "bundled_skill";
+  summary: string;
+  sourceTaskIds: string[];
+  status: "open" | "dismissed";
+  // Set when this finding has been surfaced in a skill-review digest, so it is
+  // never re-posted (collision-free per-item flag, not a timestamp watermark).
+  digestedAt?: string;
+  createdAt: string;
+}
+
+// A bounded edit to a skill's markdown body (SkillOpt-style). Anchors/targets
+// match as EXACT substrings; a no-match is recorded as skipped, never thrown.
+export type SkillEditOp =
+  | { op: "append"; content: string }
+  | { op: "insert_after"; anchor: string; content: string }
+  | { op: "replace"; target: string; content: string }
+  | { op: "delete"; target: string };
 
 export interface PairingCode {
   id: string;

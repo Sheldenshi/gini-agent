@@ -52,6 +52,8 @@ import { embeddingStatus, reembedAllBanks, reembedBank } from "./memory/embeddin
 import { rerankerStatus } from "./memory/reranker";
 import { listBanks, listMemoryUnits, getBank, updateBank, ensureDefaultBank, ensureAgentBank, DEFAULT_BANK_ID, type Network } from "./state";
 import { proposeImprovement, reviewImprovement } from "./governance/improvements";
+import { runDailyReview } from "./learning/daily-review";
+import { computeSkillScores } from "./learning/score";
 import {
   approvePairing,
   authorizedBearer,
@@ -1660,6 +1662,15 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["POST", /^\/api\/improvements$/, async (request) => json(await proposeImprovement(config, await body(request)), 201)],
     ["POST", /^\/api\/improvements\/([^/]+)\/approve$/, async (_request, params) => json(await reviewImprovement(config, params[0], "approve"))],
     ["POST", /^\/api\/improvements\/([^/]+)\/reject$/, async (_request, params) => json(await reviewImprovement(config, params[0], "reject"))],
+    // Skill-learning read surfaces + manual review trigger (ADR
+    // skill-learning-from-outcomes.md). The review pass otherwise runs on the
+    // slow server loop; POST /review fires it on demand (for testing/dogfood).
+    ["GET", /^\/api\/learning\/outcomes$/, () => json(readState(config.instance).skillOutcomes)],
+    ["GET", /^\/api\/learning\/findings$/, () => json(readState(config.instance).learningFindings)],
+    // Read-only, observational skill reliability scores. Gates nothing — purely
+    // a human-facing indicator (ADR skill-learning-from-outcomes.md).
+    ["GET", /^\/api\/learning\/scores$/, () => json(computeSkillScores(config))],
+    ["POST", /^\/api\/learning\/review$/, async () => json(await runDailyReview(config))],
     ["GET", /^\/api\/devices$/, () => json(publicState(config).devices)],
     ["POST", /^\/api\/devices\/([^/]+)\/revoke$/, async (_request, params) => json(await revokePairedDevice(config, params[0]))],
     ["POST", /^\/api\/pairing$/, async (request) => json(await createPairing(config, await body(request)), 201)],

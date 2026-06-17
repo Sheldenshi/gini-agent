@@ -167,6 +167,8 @@ export {
   createJob,
   createJobRun,
   createImprovementProposal,
+  createSkillOutcome,
+  createLearningFinding,
   createPairingCode,
   claimPairingCode,
   revokeDevice,
