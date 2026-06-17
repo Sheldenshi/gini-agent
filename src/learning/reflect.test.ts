@@ -128,7 +128,7 @@ describe("reflectOnSkillOutcomes", () => {
     expect(String(proposal!.payload.baseBody)).toBe(skill.body);
     // sourceTraceIds are real trace ids (or [] when the task has no trace), never
     // the task ids themselves — sourceTaskId stays the primary evidence pointer.
-    expect(["task_0", "task_1"]).toContain(proposal!.sourceTaskId);
+    expect(["task_0", "task_1"]).toContain(proposal!.sourceTaskId!);
     expect(proposal!.sourceTraceIds).not.toContain("task_0");
     expect(proposal!.sourceTraceIds).not.toContain("task_1");
     expect(proposal!.sourceTraceIds).toEqual([]);
