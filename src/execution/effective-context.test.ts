@@ -92,7 +92,7 @@ function buildState(overrides: Partial<RuntimeState> = {}): RuntimeState {
     chatMessages: [],
     messagingMessages: [],
     runs: [],
-    planSteps: []
+    planSteps: [], usageLedger: []
   };
   return { ...base, ...overrides };
 }

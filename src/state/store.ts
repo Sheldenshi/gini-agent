@@ -63,6 +63,7 @@ export function createEmptyState(instance: Instance): RuntimeState {
     emailWatchers: [],
     events: [],
     jobRuns: [],
+    usageLedger: [],
     chatSessions: [],
     chatMessages: [],
     messagingMessages: [],
@@ -1302,6 +1303,7 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
   state.emailWatchers ??= [];
   state.events ??= [];
   state.jobRuns ??= [];
+  state.usageLedger ??= [];
   state.chatSessions ??= [];
   state.chatMessages ??= [];
   state.runs ??= [];

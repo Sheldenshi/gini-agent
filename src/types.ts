@@ -697,6 +697,12 @@ export interface RuntimeState {
   emailTriageAgents?: string[];
   events: RuntimeEvent[];
   jobRuns: JobRunRecord[];
+  // Durable per-day token-usage rollup across every generative provider call
+  // (chat, jobs, subagents, memory, titles, vision, …). Written by recordUsage
+  // and read by the home usage chart, so the chart survives task pruning and
+  // captures spend that never lands on a task. Legacy states omit it (healed
+  // to []). See ADR usage-accounting.md.
+  usageLedger: UsageLedgerEntry[];
   chatSessions: ChatSessionRecord[];
   chatMessages: ChatMessageRecord[];
   messagingMessages: MessagingMessageRecord[];
@@ -1949,6 +1955,49 @@ export interface CostRecord {
   outputTokens?: number;
   totalTokens?: number;
   estimatedUsd?: number;
+}
+
+// What kind of work spent the tokens. Kept deliberately small so the usage
+// chart can segment by it; finer-grained call sites (memory retain vs reflect,
+// vision_query vs browser_vision) collapse into one bucket here.
+export type UsageSource =
+  | "chat"
+  | "job"
+  | "subagent"
+  | "memory"
+  | "chat-title"
+  | "vision"
+  | "aux"
+  | "imperative"
+  | "other";
+
+// Attribution passed by a caller into a generative provider entry point so the
+// usage ledger can tag the recorded spend. Only `source` is required; the ids
+// enable per-agent/-task/-job breakdowns. A call site that passes no context at
+// all is simply not recorded (keeps existing callers/tests side-effect free).
+export interface UsageContext {
+  source: UsageSource;
+  agentId?: string;
+  taskId?: string;
+  jobId?: string;
+  subagentId?: string;
+}
+
+// One durable, append-rolled-up usage bucket. Keyed by (day, source, agentId,
+// provider, model); recordUsage sums token counts, USD, and call count into the
+// matching bucket. `day` is a local-calendar YYYY-MM-DD so the home chart reads
+// pre-bucketed server-authoritative daily totals that survive task pruning.
+export interface UsageLedgerEntry {
+  day: string;
+  source: UsageSource;
+  agentId?: string;
+  provider: string;
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  estimatedUsd: number;
+  calls: number;
 }
 
 export interface ConnectorSecretRef {

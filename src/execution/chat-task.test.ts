@@ -5887,7 +5887,7 @@ describe("buildInactiveSkillsBlock", () => {
       mcpServers: [], messagingBridges: [], importReports: [], agents: [],
       activeAgentId: undefined, relays: [], notifications: [], emailWatchers: [], events: [],
       jobRuns: [], chatSessions: [], chatMessages: [], messagingMessages: [],
-      runs: [], planSteps: []
+      runs: [], planSteps: [], usageLedger: []
     };
   }
 
@@ -5998,7 +5998,7 @@ describe("buildMcpServersBlock", () => {
       mcpServers: servers, messagingBridges: [], importReports: [], agents: [],
       activeAgentId: undefined, relays: [], notifications: [], emailWatchers: [], events: [],
       jobRuns: [], chatSessions: [], chatMessages: [], messagingMessages: [],
-      runs: [], planSteps: []
+      runs: [], planSteps: [], usageLedger: []
     };
   }
 
