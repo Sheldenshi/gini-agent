@@ -249,6 +249,24 @@ also run with that conversation's prior-turn context (token-budgeted,
 like any chat turn), whereas a channel-bound job's fires see only
 prior fires.
 
+A chat-bound fire shares the conversation's one ordinal stream, so it
+must not disrupt the user's own turn. Two rules keep it from interleaving
+with a live turn. **Deferral:** `runDueJobs` skips claiming a chat-bound
+job while its bound session has a live (user-initiated, no-`jobId`)
+task in flight, leaving `nextRunAt` untouched so the fire retries on the
+next ~1s tick once that turn reaches a terminal status (it mirrors the
+same-job overlap skip directly above it). The defer spans the entire open
+turn, including parked `waiting_approval`/`waiting_input` states, because a
+resumed turn appends higher-ordinal blocks that would bracket the fire's
+blocks and reorder the `taskId`-grouped transcript — so the check must not
+narrow to `running`. Manual `run_job`/Run-now is exempt; it is an explicit
+user action. **Attribution:** a chat-bound fire's blocks render in a
+distinct light-bordered group subtitled "from &lt;job name&gt;", resolved
+client-side from each block's `runId` → its `kind:"job"` run → the job's
+name (web and mobile, the shared dual renderers). Together these keep a
+watcher/reminder fire legible as the job's output rather than a mis-ordered
+conversation turn.
+
 The binding stays modifiable after creation: `update_job` accepts the
 same `deliverTo` enum (`rebindJobDelivery` in `src/jobs/index.ts`,
 audited as `job.delivery.rebound`). Switching to `"channel"` always
@@ -505,10 +523,13 @@ Con:
   (resolution by name/id/kind, dedupe against the origin mirror,
   fire-time resolution failure logged without failing the run, and
   `create_job`/`update_job` validation against configured bridges). It
-  also covers `removeJob`'s channel archive: a deleted job's dedicated
-  channel is archived (history intact), a chat-bound conversation is left
-  untouched, and a channel a sibling job still delivers into is spared
-  until the last job is removed.
+  also covers chat-bound deferral (a due chat-bound job is skipped — no
+  run, `nextRunAt` unchanged — while its session has a live non-`jobId`
+  turn in flight, firing on the next tick once that turn is terminal) and
+  `removeJob`'s channel archive: a deleted job's dedicated channel is
+  archived (history intact), a chat-bound conversation is left untouched,
+  and a channel a sibling job still delivers into is spared until the last
+  job is removed.
 - `bun test src/state/store.test.ts` covers `archiveOrphanJobChannels`:
   a job channel orphaned by a pre-cleanup deletion is archived (with the
   legacy `origin:"job"`→`kind:"channel"` backfill running first), a

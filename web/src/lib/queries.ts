@@ -13,6 +13,7 @@ import type {
   JobRecord,
   JobRunRecord,
   PendingChatMessage,
+  RunRecord,
   RuntimeEvent,
   RuntimeStatus,
   SetupRequest,
@@ -346,7 +347,7 @@ export function useChatSessions() {
   });
 }
 
-export type ChatSessionDetail = ChatSession & { messages: ChatMessage[]; tasks: Task[] };
+export type ChatSessionDetail = ChatSession & { messages: ChatMessage[]; tasks: Task[]; runs: RunRecord[] };
 
 // Statuses where a chat task is no longer producing partial text — used to
 // decide polling cadence below.
@@ -371,6 +372,22 @@ export function useChatSession(id: string | null) {
       const hasInflight = data.tasks?.some((t) => !CHAT_TERMINAL_TASK_STATUSES.has(t.status));
       return hasInflight ? 800 : 3000;
     }
+  });
+}
+
+// Run records for one session — used to mark job-delivered chat messages
+// with a "from <job name>" badge. GET /chat/:id returns the session's full
+// run list (incl. kind/jobId); we select just `runs` and join jobId → name
+// against the jobs list at the call site. Far leaner than useChatSession,
+// which polls the full detail at ~800ms while a task is in flight; the badge
+// name set only changes when a new run lands, so ~30s is ample.
+export function useChatRuns(id: string | null) {
+  return useQuery<ChatSessionDetail, Error, RunRecord[]>({
+    queryKey: ["chat-runs", id],
+    queryFn: () => api<ChatSessionDetail>(`/chat/${id}`),
+    enabled: Boolean(id),
+    refetchInterval: 30_000,
+    select: (detail) => detail.runs ?? []
   });
 }
 

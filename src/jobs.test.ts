@@ -124,6 +124,51 @@ describe("cron lifecycle", () => {
     expect(audit).toBeDefined();
   });
 
+  test("deferral: a due chat-bound job is skipped while its session has a live turn, then fires once it ends", async () => {
+    const config = testConfig("jobs-defer-live-turn");
+    const handler = createHandler(config);
+
+    const sessionId = "chat_defer_test";
+    const job = await call(handler, config, "/api/jobs", {
+      method: "POST",
+      body: JSON.stringify({ name: "watcher job", script: "true", intervalSeconds: 60 })
+    });
+
+    // Make the job chat-bound and due now, and inject a live (user-initiated)
+    // turn for that session: a non-terminal task with no jobId.
+    const dueAt = new Date(Date.now() - 5_000).toISOString();
+    await mutateState(config.instance, (state) => {
+      const item = state.jobs.find((candidate) => candidate.id === job.id);
+      if (!item) throw new Error("setup: job missing");
+      item.chatSessionId = sessionId;
+      item.nextRunAt = dueAt;
+      const liveTurn = createTask(state.instance, "you can send", undefined, undefined, undefined, undefined, undefined, sessionId);
+      liveTurn.status = "running";
+      upsertTask(state, liveTurn);
+    });
+
+    await runDueJobs(config);
+
+    // Skipped: nextRunAt untouched and no run created.
+    const deferred = readState(config.instance);
+    expect(deferred.jobs.find((candidate) => candidate.id === job.id)!.nextRunAt).toBe(dueAt);
+    expect(deferred.jobRuns.filter((run) => run.jobId === job.id)).toHaveLength(0);
+
+    // Settle the live turn; the next tick claims and dispatches the job.
+    await mutateState(config.instance, (state) => {
+      const liveTurn = state.tasks.find((t) => t.chatSessionId === sessionId && t.jobId === undefined);
+      if (!liveTurn) throw new Error("setup: live turn missing");
+      liveTurn.status = "completed";
+    });
+
+    await runDueJobs(config);
+
+    const after = readState(config.instance);
+    expect(after.jobRuns.filter((run) => run.jobId === job.id)).toHaveLength(1);
+    // nextRunAt advanced off the original due time now that it claimed.
+    expect(after.jobs.find((candidate) => candidate.id === job.id)!.nextRunAt).not.toBe(dueAt);
+  });
+
   test("prompt-job run finalizes asynchronously when the task settles", async () => {
     const config = testConfig("jobs-async-prompt");
     const handler = createHandler(config);

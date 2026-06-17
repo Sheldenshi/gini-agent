@@ -33,6 +33,7 @@ import {
   useAllJobs,
   useCancelTask,
   useChatBlocks,
+  useChatRuns,
   useChatSessions,
   useInvalidate,
   useRemovePendingChatMessage,
@@ -41,6 +42,16 @@ import {
 } from "@/lib/queries";
 import type { ChatBlock } from "@runtime/types";
 import type { ChatSession, ThreadSummary } from "@/lib/view-types";
+
+// The job name a render item was delivered by, or undefined for ordinary
+// conversation. A file_artifact card has no runId of its own, so the caller
+// carries the preceding run's name forward to it (it always trails its run's
+// tool group). `tool_group` reads its first call's runId; `block` its own.
+function itemJobName(item: ChatRenderItem, runIdToJobName: Map<string, string>): string | undefined {
+  if (item.kind === "tool_group") return item.calls[0]?.runId ? runIdToJobName.get(item.calls[0].runId) : undefined;
+  if (item.kind === "block") return item.block.runId ? runIdToJobName.get(item.block.runId) : undefined;
+  return undefined;
+}
 
 export default function ChatPage() {
   const params = useSearchParams();
@@ -269,6 +280,41 @@ function ChatSurface({
   const renderItems = useMemo<ChatRenderItem[]>(() => groupExchanges(visibleBlocks), [visibleBlocks]);
   const hasBlocks = visibleBlocks.length > 0;
 
+  // Map a job run's runId → its job name so messages delivered by a scheduled
+  // job render with a "from <job name>" badge, distinguishing them from the
+  // user's own conversation. The runs query carries the full run records
+  // (kind/jobId); the jobs list resolves jobId → name.
+  const chatRuns = useChatRuns(sessionId);
+  const runIdToJobName = useMemo(() => {
+    const jobNameById = new Map((allJobs.data ?? []).map((j) => [j.id, j.name]));
+    const map = new Map<string, string>();
+    for (const run of chatRuns.data ?? []) {
+      if (run.kind !== "job" || !run.jobId) continue;
+      const name = jobNameById.get(run.jobId);
+      if (name) map.set(run.id, name);
+    }
+    return map;
+  }, [chatRuns.data, allJobs.data]);
+
+  // Segment the render items into consecutive runs sharing one job name (a
+  // file_artifact card inherits the preceding item's name since it trails its
+  // run's tool group). Each segment with a jobName renders inside one bordered
+  // container with a single "from <job name>" header; segments without one
+  // render exactly as before. Grouping happens here, not in groupExchanges.
+  const itemSegments = useMemo(() => {
+    const segments: { jobName?: string; items: ChatRenderItem[] }[] = [];
+    let lastJobName: string | undefined;
+    for (const item of renderItems) {
+      const ownJobName = itemJobName(item, runIdToJobName);
+      const jobName = ownJobName ?? (item.kind === "file_artifact" ? lastJobName : undefined);
+      lastJobName = item.kind === "file_artifact" ? lastJobName : ownJobName;
+      const tail = segments[segments.length - 1];
+      if (tail && tail.jobName === jobName) tail.items.push(item);
+      else segments.push({ jobName, items: [item] });
+    }
+    return segments;
+  }, [renderItems, runIdToJobName]);
+
   // Pin the transcript to the newest message. Snap instantly when the chat
   // opens or the user returns to the Messages tab (the viewport mounts at the
   // top, so an animated scroll there would be visible); follow smoothly as new
@@ -314,6 +360,70 @@ function ChatSurface({
       .getElementById(`chat-msg-${activeMatchId}`)
       ?.scrollIntoView({ block: "center", behavior: "smooth" });
   }, [activeMatchId]);
+
+  // Render one chat item as an <li>. Shared by the plain transcript and the
+  // job-grouped containers so job-delivered messages render identically except
+  // for their wrapper.
+  const renderItem = (item: ChatRenderItem) => {
+    if (item.kind === "tool_group") {
+      return (
+        <li key={item.id}>
+          <BlockToolCallsCollapsed calls={item.calls} steps={item.steps} resultsByCallId={toolResultsByCallId} />
+        </li>
+      );
+    }
+    if (item.kind === "file_artifact") {
+      return (
+        <li key={item.id}>
+          <GeneratedFilesCard files={item.files} />
+        </li>
+      );
+    }
+    const block = item.block;
+    // A thread can branch off either the user's message (an agent-routed
+    // turn) or an assistant reply (the user's own "Reply in thread"), so look
+    // up a chip for both.
+    const thread =
+      block.kind === "assistant_text" || block.kind === "user_text"
+        ? threadByParent.get(block.id)
+        : undefined;
+    // An assistant reply with no thread yet gets the always-visible "Reply in
+    // thread" affordance so the user can branch a new thread off it
+    // (Slack-style).
+    const canStartThread = block.kind === "assistant_text" && !block.streaming && !thread;
+    const isMatch = matches.includes(block.id);
+    const isActiveMatch = block.id === activeMatchId;
+    return (
+      <li
+        key={block.id}
+        id={`chat-msg-${block.id}`}
+        className={`space-y-2 transition-colors ${
+          isActiveMatch
+            ? "rounded-lg bg-[#4277FB]/5 ring-2 ring-[#4277FB]/70"
+            : isMatch
+              ? "rounded-lg bg-[#4277FB]/5"
+              : ""
+        }`}
+      >
+        <BlockRenderer
+          block={block}
+          toolResult={block.kind === "tool_call" ? toolResultsByCallId.get(block.callId) : undefined}
+          agent={messageAgent}
+        />
+        {thread ? (
+          // Assistant replies sit in a 46px avatar gutter; user messages are
+          // right-aligned, so align the chip to the message it branched from.
+          <div className={block.kind === "user_text" ? "flex justify-end" : "pl-[46px]"}>
+            <ThreadChip thread={thread} onOpen={() => setOpenThread(thread)} />
+          </div>
+        ) : canStartThread ? (
+          <div className="pl-[46px]">
+            <ReplyInThreadButton onClick={() => setOpenThread(newThreadFor(sessionId, block))} />
+          </div>
+        ) : null}
+      </li>
+    );
+  };
 
   return (
     <>
@@ -371,74 +481,21 @@ function ChatSurface({
                   </div>
                 ) : (
                   <ul className="space-y-5">
-                    {renderItems.map((item) => {
-                      if (item.kind === "tool_group") {
-                        return (
-                          <li key={item.id}>
-                            <BlockToolCallsCollapsed calls={item.calls} steps={item.steps} resultsByCallId={toolResultsByCallId} />
-                          </li>
-                        );
-                      }
-                      if (item.kind === "file_artifact") {
-                        return (
-                          <li key={item.id}>
-                            <GeneratedFilesCard files={item.files} />
-                          </li>
-                        );
-                      }
-                      const block = item.block;
-                      // A thread can branch off either the user's message (an
-                      // agent-routed turn) or an assistant reply (the user's
-                      // own "Reply in thread"), so look up a chip for both.
-                      const thread =
-                        block.kind === "assistant_text" || block.kind === "user_text"
-                          ? threadByParent.get(block.id)
-                          : undefined;
-                      // An assistant reply with no thread yet gets the always-
-                      // visible "Reply in thread" affordance so the user can
-                      // branch a new thread off it (Slack-style).
-                      const canStartThread =
-                        block.kind === "assistant_text" && !block.streaming && !thread;
-                      const isMatch = matches.includes(block.id);
-                      const isActiveMatch = block.id === activeMatchId;
-                      return (
-                        <li
-                          key={block.id}
-                          id={`chat-msg-${block.id}`}
-                          className={`space-y-2 transition-colors ${
-                            isActiveMatch
-                              ? "rounded-lg bg-[#4277FB]/5 ring-2 ring-[#4277FB]/70"
-                              : isMatch
-                                ? "rounded-lg bg-[#4277FB]/5"
-                                : ""
-                          }`}
-                        >
-                          <BlockRenderer
-                            block={block}
-                            toolResult={
-                              block.kind === "tool_call"
-                                ? toolResultsByCallId.get(block.callId)
-                                : undefined
-                            }
-                            agent={messageAgent}
-                          />
-                          {thread ? (
-                            // Assistant replies sit in a 46px avatar gutter;
-                            // user messages are right-aligned, so align the
-                            // chip to the message it branched from.
-                            <div className={block.kind === "user_text" ? "flex justify-end" : "pl-[46px]"}>
-                              <ThreadChip thread={thread} onOpen={() => setOpenThread(thread)} />
-                            </div>
-                          ) : canStartThread ? (
-                            <div className="pl-[46px]">
-                              <ReplyInThreadButton
-                                onClick={() => setOpenThread(newThreadFor(sessionId, block))}
-                              />
-                            </div>
-                          ) : null}
+                    {itemSegments.map((segment, segmentIndex) =>
+                      segment.jobName ? (
+                        // Job-delivered messages: one light-blue left-bordered
+                        // container with a single "from <job name>" subtitle so
+                        // they're distinguishable from the user's own turn.
+                        <li key={`job-${segmentIndex}`}>
+                          <div className="rounded-r-lg border-l-2 border-sky-500/40 bg-sky-500/5 py-3 pl-4">
+                            <p className="mb-2 text-xs text-muted-foreground">from {segment.jobName}</p>
+                            <ul className="space-y-5">{segment.items.map(renderItem)}</ul>
+                          </div>
                         </li>
-                      );
-                    })}
+                      ) : (
+                        segment.items.map(renderItem)
+                      )
+                    )}
                   </ul>
                 )}
                 <div ref={messagesEndRef} />

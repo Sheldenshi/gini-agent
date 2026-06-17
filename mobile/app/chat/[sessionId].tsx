@@ -37,6 +37,7 @@ import {
   isTaskInFlight,
   useAgents,
   useCancelTask,
+  useChatRuns,
   useChatStream,
   useJobs,
   useRemovePendingChatMessage,
@@ -137,6 +138,16 @@ function findInFlightTaskId(blocks: ChatBlock[]): string | null {
     }
   }
   return null;
+}
+
+// The job name a render item was delivered by, or undefined for ordinary
+// conversation. A file_artifact card has no runId of its own, so the caller
+// carries the preceding run's name forward to it (it always trails its run's
+// tool group). `tool_group` reads its first call's runId; `block` its own.
+function itemJobName(item: ChatRenderItem, runIdToJobName: Map<string, string>): string | undefined {
+  if (item.kind === "tool_group") return item.calls[0]?.runId ? runIdToJobName.get(item.calls[0].runId) : undefined;
+  if (item.kind === "block") return item.block.runId ? runIdToJobName.get(item.block.runId) : undefined;
+  return undefined;
 }
 
 // Single-agent chat: an agent header, a Messages / Threads / Jobs tab
@@ -257,6 +268,44 @@ export default function ChatDetailScreen() {
     () => groupExchanges(visible),
     [visible]
   );
+
+  // Map a job run's runId → its job name so messages delivered by a scheduled
+  // job render with a "from <job name>" badge. The session detail carries the
+  // full run records (kind/jobId); the jobs list resolves jobId → name. The
+  // name lookup uses the UNSCOPED jobs list (not the per-agent `jobs` above):
+  // a job owned by a different agent can still deliver into this session, so
+  // scoping the name join to this agent would drop its badge.
+  const chatRuns = useChatRuns(sessionId ?? null);
+  const allJobs = useJobs("all");
+  const runIdToJobName = useMemo(() => {
+    const jobNameById = new Map((allJobs.data ?? []).map((j) => [j.id, j.name]));
+    const map = new Map<string, string>();
+    for (const run of chatRuns.data ?? []) {
+      if (run.kind !== "job" || !run.jobId) continue;
+      const name = jobNameById.get(run.jobId);
+      if (name) map.set(run.id, name);
+    }
+    return map;
+  }, [chatRuns.data, allJobs.data]);
+
+  // Segment the render items into consecutive runs sharing one job name (a
+  // file_artifact card inherits the preceding item's name since it trails its
+  // run's tool group). Each segment with a jobName renders inside one bordered
+  // container with a single "from <job name>" header; segments without one
+  // render exactly as before.
+  const itemSegments = useMemo(() => {
+    const segments: { jobName?: string; items: ChatRenderItem[] }[] = [];
+    let lastJobName: string | undefined;
+    for (const item of renderItems) {
+      const ownJobName = itemJobName(item, runIdToJobName);
+      const jobName = ownJobName ?? (item.kind === "file_artifact" ? lastJobName : undefined);
+      lastJobName = item.kind === "file_artifact" ? lastJobName : ownJobName;
+      const tail = segments[segments.length - 1];
+      if (tail && tail.jobName === jobName) tail.items.push(item);
+      else segments.push({ jobName, items: [item] });
+    }
+    return segments;
+  }, [renderItems, runIdToJobName]);
 
   const inFlight = useMemo(() => isTaskInFlight(list), [list]);
   const inFlightTaskId = useMemo(() => findInFlightTaskId(list), [list]);
@@ -508,6 +557,60 @@ export default function ChatDetailScreen() {
     scrollRef.current?.scrollToEnd({ animated: true });
   };
 
+  // Render one chat item. Shared by the plain transcript and the job-grouped
+  // containers so job-delivered messages render identically except for their
+  // wrapper.
+  const renderItem = (item: ChatRenderItem) => {
+    if (item.kind === "tool_group") {
+      return (
+        <BlockToolCallsCollapsed
+          key={item.id}
+          calls={item.calls}
+          steps={item.steps}
+          resultsByCallId={toolResultsByCallId}
+        />
+      );
+    }
+    if (item.kind === "file_artifact") {
+      return <GeneratedFilesCard key={item.id} files={item.files} />;
+    }
+    // A thread can branch off either an assistant reply (the user's own
+    // "Reply in thread") or the user's message (an agent-routed turn), so look
+    // up a chip for both. Render the block then the inline "N replies" chip
+    // beneath it. A finished assistant reply with no thread yet shows the
+    // "Reply in thread" pill so the user can start one.
+    const block = item.block;
+    const thread =
+      block.kind === "assistant_text" || block.kind === "user_text"
+        ? threadByParentBlock.get(block.id)
+        : undefined;
+    const canStartThread = block.kind === "assistant_text" && !block.streaming && !thread;
+    return (
+      <View key={block.id}>
+        <BlockRenderer
+          block={block}
+          toolResult={block.kind === "tool_call" ? toolResultsByCallId.get(block.callId) : undefined}
+        />
+        {thread ? (
+          <View style={styles.threadChipWrap}>
+            <ThreadRepliesChip
+              replyCount={thread.replyCount}
+              lastReplyAt={thread.lastReplyAt}
+              // User messages are right-aligned, so align the chip to the
+              // message it branched from.
+              align={block.kind === "user_text" ? "end" : "start"}
+              onPress={() => router.push(`/chat/${sessionId}/thread/${thread.threadId}`)}
+            />
+          </View>
+        ) : canStartThread ? (
+          <View style={styles.threadChipWrap}>
+            <ReplyInThreadPill onPress={() => openNewThread(sessionId, block)} />
+          </View>
+        ) : null}
+      </View>
+    );
+  };
+
   if (unauthorized) return null;
 
   return (
@@ -594,68 +697,19 @@ export default function ChatDetailScreen() {
               }}
             >
               {visible.length > 0 ? (
-                renderItems.map((item) => {
-                  if (item.kind === "tool_group") {
-                    return (
-                      <BlockToolCallsCollapsed
-                        key={item.id}
-                        calls={item.calls}
-                        steps={item.steps}
-                        resultsByCallId={toolResultsByCallId}
-                      />
-                    );
-                  }
-                  if (item.kind === "file_artifact") {
-                    return <GeneratedFilesCard key={item.id} files={item.files} />;
-                  }
-                  // A thread can branch off either an assistant reply (the
-                  // user's own "Reply in thread") or the user's message (an
-                  // agent-routed turn), so look up a chip for both. Render the
-                  // block then the inline "N replies" chip beneath it. A
-                  // finished assistant reply with no thread yet shows the
-                  // "Reply in thread" pill so the user can start one.
-                  const block = item.block;
-                  const thread =
-                    block.kind === "assistant_text" || block.kind === "user_text"
-                      ? threadByParentBlock.get(block.id)
-                      : undefined;
-                  const canStartThread =
-                    block.kind === "assistant_text" && !block.streaming && !thread;
-                  return (
-                    <View key={block.id}>
-                      <BlockRenderer
-                        block={block}
-                        toolResult={
-                          block.kind === "tool_call"
-                            ? toolResultsByCallId.get(block.callId)
-                            : undefined
-                        }
-                      />
-                      {thread ? (
-                        <View style={styles.threadChipWrap}>
-                          <ThreadRepliesChip
-                            replyCount={thread.replyCount}
-                            lastReplyAt={thread.lastReplyAt}
-                            // User messages are right-aligned, so align the
-                            // chip to the message it branched from.
-                            align={block.kind === "user_text" ? "end" : "start"}
-                            onPress={() =>
-                              router.push(
-                                `/chat/${sessionId}/thread/${thread.threadId}`
-                              )
-                            }
-                          />
-                        </View>
-                      ) : canStartThread ? (
-                        <View style={styles.threadChipWrap}>
-                          <ReplyInThreadPill
-                            onPress={() => openNewThread(sessionId, block)}
-                          />
-                        </View>
-                      ) : null}
+                itemSegments.map((segment, segmentIndex) =>
+                  segment.jobName ? (
+                    // Job-delivered messages: one light-blue left-bordered
+                    // container with a single "from <job name>" subtitle so
+                    // they're distinguishable from the user's own turn.
+                    <View key={`job-${segmentIndex}`} style={styles.jobRun}>
+                      <Text style={styles.jobRunLabel}>from {segment.jobName}</Text>
+                      {segment.items.map(renderItem)}
                     </View>
-                  );
-                })
+                  ) : (
+                    segment.items.map(renderItem)
+                  )
+                )
               ) : !voicePending ? (
                 <View style={styles.emptyChat}>
                   <Text style={styles.emptyChatText}>What can I help with?</Text>
@@ -1098,6 +1152,23 @@ const styles = StyleSheet.create({
     gap: 16
   },
   threadChipWrap: { marginTop: 8 },
+  // Job-delivered run container: light-blue left border + faint tint so a
+  // scheduled job's messages stand apart from the user's own conversation.
+  jobRun: {
+    gap: 16,
+    paddingLeft: 12,
+    paddingVertical: 8,
+    borderLeftWidth: 2,
+    borderLeftColor: theme.accent,
+    backgroundColor: "#EAF3FF",
+    borderTopRightRadius: 8,
+    borderBottomRightRadius: 8
+  },
+  jobRunLabel: {
+    color: theme.muted,
+    fontFamily: family("HankenGrotesk", 600),
+    fontSize: 12
+  },
   emptyChat: {
     flex: 1,
     minHeight: 240,
