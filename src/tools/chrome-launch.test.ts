@@ -2,7 +2,7 @@ import { afterEach, describe, expect, mock, test } from "bun:test";
 import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createServer, type AddressInfo, type Server } from "node:net";
+import { createServer, type Server } from "node:net";
 import {
   DEFAULT_CDP_PORT_BASE,
   defaultDeps,
@@ -48,16 +48,17 @@ describe("findFreePort", () => {
   });
 
   test("rolls forward past an occupied port", async () => {
-    // Bind :0 so the OS hands back a guaranteed-free port — a hard-coded base
-    // could already be held by a parallel worker or a TIME_WAIT socket and make
-    // this listen() throw instead of testing the roll-forward.
+    // Pick a low, in-range base via the production walker (not listen(0), whose
+    // OS-assigned ephemeral port can land near 65535 and leave findFreePort's
+    // 1000-port forward window with no in-range candidates). From 9333 the
+    // window is 9333..10332, all valid, so the roll-forward always has headroom.
+    const base = await findFreePort(DEFAULT_CDP_PORT_BASE);
     const occupied: Server = createServer();
     occupied.on("error", () => undefined); // never an unhandled server error
     await new Promise<void>((resolve, reject) => {
       occupied.once("error", reject);
-      occupied.listen(0, "127.0.0.1", () => resolve());
+      occupied.listen(base, "127.0.0.1", () => resolve());
     });
-    const base = (occupied.address() as AddressInfo).port;
     try {
       const port = await findFreePort(base);
       expect(port).toBeGreaterThan(base);

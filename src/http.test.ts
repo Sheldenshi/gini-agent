@@ -2843,6 +2843,36 @@ describe("runtime api", () => {
     expect(readState(config.instance).setupRequests.find((s) => s.id === setup.id)?.status).toBe("cancelled");
   });
 
+  test("a frames request after a screencast complete is rejected (no bridge recreation)", async () => {
+    // /complete marks the setup terminal BEFORE stopping the bridge, so a
+    // frames/input request racing the completion sees status!=="pending" and
+    // 404s instead of recreating an orphaned bridge in the teardown gap.
+    const config = testConfig("screencast-complete-then-frames");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "browser.connect",
+        target: "https://example.com",
+        reason: "Sign in",
+        payload: { toolCallId: "call_sc_race", signInStarted: true, screencast: true }
+      })
+    );
+    const done = await call(handler, config, `/api/setup-requests/${setup.id}/complete`, {
+      method: "POST",
+      body: JSON.stringify({})
+    });
+    expect(done.ok).toBe(true);
+    const framesRes = await rawCall(
+      handler,
+      config,
+      `/api/browser/screencast/${setup.id}/frames`,
+      { method: "GET" },
+      config.token
+    );
+    expect(framesRes.status).toBe(404);
+  });
+
   test("screencast input rejects a malformed JSON body with 400", async () => {
     const config = testConfig("screencast-bad-body");
     const handler = createHandler(config);

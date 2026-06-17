@@ -1,18 +1,24 @@
 // Browser automation tools. Drives Chromium via playwright-core in one of
-// two modes:
+// three modes:
 //
-//   - "persistent" (default): chromium.launchPersistentContext(dataDir, {
-//     headless }) — one BrowserContext backed by the per-instance profile
-//     directory at ~/.gini/instances/<inst>/chrome-profile/. Used for BOTH
-//     the headless default (no state.browser record) and the visible window
-//     (state.browser.mode === "managed") — the only difference is the
-//     `headless` flag at launch. Sign-ins land on disk under the profile dir
-//     and persist across Connect/Disconnect cycles and across runtime
-//     restarts. All tasks share the single context (cookies bleed across
-//     tasks within an instance, per the explicit product decision).
+//   - "spawned" (default): a per-instance branded Chrome the runtime launches
+//     itself (launchSpawnedChrome) over the pipe transport, with a free-picked
+//     --remote-debugging-port for the sign-in screencast. This is the agent's
+//     DEFAULT path when there is no state.browser record. Backed by the
+//     per-instance profile dir at ~/.gini/instances/<inst>/chrome-profile/.
+//   - "persistent": chromium.launchPersistentContext(dataDir, { headless }) —
+//     the visible "Connect"/managed window (state.browser.mode === "managed"),
+//     backed by the SAME per-instance profile dir; the headed/headless flag is
+//     the only launch difference.
 //   - "cdp": chromium.connectOverCDP(url) — attach to an external Chrome
 //     the user started themselves. We reuse browser.contexts()[0] for the
 //     same shared-cookie reason.
+//
+// All modes share the per-instance profile dir, so a sign-in done in any of
+// them is visible to the others; sign-ins persist across Connect/Disconnect
+// cycles and across runtime restarts. All tasks share the single context
+// (cookies bleed across tasks within an instance, per the explicit product
+// decision).
 //
 // "Connect" and "Disconnect" are visibility toggles. They tear down the
 // current shared handle so the next call relaunches with the right

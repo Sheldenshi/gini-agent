@@ -945,9 +945,13 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         // headless with no relaunch (completeBrowserConnectSetup's managed
         // relaunch only applies to the visible-window fallback).
         if (setup.payload.screencast === true) {
-          await stopActiveBridge(setupId);
           const result = JSON.stringify({ success: true, connected: true, mode: "screencast" });
+          // Mark the setup terminal BEFORE tearing the bridge down: a frames /
+          // input request racing this completion would otherwise pass the
+          // status==="pending" gate in the teardown gap and recreate an orphaned
+          // bridge. Resolving first makes that racer 404 instead.
           await resolveSetupRequest(config, setupId, "complete", { actor: "user", toolResult: result, awaitResume: false });
+          await stopActiveBridge(setupId);
           return json({ ok: true });
         }
         const { ok, result } = await completeBrowserConnectSetup(config, setup);
@@ -1063,11 +1067,16 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       // If this cancels an active sign-in screencast, tear the bridge down so
       // the raw-CDP socket to the headless Chrome doesn't dangle. The agent's
       // browser itself stays up (the bridge is only the screencast channel).
+      // Resolve (mark terminal) BEFORE stopping the bridge so a racing
+      // frames/input request fails the status==="pending" gate instead of
+      // recreating an orphaned bridge in the teardown gap.
       const cancelled = readState(config.instance).setupRequests.find((s) => s.id === params[0]);
-      if (cancelled?.action === "browser.connect" && cancelled.payload.screencast === true) {
+      const wasScreencast = cancelled?.action === "browser.connect" && cancelled.payload.screencast === true;
+      const cancelResult = await resolveSetupRequest(config, params[0], "cancel", { actor: "user", awaitResume: false });
+      if (wasScreencast) {
         await stopActiveBridge(params[0]);
       }
-      return json(await resolveSetupRequest(config, params[0], "cancel", { actor: "user", awaitResume: false }));
+      return json(cancelResult);
     }],
     // Stage 1 of the browser.connect two-stage flow. The chat UI's
     // "Connect" button POSTs here on a browser.connect SetupRequest:

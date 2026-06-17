@@ -28,5 +28,5 @@ The handoff is one of three completion paths at the sensitive boundary (payment 
 
 - `browser_connect({ reason, mode: "handoff" })` on a live page mints a `browser.connect` SetupRequest whose payload carries `mode: "handoff"`; the same call without `mode` (or with an unrecognized value) mints a payload with no `mode` key.
 - The web card renders "I'm done" as the stage-2 button for a handoff payload and "I've signed in" for every other payload, including pre-existing rows.
-- Completing a handoff setup relaunches the managed browser headless, exactly like a sign-in completion.
+- Completing a handoff setup in the default screencast path stops the screencast bridge and resumes the already-headless agent with no relaunch; in the visible-window fallback it relaunches the managed browser headless — both behave exactly like the corresponding sign-in completion.
 - The tool-catalog description names both sanctioned uses and keeps the sign-in steers (never a first step, never proactive) intact.

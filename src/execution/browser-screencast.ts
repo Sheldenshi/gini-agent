@@ -66,6 +66,11 @@ export interface ScreencastDeps {
   fetchJson: (url: string) => Promise<CdpVersionTarget[]>;
   // Resolves the spawned Chrome's debug port (production: getScreencastPort).
   resolvePort: () => number | null;
+  // The BROWSER-level CDP wsUrl (from /json/version) for the Target discovery
+  // socket that tells us a new page target's openerId — /json/list omits it.
+  // Returns null when it can't be resolved (the bridge then never follows a
+  // popup, the safe default).
+  fetchBrowserWsUrl: (port: number) => Promise<string | null>;
 }
 
 // The minimal WebSocket surface we use, so a test can inject a fake.
@@ -81,7 +86,17 @@ export function defaultDeps(): ScreencastDeps {
   return {
     openSocket: (wsUrl) => new WebSocket(wsUrl) as unknown as WebSocketLike,
     fetchJson: async (url) => (await (await fetch(url)).json()) as CdpVersionTarget[],
-    resolvePort: getScreencastPort
+    resolvePort: getScreencastPort,
+    fetchBrowserWsUrl: async (port) => {
+      try {
+        const info = (await (await fetch(`http://127.0.0.1:${port}/json/version`)).json()) as {
+          webSocketDebuggerUrl?: string;
+        };
+        return typeof info.webSocketDebuggerUrl === "string" ? info.webSocketDebuggerUrl : null;
+      } catch {
+        return null;
+      }
+    }
   };
 }
 
@@ -102,12 +117,23 @@ export class ScreencastBridge {
   private readonly stopTimeoutMs: number;
   // Target-follow state (popup / new-tab sign-in support).
   private currentWsUrl: string | undefined;
-  private knownTargetIds = new Set<string>();
   private targetWatch: ReturnType<typeof setInterval> | undefined;
   // True for the whole switchTo window: suppresses the dropped socket's close
   // handler from tearing the whole bridge down, and pauses the watcher.
   private switching = false;
   private readonly targetWatchMs: number;
+  // Opener-scoped target-follow. The shared per-instance Chrome holds pages for
+  // EVERY concurrent task, so following any new page target would let a sibling
+  // task's tab steal the operator's sign-in screencast (and their keystrokes).
+  // We instead follow only the sign-in's OWN target family: the watched page
+  // plus popups it (transitively) opened. openerId comes from a browser-level
+  // Target.targetCreated stream (/json/list omits it). signInFamily holds the
+  // CDP targetIds in that family; targetWsUrls maps targetId → page wsUrl.
+  private browserCdp: WebSocketLike | undefined;
+  private browserCdpId = 0;
+  private readonly signInFamily = new Set<string>();
+  private readonly targetWsUrls = new Map<string, string>();
+  private currentTargetId: string | undefined;
 
   constructor(
     deps: Partial<ScreencastDeps> = {},
@@ -141,15 +167,23 @@ export class ScreencastBridge {
     if (!pageTarget?.webSocketDebuggerUrl) {
       throw new Error("No page target available on the spawned browser.");
     }
-    // Remember the page targets present at attach time so the watcher can
-    // recognize a NEW one (a popup the sign-in flow opens) as it appears.
-    this.knownTargetIds = new Set(pages.map((p) => p.id).filter((id): id is string => typeof id === "string"));
+    // Seed the sign-in target family with the watched page so the watcher only
+    // follows popups THIS page opens — never a sibling task's tab in the shared
+    // context. Record its id ↔ wsUrl so we can match targetCreated events.
+    if (typeof pageTarget.id === "string") {
+      this.currentTargetId = pageTarget.id;
+      this.signInFamily.add(pageTarget.id);
+      this.targetWsUrls.set(pageTarget.id, pageTarget.webSocketDebuggerUrl);
+    }
     await this.attachTo(pageTarget.webSocketDebuggerUrl);
-    // Follow popup / new-tab sign-in: many OAuth flows open a popup window
-    // (a new page target) the user must complete in. Poll the target list and
-    // re-point the screencast to a freshly-opened page, falling back to the
-    // remaining page when it closes. Same-tab redirect sign-in needs no switch
-    // (the screencast follows the page target through its own navigations).
+    // Follow popup / new-tab sign-in: many OAuth flows open a popup the user
+    // must complete in. A browser-level Target.targetCreated stream tells us
+    // each new page target's openerId; the watcher re-points the screencast to
+    // a fresh page ONLY when it belongs to this sign-in's opener family, and
+    // falls back within the family when the watched page closes. Same-tab
+    // redirect sign-in needs no switch (the screencast follows the page target
+    // through its own navigations).
+    await this.startTargetDiscovery(port);
     this.startTargetWatch(port);
   }
 
@@ -208,9 +242,67 @@ export class ScreencastBridge {
     return promise;
   }
 
-  // Poll /json and switch the screencast to a popup/new tab when one appears,
-  // or back to a remaining page when the watched one closes. Best-effort; the
-  // interval is unref'd so it never holds the process open.
+  // Open a browser-level CDP socket and subscribe to Target lifecycle events so
+  // we learn each new page target's openerId (the /json/list REST endpoint the
+  // watcher polls omits it). A target whose openerId is already in the sign-in
+  // family joins the family — that's how a popup the watched page opened (and a
+  // popup THAT popup opens) is recognized, while a sibling task's freshly opened
+  // tab, which has no opener in the family, is excluded. Best-effort: if the
+  // browser wsUrl can't be resolved or the socket fails, the family stays just
+  // the watched page and the bridge simply never follows a popup (safe default).
+  private async startTargetDiscovery(port: number): Promise<void> {
+    let wsUrl: string | null;
+    try {
+      wsUrl = await this.deps.fetchBrowserWsUrl(port);
+    } catch {
+      wsUrl = null;
+    }
+    if (!wsUrl) return;
+    const socket = this.deps.openSocket(wsUrl);
+    this.browserCdp = socket;
+    socket.addEventListener("open", () => {
+      // setDiscoverTargets makes Chrome emit Target.targetCreated/targetInfoChanged
+      // for every target, each carrying targetId + openerId + type + url.
+      try {
+        socket.send(JSON.stringify({ id: ++this.browserCdpId, method: "Target.setDiscoverTargets", params: { discover: true } }));
+      } catch {
+        // ignore — discovery is best-effort
+      }
+    });
+    socket.addEventListener("message", (ev) => this.onBrowserCdpMessage(ev.data));
+    // A dropped discovery socket just disables popup-follow; it must NOT tear
+    // the screencast down (that's the page-level socket's job).
+    socket.addEventListener("close", () => {
+      if (socket === this.browserCdp) this.browserCdp = undefined;
+    });
+    socket.addEventListener("error", () => {
+      if (socket === this.browserCdp) this.browserCdp = undefined;
+    });
+  }
+
+  // Fold a Target.targetCreated/targetInfoChanged event into the sign-in family:
+  // a page target whose opener is already in the family joins it. Pure
+  // bookkeeping — the watcher does the actual screencast switch.
+  private onBrowserCdpMessage(raw: unknown): void {
+    let msg: { method?: string; params?: { targetInfo?: { targetId?: string; type?: string; openerId?: string } } };
+    try {
+      msg = JSON.parse(String(raw));
+    } catch {
+      return;
+    }
+    if (msg.method !== "Target.targetCreated" && msg.method !== "Target.targetInfoChanged") return;
+    const info = msg.params?.targetInfo;
+    if (!info || info.type !== "page" || typeof info.targetId !== "string") return;
+    if (typeof info.openerId === "string" && this.signInFamily.has(info.openerId)) {
+      this.signInFamily.add(info.targetId);
+    }
+  }
+
+  // Poll /json and switch the screencast to a popup the sign-in opened, or back
+  // to a surviving family page when the watched one closes. Only ever switches
+  // among the sign-in's OWN target family (seeded in start(), grown by opener in
+  // onBrowserCdpMessage), so a sibling task's tab can't steal the screencast.
+  // Best-effort; the interval is unref'd so it never holds the process open.
   private startTargetWatch(port: number): void {
     this.targetWatch = setInterval(() => {
       void (async () => {
@@ -222,21 +314,34 @@ export class ScreencastBridge {
         } catch {
           return; // transient; try again next tick
         }
-        const current = pages.find((p) => p.webSocketDebuggerUrl === this.currentWsUrl);
-        // A brand-new page target (not seen at attach and not the current one)
-        // is a popup the sign-in opened — switch the screencast to it.
-        const fresh = pages.find(
-          (p) => typeof p.id === "string" && !this.knownTargetIds.has(p.id) && p.webSocketDebuggerUrl !== this.currentWsUrl
-        );
-        if (fresh?.webSocketDebuggerUrl) {
-          if (typeof fresh.id === "string") this.knownTargetIds.add(fresh.id);
+        // Keep the id → wsUrl map fresh for the family members present now.
+        for (const p of pages) {
+          if (typeof p.id === "string" && p.webSocketDebuggerUrl) this.targetWsUrls.set(p.id, p.webSocketDebuggerUrl);
+        }
+        const live = (id: string): CdpVersionTarget | undefined =>
+          pages.find((p) => p.id === id && p.webSocketDebuggerUrl);
+        // A family page that ISN'T the one we're showing is a popup the sign-in
+        // opened (or a re-surfaced opener) — switch to it.
+        const fresh = [...this.signInFamily]
+          .map(live)
+          .find((p): p is CdpVersionTarget => !!p && p.id !== this.currentTargetId && !!p.webSocketDebuggerUrl);
+        if (fresh?.webSocketDebuggerUrl && typeof fresh.id === "string") {
+          this.currentTargetId = fresh.id;
           await this.switchTo(fresh.webSocketDebuggerUrl);
           return;
         }
-        // The watched page closed (popup dismissed / tab gone) — fall back to
-        // whatever page remains so the operator isn't left on a dead frame.
-        if (!current && pages[0]?.webSocketDebuggerUrl) {
-          await this.switchTo(pages[0].webSocketDebuggerUrl);
+        // The watched page is gone (popup dismissed / tab closed) — fall back to
+        // any surviving FAMILY page so the operator isn't left on a dead frame,
+        // never to an unrelated task's tab.
+        const currentAlive = this.currentTargetId ? live(this.currentTargetId) : undefined;
+        if (!currentAlive) {
+          const survivor = [...this.signInFamily]
+            .map(live)
+            .find((p): p is CdpVersionTarget => !!p && !!p.webSocketDebuggerUrl);
+          if (survivor?.webSocketDebuggerUrl && typeof survivor.id === "string") {
+            this.currentTargetId = survivor.id;
+            await this.switchTo(survivor.webSocketDebuggerUrl);
+          }
         }
       })();
     }, this.targetWatchMs);
@@ -314,6 +419,14 @@ export class ScreencastBridge {
     if (this.targetWatch) {
       clearInterval(this.targetWatch);
       this.targetWatch = undefined;
+    }
+    if (this.browserCdp) {
+      try {
+        this.browserCdp.close();
+      } catch {
+        // ignore
+      }
+      this.browserCdp = undefined;
     }
     this.subscribers.clear();
     for (const resolve of this.pending.values()) resolve(undefined);
@@ -501,7 +614,16 @@ export async function getOrStartBridge(
 // must not kill another's live screencast; a mismatch is a no-op. Pass no owner
 // for an unconditional teardown (shutdown / closeAll).
 export async function stopActiveBridge(owner?: string): Promise<void> {
-  if (owner !== undefined && activeOwner !== undefined && activeOwner !== owner && startingOwner !== owner) {
+  // No-op when a DIFFERENT setup holds the bridge — whether it's already active
+  // OR still starting (activeOwner is unset during the in-flight window, so we
+  // must also consult startingOwner or a non-owner teardown could abort another
+  // setup's still-connecting bridge).
+  if (
+    owner !== undefined &&
+    (activeOwner !== undefined || startingOwner !== undefined) &&
+    activeOwner !== owner &&
+    startingOwner !== owner
+  ) {
     return;
   }
   bridgeGeneration += 1;

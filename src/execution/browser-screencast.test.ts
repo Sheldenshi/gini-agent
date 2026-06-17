@@ -360,20 +360,38 @@ async function waitUntil(pred: () => boolean, timeoutMs = 500): Promise<void> {
   }
 }
 
+const BROWSER_WS = "ws://127.0.0.1:9333/devtools/browser/abc";
+
+const mkPage = (
+  id: string,
+  url: string
+): CdpVersionTarget & { id: string; webSocketDebuggerUrl: string } => ({
+  id,
+  type: "page",
+  url,
+  webSocketDebuggerUrl: `ws://127.0.0.1:9333/devtools/page/${id}`
+});
+
 // A target list the test can rewrite between watcher polls, with a socket-per-URL
-// factory so a switch dials a distinct socket the test can inspect.
+// factory so a switch dials a distinct socket the test can inspect. Also models
+// the browser-level Target discovery socket: openPopup() adds a page to the
+// target list AND fires Target.targetCreated carrying the openerId, so the
+// bridge's opener-scoped follow can recognize it as part of the sign-in family.
 function followHarness(initial: CdpVersionTarget[]) {
   let targets = initial;
   const sockets = new Map<string, FakeSocket>();
   const dialed: string[] = [];
+  let browserSocket: FakeSocket | undefined;
   const openSocket = (url: string): WebSocketLike => {
     const socket = new FakeSocket();
-    // Auto-open so attachTo's startScreencast sends complete on their own.
     const origAdd = socket.addEventListener.bind(socket);
     socket.addEventListener = (event, listener) => {
       origAdd(event, listener);
+      // Auto-open so attachTo's startScreencast (and the discovery socket's
+      // setDiscoverTargets) complete on their own.
       if (event === "open") queueMicrotask(() => socket.open());
     };
+    if (url === BROWSER_WS) browserSocket = socket;
     sockets.set(url, socket);
     dialed.push(url);
     return socket;
@@ -381,7 +399,8 @@ function followHarness(initial: CdpVersionTarget[]) {
   const deps: Partial<ScreencastDeps> = {
     openSocket,
     fetchJson: async () => targets,
-    resolvePort: () => 9333
+    resolvePort: () => 9333,
+    fetchBrowserWsUrl: async () => BROWSER_WS
   };
   return {
     deps,
@@ -389,30 +408,45 @@ function followHarness(initial: CdpVersionTarget[]) {
     sockets,
     setTargets(next: CdpVersionTarget[]) {
       targets = next;
+    },
+    // Simulate `openerPage` opening `popup`: the page appears in /json AND the
+    // discovery socket reports its openerId.
+    openPopup(openerId: string, popup: CdpVersionTarget & { id: string }) {
+      targets = [...targets, popup];
+      browserSocket?.fire("message", {
+        data: JSON.stringify({
+          method: "Target.targetCreated",
+          params: { targetInfo: { targetId: popup.id, type: "page", openerId } }
+        })
+      });
+    },
+    // Simulate an UNRELATED page (e.g. another task's tab) appearing with no
+    // opener in the sign-in family — discovery reports it, but the family
+    // excludes it.
+    openUnrelated(page: CdpVersionTarget & { id: string }, openerId?: string) {
+      targets = [...targets, page];
+      browserSocket?.fire("message", {
+        data: JSON.stringify({
+          method: "Target.targetCreated",
+          params: { targetInfo: { targetId: page.id, type: "page", ...(openerId ? { openerId } : {}) } }
+        })
+      });
     }
   };
 }
 
 describe("ScreencastBridge target-follow (popup / new-tab)", () => {
-  const page = (
-    id: string,
-    url: string
-  ): CdpVersionTarget & { id: string; webSocketDebuggerUrl: string } => ({
-    id,
-    type: "page",
-    url,
-    webSocketDebuggerUrl: `ws://127.0.0.1:9333/devtools/page/${id}`
-  });
+  const page = mkPage;
 
-  test("switches the screencast to a freshly-opened popup target", async () => {
+  test("switches the screencast to a popup the watched page opened", async () => {
     const opener = page("opener", "https://signin.example/");
     const h = followHarness([opener]);
     const bridge = new ScreencastBridge(h.deps, 20, 5);
     await bridge.start("https://signin.example/");
-    expect(h.dialed).toEqual([opener.webSocketDebuggerUrl]);
-    // OAuth pops a new tab the user must complete in.
+    expect(h.dialed).toContain(opener.webSocketDebuggerUrl);
+    // OAuth pops a new tab opened BY the watched page (openerId === opener).
     const popup = page("popup", "https://idp.example/authorize");
-    h.setTargets([opener, popup]);
+    h.openPopup("opener", popup);
     await waitUntil(() => h.dialed.includes(popup.webSocketDebuggerUrl));
     expect(h.dialed.at(-1)).toBe(popup.webSocketDebuggerUrl);
     // The old opener socket was dropped during the deliberate switch, but the
@@ -422,17 +456,36 @@ describe("ScreencastBridge target-follow (popup / new-tab)", () => {
     await bridge.stop();
   });
 
-  test("falls back to the remaining page when the watched target closes", async () => {
-    const opener = page("opener", "https://app.example/");
-    const popup = page("popup", "https://idp.example/authorize");
-    const h = followHarness([opener, popup]);
+  test("does NOT switch to an unrelated task's tab (no opener in the family)", async () => {
+    const opener = page("opener", "https://signin.example/");
+    const h = followHarness([opener]);
     const bridge = new ScreencastBridge(h.deps, 20, 5);
-    // Attach to the popup (preferUrl matches it); both are "known" at attach.
-    await bridge.start("https://idp.example/authorize");
-    expect(h.dialed).toEqual([popup.webSocketDebuggerUrl]);
-    // Popup closes after sign-in — only the opener remains.
+    await bridge.start("https://signin.example/");
+    const dialsAfterStart = h.dialed.length;
+    // A sibling task opens a tab — it appears in /json and discovery, but its
+    // opener is NOT in the sign-in family (or it has none). Must be ignored.
+    h.openUnrelated(page("sibling", "https://other-task.example/"), "some-other-page");
+    h.openUnrelated(page("orphan", "https://orphan.example/")); // no opener at all
+    await new Promise((r) => setTimeout(r, 40));
+    expect(h.dialed.length).toBe(dialsAfterStart); // no new page socket dialed
+    expect(h.dialed).not.toContain("ws://127.0.0.1:9333/devtools/page/sibling");
+    expect(h.dialed).not.toContain("ws://127.0.0.1:9333/devtools/page/orphan");
+    expect(bridge.isClosed()).toBe(false);
+    await bridge.stop();
+  });
+
+  test("falls back to the opener when the watched popup closes", async () => {
+    const opener = page("opener", "https://app.example/");
+    const h = followHarness([opener]);
+    const bridge = new ScreencastBridge(h.deps, 20, 5);
+    await bridge.start("https://app.example/");
+    // Opener pops a popup; bridge follows it.
+    const popup = page("popup", "https://idp.example/authorize");
+    h.openPopup("opener", popup);
+    await waitUntil(() => h.dialed.includes(popup.webSocketDebuggerUrl));
+    // Popup closes after sign-in — only the opener remains in the family.
     h.setTargets([opener]);
-    await waitUntil(() => h.dialed.includes(opener.webSocketDebuggerUrl));
+    await waitUntil(() => h.dialed.lastIndexOf(opener.webSocketDebuggerUrl) > h.dialed.indexOf(popup.webSocketDebuggerUrl));
     expect(h.dialed.at(-1)).toBe(opener.webSocketDebuggerUrl);
     expect(bridge.isClosed()).toBe(false);
     await bridge.stop();
@@ -443,9 +496,10 @@ describe("ScreencastBridge target-follow (popup / new-tab)", () => {
     const h = followHarness([opener]);
     const bridge = new ScreencastBridge(h.deps, 20, 5);
     await bridge.start("https://signin.example/");
-    // Let several poll ticks pass with no new/closed target.
+    const dialsAfterStart = h.dialed.length;
+    // Let several poll ticks pass with no new/closed family target.
     await new Promise((r) => setTimeout(r, 30));
-    expect(h.dialed).toEqual([opener.webSocketDebuggerUrl]);
+    expect(h.dialed.length).toBe(dialsAfterStart);
     await bridge.stop();
   });
 
@@ -453,7 +507,8 @@ describe("ScreencastBridge target-follow (popup / new-tab)", () => {
     const opener = page("opener", "https://signin.example/");
     const popup = page("popup", "https://idp.example/authorize");
     let calls = 0;
-    const sockets = new Map<string, FakeSocket>();
+    let targets: CdpVersionTarget[] = [opener];
+    let browserSocket: FakeSocket | undefined;
     const dialed: string[] = [];
     const openSocket = (url: string): WebSocketLike => {
       const socket = new FakeSocket();
@@ -462,7 +517,7 @@ describe("ScreencastBridge target-follow (popup / new-tab)", () => {
         origAdd(event, listener);
         if (event === "open") queueMicrotask(() => socket.open());
       };
-      sockets.set(url, socket);
+      if (url === BROWSER_WS) browserSocket = socket;
       dialed.push(url);
       return socket;
     };
@@ -471,18 +526,80 @@ describe("ScreencastBridge target-follow (popup / new-tab)", () => {
         openSocket,
         fetchJson: async () => {
           calls += 1;
-          if (calls === 1) return [opener]; // start()'s initial enumeration
           if (calls === 2) throw new Error("transient /json failure");
-          return [opener, popup]; // recovers next tick
+          return targets;
         },
-        resolvePort: () => 9333
+        resolvePort: () => 9333,
+        fetchBrowserWsUrl: async () => BROWSER_WS
       },
       20,
       5
     );
     await bridge.start("https://signin.example/");
+    // The popup (opened by the watched page) appears after the transient error.
+    targets = [opener, popup];
+    browserSocket?.fire("message", {
+      data: JSON.stringify({
+        method: "Target.targetCreated",
+        params: { targetInfo: { targetId: "popup", type: "page", openerId: "opener" } }
+      })
+    });
     await waitUntil(() => dialed.includes(popup.webSocketDebuggerUrl));
     expect(dialed.at(-1)).toBe(popup.webSocketDebuggerUrl);
+    await bridge.stop();
+  });
+
+  test("a dropped discovery socket disables follow but keeps the screencast alive", async () => {
+    const opener = page("opener", "https://signin.example/");
+    const h = followHarness([opener]);
+    const bridge = new ScreencastBridge(h.deps, 20, 5);
+    await bridge.start("https://signin.example/");
+    const browserSocket = h.sockets.get(BROWSER_WS)!;
+    // Discovery socket errors then closes — popup-follow is now disabled, but
+    // the page-level screencast must stay live.
+    browserSocket.fire("error", {});
+    browserSocket.close();
+    expect(bridge.isClosed()).toBe(false);
+    // A later family popup can no longer be followed (discovery is gone), but
+    // the bridge does not crash on the event.
+    h.openPopup("opener", page("popup", "https://idp.example/authorize"));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(bridge.isClosed()).toBe(false);
+    await bridge.stop();
+  });
+
+  test("popup-follow is disabled when the browser wsUrl can't be resolved", async () => {
+    const opener = page("opener", "https://signin.example/");
+    const dialed: string[] = [];
+    let targets: CdpVersionTarget[] = [opener];
+    const openSocket = (url: string): WebSocketLike => {
+      const socket = new FakeSocket();
+      const origAdd = socket.addEventListener.bind(socket);
+      socket.addEventListener = (event, listener) => {
+        origAdd(event, listener);
+        if (event === "open") queueMicrotask(() => socket.open());
+      };
+      dialed.push(url);
+      return socket;
+    };
+    const bridge = new ScreencastBridge(
+      {
+        openSocket,
+        fetchJson: async () => targets,
+        resolvePort: () => 9333,
+        fetchBrowserWsUrl: async () => null // can't resolve → no discovery socket
+      },
+      20,
+      5
+    );
+    await bridge.start("https://signin.example/");
+    // No browser ws was dialed (only the page socket).
+    expect(dialed).toEqual([opener.webSocketDebuggerUrl]);
+    // A new page appears, but with no discovery socket the family never grows,
+    // so it is not followed.
+    targets = [opener, page("popup", "https://idp.example/authorize")];
+    await new Promise((r) => setTimeout(r, 30));
+    expect(dialed).toEqual([opener.webSocketDebuggerUrl]);
     await bridge.stop();
   });
 
@@ -493,8 +610,9 @@ describe("ScreencastBridge target-follow (popup / new-tab)", () => {
     await bridge.start("https://signin.example/");
     await bridge.stop();
     const dialsAtStop = h.dialed.length;
-    // A new popup appears AFTER teardown — the cleared interval must ignore it.
-    h.setTargets([opener, page("late", "https://idp.example/late")]);
+    // A new family popup appears AFTER teardown — the cleared interval and the
+    // closed discovery socket must ignore it.
+    h.openPopup("opener", page("late", "https://idp.example/late"));
     await new Promise((r) => setTimeout(r, 30));
     expect(h.dialed.length).toBe(dialsAtStop);
   });
@@ -502,10 +620,11 @@ describe("ScreencastBridge target-follow (popup / new-tab)", () => {
   test("recovers (does not permanently stall) when a popup dies mid-attach", async () => {
     const opener = page("opener", "https://app.example/");
     const popup = page("popup", "https://idp.example/authorize");
-    const sockets = new Map<string, FakeSocket>();
     const dialed: string[] = [];
+    let browserSocket: FakeSocket | undefined;
     const openSocket = (url: string): WebSocketLike => {
       const socket = new FakeSocket();
+      if (url === BROWSER_WS) browserSocket = socket;
       const origAdd = socket.addEventListener.bind(socket);
       socket.addEventListener = (event, listener) => {
         origAdd(event, listener);
@@ -515,22 +634,28 @@ describe("ScreencastBridge target-follow (popup / new-tab)", () => {
           queueMicrotask(() => (url === popup.webSocketDebuggerUrl ? socket.close() : socket.open()));
         }
       };
-      sockets.set(url, socket);
       dialed.push(url);
       return socket;
     };
     let targets: CdpVersionTarget[] = [opener];
     const bridge = new ScreencastBridge(
-      { openSocket, fetchJson: async () => targets, resolvePort: () => 9333 },
+      { openSocket, fetchJson: async () => targets, resolvePort: () => 9333, fetchBrowserWsUrl: async () => BROWSER_WS },
       20,
       5
     );
     await bridge.start("https://app.example/");
-    // Popup appears; its attach will fail. The bridge must NOT close, and the
-    // switching flag must clear so the next tick can recover.
+    // Family popup appears; its attach will fail. The bridge must NOT close, and
+    // the switching flag must clear so the next tick can recover.
     targets = [opener, popup];
+    browserSocket?.fire("message", {
+      data: JSON.stringify({
+        method: "Target.targetCreated",
+        params: { targetInfo: { targetId: "popup", type: "page", openerId: "opener" } }
+      })
+    });
     await waitUntil(() => dialed.includes(popup.webSocketDebuggerUrl));
-    // Popup is gone now; only the opener remains. The watcher must re-point to it.
+    // Popup is gone now; only the opener remains in the family. The watcher must
+    // re-point to it.
     targets = [opener];
     const dialsBeforeRecovery = dialed.length;
     await waitUntil(() => dialed.length > dialsBeforeRecovery && dialed.at(-1) === opener.webSocketDebuggerUrl);
@@ -544,9 +669,11 @@ describe("ScreencastBridge target-follow (popup / new-tab)", () => {
     // The opener's socket never auto-replies, so a send() on it stays pending
     // until something drains this.pending — which the switch must do.
     let openerSocket: FakeSocket | undefined;
+    let browserSocket: FakeSocket | undefined;
     const openSocket = (url: string): WebSocketLike => {
       const socket = new FakeSocket();
       if (url === opener.webSocketDebuggerUrl) openerSocket = socket;
+      if (url === BROWSER_WS) browserSocket = socket;
       const origAdd = socket.addEventListener.bind(socket);
       socket.addEventListener = (event, listener) => {
         origAdd(event, listener);
@@ -556,16 +683,22 @@ describe("ScreencastBridge target-follow (popup / new-tab)", () => {
     };
     let targets: CdpVersionTarget[] = [opener];
     const bridge = new ScreencastBridge(
-      { openSocket, fetchJson: async () => targets, resolvePort: () => 9333 },
+      { openSocket, fetchJson: async () => targets, resolvePort: () => 9333, fetchBrowserWsUrl: async () => BROWSER_WS },
       20,
       5
     );
     await bridge.start("https://app.example/");
     // Wedge the opener socket: stop auto-replying so the next send() stays open.
     openerSocket!.autoReply = false;
-    // An operator click lands while a popup is about to be switched to.
+    // An operator click lands while a family popup is about to be switched to.
     const inputDone = bridge.dispatchInput({ kind: "move", x: 5, y: 5 });
-    targets = [opener, popup]; // triggers switchTo, which drains this.pending
+    targets = [opener, popup];
+    browserSocket?.fire("message", {
+      data: JSON.stringify({
+        method: "Target.targetCreated",
+        params: { targetInfo: { targetId: "popup", type: "page", openerId: "opener" } }
+      })
+    }); // triggers switchTo, which drains this.pending
     // The orphaned send must be resolved by the switch, so dispatchInput settles.
     await inputDone;
     expect(bridge.isClosed()).toBe(false);
@@ -743,6 +876,42 @@ describe("getOrStartBridge / stopActiveBridge", () => {
     // The owner's teardown does stop it.
     await stopActiveBridge("setup-A");
     expect(stopped).toBe(1);
+  });
+
+  test("a non-owner teardown during an in-flight start does not abort the starting bridge", async () => {
+    // Hold setup A's start() pending at fetchJson, fire setup B's teardown in
+    // that window (activeOwner is still unset, only startingOwner='setup-A'),
+    // then release. A must install normally — B must not kill it.
+    const { promise: gate, resolve: openGate } = Promise.withResolvers<void>();
+    const socket = new FakeSocket();
+    const origAdd = socket.addEventListener.bind(socket);
+    socket.addEventListener = (event, listener) => {
+      origAdd(event, listener);
+      if (event === "open") queueMicrotask(() => socket.open());
+    };
+    const built: ScreencastBridge[] = [];
+    const factory = () => {
+      const b = new ScreencastBridge({
+        openSocket: () => socket,
+        fetchJson: async () => {
+          await gate;
+          return [{ type: "page", webSocketDebuggerUrl: "ws://x" }];
+        },
+        resolvePort: () => 9333
+      });
+      built.push(b);
+      return b;
+    };
+    const startP = getOrStartBridge("setup-A", undefined, factory);
+    await Promise.resolve(); // start() is now parked at the fetchJson await
+    await stopActiveBridge("setup-B"); // non-owner teardown in the in-flight window
+    openGate();
+    const bridge = await startP;
+    expect(built.length).toBe(1);
+    expect(bridge.isClosed()).toBe(false); // A survived B's teardown
+    // A is the installed active bridge: A's own reuse returns it.
+    expect(await getOrStartBridge("setup-A", undefined, factory)).toBe(bridge);
+    await stopActiveBridge("setup-A");
   });
 });
 
