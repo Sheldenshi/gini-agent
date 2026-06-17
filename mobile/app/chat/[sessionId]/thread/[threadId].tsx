@@ -23,6 +23,7 @@ import { ApiError, uploadImage, type UploadRef } from "@/src/api";
 import { AttachmentSheet } from "@/src/components/AttachmentSheet";
 import { AgentAvatar, agentSwatch } from "@/src/components/chat/AgentAvatar";
 import { BlockRenderer } from "@/src/components/chat/BlockRenderer";
+import { BlockThinking } from "@/src/components/chat/BlockThinking";
 import { GeneratedFilesCard } from "@/src/components/chat/GeneratedFilesCard";
 import { groupExchanges, type ChatRenderItem } from "@/src/group-exchanges";
 import {
@@ -401,8 +402,8 @@ export default function ThreadViewScreen() {
                     // tool_group items only appear after groupExchanges
                     // folds a completed exchange; replay the process
                     // inline — tool calls via BlockRenderer, the model's
-                    // pre-tool narration as a muted line — to keep the
-                    // thread surface simple.
+                    // pre-tool narration as a "Thinking" row — to keep
+                    // the thread surface in parity with the main chat.
                     return item.steps.map((step) =>
                       step.kind === "tool_call" ? (
                         <BlockRenderer
@@ -411,9 +412,7 @@ export default function ThreadViewScreen() {
                           toolResult={toolResultsByCallId.get(step.block.callId)}
                         />
                       ) : (
-                        <Text key={step.block.id} style={styles.threadNarration}>
-                          {step.block.text}
-                        </Text>
+                        <BlockThinking key={step.block.id} block={step.block} />
                       )
                     );
                   }
@@ -654,14 +653,6 @@ const styles = StyleSheet.create({
   },
 
   replies: { paddingHorizontal: 14, paddingBottom: 8, gap: 12 },
-  // Pre-tool narration rendered muted so it reads as process, not a
-  // standalone reply, mirroring the collapsed tool group's narration.
-  threadNarration: {
-    color: theme.muted,
-    fontFamily: family("HankenGrotesk", 500),
-    fontSize: 14,
-    lineHeight: 20
-  },
   repliesEmpty: {
     color: theme.muted,
     fontFamily: family("HankenGrotesk", 500),
