@@ -109,6 +109,24 @@ The model rests on four pieces:
   only fires under launchd supervision, so a manual foreground `gini
   watchdog` never creates plists.
 
+- **Boot-time singleton preflight.** A gateway binds a per-instance port only
+  one process can hold, but supervision races can still spawn a second — a
+  KeepAlive respawn racing the incumbent's drain, or dual supervision (a manual
+  foreground `gini run` on a launchd instance). Before any boot work,
+  `src/server.ts` probes `/api/status` on its own `config.port`; if a healthy
+  gateway already answers, it logs `runtime.boot.incumbent` and exits 0 instead
+  of running the full boot and throwing an uncaught "Failed to start server. Is
+  port `<port>` in use?" from `Bun.serve`. Under always-respawn KeepAlive that
+  uncaught throw would crash-loop the duplicate at the `ThrottleInterval`
+  cadence, flooding deduped crash reports AND racing the incumbent's
+  `state.json` writes (a duplicate runs install + reconcile mutations before
+  reaching `Bun.serve`); a clean early exit is benign — KeepAlive throttles the
+  harmless respawn, and the next boot binds once the incumbent is gone. A free
+  port (the probe's fetch is refused) or a foreign non-gateway holder both fall
+  through to the real bind, where a genuine conflict still surfaces. Because
+  `enable` frees the port before a reload relaunch (below), the preflight fires
+  only for a true duplicate, never a legitimate restart.
+
 Installed plists are reconciled to the current template on startup, so a
 runtime version update propagates supervision-template changes to *existing*
 installs, not just fresh ones. Each generated plist carries a
@@ -341,4 +359,8 @@ launchd instances so foreground/conductor/tmux runs are unaffected.
   the gateway/web before re-bootstrapping, so a reload (including the
   detached reconcile/refresh relaunch) never hits EADDRINUSE; the watchdog
   reload performs no port-free wait.
+- A gateway boot for an instance whose `config.port` a healthy gateway already
+  holds logs `runtime.boot.incumbent` and exits 0 without running the boot or
+  throwing from `Bun.serve`, and the incumbent stays healthy; a free or
+  foreign-held port falls through to the real bind.
 - `bun run typecheck`, `bun run test`, and `bun run gini smoke` pass.
