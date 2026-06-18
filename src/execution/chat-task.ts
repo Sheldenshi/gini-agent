@@ -2734,6 +2734,24 @@ async function runLoop(
     const pendingApprovals: PendingToolCall[] = [];
     const toolResultMessages: ToolCallingMessage[] = [];
 
+    // Append a tool result to this turn's working set AND persist it as a
+    // durable transcript row in one step. Every place that resolves a tool
+    // call must do both: the in-memory push keeps THIS turn's history paired,
+    // and the durable row keeps a later replay/rebuild paired. Splitting the
+    // two (push without persist) is exactly the dangling-tool_use bug the
+    // provider-side backstop in src/provider.ts had to catch — keep them
+    // together so a new branch can't reintroduce it. Branch-specific emit /
+    // trace / state-mutation calls stay at the call site; this owns only the
+    // push+persist pair.
+    const recordToolResult = (callId: string, content: string): void => {
+      toolResultMessages.push({ role: "tool", tool_call_id: callId, content });
+      persistTranscriptRow(config, taskId, transcriptSessionId, {
+        role: "tool",
+        toolCallId: callId,
+        content
+      });
+    };
+
     // Before we start dispatching tool calls, finalize the streaming
     // assistant_text block (if any) so clients see the model's
     // pre-tool-call narration as a settled block rather than a
@@ -2798,16 +2816,7 @@ async function runLoop(
       if (pausedThisTurn) {
         const skipMessage = "Skipped: a prior tool call in this turn requires approval. Will re-evaluate after that approval resolves.";
         const skipContent = JSON.stringify({ ok: false, skipped: true, reason: skipMessage });
-        toolResultMessages.push({
-          role: "tool",
-          tool_call_id: call.id,
-          content: skipContent
-        });
-        persistTranscriptRow(config, taskId, transcriptSessionId, {
-          role: "tool",
-          toolCallId: call.id,
-          content: skipContent
-        });
+        recordToolResult(call.id, skipContent);
         emitToolCallStatus(emitCtx, { callId: call.id, status: "error", errorMessage: skipMessage });
         emitToolResult(emitCtx, { callId: call.id, result: skipMessage });
         await mutateState(config.instance, (state) => {
@@ -2951,12 +2960,7 @@ async function runLoop(
         // paired (assistant tool_call -> tool result) in the exact sequence
         // the provider emitted the calls.
         for (const entry of settled) {
-          toolResultMessages.push({ role: "tool", tool_call_id: entry.member.id, content: entry.content });
-          persistTranscriptRow(config, taskId, transcriptSessionId, {
-            role: "tool",
-            toolCallId: entry.member.id,
-            content: entry.content
-          });
+          recordToolResult(entry.member.id, entry.content);
           if (entry.ok) {
             emitToolCallStatus(emitCtx, { callId: entry.member.id, status: "ok" });
           } else {
@@ -3008,7 +3012,7 @@ async function runLoop(
           }
         }
         const content = JSON.stringify(resultPayload);
-        toolResultMessages.push({ role: "tool", tool_call_id: call.id, content });
+        recordToolResult(call.id, content);
         await mutateState(config.instance, (state) => {
           const item = findTask(state, taskId);
           if (isTerminalTaskStatus(item.status)) return;
@@ -3049,7 +3053,7 @@ async function runLoop(
           updateRecentToolCall(item, call.id, "done");
           item.updatedAt = now();
         });
-        toolResultMessages.push({ role: "tool", tool_call_id: call.id, content: result });
+        recordToolResult(call.id, result);
         emitToolCallStatus(emitCtx, { callId: call.id, status: "ok" });
         emitToolResult(emitCtx, { callId: call.id, result });
         continue;
@@ -3069,7 +3073,7 @@ async function runLoop(
           ok: false,
           error: `Tool '${call.function.name}' is available but not loaded yet. Call load_tools({"names":["${call.function.name}"]}) first, then call it on the next turn.`
         });
-        toolResultMessages.push({ role: "tool", tool_call_id: call.id, content: nudge });
+        recordToolResult(call.id, nudge);
         emitToolCallStatus(emitCtx, { callId: call.id, status: "error", errorMessage: "tool not loaded" });
         emitToolResult(emitCtx, { callId: call.id, result: nudge });
         await mutateState(config.instance, (state) => {
@@ -3126,16 +3130,7 @@ async function runLoop(
           workingMessages
         );
         if (dispatch.kind === "sync") {
-          toolResultMessages.push({
-            role: "tool",
-            tool_call_id: call.id,
-            content: dispatch.result
-          });
-          persistTranscriptRow(config, taskId, transcriptSessionId, {
-            role: "tool",
-            toolCallId: call.id,
-            content: dispatch.result
-          });
+          recordToolResult(call.id, dispatch.result);
           // Flip the tool_call row to `ok` and append a tool_result
           // block carrying a truncated preview of the dispatch result.
           emitToolCallStatus(emitCtx, { callId: call.id, status: "ok" });
@@ -3231,16 +3226,7 @@ async function runLoop(
           message: `Tool call ${call.function.name} failed: ${message}`,
           data: { toolCallId: call.id }
         });
-        toolResultMessages.push({
-          role: "tool",
-          tool_call_id: call.id,
-          content: `Error: ${message}`
-        });
-        persistTranscriptRow(config, taskId, transcriptSessionId, {
-          role: "tool",
-          toolCallId: call.id,
-          content: `Error: ${message}`
-        });
+        recordToolResult(call.id, `Error: ${message}`);
         emitToolCallStatus(emitCtx, {
           callId: call.id,
           status: "error",

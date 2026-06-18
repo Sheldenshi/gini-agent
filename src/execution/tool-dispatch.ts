@@ -406,8 +406,21 @@ async function dispatchToolCallInner(
       // and steer the agent to browse headless first; it then only escalates to
       // a Connect prompt when a navigation genuinely reaches such a step.
       // Validate the reason first so a missing reason fails identically
-      // regardless of browser state.
-      requireString(args, "reason");
+      // regardless of browser state. `reason` is schema-required, but a model
+      // can still omit it; surface a recoverable, actionable nudge (matching
+      // the other branches here) instead of a bare throw so the model simply
+      // retries WITH a reason rather than seeing a terse "Error:" line and
+      // stalling (issue #397).
+      if (typeof args.reason !== "string" || args.reason.length === 0) {
+        return {
+          kind: "sync",
+          result: JSON.stringify({
+            ok: false,
+            error:
+              "browser_connect requires a `reason`: one short user-facing sentence shown on the Connect card (e.g. 'Sign in to GitHub to continue'). Re-call browser_connect with that `reason` (keep the same `url`)."
+          })
+        };
+      }
       // Exempt an explicit headless:true reconnect: the setup skill re-opens
       // the browser invisibly AFTER browser_close (post sign-in), so it has no
       // live session by design. The cold-call misuse is always headless-unset.

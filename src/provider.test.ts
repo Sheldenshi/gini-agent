@@ -4250,7 +4250,14 @@ describe("anthropic provider", () => {
             { type: "document", document: { mimeType: "application/pdf", data: "BBBB", filename: "d.pdf" } }
           ]
         },
-        { role: "assistant", content: "thinking", tool_calls: [{ id: "toolu_x", type: "function", function: { name: "search", arguments: '{"q":"hi"}' } }] },
+        {
+          role: "assistant",
+          content: "thinking",
+          tool_calls: [
+            { id: "toolu_x", type: "function", function: { name: "search", arguments: '{"q":"hi"}' } },
+            { id: "toolu_y", type: "function", function: { name: "search", arguments: '{"q":"bye"}' } }
+          ]
+        },
         { role: "tool", tool_call_id: "toolu_x", content: "result-1" },
         { role: "tool", tool_call_id: "toolu_y", content: "result-2" },
         { role: "assistant", content: [{ type: "text", text: "array text" }] },
@@ -4273,7 +4280,8 @@ describe("anthropic provider", () => {
           role: "assistant",
           content: [
             { type: "text", text: "thinking" },
-            { type: "tool_use", id: "toolu_x", name: "search", input: { q: "hi" } }
+            { type: "tool_use", id: "toolu_x", name: "search", input: { q: "hi" } },
+            { type: "tool_use", id: "toolu_y", name: "search", input: { q: "bye" } }
           ]
         },
         {
@@ -5047,6 +5055,190 @@ describe("anthropic provider", () => {
       }
     } finally {
       restoreEnv();
+    }
+  });
+
+  // Issue #397: a transcript can carry an assistant tool_use whose tool_result
+  // was never persisted (inline-handled load_tools / deferred-nudge /
+  // start_thread push the result into the live turn only). Replaying it into a
+  // tool-pairing-strict provider must NOT 400 — the request builder drops the
+  // dangling tool_use (and any orphan tool_result) before translating.
+  test("bedrock: drops a dangling tool_use whose tool_result is missing", async () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const fetchStub = installFetch(() =>
+      anthropicJson({
+        output: { message: { role: "assistant", content: [{ text: "ok" }] } },
+        stopReason: "end_turn",
+        usage: {}
+      })
+    );
+    try {
+      const provider = normalizeProvider({ name: "bedrock", model: "us.anthropic.claude-opus-4-8", awsRegion: "us-east-1" });
+      const messages: ToolCallingMessage[] = [
+        { role: "user", content: "go" },
+        // Dangling: this tool_use has no following tool_result.
+        { role: "assistant", content: "", tool_calls: [{ id: "tu_dangle", type: "function", function: { name: "load_tools", arguments: "{}" } }] },
+        // Paired: this one is answered.
+        { role: "assistant", content: "", tool_calls: [{ id: "tu_ok", type: "function", function: { name: "list_toolsets", arguments: "{}" } }] },
+        { role: "tool", tool_call_id: "tu_ok", content: "{\"ok\":true}" }
+      ];
+      await generateToolCallingResponse(config(provider), messages, []);
+      const body = JSON.parse(String(fetchStub.calls[0]!.init.body));
+      const dumped = JSON.stringify(body.messages);
+      expect(dumped).not.toContain("tu_dangle");
+      // The well-formed pair survives.
+      expect(dumped).toContain("tu_ok");
+      // No assistant turn carries a toolUse id without a following toolResult.
+      const ids = new Set<string>();
+      for (const m of body.messages as Array<{ role: string; content: Array<Record<string, unknown>> }>) {
+        if (m.role === "user") for (const b of m.content) if (b.toolResult) ids.add(String((b.toolResult as Record<string, unknown>).toolUseId));
+      }
+      for (const m of body.messages as Array<{ role: string; content: Array<Record<string, unknown>> }>) {
+        if (m.role === "assistant") for (const b of m.content) if (b.toolUse) expect(ids.has(String((b.toolUse as Record<string, unknown>).toolUseId))).toBe(true);
+      }
+    } finally {
+      fetchStub.restore();
+      restoreSk();
+      restoreAk();
+    }
+  });
+
+  test("bedrock: drops an orphan tool_result with no preceding tool_use", async () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const fetchStub = installFetch(() =>
+      anthropicJson({ output: { message: { role: "assistant", content: [{ text: "ok" }] } }, stopReason: "end_turn", usage: {} })
+    );
+    try {
+      const provider = normalizeProvider({ name: "bedrock", model: "us.anthropic.claude-opus-4-8", awsRegion: "us-east-1" });
+      const messages: ToolCallingMessage[] = [
+        { role: "user", content: "go" },
+        // Orphan: no assistant tool_use ever claimed tu_orphan.
+        { role: "tool", tool_call_id: "tu_orphan", content: "{\"ok\":true}" }
+      ];
+      await generateToolCallingResponse(config(provider), messages, []);
+      const body = JSON.parse(String(fetchStub.calls[0]!.init.body));
+      expect(JSON.stringify(body.messages)).not.toContain("tu_orphan");
+    } finally {
+      fetchStub.restore();
+      restoreSk();
+      restoreAk();
+    }
+  });
+
+  test("anthropic: drops a dangling tool_use before building the Messages request", async () => {
+    const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    const fetchStub = installFetch(() =>
+      anthropicJson({ id: "m", type: "message", role: "assistant", content: [{ type: "text", text: "ok" }], stop_reason: "end_turn", usage: {} })
+    );
+    try {
+      const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
+      const messages: ToolCallingMessage[] = [
+        { role: "user", content: "go" },
+        { role: "assistant", content: "", tool_calls: [{ id: "tu_dangle", type: "function", function: { name: "load_tools", arguments: "{}" } }] }
+      ];
+      await generateToolCallingResponse(config(provider), messages, []);
+      const body = JSON.parse(String(fetchStub.calls[0]!.init.body));
+      expect(JSON.stringify(body.messages)).not.toContain("tu_dangle");
+    } finally {
+      fetchStub.restore();
+      restoreEnv();
+    }
+  });
+
+  // Pairing is turn-window-bounded, not global-id. Synthesized text-backstop
+  // ids (name:args:index, index resets per turn) can recur across turns, so a
+  // turn-1 result must NOT satisfy a turn-2 dangling tool_use with the same id.
+  // Global pairing would keep turn 2's tool_use → an unanswered tool_use on the
+  // wire → 400. Here `dup_id` is answered in turn 1 but dangling in turn 2: the
+  // turn-1 pair survives, the turn-2 tool_use is dropped.
+  test("bedrock: a reused tool_call id is paired per-turn, not globally", async () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const fetchStub = installFetch(() =>
+      anthropicJson({ output: { message: { role: "assistant", content: [{ text: "ok" }] } }, stopReason: "end_turn", usage: {} })
+    );
+    try {
+      const provider = normalizeProvider({ name: "bedrock", model: "us.anthropic.claude-opus-4-8", awsRegion: "us-east-1" });
+      const messages: ToolCallingMessage[] = [
+        { role: "user", content: "turn 1" },
+        { role: "assistant", content: "", tool_calls: [{ id: "dup_id", type: "function", function: { name: "search", arguments: "{}" } }] },
+        { role: "tool", tool_call_id: "dup_id", content: "{\"ok\":true}" },
+        { role: "user", content: "turn 2" },
+        // Same id, but NO result this turn — must be dropped, not rescued by turn 1's result.
+        { role: "assistant", content: "", tool_calls: [{ id: "dup_id", type: "function", function: { name: "search", arguments: "{}" } }] }
+      ];
+      await generateToolCallingResponse(config(provider), messages, []);
+      const body = JSON.parse(String(fetchStub.calls[0]!.init.body)) as {
+        messages: Array<{ role: string; content: Array<Record<string, unknown>> }>;
+      };
+      // Every assistant toolUse on the wire must be immediately followed by a
+      // user turn whose first block is a matching toolResult.
+      for (let i = 0; i < body.messages.length; i++) {
+        const m = body.messages[i]!;
+        if (m.role !== "assistant") continue;
+        const toolUseIds = m.content.filter((b) => b.toolUse).map((b) => String((b.toolUse as Record<string, unknown>).toolUseId));
+        if (toolUseIds.length === 0) continue;
+        const next = body.messages[i + 1];
+        const resultIds = (next?.content ?? []).filter((b) => b.toolResult).map((b) => String((b.toolResult as Record<string, unknown>).toolUseId));
+        for (const id of toolUseIds) expect(resultIds).toContain(id);
+      }
+      // Exactly ONE toolUse survives (turn 1's), since turn 2's is dangling.
+      const toolUseCount = body.messages.reduce(
+        (n, m) => n + (m.role === "assistant" ? m.content.filter((b) => b.toolUse).length : 0),
+        0
+      );
+      expect(toolUseCount).toBe(1);
+    } finally {
+      fetchStub.restore();
+      restoreSk();
+      restoreAk();
+    }
+  });
+
+  // A plain assistant row interleaved between a tool_use and its result must be
+  // HOISTED so the toolResult leads the message immediately after the toolUse
+  // turn. Bedrock Converse rejects an interposed assistant turn ("toolResult
+  // blocks ... exceeds the number of toolUse blocks of previous turn"). The
+  // backstop re-emits the matched result adjacent to its call, then the
+  // interleaved row after.
+  test("bedrock: hoists a tool_result over an interleaved assistant row", async () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const fetchStub = installFetch(() =>
+      anthropicJson({ output: { message: { role: "assistant", content: [{ text: "ok" }] } }, stopReason: "end_turn", usage: {} })
+    );
+    try {
+      const provider = normalizeProvider({ name: "bedrock", model: "us.anthropic.claude-opus-4-8", awsRegion: "us-east-1" });
+      const messages: ToolCallingMessage[] = [
+        { role: "user", content: "go" },
+        { role: "assistant", content: "", tool_calls: [{ id: "tu_x", type: "function", function: { name: "search", arguments: "{}" } }] },
+        { role: "assistant", content: "thinking out loud" }, // interleaved plain text
+        { role: "tool", tool_call_id: "tu_x", content: "{\"ok\":true}" }
+      ];
+      await generateToolCallingResponse(config(provider), messages, []);
+      const body = JSON.parse(String(fetchStub.calls[0]!.init.body)) as {
+        messages: Array<{ role: string; content: Array<Record<string, unknown>> }>;
+      };
+      // Find the assistant turn carrying the toolUse; the VERY NEXT message must
+      // be a user turn leading with the matching toolResult.
+      const idx = body.messages.findIndex((m) => m.role === "assistant" && m.content.some((b) => b.toolUse));
+      expect(idx).toBeGreaterThanOrEqual(0);
+      const next = body.messages[idx + 1]!;
+      expect(next.role).toBe("user");
+      expect(next.content[0]!.toolResult).toBeDefined();
+      expect(String((next.content[0]!.toolResult as Record<string, unknown>).toolUseId)).toBe("tu_x");
+      // Hoisting the result over the interleaved row must RE-EMIT that row, not
+      // drop it — the model's narration must survive.
+      const survived = body.messages.some(
+        (m) => m.role === "assistant" && m.content.some((b) => b.text === "thinking out loud")
+      );
+      expect(survived).toBe(true);
+    } finally {
+      fetchStub.restore();
+      restoreSk();
+      restoreAk();
     }
   });
 });

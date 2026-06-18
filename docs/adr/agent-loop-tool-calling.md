@@ -142,7 +142,12 @@ being re-read every turn.
   grouped under the assistant `tool_calls` row that emitted its id;
   orphan tool rows and assistant rows missing any paired result are
   dropped, so a partially-persisted turn can never produce a provider
-  400 on the ordering invariant.
+  400 on the ordering invariant. The tool-pairing-strict request
+  builders (Anthropic Messages, Bedrock Converse) in `src/provider.ts`
+  re-run the same window-bounded pairing pass (`pairToolCallingMessages`)
+  as a request-build backstop, so any non-replay path that reaches them
+  — resume snapshots, in-turn compaction, future callers — is held to
+  the same ordering invariant.
 - These rows are model-facing replay state, **not** the human-facing
   transcript. The chat UI renders from the ChatBlock stream (ADR
   chat-block-protocol.md), and the JSON view-builders in

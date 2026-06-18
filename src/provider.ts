@@ -690,6 +690,78 @@ function stripDocumentPartsIfUnsupported(
   });
 }
 
+// Drop unpaired tool-calling messages so the tool-pairing-strict providers
+// (Anthropic Messages, Bedrock Converse) never 400 on a malformed history.
+// Both APIs require every assistant `tool_use` block to be answered by a
+// `tool_result` in the immediately-following message, and reject an orphan
+// `tool_result` with no preceding `tool_use`. A history can carry an unpaired
+// pair when an inline-handled tool (load_tools, the deferred-not-loaded nudge,
+// start_thread) pushed its result into the live turn but never persisted a
+// transcript row — so a later replay reconstructs the assistant tool_use
+// without its result. chat-task's priorChatMessages does a similar pass, but
+// this is the request-build backstop that catches ANY path (resume snapshots,
+// in-turn compaction, future callers) regardless of how the gap arose.
+//
+// Pairing is TURN-WINDOW-bounded, not global: each assistant tool_use turn is
+// answered only by the `tool` results in its own turn window — the rows that
+// follow it up to, but not including, the next user message (a turn boundary)
+// or the next assistant tool_use turn. A global "id answered anywhere later"
+// check is wrong because synthesized text-backstop ids (synthesizeToolCallId
+// hashes name:args:index, and index resets each turn) can recur across turns:
+// a turn-1 result would then falsely satisfy a turn-2 dangling tool_use with
+// the same id, leaving an unanswered tool_use on the wire. Interleaved plain
+// assistant text inside the window is skipped (a gated tool persists an
+// approval_reason / text row between its tool_use and its on-resume result),
+// but a user row or the next tool round ends the window. An assistant turn is
+// kept only when EVERY id it carries is answered in its window; otherwise the
+// turn and its partial results drop together (a partial tool_use set still
+// 400s). A `tool` row survives only as a matched result of a kept turn; any
+// other `tool` row is an orphan and is dropped.
+//
+// Matched results are emitted IMMEDIATELY after their assistant tool_use turn,
+// hoisting them over any interleaved approval_reason / plain-text row that sat
+// between the call and its result. Bedrock Converse requires the toolResult to
+// lead the very next message after the toolUse turn (an interposed assistant
+// text turn 400s with "toolResult blocks ... exceeds the number of toolUse
+// blocks of previous turn"); the interleaved row is re-emitted in its original
+// order right after the hoisted results. This mirrors priorChatMessages so the
+// rebuild-time and request-build guards agree.
+function pairToolCallingMessages(messages: ToolCallingMessage[]): ToolCallingMessage[] {
+  const isToolUseTurn = (m: ToolCallingMessage): boolean =>
+    m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length > 0;
+  const out: ToolCallingMessage[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i]!;
+    if (isToolUseTurn(message)) {
+      const ids = message.tool_calls!.map((call) => call.id);
+      const idSet = new Set(ids);
+      const resultIndexById = new Map<string, number>();
+      for (let j = i + 1; j < messages.length; j++) {
+        const next = messages[j]!;
+        if (next.role === "user") break; // turn boundary
+        if (isToolUseTurn(next)) break; // next tool round
+        if (next.role !== "tool") continue; // skip interleaved approval_reason / plain text
+        const id = next.tool_call_id;
+        if (typeof id === "string" && idSet.has(id) && !resultIndexById.has(id)) {
+          resultIndexById.set(id, j);
+        }
+      }
+      if (!ids.every((id) => resultIndexById.has(id))) continue; // drop the unanswered turn
+      out.push(message);
+      // Emit results in the assistant turn's id order, immediately adjacent —
+      // hoisted over any interleaved row, which the outer loop re-emits after.
+      for (const id of ids) out.push(messages[resultIndexById.get(id)!]!);
+      continue;
+    }
+    // A `tool` row reached directly by the outer loop is either an orphan or a
+    // result already emitted next to its (kept) assistant turn above — drop it
+    // so no result leads without its tool_use and none double-emits.
+    if (message.role === "tool") continue;
+    out.push(message);
+  }
+  return out;
+}
+
 export interface ToolCallingResult {
   provider: ProviderConfig;
   text: string;
@@ -1599,7 +1671,7 @@ async function callAnthropicMessages(
   // including a Bedrock Mantle Messages baseUrl.
   const messagesUrl = `${baseUrl.replace(/\/v1(\/messages)?$/, "")}/v1/messages`;
   const wantStream = Boolean(onDelta);
-  const safeMessages = stripDocumentPartsIfUnsupported(messages, provider);
+  const safeMessages = pairToolCallingMessages(stripDocumentPartsIfUnsupported(messages, provider));
   const { system, messages: anthropicMessages } = translateMessagesToAnthropic(safeMessages);
   const extras = sanitizeExtraBody(provider.extraBody, ANTHROPIC_RESERVED_EXTRA_BODY_KEYS);
   const resolvedMaxTokens =
@@ -2249,7 +2321,7 @@ async function callBedrockConverse(
   const wantStream =
     Boolean(onDelta) && !(toolConfig && !bedrockSupportsStreamingWithTools(provider.model));
   const url = bedrockConverseUrl(region, provider.model, wantStream);
-  const safeMessages = stripDocumentPartsIfUnsupported(messages, provider);
+  const safeMessages = pairToolCallingMessages(stripDocumentPartsIfUnsupported(messages, provider));
   const { system, messages: converseMessages } = translateMessagesToConverse(safeMessages);
   const extraMax =
     isRecord(provider.extraBody) && typeof provider.extraBody.max_tokens === "number" ? provider.extraBody.max_tokens : undefined;
