@@ -582,7 +582,13 @@ export async function dispatchNextPendingChatMessage(config: RuntimeConfig, sess
     clientSurface: popped.clientSurface
   };
   try {
-    await runChatSubmission(config, sessionId, prepared);
+    // A queued thread reply re-dispatches back into its thread; a main-chat
+    // message runs as a normal turn. popped.threadId distinguishes them.
+    if (popped.threadId) {
+      await runThreadSubmission(config, sessionId, popped.threadId, popped.parentBlockId!, prepared);
+    } else {
+      await runChatSubmission(config, sessionId, prepared);
+    }
   } catch (error) {
     appendLog(config.instance, "chat.queue.dispatch_failed", {
       sessionId,
@@ -652,7 +658,51 @@ export async function submitThreadReply(
     if (!parent) throw new Error("Thread not found: parent message not found in this chat");
     parentBlockId = parent.id;
   }
-  const { content, images, audio, liveSession, clientSurface } = await prepareChatSubmission(config, sessionId, input);
+  const prepared = await prepareChatSubmission(config, sessionId, input);
+  // Serialize behind any live turn for this session, exactly like
+  // submitChatMessage: enqueue when a turn is already in flight or the queue
+  // is non-empty, so a reply typed mid-turn (e.g. while a prior turn is paused
+  // at waiting_approval) queues instead of spawning a second competing task.
+  // The session-scoped guard keeps one live turn per session; the queued reply
+  // carries its thread membership so auto-dispatch re-runs it in this thread.
+  // See ADR chat-message-queue.md.
+  const liveState = readState(config.instance);
+  const session = liveState.chatSessions.find((item) => item.id === sessionId);
+  const shouldQueue =
+    sessionHasInFlightChatTask(liveState, sessionId) || (session?.pendingMessages?.length ?? 0) > 0;
+  if (shouldQueue) {
+    const { content, images, clientSurface } = prepared;
+    const pending = await mutateState(config.instance, (current) =>
+      enqueuePendingChatMessage(current, sessionId, {
+        content,
+        ...(images.length > 0 ? { images } : {}),
+        ...(clientSurface ? { clientSurface } : {}),
+        threadId,
+        parentBlockId
+      })
+    );
+    const updated = readState(config.instance).chatSessions.find((item) => item.id === sessionId);
+    if (updated) publishChatSession(config.instance, updated);
+    return { sessionId, queued: true as const, pendingId: pending.id };
+  }
+  return runThreadSubmission(config, sessionId, threadId, parentBlockId, prepared, {
+    alsoToMain: Boolean(input.alsoToMain)
+  });
+}
+
+// Actually run a prepared thread reply: create the conversation run, spawn the
+// thread-tagged task, persist the user message + thread ChatBlock (and the
+// optional main-chat mirror). Extracted so the immediate submit path and the
+// queue auto-dispatch path produce an identical threaded turn.
+async function runThreadSubmission(
+  config: RuntimeConfig,
+  sessionId: string,
+  threadId: string,
+  parentBlockId: string,
+  prepared: PreparedChatSubmission,
+  options?: { alsoToMain?: boolean }
+) {
+  const { content, images, audio, liveSession, clientSurface } = prepared;
   const run = await createConversationRun(config, { conversationId: sessionId, input: content });
   const task = await submitTask(config, content, {
     runId: run.id,
@@ -709,7 +759,7 @@ export async function submitThreadReply(
   // mirror only the user's message (not the agent's threaded response) into
   // the main chat as an un-threaded user_text block. Best-effort like the
   // thread block above.
-  if (input.alsoToMain) {
+  if (options?.alsoToMain) {
     try {
       insertChatBlock(config.instance, {
         kind: "user_text",

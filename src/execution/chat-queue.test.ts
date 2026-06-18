@@ -13,12 +13,13 @@ import {
   normalizeProvider,
   setEchoToolCallingResponse
 } from "../provider";
-import { mutateState, readState } from "../state";
+import { insertChatBlock, listThreadBlocks, mutateState, readState } from "../state";
 import {
   createChat,
   dispatchNextPendingChatMessage,
   removePendingChatMessageById,
-  submitChatMessage
+  submitChatMessage,
+  submitThreadReply
 } from "./chat";
 import type { RuntimeConfig, Task } from "../types";
 
@@ -284,6 +285,97 @@ describe("chat message queue", () => {
       (m) => m.sessionId === chat.id && m.role === "user" && m.content === "queued during approval"
     );
     expect(userMsg).toBeDefined();
+  });
+
+  test("thread reply enqueues behind an in-flight task, carrying its thread membership", async () => {
+    const config = buildConfig(workspaceRoot, "queue-thread-busy");
+    const chat = await createChat(config, { title: "thread-busy" });
+    // Root a thread on a main-chat block, then make the session busy so a
+    // reply typed mid-turn has to queue instead of spawning a second task.
+    const parent = insertChatBlock(config.instance, {
+      kind: "user_text",
+      sessionId: chat.id,
+      text: "original message",
+      agentId: null
+    });
+    await seedInFlightTask(config, chat.id);
+    const tasksBefore = readState(config.instance).tasks.length;
+
+    const result = await submitThreadReply(config, chat.id, "thread_busy", {
+      content: "reply during a live turn",
+      parentBlockId: parent.id
+    });
+
+    expect("queued" in result && result.queued).toBe(true);
+    if (!("queued" in result)) throw new Error("expected queued result");
+    expect(result.pendingId).toBeString();
+    // No second task spawned — the in-flight one is still the only task.
+    expect(readState(config.instance).tasks.length).toBe(tasksBefore);
+    const pending = session(config, chat.id)?.pendingMessages ?? [];
+    expect(pending).toHaveLength(1);
+    expect(pending[0]?.content).toBe("reply during a live turn");
+    expect(pending[0]?.threadId).toBe("thread_busy");
+    expect(pending[0]?.parentBlockId).toBe(parent.id);
+  });
+
+  test("dispatchNextPendingChatMessage re-dispatches a queued thread reply back into its thread", async () => {
+    const config = buildConfig(workspaceRoot, "queue-thread-dispatch");
+    stubTurn(config);
+    const chat = await createChat(config, { title: "thread-dispatch" });
+    const parent = insertChatBlock(config.instance, {
+      kind: "user_text",
+      sessionId: chat.id,
+      text: "original message",
+      agentId: null
+    });
+    const inFlight = await seedInFlightTask(config, chat.id);
+    await submitThreadReply(config, chat.id, "thread_dispatch", {
+      content: "queued thread reply",
+      parentBlockId: parent.id
+    });
+    expect((session(config, chat.id)?.pendingMessages ?? [])[0]?.threadId).toBe("thread_dispatch");
+    const tasksBefore = readState(config.instance).tasks.length;
+    // Settle the live turn so the guarded dispatch can pop.
+    await settleTask(config, inFlight, "completed");
+
+    await dispatchNextPendingChatMessage(config, chat.id);
+
+    // The queue drained and a new task spawned for the popped reply.
+    expect(session(config, chat.id)?.pendingMessages ?? []).toHaveLength(0);
+    expect(readState(config.instance).tasks.length).toBe(tasksBefore + 1);
+    // The dispatched task threads — it is not a main-chat turn.
+    const dispatched = readState(config.instance).tasks.find((t) => t.id !== inFlight);
+    expect(dispatched?.threadId).toBe("thread_dispatch");
+    expect(dispatched?.parentBlockId).toBe(parent.id);
+    // The user row lands as a thread-tagged block, not in the main stream.
+    const threadBlocks = listThreadBlocks(config.instance, chat.id, "thread_dispatch");
+    const userBlock = threadBlocks.find((b) => b.kind === "user_text" && b.text === "queued thread reply");
+    expect(userBlock).toBeDefined();
+    expect(userBlock?.threadId).toBe("thread_dispatch");
+  });
+
+  test("a queued main-chat message still drains via the main path, with no thread membership", async () => {
+    const config = buildConfig(workspaceRoot, "queue-main-after-thread");
+    stubTurn(config);
+    const chat = await createChat(config, { title: "main-drain" });
+    const inFlight = await seedInFlightTask(config, chat.id);
+    await submitChatMessage(config, chat.id, { content: "plain main message" });
+    expect((session(config, chat.id)?.pendingMessages ?? [])[0]?.threadId).toBeUndefined();
+    const tasksBefore = readState(config.instance).tasks.length;
+    await settleTask(config, inFlight, "completed");
+
+    await dispatchNextPendingChatMessage(config, chat.id);
+
+    expect(session(config, chat.id)?.pendingMessages ?? []).toHaveLength(0);
+    expect(readState(config.instance).tasks.length).toBe(tasksBefore + 1);
+    // The dispatched task is a main-chat turn — no thread membership.
+    const dispatched = readState(config.instance).tasks.find((t) => t.id !== inFlight);
+    expect(dispatched?.threadId).toBeUndefined();
+    const userMsg = readState(config.instance).chatMessages.find(
+      (m) => m.sessionId === chat.id && m.role === "user" && m.content === "plain main message"
+    );
+    expect(userMsg).toBeDefined();
+    expect(userMsg?.threadId).toBeUndefined();
   });
 
   test("removePendingChatMessageById removes the right item and reports unknown ids", async () => {

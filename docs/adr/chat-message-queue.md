@@ -23,7 +23,7 @@ The gateway owns durable state and execution; web, mobile, CLI, and messaging br
 
 ## Data model
 
-`PendingChatMessage` (`src/types.ts`) is `{ id; content; images?; clientSurface?; createdAt }`. Audio is intentionally absent: a voice message is transcribed to `content` during `prepareChatSubmission`, so only the resulting text plus image refs are queued. `pendingMessages` is optional on `ChatSessionRecord` so existing persisted state stays valid without a migration.
+`PendingChatMessage` (`src/types.ts`) is `{ id; content; images?; clientSurface?; threadId?; parentBlockId?; createdAt }`. Audio is intentionally absent: a voice message is transcribed to `content` during `prepareChatSubmission`, so only the resulting text plus image refs are queued. `threadId`/`parentBlockId` are set only for a queued thread reply so auto-dispatch can re-run it inside its thread (a popped reply that dropped them would drain as a main-chat turn); both are optional, so `pendingMessages` is optional on `ChatSessionRecord` and existing persisted state stays valid without a migration.
 
 The state helpers operate on `RuntimeState` inside a `mutateState` callback, matching the sibling record helpers (`src/state/records.ts`): `enqueuePendingChatMessage`, `removePendingChatMessage`, `shiftPendingChatMessage`, and `sessionHasInFlightChatTask` (true when `state.tasks` has any task for the session whose status is not terminal — queued/running/waiting_approval all count as in-flight).
 
@@ -33,11 +33,13 @@ The state helpers operate on `RuntimeState` inside a `mutateState` callback, mat
 
 An optional `{ bypassQueue: true }` skips the enqueue decision entirely and always runs now. Only the messaging bridge passes it (see "Why messaging bypasses the queue"); a function overload narrows the return type to the run-now shape for that caller so it gets a `taskId` without discriminating on `queued`. Interactive clients omit the option and keep the discriminated union.
 
+`submitThreadReply` (a reply posted inside a thread) shares the same session-level queue and one-turn-per-session serialization. It validates the session and resolves the thread's `parentBlockId` up front (so a bad reply still fails fast), runs `prepareChatSubmission`, then applies the identical session-scoped guard (`sessionHasInFlightChatTask` or a non-empty queue) and either enqueues the reply — carrying its `threadId`/`parentBlockId` — or runs it now. A queued thread reply therefore waits behind a live turn in its session (including one paused at `waiting_approval`) instead of spawning a second competing task, and auto-dispatch re-runs it back into the same thread (see below).
+
 `runChatSubmission(config, sessionId, prepared)` is the extracted run-now body (create the conversation run, `submitTask`, link the run, persist the user `ChatMessageRecord` + `user_text` `ChatBlock`). Both the immediate path and the auto-dispatch path call it so a queued message becomes an identical real turn when it runs.
 
 ## FIFO one-per-turn auto-dispatch
 
-`dispatchNextPendingChatMessage(config, sessionId)` is the **single guarded chokepoint** for draining the queue. It is atomic and idempotent: the in-flight check (`sessionHasInFlightChatTask`) AND the FIFO pop (`shiftPendingChatMessage`) run inside ONE `mutateState`, so a queued message is popped only when the session is truly idle. It then publishes the shrunk queue and runs the popped message via `runChatSubmission`. A run failure is logged (`chat.queue.dispatch_failed`) and swallowed so one bad turn doesn't crash the dispatch chain — the remaining queue stays intact for the next terminal transition.
+`dispatchNextPendingChatMessage(config, sessionId)` is the **single guarded chokepoint** for draining the queue. It is atomic and idempotent: the in-flight check (`sessionHasInFlightChatTask`) AND the FIFO pop (`shiftPendingChatMessage`) run inside ONE `mutateState`, so a queued message is popped only when the session is truly idle. It then publishes the shrunk queue and runs the popped message: a thread reply (`popped.threadId` set) via `runThreadSubmission` so it re-runs inside its thread, otherwise a main-chat message via `runChatSubmission`. A run failure is logged (`chat.queue.dispatch_failed`) and swallowed so one bad turn doesn't crash the dispatch chain — the remaining queue stays intact for the next terminal transition.
 
 Because `sessionHasInFlightChatTask` treats queued/running/**waiting_approval** as in-flight, calling the chokepoint while a turn is still active or paused for approval pops nothing and no-ops. That makes the function safe to call redundantly from several settle points: at most one queued message drains, and only once no live turn remains for the session.
 
@@ -80,6 +82,7 @@ So messaging passes `{ bypassQueue: true }` to `submitChatMessage` and always ru
 - A submit behind a non-empty queue with no running task still enqueues, preserving FIFO order (`src/execution/chat-queue.test.ts`).
 - `dispatchNextPendingChatMessage` pops FIFO and runs the next message once the session is idle (creates a task + user row for the popped content; the queue shrinks); it is a no-op on an empty queue (`src/execution/chat-queue.test.ts`).
 - The guard holds the queue while a turn is paused at `waiting_approval` (calling the chokepoint pops nothing and starts no second task), then drains the queued message once the paused task reaches a terminal status (`src/execution/chat-queue.test.ts`).
+- A thread reply posted while the session has an in-flight task enqueues (`queued: true`, no second task) with `threadId`/`parentBlockId` on the pending entry; auto-dispatch re-runs it back into the same thread (the dispatched task carries the original `threadId`) (`src/execution/chat-queue.test.ts`).
 - `removePendingChatMessageById` removes the right item and returns false for an unknown id; the DELETE route maps that to 404 (`src/execution/chat-queue.test.ts`, `src/http.test.ts`).
 - `bypassQueue: true` runs immediately even while a turn is in flight: it returns the run-now shape with a `taskId`, creates a new task, and leaves `pendingMessages` empty (`src/execution/chat-queue.test.ts`).
 - Two inbound bridge messages to the same session bypass the queue and each runs its own task immediately; both user rows land in order, synchronously (`src/integrations/messaging.test.ts`).

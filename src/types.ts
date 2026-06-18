@@ -1061,6 +1061,12 @@ export interface PendingChatMessage {
   content: string;
   images?: ImageAttachment[];
   clientSurface?: ChatClientSurface;
+  // Set when the queued message is a thread reply, so auto-dispatch
+  // re-dispatches it back into its thread (a popped reply that lost these
+  // would drain as a main-chat turn). Optional so persisted state without
+  // them stays valid.
+  threadId?: string;
+  parentBlockId?: string;
   createdAt: string;
 }
 

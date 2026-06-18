@@ -1195,6 +1195,7 @@ describe("chat message client surface", () => {
       client: "mobile",
       parentBlockId: parent.id
     });
+    if ("queued" in submitted) throw new Error("idle session should run the thread reply now");
     expect(taskSurface(config, submitted.taskId)).toBe("mobile");
   });
 
