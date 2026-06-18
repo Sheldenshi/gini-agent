@@ -9,6 +9,7 @@
 
 import { describe, expect, test } from "bun:test";
 import {
+  APPROVAL_CATEGORY_ACTIONS,
   APPROVE_ACTION,
   DENY_ACTION,
   dispatchNotificationResponse,
@@ -143,5 +144,33 @@ describe("dispatchNotificationResponse", () => {
     );
     expect(outcome).toEqual({ kind: "ignored" });
     expect(deps.calls.navigate).toEqual([]);
+  });
+});
+
+describe("APPROVAL_CATEGORY_ACTIONS", () => {
+  test("Approve requires authentication so it can't be granted from a locked screen", () => {
+    const approve = APPROVAL_CATEGORY_ACTIONS.find((a) => a.identifier === APPROVE_ACTION);
+    // Security invariant: approving authorizes the high-risk action the
+    // agent paused on, so iOS must demand Face ID / Touch ID / passcode
+    // before the handler runs. Without this a locked-phone holder could
+    // approve a dangerous operation straight from the lock screen.
+    expect(approve?.options.isAuthenticationRequired).toBe(true);
+  });
+
+  test("Deny is fail-safe: destructive styling, no auth gate, no foregrounding", () => {
+    const deny = APPROVAL_CATEGORY_ACTIONS.find((a) => a.identifier === DENY_ACTION);
+    // Denying only cancels the pending action (never grants), so it needs
+    // no unlock; it's marked destructive for the red lock-screen styling.
+    expect(deny?.options.isDestructive).toBe(true);
+    expect(deny?.options.isAuthenticationRequired).toBe(false);
+    expect(deny?.options.opensAppToForeground).toBe(false);
+  });
+
+  test("both actions dispatch in the background (no foregrounding)", () => {
+    // The response listener routes Approve/Deny straight to the gateway;
+    // neither action should force the app to foreground.
+    for (const action of APPROVAL_CATEGORY_ACTIONS) {
+      expect(action.options.opensAppToForeground).toBe(false);
+    }
   });
 });

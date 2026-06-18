@@ -44,6 +44,7 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import { api, ApiError } from "./api";
 import {
   APPROVAL_CATEGORY,
+  APPROVAL_CATEGORY_ACTIONS,
   APPROVE_ACTION,
   DENY_ACTION,
   dispatchNotificationResponse
@@ -143,27 +144,13 @@ export function registerApprovalCategoryAsync(): Promise<void> {
   categoryRegistration = (async () => {
     if (Platform.OS !== "ios") return;
     try {
-      await Notifications.setNotificationCategoryAsync(APPROVAL_CATEGORY, [
-        {
-          identifier: APPROVE_ACTION,
-          buttonTitle: "Approve",
-          options: {
-            opensAppToForeground: false,
-            isAuthenticationRequired: false,
-            isDestructive: false
-          }
-        },
-        {
-          identifier: DENY_ACTION,
-          buttonTitle: "Deny",
-          options: {
-            opensAppToForeground: false,
-            isAuthenticationRequired: false,
-            // Deny is the destructive choice — iOS highlights it red.
-            isDestructive: true
-          }
-        }
-      ]);
+      // Action specs (including the Approve auth-required invariant) live
+      // in push-dispatch.ts so they're unit-testable without the native
+      // module. expo-notifications wants a mutable array, so copy it.
+      await Notifications.setNotificationCategoryAsync(
+        APPROVAL_CATEGORY,
+        APPROVAL_CATEGORY_ACTIONS.map((action) => ({ ...action }))
+      );
     } catch {
       // setNotificationCategoryAsync can throw on the very first launch
       // before the native module is ready. Clear the cached promise so

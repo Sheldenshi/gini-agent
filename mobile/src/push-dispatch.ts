@@ -15,6 +15,50 @@ export const APPROVAL_CATEGORY = "APPROVAL_REQUEST";
 export const APPROVE_ACTION = "APPROVE";
 export const DENY_ACTION = "DENY";
 
+// The lock-screen action buttons for the APPROVAL_REQUEST category, kept
+// here (the native-free module) as a plain data spec so the security
+// invariants are unit-testable without expo-notifications. `push.ts`
+// feeds this straight into `setNotificationCategoryAsync`.
+//
+// Security invariant: Approve MUST set `isAuthenticationRequired: true`.
+// Approving grants the high-risk action the agent paused on (terminal
+// exec, file writes, etc.); without the flag iOS would let anyone tap
+// Approve from a LOCKED phone and authorize it. The flag forces Face ID /
+// Touch ID / passcode before the handler runs, without foregrounding the
+// app (the gateway POST stays a background dispatch). Deny is fail-safe
+// (it cancels, never grants), so it needs no auth gate; it is marked
+// destructive for the red styling.
+export interface ApprovalActionSpec {
+  identifier: string;
+  buttonTitle: string;
+  options: {
+    opensAppToForeground: boolean;
+    isAuthenticationRequired: boolean;
+    isDestructive: boolean;
+  };
+}
+
+export const APPROVAL_CATEGORY_ACTIONS: readonly ApprovalActionSpec[] = [
+  {
+    identifier: APPROVE_ACTION,
+    buttonTitle: "Approve",
+    options: {
+      opensAppToForeground: false,
+      isAuthenticationRequired: true,
+      isDestructive: false
+    }
+  },
+  {
+    identifier: DENY_ACTION,
+    buttonTitle: "Deny",
+    options: {
+      opensAppToForeground: false,
+      isAuthenticationRequired: false,
+      isDestructive: true
+    }
+  }
+];
+
 export type NotificationDispatchOutcome =
   | { kind: "tap"; sessionId: string }
   | { kind: "approve"; approvalId: string }
