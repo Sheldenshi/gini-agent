@@ -6229,7 +6229,33 @@ describe("dispatchToolCall(browser_connect)", () => {
     if (result.kind !== "sync") throw new Error("unreachable");
     const parsed = JSON.parse(result.result) as { ok: boolean; error?: string };
     expect(parsed.ok).toBe(false);
-    expect(parsed.error).toMatch(/needs a web chat session/i);
+    expect(parsed.error).toMatch(/needs a live web chat session/i);
+    expect(readState(config.instance).setupRequests.filter((s) => s.action === "browser.connect").length).toBe(0);
+    rmSync(ROOT, { recursive: true, force: true });
+  });
+
+  test("refuses (no card) on a job-origin session — a scheduled job can't show the card", async () => {
+    rmSync(ROOT, { recursive: true, force: true });
+    mkdirSync(WORKSPACE, { recursive: true });
+    const config = dispatchConfig("browser-connect-dispatch-job");
+    const taskId = await mutateState(config.instance, (state) => {
+      // A dedicated job-spawned session IS a session, but origin "job" means no
+      // web card was ever rendered — minting one would park the job forever.
+      const session = createChatSession(state, "job chat", undefined, undefined, "job");
+      const task = createTask(state.instance, "connect job", undefined, undefined, undefined, undefined, undefined, session.id);
+      upsertTask(state, task);
+      return task.id;
+    });
+    browserTest.installFakeSessionWithPageForTest(taskId, {
+      url: () => "https://example.com/login",
+      close: () => Promise.resolve()
+    });
+    const result = await dispatchToolCall(config, taskId, "browser_connect", "call_job", JSON.stringify({ reason: "Sign in" }));
+    expect(result.kind).toBe("sync");
+    if (result.kind !== "sync") throw new Error("unreachable");
+    const parsed = JSON.parse(result.result) as { ok: boolean; error?: string };
+    expect(parsed.ok).toBe(false);
+    expect(parsed.error).toMatch(/needs a live web chat session/i);
     expect(readState(config.instance).setupRequests.filter((s) => s.action === "browser.connect").length).toBe(0);
     rmSync(ROOT, { recursive: true, force: true });
   });

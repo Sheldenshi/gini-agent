@@ -467,12 +467,12 @@ async function dispatchToolCallInner(
         ? connectState.chatSessions.find((s) => s.id === connectTask.chatSessionId)
         : undefined;
       const connectSurfaceKind = connectSession?.source?.kind ?? connectSession?.outboundMirror?.kind;
-      if (!connectSession) {
+      if (!connectSession || connectSession.origin === "job") {
         return {
           kind: "sync",
           result: JSON.stringify({
             ok: false,
-            error: "browser_connect surfaces an in-chat Connect card, which needs a web chat session — this task isn't attached to one (subagent child, scheduled job, or other headless run). Don't call browser_connect here; complete the browsing without the user, or route this through the parent web chat."
+            error: "browser_connect surfaces an in-chat Connect card, which needs a live web chat session — this task isn't attached to one (subagent child, scheduled job, or other headless run). Don't call browser_connect here; complete the browsing without the user, or route this through the parent web chat."
           })
         };
       }
