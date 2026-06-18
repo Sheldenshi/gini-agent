@@ -4399,7 +4399,7 @@ describe("chat-task loop", () => {
     // transcript sits below the chars/4 high-water mark given the always-on
     // tool-schema floor and system-prompt slice.
     for (let i = 0; i < 12; i++) {
-      writeFileSync(join(workspaceRoot, `chunk${i}.md`), `chunk-${i} `.repeat(380));
+      writeFileSync(join(workspaceRoot, `chunk${i}.md`), `chunk-${i} `.repeat(362));
       setEchoToolCallingResponse({
         provider,
         text: "",
@@ -4882,7 +4882,7 @@ describe("chat-task loop", () => {
     __setBaseToolCatalogForTests(FIXED_COMPACTION_CATALOG);
 
     for (let i = 0; i < 7; i++) {
-      await seedBulkSkill(config, `bulk-skill-${i}`, `BODY-${i} ${"x".repeat(8_600)}`);
+      await seedBulkSkill(config, `bulk-skill-${i}`, `BODY-${i} ${"x".repeat(8_372)}`);
       setEchoToolCallingResponse({
         provider,
         text: "",
@@ -5133,7 +5133,7 @@ describe("chat-task loop", () => {
     // three iterations apart, wide enough that the refill guard stays quiet
     // — and the third trigger at iteration 13 hits the cap.
     for (let i = 0; i < 12; i++) {
-      await seedBulkSkill(config, `bulk-skill-${i}`, `BODY-${i} ${"x".repeat(8_600)}`);
+      await seedBulkSkill(config, `bulk-skill-${i}`, `BODY-${i} ${"x".repeat(8_372)}`);
       queueRead(i);
     }
     setEchoAuxTextResponse({ text: "SUMMARY-ONE" });
@@ -5180,7 +5180,7 @@ describe("chat-task loop", () => {
     __setBaseToolCatalogForTests(FIXED_COMPACTION_CATALOG);
 
     for (let i = 0; i < 7; i++) {
-      await seedBulkSkill(config, `bulk-skill-${i}`, `BODY-${i} ${"x".repeat(8_600)}`);
+      await seedBulkSkill(config, `bulk-skill-${i}`, `BODY-${i} ${"x".repeat(8_372)}`);
       setEchoToolCallingResponse({
         provider,
         text: "",
@@ -5247,7 +5247,7 @@ describe("chat-task loop", () => {
     // system-prompt slice] ≈ 17,661 tokens), so no
     // elision and no proactive compaction ever engages.
     for (let i = 0; i < 12; i++) {
-      await seedBulkSkill(config, `chunk-skill-${i}`, `chunk-${i} ${"x".repeat(3_510)}`);
+      await seedBulkSkill(config, `chunk-skill-${i}`, `chunk-${i} ${"x".repeat(3_396)}`);
       setEchoToolCallingResponse({
         provider,
         text: "",

@@ -518,7 +518,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "browser_console",
-      description: "Read recent console messages from the current page. Optionally evaluate a JavaScript expression and return its result.",
+      description: "Read recent console messages from the current page, and/or evaluate a JavaScript expression in the page and return its result. Use the expression to read data the accessibility snapshot omits (values the page renders with JS) or to call the page's own APIs with fetch() in its signed-in session.",
       parameters: {
         type: "object",
         properties: {
