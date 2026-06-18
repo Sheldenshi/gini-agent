@@ -11,9 +11,9 @@
 // per-instance Chrome — `connect` is a no-op acknowledgement and sign-in
 // happens through the in-chat screencast modal, not the CLI. Passing `--url`
 // attaches the runtime to your OWN already-running external Chrome over that
-// CDP websocket URL (a power-user option; CDP attach is flaky under the current
-// Playwright + Bun stack). To clear saved logins from the spawned profile,
-// rm -rf the per-instance profile dir manually.
+// CDP websocket URL (an opt-in transport for users who run their own Chrome).
+// To clear saved logins from the spawned profile, rm -rf the per-instance
+// profile dir manually.
 import type { CliContext } from "../context";
 import { flagValue, restAfter } from "../args";
 import { api } from "../api";

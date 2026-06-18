@@ -459,8 +459,10 @@ const spawnedSessionProvider: BrowserSessionProvider = {
 
 // Attach to the user's OWN external Chrome over a CDP websocket URL they
 // supplied via /api/browser/connect. We NEVER spawn or kill this process — the
-// user owns it. CDP attach is known-flaky under playwright-core 1.60 + Bun; we
-// keep it for users who explicitly point us at their own Chrome.
+// user owns it. connectOverCDP works under Bun via the bundled-ws→built-in-ws
+// patch (patches/playwright-core@1.60.0.patch); without it the CDP websocket
+// handshake deadlocks. This is an opt-in transport for users who point us at
+// their own Chrome.
 const cdpSessionProvider: BrowserSessionProvider = {
   kind: "cdp",
   async connect(record) {
@@ -481,8 +483,8 @@ const cdpSessionProvider: BrowserSessionProvider = {
       if (/timeout|websocket|protocol/i.test(message)) {
         throw new Error(
           `Failed to attach over CDP: ${message}. ` +
-            "CDP attach can hang under the current Playwright + Bun stack. " +
-            "Disconnect and let the agent use its own spawned browser instead."
+            "Confirm Chrome is running with --remote-debugging-port and the cdpUrl host:port is reachable, " +
+            "or disconnect and let the agent use its own spawned browser instead."
         );
       }
       throw error instanceof Error ? error : new Error(message);
@@ -495,12 +497,16 @@ const cdpSessionProvider: BrowserSessionProvider = {
     const candidate = handle.browser as unknown as { disconnect?: () => Promise<void> };
     if (typeof candidate.disconnect === "function") {
       // Bound the disconnect, but NEVER kill — the remote Chrome is the user's
-      // own process.
+      // own process. (playwright-core 1.60 does not expose disconnect() on a
+      // connectOverCDP Browser, so this branch is dormant there; kept for
+      // builds/versions that do, where it's the clean detach.)
       await settledWithin(candidate.disconnect(), teardownCloseTimeoutMs);
     }
     // If disconnect() isn't available on this CDP-attached Browser, do NOT fall
-    // back to close() — close() over CDP terminates the user's Chrome. Leaking
-    // the in-process handle is strictly better than killing the user's browser.
+    // back to close(). On some Playwright builds close() over CDP terminates the
+    // remote, and killing the user's own Chrome is never acceptable; leaking the
+    // in-process handle is strictly the safer failure. The handle is dropped on
+    // the next ensureShared() reattach regardless.
   }
 };
 

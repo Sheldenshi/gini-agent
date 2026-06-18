@@ -18,8 +18,9 @@
 //     runtime at their OWN already-running external Chrome over a CDP websocket
 //     URL. We probe the endpoint, persist the URL (credentials stripped) as the
 //     `state.browser` record, and attach over CDP — never spawning or signalling
-//     that process. CDP attach is known-flaky under playwright-core 1.60 + Bun;
-//     the UI warns users it's a power-user option.
+//     that process. connectOverCDP works under Bun via the bundled-ws→built-in
+//     patch (patches/playwright-core@1.60.0.patch); it's an opt-in transport for
+//     users who run their own Chrome.
 //
 // (The old "managed" visible-window mode was removed — issue #420.)
 //

@@ -135,8 +135,8 @@ export function BrowserSettingsCard() {
                     --remote-debugging-port=9222
                   </code>{" "}
                   yourself, then paste its websocket debugger URL here. The runtime drives
-                  that Chrome but never starts or stops the process. CDP attach is a power-user
-                  option and can be flaky; the default spawned browser is more reliable.
+                  that Chrome but never starts or stops the process. Most people don't need this —
+                  the agent's own browser works out of the box.
                 </p>
                 <div className="mt-2">
                   <Button

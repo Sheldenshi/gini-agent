@@ -24,6 +24,9 @@
     "onnxruntime-node",
     "protobufjs",
   ],
+  "patchedDependencies": {
+    "playwright-core@1.60.0": "patches/playwright-core@1.60.0.patch",
+  },
   "packages": {
     "@emnapi/runtime": ["@emnapi/runtime@1.10.0", "", { "dependencies": { "tslib": "^2.4.0" } }, "sha512-ewvYlk86xUoGI0zQRNq/mC+16R1QeDlKQy21Ki3oSYXNgLb45GV1P6A0M+/s6nyCuNDqe5VpaY84BzXGwVbwFA=="],
 

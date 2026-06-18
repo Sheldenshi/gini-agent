@@ -6,12 +6,15 @@
 //
 // Transport: a single RAW CDP WebSocket to the spawned Chrome's debug port
 // (Page.startScreencast → screencastFrame → ack), exactly the technique the
-// standalone control panel uses. Raw CDP is used — NOT playwright
-// connectOverCDP — because connectOverCDP hangs on the WebSocket handshake
-// under playwright-core 1.60 + Bun, whereas a raw WebSocket to the same debug
-// endpoint works. The agent's automation keeps driving the SAME Chrome over
-// its pipe transport; this screencast is a SEPARATE read/drive channel on the
-// same process, so the two never conflict.
+// standalone control panel uses. Raw CDP is the right tool here regardless of
+// Playwright: the screencast (Page.startScreencast + Input.* relay) is its own
+// purpose-built channel, not a Playwright session. The raw WebSocket uses Bun's
+// native WebSocket, which is why this path always worked under Bun even when
+// playwright's connectOverCDP did not (that hang — playwright-core's bundled
+// `ws` — is fixed separately by patches/playwright-core@1.60.0.patch). The
+// agent's automation keeps driving the SAME Chrome over its pipe transport;
+// this screencast is a SEPARATE read/drive channel on the same process, so the
+// two never conflict.
 //
 // Security: the bridge dials ONLY a loopback debug port supplied by the
 // browser manager (getScreencastPort → the spawned handle's port, always

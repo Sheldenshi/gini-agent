@@ -3,14 +3,15 @@
 // args, a clean (non-"HeadlessChrome") User-Agent, the caller-supplied
 // `--user-data-dir` profile, and a free-picked `--remote-debugging-port`.
 //
-// Transport: chromium.launchPersistentContext, NOT spawn + connectOverCDP.
-// Playwright drives a persistent context over its PIPE transport
-// (`--remote-debugging-pipe`), which works under Bun; attaching to a
-// TCP CDP endpoint via connectOverCDP hangs on the WebSocket handshake under
-// playwright-core 1.60 + Bun. We still inject a free `--remote-debugging-port`
-// into the launch args so the spawned Chrome ALSO exposes a debug endpoint —
-// the sign-in screencast bridge attaches to it over raw CDP — without routing
-// the agent's automation through that endpoint.
+// Transport: chromium.launchPersistentContext, which drives the self-launched
+// context over Playwright's PIPE transport (`--remote-debugging-pipe`) — the
+// natural transport for a browser we spawn ourselves, no TCP debug socket
+// needed for automation. (For attaching to a user's ALREADY-running Chrome the
+// cdp provider uses connectOverCDP over a TCP WebSocket, which works under Bun
+// via patches/playwright-core@1.60.0.patch.) We still inject a free
+// `--remote-debugging-port` into the launch args so the spawned Chrome ALSO
+// exposes a debug endpoint — the sign-in screencast bridge attaches to it over
+// raw CDP — without routing the agent's automation through that endpoint.
 //
 // This launcher free-picks the debug port and owns the launch directly. The
 // caller (the spawned BrowserSessionProvider in browser.ts) passes the
