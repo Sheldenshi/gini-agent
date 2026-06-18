@@ -170,6 +170,56 @@ describe("cdp attach", () => {
     }
   });
 
+  test("same-host reconnect refreshes a stale ws path from the probe (Chrome restarted, new guid)", async () => {
+    const config = testConfig("cdp-reconnect-refresh");
+    const { mutateState, now } = await import("../state");
+    await mutateState(config.instance, (state) => {
+      // Stored path carries the OLD browser guid.
+      state.browser = { mode: "cdp", cdpUrl: "ws://127.0.0.1:9222/devtools/browser/OLD-guid", startedAt: now() };
+    });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      // The restarted Chrome answers on the same host:port with a NEW guid.
+      new Response(JSON.stringify({ webSocketDebuggerUrl: "ws://127.0.0.1:9222/devtools/browser/NEW-guid" }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      })) as unknown as typeof fetch;
+    try {
+      const status = await connectBrowser(config, { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/anything" });
+      expect(status.connected).toBe(true);
+      // The record (and persisted state) is refreshed to the new ws path so the
+      // next connectOverCDP doesn't attach to the dead old guid.
+      expect(status.record?.cdpUrl).toBe("ws://127.0.0.1:9222/devtools/browser/NEW-guid");
+      expect(readState(config.instance).browser?.cdpUrl).toBe("ws://127.0.0.1:9222/devtools/browser/NEW-guid");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("bare connect (no cdpUrl) clears an active cdp record so tools fall back to the spawned default", async () => {
+    const config = testConfig("cdp-bare-connect-clears");
+    const { mutateState, now } = await import("../state");
+    await mutateState(config.instance, (state) => {
+      state.browser = { mode: "cdp", cdpUrl: "ws://127.0.0.1:9222/devtools/browser/abc", startedAt: now() };
+    });
+    // A bare connect means "use the default spawned transport" — it must drop
+    // the cdp record (and write a disconnect audit row) rather than leave tools
+    // silently driving the user's external Chrome.
+    const status = await connectBrowser(config, {});
+    expect(status.connected).toBe(false);
+    expect(readState(config.instance).browser ?? null).toBeNull();
+    const rows = readState(config.instance).audit.filter((r) => r.action === "browser.disconnect");
+    expect(rows.length).toBe(1);
+  });
+
+  test("bare connect with no existing record is a pure no-op (no audit row)", async () => {
+    const config = testConfig("cdp-bare-connect-noop");
+    const status = await connectBrowser(config, {});
+    expect(status.connected).toBe(false);
+    expect(readState(config.instance).browser ?? null).toBeNull();
+    expect(readState(config.instance).audit.filter((r) => r.action === "browser.disconnect").length).toBe(0);
+  });
+
   test("connect re-attaches when the existing record's endpoint is no longer reachable", async () => {
     const config = testConfig("cdp-reconnect-stale");
     const { mutateState, now } = await import("../state");
@@ -178,13 +228,16 @@ describe("cdp attach", () => {
     });
     const originalFetch = globalThis.fetch;
     // The liveness re-probe of the existing record runs first with a SHORT
-    // deadline (probeIntervalMs * 2); we fail every fetch until that window has
-    // elapsed, then succeed so the subsequent fresh-attach probe lands the new
-    // endpoint. Gating on elapsed time (not call count) is robust to however
-    // many polls each window makes.
-    const livenessFailsUntil = Date.now() + 60;
+    // deadline (probeIntervalMs * 2 → at most two polls); fail those polls
+    // deterministically by call count so the liveness probe returns null and we
+    // fall through to a fresh attach (which the later call succeeds). Counting
+    // calls (not wall-clock) is robust to event-loop stalls.
+    let calls = 0;
     globalThis.fetch = (async () => {
-      if (Date.now() < livenessFailsUntil) throw new Error("ECONNREFUSED");
+      calls++;
+      // Cover the liveness window (deadline = 2*interval, so ≤ 2 attempts):
+      // fail the first three calls outright, then succeed for the fresh attach.
+      if (calls <= 3) throw new Error("ECONNREFUSED");
       return new Response(JSON.stringify({ webSocketDebuggerUrl: "ws://127.0.0.1:9222/devtools/browser/fresh" }), {
         status: 200,
         headers: { "content-type": "application/json" }
@@ -194,7 +247,7 @@ describe("cdp attach", () => {
       const status = await connectBrowser(
         config,
         { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/anything" },
-        { probeIntervalMs: 20, probeTimeoutMs: 2000 }
+        { probeIntervalMs: 10, probeTimeoutMs: 2000 }
       );
       expect(status.connected).toBe(true);
       expect(status.record?.cdpUrl).toBe("ws://127.0.0.1:9222/devtools/browser/fresh");

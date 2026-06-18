@@ -6172,6 +6172,42 @@ describe("dispatchToolCall(browser_connect)", () => {
     rmSync(ROOT, { recursive: true, force: true });
   });
 
+  test("on the cdp transport, refuses to mint a Connect card and steers to the user's own Chrome", async () => {
+    // The Connect card's screencast streams the SPAWNED headless Chrome; when
+    // the user has attached their own Chrome over CDP there's nothing to
+    // screencast, so a card would 409 on open and strand them. The dispatch
+    // must short-circuit with a sync ok:false steer instead of minting a card.
+    rmSync(ROOT, { recursive: true, force: true });
+    mkdirSync(WORKSPACE, { recursive: true });
+    const config = dispatchConfig("browser-connect-dispatch-cdp");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "connect on cdp", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      // A live cdp attach record makes the active transport "cdp".
+      state.browser = { mode: "cdp", cdpUrl: "ws://127.0.0.1:9222/devtools/browser/abc", startedAt: new Date().toISOString() };
+      return task.id;
+    });
+    browserTest.installFakeSessionWithPageForTest(taskId, {
+      url: () => "https://example.com/login",
+      close: () => Promise.resolve()
+    });
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "browser_connect",
+      "call_connect_cdp",
+      JSON.stringify({ reason: "Sign in" })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind !== "sync") throw new Error("unreachable");
+    const parsed = JSON.parse(result.result) as { ok: boolean; error?: string };
+    expect(parsed.ok).toBe(false);
+    expect(parsed.error).toMatch(/attached their own Chrome over CDP/i);
+    // No Connect card was minted.
+    expect(readState(config.instance).setupRequests.filter((s) => s.action === "browser.connect").length).toBe(0);
+    rmSync(ROOT, { recursive: true, force: true });
+  });
+
   test("missing reason returns a recoverable nudge without creating an approval row", async () => {
     rmSync(ROOT, { recursive: true, force: true });
     mkdirSync(WORKSPACE, { recursive: true });

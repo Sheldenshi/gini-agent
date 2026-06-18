@@ -437,6 +437,22 @@ async function dispatchToolCallInner(
           })
         };
       }
+      // Transport guard: the Connect card's screencast streams the SPAWNED
+      // headless Chrome. When the user has attached the runtime to their OWN
+      // external Chrome over CDP (state.browser is a cdp record), there is no
+      // spawned browser to screencast, so a Connect card would 409 on open and
+      // strand the user. The user already has their own VISIBLE Chrome — steer
+      // the agent to ask them to do the step there directly, then retry.
+      if ((readState(config.instance).browser?.mode ?? null) === "cdp") {
+        return {
+          kind: "sync",
+          result: JSON.stringify({
+            ok: false,
+            error:
+              "The user has attached their own Chrome over CDP, so there's no in-chat browser view to open. Don't surface a Connect card. Instead, tell the user to complete this step (sign-in, payment, confirmation) directly in their own Chrome window that you're driving, then retry the navigation / re-snapshot the page to continue."
+          })
+        };
+      }
       // Loop guard: cap Connect cards per sign-in wall (host) per task. The
       // first card pauses the task for the user; minting it always resolves
       // before a second connect can be dispatched, so a binary "already asked"

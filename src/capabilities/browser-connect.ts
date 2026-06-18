@@ -205,9 +205,15 @@ async function connectBrowserInner(
   input: ConnectInput,
   internal: InternalConnectOptions
 ): Promise<Status> {
-  // No cdpUrl → the default spawned transport. Nothing to launch or attach
-  // here; the next browser_* tool call lazily spawns the per-instance Chrome.
+  // No cdpUrl → the default spawned transport. A bare connect means "use the
+  // default": if a cdp record is still persisted, leaving it would let the next
+  // tool call keep attaching to the user's external Chrome, contradicting the
+  // {connected:false} we return here. Drop it (and the in-process handle, and
+  // write the disconnect audit row) so the next call relaunches spawned.
+  // Otherwise it's a pure no-op acknowledgement — the spawned Chrome launches
+  // lazily on the first browser_* tool call.
   if (typeof input.cdpUrl !== "string" || input.cdpUrl.length === 0) {
+    if (readState(config.instance).browser) return await disconnectBrowserInner(config);
     return { connected: false };
   }
 
@@ -233,15 +239,28 @@ async function connectBrowserInner(
 
   const existing = readState(config.instance).browser ?? null;
   if (existing && targetsExistingRecord(existing, validated.url)) {
-    // Same endpoint already recorded — re-probe its liveness in one short poll
+    // Same host:port already recorded — re-probe its liveness in one short poll
     // window rather than waiting out a cold start.
     const probe = await probeCdp(cdpHttpForm(existing.cdpUrl), probeIntervalMs * 2, probeIntervalMs);
     if (probe) {
+      // Chrome regenerates its browser-level ws path (/devtools/browser/<guid>)
+      // on every restart, and playwright's connectOverCDP uses a ws URL
+      // VERBATIM (no /json/version re-resolution). So the host:port probe can
+      // succeed against a restarted Chrome while the stored ws path is stale —
+      // refresh the record from the probe's fresh webSocketDebuggerUrl before
+      // returning, or the next tool call would attach to a dead guid.
+      const freshWs = probe.webSocketDebuggerUrl ? stripUrlCredentials(probe.webSocketDebuggerUrl) : existing.cdpUrl;
+      const record: BrowserConnectionRecord = freshWs === existing.cdpUrl ? existing : { ...existing, cdpUrl: freshWs };
+      if (record !== existing) {
+        await mutateState(config.instance, (state) => {
+          state.browser = record;
+        });
+      }
       // Drop any cached in-process handle (e.g. a previously-spawned Chrome)
       // so the NEXT browser tool call re-reads this cdp record and attaches via
       // the cdp branch rather than reusing the stale spawned handle.
       await disconnectSharedBrowser();
-      return { connected: true, record: existing };
+      return { connected: true, record };
     }
     // Stale record (the user's Chrome went away) — fall through to a fresh
     // attach so we don't report a dead endpoint as connected.
