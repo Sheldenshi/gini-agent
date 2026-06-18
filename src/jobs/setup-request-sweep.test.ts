@@ -116,4 +116,47 @@ describe("runSetupRequestSweep", () => {
     const state = readState(config.instance);
     expect(state.setupRequests.find((r) => r.id === "setup_done")?.status).toBe("completed");
   });
+
+  test("cancels an abandoned confirmation request without blocking on the resume", async () => {
+    const config = buildConfig("sweep-confirmation");
+    await seedTask(config, "task_confirm");
+    const old = new Date(Date.now() - SETUP_REQUEST_TTL_MS - 60_000).toISOString();
+    // A confirmation.request cancel feeds {confirmed:false} back into the chat
+    // loop. With awaitResume:false that resume fires in the background, so the
+    // sweep must return promptly with the request cancelled, never awaiting a
+    // full agent loop inline.
+    await seedSetupRequest(config, {
+      id: "setup_confirm",
+      taskId: "task_confirm",
+      status: "pending",
+      action: "confirmation.request",
+      payload: { toolCallId: "call_confirm" },
+      createdAt: old
+    });
+
+    const report = await runSetupRequestSweep(config);
+
+    expect(report.expired).toContain("setup_confirm");
+    const state = readState(config.instance);
+    expect(state.setupRequests.find((r) => r.id === "setup_confirm")?.status).toBe("cancelled");
+  });
+
+  test("does not sweep a request with an unparseable createdAt", async () => {
+    const config = buildConfig("sweep-bad-timestamp");
+    await seedTask(config, "task_bad");
+    await seedSetupRequest(config, {
+      id: "setup_bad",
+      taskId: "task_bad",
+      status: "pending",
+      createdAt: "not-a-date"
+    });
+
+    const report = await runSetupRequestSweep(config);
+
+    expect(report.considered).toBe(1);
+    expect(report.expired).not.toContain("setup_bad");
+    const state = readState(config.instance);
+    expect(state.setupRequests.find((r) => r.id === "setup_bad")?.status).toBe("pending");
+    expect(state.tasks.find((t) => t.id === "task_bad")?.status).toBe("waiting_approval");
+  });
 });

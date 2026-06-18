@@ -18,10 +18,11 @@ import { ApprovalRaceLostError, resolveSetupRequest } from "../agent";
 
 // 24h default: long enough that a user answering a prompt later the same
 // day still works; the queue-guard fix already covers the live-reply case,
-// so this only reaps truly-abandoned requests. Tunable via env.
-export const SETUP_REQUEST_TTL_MS = Number(
-  process.env.GINI_SETUP_REQUEST_TTL_MS ?? 24 * 60 * 60 * 1000
-);
+// so this only reaps truly-abandoned requests. Tunable via env, but a
+// non-finite or non-positive override falls back to the default rather than
+// poisoning the age comparison (a NaN TTL would sweep every pending request).
+const envTtl = Number(process.env.GINI_SETUP_REQUEST_TTL_MS);
+export const SETUP_REQUEST_TTL_MS = Number.isFinite(envTtl) && envTtl > 0 ? envTtl : 24 * 60 * 60 * 1000;
 
 export async function runSetupRequestSweep(
   config: RuntimeConfig
@@ -34,14 +35,25 @@ export async function runSetupRequestSweep(
   for (const item of state.setupRequests) {
     if (item.status !== "pending") continue;
     considered += 1;
-    if (at - Date.parse(item.createdAt) <= SETUP_REQUEST_TTL_MS) continue;
+    // An unparseable createdAt yields NaN; treat a non-finite age as
+    // not-yet-expired so a corrupt timestamp is never swept.
+    const age = at - Date.parse(item.createdAt);
+    if (!Number.isFinite(age) || age <= SETUP_REQUEST_TTL_MS) continue;
     try {
-      await resolveSetupRequest(config, item.id, "cancel", { actor: "runtime" });
+      // Match the HTTP cancel contract (awaitResume:false) so the sweep never
+      // runs a full agent loop inline — the connector/choice/confirmation
+      // resume fires in the background.
+      await resolveSetupRequest(config, item.id, "cancel", { actor: "runtime", awaitResume: false });
       expired.push(item.id);
     } catch (error) {
       // The request was resolved between our read and the call — another
-      // caller won the race. Swallow and continue.
-      if (!(error instanceof ApprovalRaceLostError)) throw error;
+      // caller won the race. Swallow it; for any other error, log and keep
+      // going so one bad item never truncates the rest of the pass.
+      if (error instanceof ApprovalRaceLostError) continue;
+      appendLog(config.instance, "setup-request.sweep.item_error", {
+        id: item.id,
+        error: error instanceof Error ? error.message : String(error)
+      });
     }
   }
 
