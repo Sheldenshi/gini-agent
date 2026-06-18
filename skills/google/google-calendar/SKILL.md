@@ -136,7 +136,9 @@ Google does not expose a dedicated RSVP method — you respond by patching the e
 ```bash
 # 1. Look up the signed-in user's email — `gws auth status` returns
 #    structured JSON; the email lives at the top-level `.user` key.
-gws auth status | jq -r '.user'
+#    Strip stderr first (`2>/dev/null`) so the `Using keyring backend`
+#    preamble doesn't contaminate the JSON; never use `2>&1`.
+gws auth status 2>/dev/null | jq -r '.user'
 
 # 2. Fetch the event to read the existing attendees array.
 gws calendar events get \
@@ -183,7 +185,7 @@ gws calendar acl insert --params '{"calendarId":"primary"}' \
 
 1. Calendar events are **time-bound things on a schedule** — meetings, appointments, focus blocks. For personal to-dos that should appear on the user's iPhone, prefer `apple-reminders`. For agent-internal alerts ("remind me in 2 hours"), use the cronjob tool. Confirm intent before deciding which.
 2. Don't add a redundant text confirmation before `events.insert`, `events.patch`, `events.delete`, or `+insert`. The runtime's `terminal_exec` approval gate is the user's safety net — if `gws *` isn't auto-approved they'll see the gate per-command; if it is, they've opted in to "just do it." When the user's command is clear ("remove dinner," "decline the 2pm"), execute. Do ask one clarifying question when the command is ambiguous — multiple events match the description, the user didn't specify which calendar, or `sendUpdates` would email attendees the user might not want notified.
-3. When the user says "accept" / "decline" / "tentative" on a meeting, confirm **which event** and **which response status** before patching. Resolve the user's own email via `gws auth status | jq -r '.user'` (or read it from the event's `attendees` array) so the patch updates the right attendee, and re-send the full `attendees` array so other invitees aren't dropped. RSVP changes email-notify the organizer when `sendUpdates` is `"all"`.
+3. When the user says "accept" / "decline" / "tentative" on a meeting, confirm **which event** and **which response status** before patching. Resolve the user's own email via `gws auth status 2>/dev/null | jq -r '.user'` (or read it from the event's `attendees` array) so the patch updates the right attendee, and re-send the full `attendees` array so other invitees aren't dropped. RSVP changes email-notify the organizer when `sendUpdates` is `"all"`.
 4. Use RFC 3339 times with an explicit offset on `+insert` and `events.insert`. Naked local times silently drift across DST boundaries.
 5. Prefer `+insert` over hand-rolling `events.insert --json` when the user just wants a normal event. The helper sets sane defaults (visibility, reminders) without forcing the agent to learn the full body schema.
 6. Adding `--meet` to `+insert` creates a Google Meet space attached to the event — this is the simplest way to give the user a join link. Do not separately call `google-meet` to create a standalone space when an event will exist anyway.

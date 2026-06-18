@@ -151,9 +151,11 @@ Each response has an `answers` map keyed by `questionId`. Cross-reference agains
 
 ### Publish settings
 
+When piping `gws` into `jq`, drop stderr first with `2>/dev/null` — `gws` prints a `Using keyring backend: keyring` preamble there that would otherwise contaminate the JSON (never `2>&1`).
+
 ```bash
 # Inspect
-gws forms forms get --params '{"formId":"<FORM_ID>"}' | jq '.publishSettings'
+gws forms forms get --params '{"formId":"<FORM_ID>"}' 2>/dev/null | jq '.publishSettings'
 
 # Update (legacy forms not supported)
 gws forms forms setPublishSettings \

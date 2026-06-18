@@ -21,6 +21,17 @@ metadata:
 
 Use `gws gmail` to read, search, send, reply, forward, draft, label, and triage Gmail directly from the terminal. The CLI wraps the Gmail v1 API and produces structured JSON, so it composes cleanly with `jq` and other shell tooling.
 
+## Parsing gws output
+
+`gws` writes its JSON to **stdout** and a `Using keyring backend: keyring` preamble (plus any warnings) to **stderr**. `terminal_exec` already shows the two streams as separate blocks, so on its own the preamble is harmless — but the moment you pipe `gws` into a JSON parser you must strip stderr first, or the preamble lands on the JSON and the parse throws:
+
+```bash
+gws ... 2>/dev/null | jq ...                    # correct: stderr dropped before the pipe
+gws ... 2>/dev/null | python3 -c 'import sys,json; json.load(sys.stdin)'
+```
+
+Never use `2>&1` when piping into a parser — it folds the preamble onto the JSON and breaks it. Do not pass `--format text` either; it is invalid (valid formats are `json`, `table`, `yaml`, `csv`), and the raw `users.*` API already defaults to JSON. When you just need the data and don't need to parse it yourself, prefer the curated `+helpers`, which print clean output.
+
 ## Prerequisites
 
 - `gws` installed and authenticated. If `gws` is not on PATH OR `gws auth status` reports no authenticated user, do NOT silently call setup. Instead, in a single short reply to the user:
@@ -119,7 +130,7 @@ Use the same recipient, subject, and body you passed to `gws gmail +send … --d
 ```bash
 gws gmail +read --id <MESSAGE_ID>                # plain-text body
 gws gmail +read --id <MESSAGE_ID> --headers      # include From/To/Subject/Date
-gws gmail +read --id <MESSAGE_ID> --format json | jq '.body'
+gws gmail +read --id <MESSAGE_ID> --format json 2>/dev/null | jq '.body'
 gws gmail +read --id <MESSAGE_ID> --html         # HTML body instead of text
 ```
 

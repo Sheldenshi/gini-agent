@@ -87,8 +87,10 @@ gws drive files list \
 gws drive files list --params '{"q":"name contains '\''Q1 budget'\''"}'
 
 # Stream every page as NDJSON
-gws drive files list --params '{"pageSize":100}' --page-all | jq -r '.files[].name'
+gws drive files list --params '{"pageSize":100}' --page-all 2>/dev/null | jq -r '.files[].name'
 ```
+
+When piping `gws` into `jq`, drop stderr first with `2>/dev/null` — `gws` prints a `Using keyring backend: keyring` preamble there that would otherwise contaminate the JSON (never `2>&1`).
 
 Useful Workspace MIME types:
 

@@ -82,10 +82,10 @@ The response includes a `documentId` you will need for subsequent reads and writ
 gws docs documents get --params '{"documentId":"<DOC_ID>"}'
 ```
 
-The response is the full structured Docs JSON tree (`body.content[]` of paragraph, table, sectionBreak, etc. elements). For a plain-text dump, pipe through `jq`:
+The response is the full structured Docs JSON tree (`body.content[]` of paragraph, table, sectionBreak, etc. elements). For a plain-text dump, pipe through `jq` — and strip stderr first with `2>/dev/null`, since `gws` prints a `Using keyring backend: keyring` preamble there that would otherwise contaminate the JSON (never use `2>&1`):
 
 ```bash
-gws docs documents get --params '{"documentId":"<DOC_ID>"}' \
+gws docs documents get --params '{"documentId":"<DOC_ID>"}' 2>/dev/null \
   | jq -r '.body.content[].paragraph?.elements[]?.textRun?.content // empty'
 ```
 
