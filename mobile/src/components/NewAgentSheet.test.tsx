@@ -16,6 +16,12 @@ const TextInput = makeStub("TextInput");
 const TouchableOpacity = makeStub("TouchableOpacity");
 const View = makeStub("View");
 const ActivityIndicator = makeStub("ActivityIndicator");
+// Included so this process-global react-native mock stays a superset: bun's
+// mock.module is process-global and --parallel shares one process across files,
+// so a sibling test importing a component that pulls `Image` from react-native
+// (e.g. the chat BlockUserText bubble) would otherwise fail static named-import
+// resolution when this mock wins last. Not read by any test here.
+const Image = makeStub("Image");
 
 const Platform = { OS: "ios" as "ios" | "android" | "web" };
 
@@ -37,6 +43,7 @@ mock.module("react-native", () => ({
   TouchableOpacity,
   View,
   ActivityIndicator,
+  Image,
   Share: { share: () => Promise.resolve({}) },
   Linking: { openURL: () => Promise.resolve() },
   useWindowDimensions: () => ({ width: 400, height: 800 }),
