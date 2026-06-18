@@ -68,7 +68,15 @@ it can be read by the agent or shown to the user. `buildCrashReport`
   `/home/<name>`, `C:\Users\<name>`) is masked to `<user>`. The path structure
   (which source/state file, line:col) is debugging signal and survives; only the
   username — which a stack frame like `/Users/jane/.gini/runtime/src/state/store.ts`
-  would otherwise publish — is removed.
+  would otherwise publish — is removed,
+- email addresses, masked to `[email]` (a conservative shape requiring a dotted
+  alphabetic TLD so package specs / version strings like `pkg@1.2.3` are kept).
+
+This scrubs **known shapes** — secrets, the OS username, emails — not arbitrary
+PII. Free text in `error.message`/`error.stack` can still carry a user-typed name,
+phone number, or a non-home filename basename (`~/Documents/<file>` keeps the
+filename). Those are bounded not by pattern redaction but by the two structural
+guarantees below: the dropped `data` payload, and consent-before-publish.
 
 Independently, the `runtime.jsonl` tail carried into a report keeps only each
 line's event name + timestamp; the `data` payload is **dropped at build time**
@@ -166,9 +174,12 @@ distinct crash for one-click filing.
 - Nothing is published without explicit consent, and `gh` authentication
   happens interactively with the user present — there is no headless `gh` path.
 - No report or issue body carries a provider key, bearer secret, gh
-  token, user/task content, or the OS username: redaction at capture (secrets +
-  home-path username masking) and the dropped `data` payload are the enforced
-  boundary, and the skill files only from the queued JSON.
+  token, user/task content, the OS username, or an email address: redaction at
+  capture (secrets + home-path username + email masking) and the dropped `data`
+  payload are the enforced boundary, and the skill files only from the queued
+  JSON. Redaction scrubs known shapes, not arbitrary PII — a user-typed name,
+  phone number, or non-home filename in a free-text error message is bounded by
+  the dropped `data` payload and consent-before-publish, not by a pattern.
 - Non-`default` and non-launchd instances (foreground, conductor, tmux,
   throwaway) capture crashes to their own queue but **never ask** and never
   file.
@@ -192,8 +203,9 @@ distinct crash for one-click filing.
   `Bearer …`, an `Authorization:` header value, and a literal secrets-env
   value; it collapses the running user's home dir to `~` and masks any other
   `/Users/<name>`, `/home/<name>`, or `C:\Users\<name>` segment to `<user>`
-  while preserving the rest of the path; the serialized `runtime.jsonl` tail
-  carries no `data` payload — all before the report reaches the queue.
+  while preserving the rest of the path; it masks an email address to `[email]`
+  while leaving a `pkg@1.2.3`-style spec intact; the serialized `runtime.jsonl`
+  tail carries no `data` payload — all before the report reaches the queue.
 - On a `default` launchd restart with fresh pending reports, exactly one ask job
   is created and bound to the agent's canonical chat (no dedicated channel), its
   prompt mentions the count and the `gini-bug-report` skill, and `lastAskedAt` is
