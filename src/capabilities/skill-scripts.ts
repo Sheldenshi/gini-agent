@@ -119,6 +119,13 @@ export interface InvokeSkillScriptOptions {
   taskId?: string;
   timeoutMs?: number;
   envOverride?: Record<string, string>;
+  // Per-turn / per-approval abort signal. When it fires, the spawned script's
+  // immediate process is SIGTERM'd (same kill the timeout uses), so a cancelled
+  // approved skill.run stops the subprocess at the source rather than running
+  // to its full timeout. Detached grandchildren inside a shell script survive,
+  // the same residual limitation documented for terminal.exec — see
+  // docs/adr/approval-execution-abort.md.
+  signal?: AbortSignal;
 }
 
 export interface SkillScriptResult {
@@ -190,12 +197,31 @@ export async function invokeSkillScript(
     try { proc.kill(); } catch { /* already exited */ }
   }, timeoutMs);
 
-  const [stdout, stderr, exitCode] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited
-  ]);
-  clearTimeout(timeoutHandle);
+  // Honor the caller's abort signal: a cancel mid-run SIGTERMs the immediate
+  // process so the script stops at the source instead of running out the full
+  // timeout. If the signal is already aborted at entry, kill right away.
+  const { signal } = options;
+  const onAbort = (): void => {
+    try { proc.kill(); } catch { /* already exited */ }
+  };
+  if (signal) {
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+  }
+
+  let stdout = "";
+  let stderr = "";
+  let exitCode = 0;
+  try {
+    [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited
+    ]);
+  } finally {
+    clearTimeout(timeoutHandle);
+    if (signal) signal.removeEventListener("abort", onAbort);
+  }
 
   let parsed: unknown = null;
   let parseError: string | undefined;

@@ -232,4 +232,54 @@ process.exit(7);
     expect(result.ok).toBe(false);
     expect(result.error).toMatch(/not JSON/);
   });
+
+  test("an aborted signal SIGTERMs the running script well before its natural end", async () => {
+    const instance = "skinv-abort";
+    const skillDir = `${ROOT}/${instance}-skills/sleeper`;
+    // A script that would run for 30s if left alone. The abort must kill it
+    // promptly rather than letting it run to completion (or to the 5-minute
+    // default timeout).
+    writeScript(join(skillDir, "scripts"), "sleep.ts", `
+await Bun.sleep(30000);
+process.stdout.write(JSON.stringify({ ok: true, slept: true }));
+`);
+    await mutateState(instance, (s) => {
+      pushSkill(s, { name: "sleeper", manifestPath: `${skillDir}/SKILL.md` });
+    });
+    const handle = findSkillScript(readState(instance), "sleeper", "sleep");
+    expect(handle).not.toBeNull();
+
+    const controller = new AbortController();
+    // Fire the abort shortly after the script spawns so it's genuinely mid-run.
+    const fired = setTimeout(() => controller.abort(), 50);
+    const startedAt = Date.now();
+    const result = await invokeSkillScript(config(instance), handle!, {}, { signal: controller.signal });
+    clearTimeout(fired);
+    const elapsed = Date.now() - startedAt;
+    // The kill lands far below the 30s sleep — the script was SIGTERM'd.
+    expect(elapsed).toBeLessThan(5000);
+    // A killed proc exits non-zero with no JSON stdout → ok=false envelope and
+    // no parsed payload (the script never reached its stdout.write).
+    expect(result.ok).toBe(false);
+    expect(result.parsed).toBeNull();
+  });
+
+  test("a signal already aborted at entry kills the script immediately", async () => {
+    const instance = "skinv-abort-preentry";
+    const skillDir = `${ROOT}/${instance}-skills/sleeper2`;
+    writeScript(join(skillDir, "scripts"), "sleep.ts", `
+await Bun.sleep(30000);
+process.stdout.write(JSON.stringify({ ok: true, slept: true }));
+`);
+    await mutateState(instance, (s) => {
+      pushSkill(s, { name: "sleeper2", manifestPath: `${skillDir}/SKILL.md` });
+    });
+    const handle = findSkillScript(readState(instance), "sleeper2", "sleep");
+    const controller = new AbortController();
+    controller.abort(); // already aborted before invoke
+    const startedAt = Date.now();
+    const result = await invokeSkillScript(config(instance), handle!, {}, { signal: controller.signal });
+    expect(Date.now() - startedAt).toBeLessThan(5000);
+    expect(result.ok).toBe(false);
+  });
 });

@@ -642,4 +642,72 @@ describe("per-turn AbortSignal", () => {
     expect(blocks.some((b) => b.kind === "tool_result" && b.callId === "call_msg")).toBe(false);
     expect(readState(config.instance).tasks.find((t) => t.id === seeded.taskId)?.status).toBe("cancelled");
   });
+
+  test("cancel denies a live pending gate even when a resolved row of the SAME task shares its deterministic callId", async () => {
+    const config = buildConfig(makeWorkspace(), uniqueInstance("cancel-dup-callid"), "strict");
+
+    // callId is non-unique within a task: the codex text-backstop synthesizes a
+    // deterministic, content-derived id, so the SAME gated call re-emitted in a
+    // later iteration of the SAME task carries the SAME callId — and the
+    // earlier emission's resolved authorization row persists alongside the new
+    // pending one. cancelTask must still deny the LIVE pending gate; subtracting
+    // it just because a resolved sibling shares the id would leave the gate
+    // card spinning after "Cancelled" (issue #395).
+    const seeded = await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "cancel-dup-callid", undefined, "agent_d");
+      const t = createTask(config.instance, "re-run the same gated call", undefined, undefined, undefined, undefined, undefined, session.id);
+      t.status = "waiting_approval";
+      t.mode = "chat";
+      // Earlier emission: an APPROVED (resolved) authorization carrying callId X.
+      const resolved = createAuthorization(state, {
+        taskId: t.id,
+        action: "terminal.exec",
+        target: "echo hi",
+        risk: "medium",
+        reason: "Run shell command",
+        payload: { command: "echo hi", toolCallId: "call_textbackstop_dup" }
+      });
+      resolved.status = "approved";
+      // Current emission: a PENDING authorization carrying the SAME callId X.
+      const pending = createAuthorization(state, {
+        taskId: t.id,
+        action: "terminal.exec",
+        target: "echo hi",
+        risk: "medium",
+        reason: "Run shell command",
+        payload: { command: "echo hi", toolCallId: "call_textbackstop_dup" }
+      });
+      // The loop snapshot also carries X as a still-pending entry (no result).
+      t.toolCallState = {
+        messages: [],
+        toolsHash: "h",
+        iterations: 2,
+        pending: [{ toolCallId: "call_textbackstop_dup", toolName: "terminal_exec", approvalId: pending.id }]
+      };
+      t.approvalIds.push(resolved.id, pending.id);
+      state.tasks.push(t);
+      return { sessionId: session.id, taskId: t.id };
+    });
+    // The live pending gate's running tool_call row (the one the user sees).
+    insertChatBlock(config.instance, {
+      kind: "tool_call",
+      toolName: "terminal_exec",
+      displayLabel: "Run shell command",
+      argsPreview: "echo hi",
+      argsFull: { command: "echo hi" },
+      status: "running",
+      callId: "call_textbackstop_dup",
+      sessionId: seeded.sessionId,
+      taskId: seeded.taskId
+    });
+
+    await cancelTask(config, seeded.taskId);
+
+    const toolCalls = listChatBlocks(config.instance, seeded.sessionId).filter((b) => b.kind === "tool_call");
+    // The live gate is settled to `denied` (not left spinning) despite the
+    // resolved sibling row sharing its callId.
+    expect(toolCalls.some((b) => b.kind === "tool_call" && b.callId === "call_textbackstop_dup" && b.status === "denied")).toBe(true);
+    expect(toolCalls.every((b) => b.kind === "tool_call" && b.status !== "running")).toBe(true);
+    expect(readState(config.instance).tasks.find((t) => t.id === seeded.taskId)?.status).toBe("cancelled");
+  });
 });

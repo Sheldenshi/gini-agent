@@ -338,32 +338,48 @@ export async function cancelTask(
     // so union the snapshot ids (filtered to entries with no result yet) with
     // the tool-call ids on the durable pending authorization / setup-request
     // rows, which exist as soon as dispatch creates the gate.
-    const gatedToolCallIds = new Set<string>(
+    // The snapshot's `pending` is persisted only once the loop pauses, so it's
+    // the fallback source for callids when no durable gate row exists yet
+    // (the mid-dispatch window). Entries that already carry a result are done.
+    const snapshotCallIds = new Set<string>(
       (task.toolCallState?.pending ?? [])
         .filter((p) => typeof p.result !== "string")
         .map((p) => p.toolCallId)
     );
-    // A call whose owning approval/setup row has LEFT `pending` (approved /
-    // completed / denied / cancelled) is no longer a live gate cancelTask
-    // should touch: its outcome is owned elsewhere. Collect those callids and
-    // subtract them from the deny set, so an approved-but-unrecorded call (no
-    // snapshot result yet) isn't wrongly denied via the snapshot path above.
+    // A callId with a LIVE pending authorization/setup row for this task is a
+    // gate to deny unconditionally. A callId whose row has LEFT `pending`
+    // (approved / completed / denied / cancelled) is owned elsewhere
+    // (executeApprovedAction on a skip, resumeChatTask on a completed run), so
+    // it must NOT be denied via the snapshot path. These two sets are NOT
+    // mutually exclusive: callId is non-unique within a task (the codex
+    // text-backstop synthesizes a deterministic, content-derived id, so the
+    // same gated call re-emitted in a later iteration of the SAME task carries
+    // the same id), and a resolved row from the earlier emission persists
+    // alongside the new pending row. So a callId can be BOTH pending (now) and
+    // resolved (earlier). A live pending row always wins — subtract
+    // `resolvedCallIds` only from the SNAPSHOT-sourced ids, never from the
+    // ids that have a pending durable row, or the live gate is left spinning
+    // after "Cancelled" (issue #395).
+    const pendingCallIds = new Set<string>();
     const resolvedCallIds = new Set<string>();
     for (const auth of state.authorizations) {
       if (auth.taskId !== taskId) continue;
       const callId = approvalToolCallId(auth.payload);
       if (!callId) continue;
-      if (auth.status === "pending") gatedToolCallIds.add(callId);
+      if (auth.status === "pending") pendingCallIds.add(callId);
       else resolvedCallIds.add(callId);
     }
     for (const setup of state.setupRequests) {
       if (setup.taskId !== taskId) continue;
       const callId = approvalToolCallId(setup.payload);
       if (!callId) continue;
-      if (setup.status === "pending") gatedToolCallIds.add(callId);
+      if (setup.status === "pending") pendingCallIds.add(callId);
       else resolvedCallIds.add(callId);
     }
-    cancelledPendingToolCallIds = [...gatedToolCallIds].filter((id) => !resolvedCallIds.has(id));
+    const fromSnapshot = [...snapshotCallIds].filter(
+      (id) => !resolvedCallIds.has(id) && !pendingCallIds.has(id)
+    );
+    cancelledPendingToolCallIds = [...new Set([...pendingCallIds, ...fromSnapshot])];
     // Halt-siblings fix: cancelling a task that's waiting on multiple
     // pending approvals must also tear down those approvals so a later
     // approve doesn't run a tool against a cancelled task. Clear the
@@ -2645,8 +2661,17 @@ async function runApprovedActionImpl(
     } else {
       // Same result mapping as skillRunTool so the model sees an
       // identical tool-result shape on both the gated and ungated paths.
-      const result = await invokeSkillScript(config, handle, scriptArgs, { taskId: approval.taskId });
+      // Thread the signal so a cancel mid-run SIGTERMs the script's process
+      // (the immediate proc; detached grandchildren survive, same as
+      // terminal.exec — see docs/adr/approval-execution-abort.md).
+      const result = await invokeSkillScript(config, handle, scriptArgs, { taskId: approval.taskId, signal });
       resultOk = result.ok;
+      // A cancel that landed during the script run must settle the gated row
+      // `denied`, not let the result route through resumeChatTask's terminal
+      // bail (which paints it `ok`). Mirror the messaging.send post-await
+      // check: unlike terminal.exec there is no winner-of-race signal, so the
+      // turn signal is the truthful source (issue #395 follow-up).
+      if (signal.aborted) verdict.aborted = true;
       if (result.parsed !== null && result.parsed !== undefined) {
         resultStr = typeof result.parsed === "string" ? result.parsed : JSON.stringify(result.parsed);
       } else {

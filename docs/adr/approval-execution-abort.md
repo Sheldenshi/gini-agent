@@ -118,6 +118,19 @@ Per-action behaviour:
   [chat-block-protocol.md](chat-block-protocol.md) for the wire
   shape and [telegram-bridge.md](telegram-bridge.md) for the
   lifecycle.
+- **`skill.run`** — an approval-gated skill script (declared
+  `requires.approval`) runs as a Bun subprocess via
+  `invokeSkillScript`. A pre-spawn `signal.aborted` check skips a
+  script whose cancel landed before execution. The signal is threaded
+  into `invokeSkillScript`: an abort mid-run SIGTERMs the immediate
+  process (the same `proc.kill()` the 5-minute timeout uses), so a
+  cancelled approved `skill.run` stops at the source instead of
+  running to its full timeout. Because the script's result carries no
+  `winner`-of-race signal (unlike `terminal.exec`), the executor sets
+  `verdict.aborted` from a post-await `signal.aborted` check so the
+  gated tool_call row settles `denied`, not `ok`. Detached
+  grandchildren inside a shell script survive — the same SIGTERM-the-
+  immediate-proc limitation as `terminal.exec` below.
 
 `cancelTask`, `failTask`, and `decideApproval-deny` each call
 `abortApprovalsForTask` from inside their own `mutateState` callback
@@ -256,6 +269,11 @@ follow-up.
   (see `src/execution/tool-dispatch.ts::requestCodeExec`), so it
   inherits the SIGTERM behavior described above. The same
   grandchildren limitation applies.
+- True process-tree teardown for `skill.run` grandchildren. The
+  script's immediate Bun process gets SIGTERM via the threaded
+  signal, but a shell script that backgrounds detached children
+  leaves them running, exactly as with `terminal.exec`. The same
+  `setsid`/`detached` fix would cover both.
 
 ## Audit action naming
 
