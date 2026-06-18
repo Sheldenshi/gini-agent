@@ -1371,6 +1371,22 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
               // controller already closed — drop it
             }
           };
+          // Allocate the keepalive interval BEFORE subscribing: subscribe() can
+          // fire onClose SYNCHRONOUSLY when the bridge is already closed (the
+          // closed-state short-circuit), and that handler clears `keepalive`.
+          // If we set the interval up after subscribe(), a synchronous onClose
+          // would run while keepalive is still undefined, then we'd install an
+          // interval nothing ever clears — a leaked timer on a closed stream.
+          // Comment keepalive so proxies don't idle-close the stream between
+          // frames (a static page emits no frames until it changes).
+          keepalive = setInterval(() => {
+            try {
+              controller.enqueue(encoder.encode(": keepalive\n\n"));
+            } catch {
+              // closed
+            }
+          }, 15_000);
+          if (typeof keepalive.unref === "function") keepalive.unref();
           // onClose: when the CDP bridge dies, close the stream so the modal's
           // EventSource reconnects (and re-hits the gate, 404ing if the setup is
           // gone) instead of dangling on a stale frame behind keepalives.
@@ -1386,16 +1402,6 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
             },
             sendUrl
           );
-          // Comment keepalive so proxies don't idle-close the stream between
-          // frames (a static page emits no frames until it changes).
-          keepalive = setInterval(() => {
-            try {
-              controller.enqueue(encoder.encode(": keepalive\n\n"));
-            } catch {
-              // closed
-            }
-          }, 15_000);
-          if (typeof keepalive.unref === "function") keepalive.unref();
         },
         cancel() {
           unsubscribe?.();
