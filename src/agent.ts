@@ -2666,12 +2666,13 @@ async function runApprovedActionImpl(
       // terminal.exec — see docs/adr/approval-execution-abort.md).
       const result = await invokeSkillScript(config, handle, scriptArgs, { taskId: approval.taskId, signal });
       resultOk = result.ok;
-      // A cancel that landed during the script run must settle the gated row
-      // `denied`, not let the result route through resumeChatTask's terminal
-      // bail (which paints it `ok`). Mirror the messaging.send post-await
-      // check: unlike terminal.exec there is no winner-of-race signal, so the
-      // turn signal is the truthful source (issue #395 follow-up).
-      if (signal.aborted) verdict.aborted = true;
+      // Settle the gated row `denied` ONLY when the abort actually won the race
+      // against the script's exit (result.aborted) — not on the caller-side
+      // `signal.aborted`, which is true even in the drain window where the
+      // script already completed and the cancel landed a tick later. Keying on
+      // result.aborted avoids mislabeling a successful script as denied while
+      // still settling a genuinely-killed one (issue #395 follow-up).
+      if (result.aborted) verdict.aborted = true;
       if (result.parsed !== null && result.parsed !== undefined) {
         resultStr = typeof result.parsed === "string" ? result.parsed : JSON.stringify(result.parsed);
       } else {

@@ -135,6 +135,12 @@ export interface SkillScriptResult {
   exitCode: number;
   parsed: unknown;
   error?: string;
+  // True only when the abort signal WON the race against the script's natural
+  // exit (or was already aborted before the spawn) — i.e. the cancel actually
+  // killed the run. A signal that fires AFTER the script already exited
+  // cleanly (the drain window) does NOT set this, so a completed run is never
+  // mislabeled aborted. Mirrors terminal.exec's `winner === "aborted"`.
+  aborted: boolean;
 }
 
 // Spawn the script with the right interpreter, pipe JSON args via stdin,
@@ -179,6 +185,23 @@ export async function invokeSkillScript(
     }
   });
 
+  const { signal } = options;
+  // Skip the spawn entirely when the cancel already landed: starting a
+  // high-risk script (connector env, workspace access) only to SIGTERM it a
+  // tick later is a needless side effect, and mirrors terminal.exec's
+  // pre-spawn `signal.aborted` guard. Reported as aborted so the caller settles
+  // the row `denied`.
+  if (signal?.aborted) {
+    if (options.taskId) {
+      appendTrace(config.instance, options.taskId, {
+        type: "tool",
+        message: `Skill script ${handle.skill.name}/${handle.scriptName} skipped: task was cancelled`,
+        data: { skill: handle.skill.name, script: handle.scriptName, aborted: true }
+      });
+    }
+    return { ok: false, stdout: "", stderr: "", exitCode: -1, parsed: null, error: "Skill script aborted: task was cancelled.", aborted: true };
+  }
+
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const proc = spawn(cmd, {
     stdin: "pipe",
@@ -198,16 +221,26 @@ export async function invokeSkillScript(
   }, timeoutMs);
 
   // Honor the caller's abort signal: a cancel mid-run SIGTERMs the immediate
-  // process so the script stops at the source instead of running out the full
-  // timeout. If the signal is already aborted at entry, kill right away.
-  const { signal } = options;
-  const onAbort = (): void => {
+  // process so the script stops at the source. Race `proc.exited` against the
+  // abort to derive a TRUTHFUL aborted verdict: `winner === "aborted"` only
+  // when the signal settled the race BEFORE the proc exited on its own. A
+  // signal that fires AFTER the proc already exited cleanly (the drain window)
+  // loses the race, so a completed run is never mislabeled aborted — the same
+  // microtask-ordered discipline terminal.exec uses. `Promise.race` is
+  // resilient to listener-timing: the abort sentinel can only win if it
+  // resolves first, regardless of when removeEventListener runs.
+  let onAbort: (() => void) | undefined;
+  const exitedSentinel = proc.exited.then(() => "exited" as const);
+  const abortSentinel = new Promise<"aborted">((resolve) => {
+    if (!signal) return; // never resolves — proc.exited always wins
+    onAbort = (): void => resolve("aborted");
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  const winner = await Promise.race([exitedSentinel, abortSentinel]);
+  if (winner === "aborted") {
     try { proc.kill(); } catch { /* already exited */ }
-  };
-  if (signal) {
-    if (signal.aborted) onAbort();
-    else signal.addEventListener("abort", onAbort, { once: true });
   }
+  const aborted = winner === "aborted";
 
   let stdout = "";
   let stderr = "";
@@ -220,7 +253,7 @@ export async function invokeSkillScript(
     ]);
   } finally {
     clearTimeout(timeoutHandle);
-    if (signal) signal.removeEventListener("abort", onAbort);
+    if (signal && onAbort) signal.removeEventListener("abort", onAbort);
   }
 
   let parsed: unknown = null;
@@ -268,7 +301,7 @@ export async function invokeSkillScript(
     );
   });
 
-  return { ok, stdout, stderr, exitCode, parsed, error };
+  return { ok, stdout, stderr, exitCode, parsed, error, aborted };
 }
 
 // Benign, non-secret ambient session/locale vars to pass through from the

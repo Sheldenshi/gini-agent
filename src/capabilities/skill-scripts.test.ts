@@ -262,6 +262,8 @@ process.stdout.write(JSON.stringify({ ok: true, slept: true }));
     // no parsed payload (the script never reached its stdout.write).
     expect(result.ok).toBe(false);
     expect(result.parsed).toBeNull();
+    // The abort WON the race, so the run is reported aborted.
+    expect(result.aborted).toBe(true);
   });
 
   test("a signal already aborted at entry kills the script immediately", async () => {
@@ -278,8 +280,53 @@ process.stdout.write(JSON.stringify({ ok: true, slept: true }));
     const controller = new AbortController();
     controller.abort(); // already aborted before invoke
     const startedAt = Date.now();
-    const result = await invokeSkillScript(config(instance), handle!, {}, { signal: controller.signal });
+    // Pass a taskId so the pre-spawn skip's trace branch is exercised too.
+    const result = await invokeSkillScript(config(instance), handle!, {}, { signal: controller.signal, taskId: "task_preabort" });
+    // Pre-aborted: the spawn is skipped entirely (no 30s sleep), reported aborted.
     expect(Date.now() - startedAt).toBeLessThan(5000);
     expect(result.ok).toBe(false);
+    expect(result.aborted).toBe(true);
+    expect(result.exitCode).toBe(-1);
+  });
+
+  test("a signal that fires AFTER the script already completed does NOT mark it aborted (drain window)", async () => {
+    const instance = "skinv-abort-drain";
+    const skillDir = `${ROOT}/${instance}-skills/quick`;
+    // A script that completes essentially immediately.
+    writeScript(join(skillDir, "scripts"), "quick.ts", `process.stdout.write(JSON.stringify({ ok: true, done: true }));`);
+    await mutateState(instance, (s) => {
+      pushSkill(s, { name: "quick", manifestPath: `${skillDir}/SKILL.md` });
+    });
+    const handle = findSkillScript(readState(instance), "quick", "quick");
+    const controller = new AbortController();
+    // The script finishes fast; the abort is fired well after it would have
+    // exited. proc.exited wins the race, so the run must be reported as a clean
+    // success — NOT mislabeled aborted just because the signal eventually fired.
+    const result = await invokeSkillScript(config(instance), handle!, {}, { signal: controller.signal });
+    controller.abort();
+    expect(result.ok).toBe(true);
+    expect(result.aborted).toBe(false);
+    expect(result.parsed).toMatchObject({ ok: true, done: true });
+  });
+
+  test("a script exceeding timeoutMs is killed by the timeout (not the abort signal)", async () => {
+    const instance = "skinv-timeout";
+    const skillDir = `${ROOT}/${instance}-skills/slowpoke`;
+    writeScript(join(skillDir, "scripts"), "slow.ts", `
+await Bun.sleep(30000);
+process.stdout.write(JSON.stringify({ ok: true, slept: true }));
+`);
+    await mutateState(instance, (s) => {
+      pushSkill(s, { name: "slowpoke", manifestPath: `${skillDir}/SKILL.md` });
+    });
+    const handle = findSkillScript(readState(instance), "slowpoke", "slow");
+    const startedAt = Date.now();
+    // Tiny timeout, no abort signal — the timeout handler SIGTERMs the proc.
+    const result = await invokeSkillScript(config(instance), handle!, {}, { timeoutMs: 50 });
+    expect(Date.now() - startedAt).toBeLessThan(5000);
+    expect(result.ok).toBe(false);
+    // A timeout kill is NOT a cancel — aborted stays false (no signal fired).
+    expect(result.aborted).toBe(false);
+    expect(result.parsed).toBeNull();
   });
 });
