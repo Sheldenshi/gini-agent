@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import "./hooks/builtins"; // the email-watch routes provision a backing job, which validates isKnownHook("skill-script")
 import { createHandler } from "./http";
-import { logDir, webPortPath } from "./paths";
+import { logDir, uploadsDir, webPortPath } from "./paths";
 import { clearWebTargetCache } from "./web-target";
 import { dirname, join } from "node:path";
 import { addAudit, appendEvent, approvePairingRequest, claimPairingRequest, createPairingRequest, insertChatBlock, isPlausibleMime, mutateState, readState, readTrace, recordProviderAuthFailure, revokeDevice, sanitizeFilename, storeUpload, uploadStat } from "./state";
@@ -5858,6 +5858,185 @@ describe("GET /api/files", () => {
     // never sniffed — a text/html or SVG upload can't execute on the app origin.
     expect(fetched.headers.get("content-disposition")).toBe("attachment");
     expect(fetched.headers.get("x-content-type-options")).toBe("nosniff");
+    // The full-body response advertises range support so a media client knows
+    // it may stream via byte ranges (iOS AVPlayer requires this to play remote
+    // audio at all).
+    expect(fetched.headers.get("accept-ranges")).toBe("bytes");
+  });
+
+  // iOS AVPlayer won't start a remote audio AVURLAsset unless the server honors
+  // Range requests (206 + Content-Range). These pin the range semantics of the
+  // upload GET so a regression can't silently break voice-message playback.
+  test("GET /api/uploads honors a bounded Range with 206 + Content-Range", async () => {
+    const config = testConfig("uploads-range-bounded");
+    const handler = createHandler(config);
+    const bytes = new Uint8Array(Array.from({ length: 100 }, (_, i) => i));
+    const ref = storeUpload(config.instance, bytes, "audio/wav");
+
+    const res = await rawCall(handler, config, `/api/uploads/${ref.id}`, {
+      headers: { range: "bytes=0-9" }
+    }, config.token);
+    expect(res.status).toBe(206);
+    expect(res.headers.get("content-range")).toBe("bytes 0-9/100");
+    expect(res.headers.get("content-length")).toBe("10");
+    expect(res.headers.get("accept-ranges")).toBe("bytes");
+    const body = new Uint8Array(await res.arrayBuffer());
+    expect(Array.from(body)).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+  });
+
+  test("GET /api/uploads serves a mid-file Range slice with exact bytes", async () => {
+    const config = testConfig("uploads-range-mid");
+    const handler = createHandler(config);
+    const bytes = new Uint8Array(Array.from({ length: 100 }, (_, i) => i));
+    const ref = storeUpload(config.instance, bytes, "audio/wav");
+
+    const res = await rawCall(handler, config, `/api/uploads/${ref.id}`, {
+      headers: { range: "bytes=10-19" }
+    }, config.token);
+    expect(res.status).toBe(206);
+    expect(res.headers.get("content-range")).toBe("bytes 10-19/100");
+    const body = new Uint8Array(await res.arrayBuffer());
+    expect(Array.from(body)).toEqual([10, 11, 12, 13, 14, 15, 16, 17, 18, 19]);
+  });
+
+  test("GET /api/uploads clamps an over-long Range end to the last byte", async () => {
+    const config = testConfig("uploads-range-clamp");
+    const handler = createHandler(config);
+    const bytes = new Uint8Array(Array.from({ length: 50 }, (_, i) => i));
+    const ref = storeUpload(config.instance, bytes, "audio/wav");
+
+    const res = await rawCall(handler, config, `/api/uploads/${ref.id}`, {
+      headers: { range: "bytes=40-999" }
+    }, config.token);
+    expect(res.status).toBe(206);
+    expect(res.headers.get("content-range")).toBe("bytes 40-49/50");
+    expect(res.headers.get("content-length")).toBe("10");
+  });
+
+  test("GET /api/uploads serves an open-ended Range to EOF", async () => {
+    const config = testConfig("uploads-range-open");
+    const handler = createHandler(config);
+    const bytes = new Uint8Array(Array.from({ length: 50 }, (_, i) => i));
+    const ref = storeUpload(config.instance, bytes, "audio/wav");
+
+    const res = await rawCall(handler, config, `/api/uploads/${ref.id}`, {
+      headers: { range: "bytes=48-" }
+    }, config.token);
+    expect(res.status).toBe(206);
+    expect(res.headers.get("content-range")).toBe("bytes 48-49/50");
+    const body = new Uint8Array(await res.arrayBuffer());
+    expect(Array.from(body)).toEqual([48, 49]);
+  });
+
+  test("GET /api/uploads serves a suffix Range (last N bytes)", async () => {
+    const config = testConfig("uploads-range-suffix");
+    const handler = createHandler(config);
+    const bytes = new Uint8Array(Array.from({ length: 50 }, (_, i) => i));
+    const ref = storeUpload(config.instance, bytes, "audio/wav");
+
+    const res = await rawCall(handler, config, `/api/uploads/${ref.id}`, {
+      headers: { range: "bytes=-5" }
+    }, config.token);
+    expect(res.status).toBe(206);
+    expect(res.headers.get("content-range")).toBe("bytes 45-49/50");
+    const body = new Uint8Array(await res.arrayBuffer());
+    expect(Array.from(body)).toEqual([45, 46, 47, 48, 49]);
+  });
+
+  test("GET /api/uploads returns 416 for a Range starting past EOF", async () => {
+    const config = testConfig("uploads-range-416");
+    const handler = createHandler(config);
+    const bytes = new Uint8Array(Array.from({ length: 50 }, (_, i) => i));
+    const ref = storeUpload(config.instance, bytes, "audio/wav");
+
+    const res = await rawCall(handler, config, `/api/uploads/${ref.id}`, {
+      headers: { range: "bytes=999-" }
+    }, config.token);
+    expect(res.status).toBe(416);
+    expect(res.headers.get("content-range")).toBe("bytes */50");
+  });
+
+  test("GET /api/uploads ignores a malformed Range and serves the full 200 body", async () => {
+    const config = testConfig("uploads-range-malformed");
+    const handler = createHandler(config);
+    const bytes = new Uint8Array(Array.from({ length: 50 }, (_, i) => i));
+    const ref = storeUpload(config.instance, bytes, "audio/wav");
+
+    const res = await rawCall(handler, config, `/api/uploads/${ref.id}`, {
+      headers: { range: "lines=1-2" }
+    }, config.token);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-length")).toBe("50");
+    expect(res.headers.get("content-range")).toBeNull();
+    expect(res.headers.get("accept-ranges")).toBe("bytes");
+  });
+
+  test("GET /api/uploads treats a reversed Range (start>end) as malformed → full 200", async () => {
+    const config = testConfig("uploads-range-reversed");
+    const handler = createHandler(config);
+    const bytes = new Uint8Array(Array.from({ length: 50 }, (_, i) => i));
+    const ref = storeUpload(config.instance, bytes, "audio/wav");
+
+    const res = await rawCall(handler, config, `/api/uploads/${ref.id}`, {
+      headers: { range: "bytes=20-10" }
+    }, config.token);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-length")).toBe("50");
+  });
+
+  test("GET /api/uploads treats an empty suffix Range (bytes=-) as malformed → full 200", async () => {
+    const config = testConfig("uploads-range-emptysuffix");
+    const handler = createHandler(config);
+    const bytes = new Uint8Array(Array.from({ length: 50 }, (_, i) => i));
+    const ref = storeUpload(config.instance, bytes, "audio/wav");
+
+    const res = await rawCall(handler, config, `/api/uploads/${ref.id}`, {
+      headers: { range: "bytes=-" }
+    }, config.token);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-length")).toBe("50");
+  });
+
+  test("GET /api/uploads returns 416 for a zero-length suffix Range (bytes=-0)", async () => {
+    const config = testConfig("uploads-range-zerosuffix");
+    const handler = createHandler(config);
+    const bytes = new Uint8Array(Array.from({ length: 50 }, (_, i) => i));
+    const ref = storeUpload(config.instance, bytes, "audio/wav");
+
+    const res = await rawCall(handler, config, `/api/uploads/${ref.id}`, {
+      headers: { range: "bytes=-0" }
+    }, config.token);
+    expect(res.status).toBe(416);
+    expect(res.headers.get("content-range")).toBe("bytes */50");
+  });
+
+  test("GET /api/uploads returns 416 for any Range against a zero-byte upload", async () => {
+    const config = testConfig("uploads-range-empty-file");
+    const handler = createHandler(config);
+    // storeUpload rejects an empty body, so write the manifest+bytes directly to
+    // exercise the total===0 branch (a 0-byte stored file can't satisfy a range).
+    const ref = storeUpload(config.instance, new Uint8Array([1]), "audio/wav");
+    writeFileSync(join(uploadsDir(config.instance), `${ref.id}.wav`), new Uint8Array([]));
+
+    const res = await rawCall(handler, config, `/api/uploads/${ref.id}`, {
+      headers: { range: "bytes=0-10" }
+    }, config.token);
+    expect(res.status).toBe(416);
+    expect(res.headers.get("content-range")).toBe("bytes */0");
+  });
+
+  test("HEAD /api/uploads advertises accept-ranges and the content length", async () => {
+    const config = testConfig("uploads-head-range");
+    const handler = createHandler(config);
+    const bytes = new Uint8Array(Array.from({ length: 42 }, (_, i) => i));
+    const ref = storeUpload(config.instance, bytes, "audio/wav");
+
+    const res = await rawCall(handler, config, `/api/uploads/${ref.id}`, {
+      method: "HEAD"
+    }, config.token);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("accept-ranges")).toBe("bytes");
+    expect(res.headers.get("content-length")).toBe("42");
   });
 
   test("POST /api/uploads accepts a text/csv file", async () => {

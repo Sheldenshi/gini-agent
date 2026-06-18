@@ -87,7 +87,7 @@ export function BlockUserText({ block }: { block: UserTextBlock }) {
 // uses — expo-audio's remote AudioSource accepts a `headers` map. The
 // track fills as playback advances; tapping play after the clip finishes
 // restarts it from the beginning.
-function VoiceBubble({ audio }: { audio: AudioAttachment }) {
+export function VoiceBubble({ audio }: { audio: AudioAttachment }) {
   const player = useAudioPlayer({ uri: uploadUrl(audio.id), headers: authHeader() });
   const status = useAudioPlayerStatus(player);
 
@@ -102,10 +102,21 @@ function VoiceBubble({ audio }: { audio: AudioAttachment }) {
   const toggle = (): void => {
     if (status.playing) {
       player.pause();
+      return;
+    }
+    // Replaying a finished clip must rewind to 0 BEFORE starting, and the seek
+    // is async: calling play() in the same tick starts the AVQueuePlayer at the
+    // end (itemTime == duration), which the native player treats as
+    // play-then-immediately-StopAtEnd, so nothing is heard and the control
+    // snaps back to "play". Only a fully-played clip needs the rewind — guard on
+    // a known (loaded) duration so a pre-load tap (duration still 0) doesn't
+    // count as "at the end" and seek needlessly. Await the seek, then play.
+    const atEnd =
+      status.didJustFinish ||
+      (status.duration > 0 && status.currentTime >= status.duration);
+    if (atEnd) {
+      void player.seekTo(0).then(() => player.play());
     } else {
-      if (status.didJustFinish || status.currentTime >= status.duration) {
-        void player.seekTo(0);
-      }
       player.play();
     }
   };

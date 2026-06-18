@@ -357,30 +357,67 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       if (!meta) return new Response(null, { status: 404 });
       return new Response(null, {
         status: 200,
-        headers: { "content-type": meta.mimeType, "content-length": String(meta.size) }
+        headers: {
+          "content-type": meta.mimeType,
+          "content-length": String(meta.size),
+          // Advertise range support so a probing client (iOS AVPlayer issues a
+          // HEAD/ranged GET before streaming) knows it can request byte ranges.
+          "accept-ranges": "bytes"
+        }
       });
     }],
-    ["GET", /^\/api\/uploads\/([^/]+)$/, (_request, params) => {
+    ["GET", /^\/api\/uploads\/([^/]+)$/, (request, params) => {
       const upload = readUpload(config.instance, params[0]);
       if (!upload) return json({ error: "Upload not found" }, 404);
+      // Common headers shared by the full-body (200) and partial (206)
+      // responses. `accept-ranges` tells the client ranged GETs are honored;
+      // iOS AVPlayer refuses to start a remote AVURLAsset that streams audio
+      // unless the server answers a `Range` request with 206 + Content-Range,
+      // which is why an audio bubble's play button was inert (issue: voice
+      // playback). Arbitrary MIME is accepted, so force a download + no-sniff:
+      // a text/html or SVG upload must never execute as a top-level document on
+      // the app origin. The bytes still render inline in <img>/<audio>
+      // (subresource loads ignore Content-Disposition). Bare `attachment` (no
+      // filename= param) avoids header injection from the stored name.
+      const commonHeaders: Record<string, string> = {
+        "content-type": upload.mimeType,
+        "cache-control": "private, max-age=31536000, immutable",
+        "content-disposition": "attachment",
+        "x-content-type-options": "nosniff",
+        "accept-ranges": "bytes"
+      };
+      const total = upload.bytes.byteLength;
+      const range = parseByteRange(request.headers.get("range"), total);
+      if (range === "unsatisfiable") {
+        // A syntactically valid range that falls outside the file: RFC 7233
+        // requires 416 with a Content-Range stating the full length.
+        return new Response(null, {
+          status: 416,
+          headers: { ...commonHeaders, "content-range": `bytes */${total}` }
+        });
+      }
+      if (range) {
+        const slice = upload.bytes.subarray(range.start, range.end + 1);
+        const buffer = slice.buffer.slice(
+          slice.byteOffset,
+          slice.byteOffset + slice.byteLength
+        ) as ArrayBuffer;
+        return new Response(buffer, {
+          status: 206,
+          headers: {
+            ...commonHeaders,
+            "content-length": String(slice.byteLength),
+            "content-range": `bytes ${range.start}-${range.end}/${total}`
+          }
+        });
+      }
       const buffer = upload.bytes.buffer.slice(
         upload.bytes.byteOffset,
-        upload.bytes.byteOffset + upload.bytes.byteLength
+        upload.bytes.byteOffset + total
       ) as ArrayBuffer;
       return new Response(buffer, {
         status: 200,
-        headers: {
-          "content-type": upload.mimeType,
-          "content-length": String(upload.bytes.length),
-          "cache-control": "private, max-age=31536000, immutable",
-          // Arbitrary MIME is now accepted, so force a download + no-sniff: a
-          // text/html or SVG upload must never execute as a top-level document
-          // on the app origin. The bytes still render inline in <img>/<audio>
-          // (subresource loads ignore Content-Disposition). Bare `attachment`
-          // (no filename= param) avoids header injection from the stored name.
-          "content-disposition": "attachment",
-          "x-content-type-options": "nosniff"
-        }
+        headers: { ...commonHeaders, "content-length": String(total) }
       });
     }],
     // Read a workspace file by relative path so the web app can show the
@@ -3410,6 +3447,47 @@ function requireDeviceToken(
 
 function json(value: unknown, statusCode = 200): Response {
   return Response.json(value, { status: statusCode });
+}
+
+// Parse a single HTTP Range header against a known total byte length. Handles
+// the three forms that matter for media streaming: `bytes=start-end`,
+// `bytes=start-` (open-ended, to EOF), and `bytes=-suffix` (the last N bytes).
+// Returns the resolved inclusive [start, end] for a satisfiable range,
+// "unsatisfiable" for a syntactically valid range that lies past the file (→
+// 416), or null when there's no/unsupported Range header (→ serve the full
+// body). Multi-range requests (a comma in the spec) are intentionally declined
+// to null — AVPlayer never sends them, and serving the whole body is a valid
+// response to any Range request.
+function parseByteRange(
+  header: string | null,
+  total: number
+): { start: number; end: number } | "unsatisfiable" | null {
+  if (!header) return null;
+  const match = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
+  if (!match) return null;
+  const [, rawStart, rawEnd] = match;
+  // An empty file can't satisfy any range; RFC 7233 maps that to 416.
+  if (total === 0) return "unsatisfiable";
+  let start: number;
+  let end: number;
+  if (rawStart === "") {
+    // Suffix form `bytes=-N`: the final N bytes. `bytes=-0` is unsatisfiable.
+    if (rawEnd === "") return null;
+    const suffix = Number(rawEnd);
+    if (suffix === 0) return "unsatisfiable";
+    start = Math.max(0, total - suffix);
+    end = total - 1;
+  } else {
+    start = Number(rawStart);
+    // A start at or past EOF is a valid-but-unsatisfiable range (→ 416). Check
+    // this before clamping `end`, otherwise an open-ended `bytes=<past-eof>-`
+    // collapses to start > end and would be misread as a malformed range.
+    if (start >= total) return "unsatisfiable";
+    end = rawEnd === "" ? total - 1 : Number(rawEnd);
+    if (start > end) return null;
+    end = Math.min(end, total - 1);
+  }
+  return { start, end };
 }
 
 // Parse the `?agentId=` filter shared by GET endpoints that return per-agent

@@ -77,7 +77,15 @@ images) — it has no audio input. Two boundaries had to be decided:
 - **Client contract.**
   - `POST /api/uploads` accepts `audio/*` (in addition to `image/*`);
     bytes land in the same upload store and are served by
-    `GET /api/uploads/:id` for playback (Bearer-authed).
+    `GET /api/uploads/:id` for playback (Bearer-authed). That GET honors
+    HTTP `Range` (responds `206 Partial Content` with `Content-Range`,
+    advertises `Accept-Ranges: bytes`, and `416` for an unsatisfiable
+    range): iOS `AVPlayer` (which backs the mobile voice bubble's
+    `expo-audio` player) will not start a remote audio `AVURLAsset` unless
+    the origin supports byte-range requests, so without range support the
+    player never loads an item and the bubble's play control is inert. The
+    range path applies to every upload type but only audio playback
+    depends on it.
   - `POST /api/chat/:id/messages` accepts an optional `audio` attachment
     ref `{ id, mimeType, size, durationMs? }`. When `content` is empty
     and `audio` is present, the gateway validates the **stored** upload
@@ -129,8 +137,21 @@ Con:
 - `bun test src/execution/chat.test.ts` covers transcribe-on-submit,
   rejection of failed/empty transcriptions, stored-mime validation of
   the audio attachment, and the post-transcription session re-check.
+- `bun test src/http.test.ts` covers `GET /api/uploads/:id` range
+  semantics: full-body `200` with `Accept-Ranges`, bounded/mid/open-ended/
+  suffix `206` slices with the right `Content-Range`, end clamping, `416`
+  for a start past EOF (and a zero-byte file), and malformed ranges
+  falling back to the full body. `HEAD` advertises `Accept-Ranges`.
+- `bun test mobile/src/components/chat/BlockUserText.test.tsx` covers the
+  voice bubble's play/pause toggle — including that replaying a finished
+  clip rewinds to 0 (awaiting `seekTo`) **before** `play()`, so the
+  AVQueuePlayer restarts at the beginning instead of at the end.
 - Live-gateway verification: a recorded 16 kHz WAV uploaded to
   `/api/uploads`, posted to `/api/chat/:id/messages` with empty content,
   is transcribed by the local whisper model into the message content and the
   `user_text` block carries the `audio` attachment, while the task input
   is transcript-only (no audio reaches the provider).
+- Live-mobile verification: tapping the voice bubble's play control on the
+  iOS simulator starts playback (the control flips to pause, the track
+  fills, the countdown advances), and tapping again after the clip ends
+  replays it from the start.
