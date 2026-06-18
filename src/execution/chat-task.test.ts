@@ -1900,7 +1900,7 @@ describe("chat-task loop", () => {
     expect(userIdx2).toBeGreaterThan(0);
     const tail2 = String(turn2[userIdx2 - 1]!.content ?? "");
     expect(tail2).toContain("The user is messaging from the mobile app");
-    expect(tail2).toContain("NOT at the gateway machine");
+    expect(tail2).toContain("a browser handoff can't reach them");
     for (const m of turn2) {
       expect(String(m.content ?? "")).not.toContain("The user is messaging from the web app");
     }
@@ -1931,7 +1931,7 @@ describe("chat-task loop", () => {
     expect(userIdx).toBeGreaterThan(0);
     const tail = String(turn[userIdx - 1]!.content ?? "");
     expect(tail).toContain("The user is messaging from Telegram");
-    expect(tail).toContain("NOT at the gateway machine");
+    expect(tail).toContain("a browser handoff can't reach them");
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });

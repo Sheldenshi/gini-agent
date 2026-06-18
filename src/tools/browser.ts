@@ -39,11 +39,11 @@ import { sanitizeUrlForAuditTarget } from "../execution/browser-fill-secrets-typ
 import type { BrowserDomainPolicy, Instance, RuntimeConfig } from "../types";
 
 // Per-instance Chrome profile directory. The agent persists ALL sign-ins
-// and cookies here; the directory survives runtime restarts and (for the
-// spawned default launch) Chrome process restarts. The spawned default
-// launch, the visible Connect/managed window, and a re-attach all share this
-// one dir, so a sign-in done in any of them is visible to the others.
-// Removing it requires deleting the directory manually.
+// and cookies here; the directory survives runtime restarts and spawned
+// Chrome process restarts. The spawned launch and every relaunch share this
+// one dir, so a sign-in (done through the in-chat screencast) is visible to
+// every later browser tool call. Removing it requires deleting the directory
+// manually.
 export function chromeProfileDirFor(instance: Instance): string {
   return join(instanceRoot(instance), "chrome-profile");
 }

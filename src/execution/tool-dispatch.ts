@@ -390,11 +390,11 @@ async function dispatchToolCallInner(
     case "test_skill":
       return await dispatchSelfOp(config, taskId, toolCallId, toolName, args);
     case "browser_connect": {
-      // browser.connect is a SetupRequest (user-actor): the user opens the
-      // visible browser, performs their step (sign-in, or a handoff step
-      // like payment entry), then signals done. There is no
-      // "auto-approve" path — the user has to perform the action — so
-      // bypass pendingOrAuto and always return the pending approval id.
+      // browser.connect is a SetupRequest (user-actor): the user acts in the
+      // in-chat screencast of the agent's headless Chrome, performs their step
+      // (sign-in, or a handoff step like payment entry), then signals done.
+      // There is no "auto-approve" path — the user has to perform the action —
+      // so bypass pendingOrAuto and always return the pending approval id.
       //
       // Navigate-first precondition (same contract as browser_fill_secrets):
       // both sanctioned uses act on a page the agent ALREADY reached by

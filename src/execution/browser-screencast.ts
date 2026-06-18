@@ -699,6 +699,11 @@ let startingOwner: string | undefined;
 // instead of each launching a CDP socket and leaking the loser's. Cleared once
 // the start settles.
 let startingBridge: Promise<ScreencastBridge> | undefined;
+// Identity of the in-flight start that owns startingBridge/startingOwner. The
+// settling start clears the slot only if this still matches its own token, so
+// a stale start that resolves after a newer start took over doesn't wipe the
+// newer start's slot. Bumped to undefined by stopActiveBridge.
+let startingToken: symbol | undefined;
 // Monotonic teardown counter. Bumped by stopActiveBridge so a start() that is
 // in flight when teardown fires doesn't install (and orphan) a now-unwanted
 // bridge: the start captures the generation up front and, if it changed by the
@@ -749,6 +754,13 @@ export async function getOrStartBridge(
   }
   const bridge = factory();
   const startedAtGeneration = bridgeGeneration;
+  // Per-start token. The .finally() below must clear the module slot ONLY if
+  // it still belongs to THIS start: after a teardown bumps the generation and
+  // a LATER start re-populates startingBridge/startingOwner, this start's
+  // settle would otherwise wipe the newer start's slot and break the
+  // single-flight guard (a third caller would launch a concurrent bridge).
+  const startToken = Symbol("screencast-start");
+  startingToken = startToken;
   startingOwner = owner;
   startingBridge = bridge
     .start(prefer?.preferUrl, prefer?.preferTargetId)
@@ -769,8 +781,13 @@ export async function getOrStartBridge(
       return bridge;
     })
     .finally(() => {
-      startingBridge = undefined;
-      startingOwner = undefined;
+      // Only clear if a newer start (or a teardown) hasn't already taken over
+      // the slot — otherwise we'd forget the in-flight newer start.
+      if (startingToken === startToken) {
+        startingBridge = undefined;
+        startingOwner = undefined;
+        startingToken = undefined;
+      }
     });
   return startingBridge;
 }
@@ -800,6 +817,10 @@ export async function stopActiveBridge(owner?: string): Promise<void> {
   activeOwner = undefined;
   startingBridge = undefined;
   startingOwner = undefined;
+  // Bump the token so an in-flight start's .finally() (which checks
+  // startingToken === its own) becomes a no-op and can't clear a slot a newer
+  // start later installs.
+  startingToken = undefined;
   if (bridge) await bridge.stop();
 }
 
@@ -811,6 +832,7 @@ export function __setActiveBridgeForTest(bridge: ScreencastBridge, owner?: strin
   activeOwner = owner;
   startingBridge = undefined;
   startingOwner = undefined;
+  startingToken = undefined;
 }
 
 // Test-only reset so a suite doesn't leak the module-level bridge.
@@ -819,4 +841,5 @@ export function __resetActiveBridgeForTest(): void {
   activeOwner = undefined;
   startingBridge = undefined;
   startingOwner = undefined;
+  startingToken = undefined;
 }

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   ScreencastBridge,
   ScreencastBusyError,
@@ -79,7 +79,36 @@ async function startWithOpen(bridge: ScreencastBridge, socket: FakeSocket, prefe
   await p;
 }
 
+// Safety net: some tests construct a ScreencastBridge with only openSocket /
+// fetchJson / resolvePort injected and drive start() to success, so the merged
+// `fetchBrowserWsUrl` default (a real `fetch("http://127.0.0.1:<port>/json/version")`)
+// would otherwise fire a live loopback request whose result depends on whatever
+// happens to be listening on that port. Intercept any loopback debug-port fetch
+// at the global level and return an empty target list, so every test is
+// hermetic without each call site having to remember to stub fetchBrowserWsUrl.
+// Safety net: some tests construct a ScreencastBridge with only openSocket /
+// fetchJson / resolvePort injected and drive start() to success, so the merged
+// `fetchBrowserWsUrl` default (a real `fetch("http://127.0.0.1:<port>/json/version")`)
+// would otherwise fire a live loopback request whose result depends on whatever
+// happens to be listening on that port. Intercept the debug-port discovery
+// fetch the test constructors target (always port 9333, /json/version) and
+// return an empty target list, so those tests are hermetic without each call
+// site having to remember to stub fetchBrowserWsUrl. Scoped narrowly so the
+// "defaultDeps exposes the real externalities" test, which hits 127.0.0.1:1 to
+// prove the real fetch body runs, is left untouched.
+const realFetch = globalThis.fetch;
+beforeEach(() => {
+  globalThis.fetch = ((input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
+    if (url.includes("127.0.0.1:9333/json/version")) {
+      return Promise.resolve(new Response("[]", { status: 200, headers: { "content-type": "application/json" } }));
+    }
+    return realFetch(input, init);
+  }) as typeof fetch;
+});
+
 afterEach(() => {
+  globalThis.fetch = realFetch;
   __resetActiveBridgeForTest();
 });
 
@@ -1111,6 +1140,60 @@ describe("getOrStartBridge / stopActiveBridge", () => {
     // A is the installed active bridge: A's own reuse returns it.
     expect(await getOrStartBridge("setup-A", undefined, factory)).toBe(bridge);
     await stopActiveBridge("setup-A");
+  });
+
+  test("a stale start settling does NOT clear a newer start's slot (single-flight holds)", async () => {
+    // Sequence: start A parks at fetchJson; stopActiveBridge bumps the
+    // generation (so A will reject as stale); start B begins and re-populates
+    // startingBridge/startingOwner; THEN A's start resolves and its .finally()
+    // runs. Without the per-start token guard, A's .finally() would null out
+    // startingBridge — wiping B's in-flight slot — and a third caller would
+    // launch a SECOND concurrent bridge for B's owner, breaking single-flight.
+    const gateA = Promise.withResolvers<void>();
+    const gateB = Promise.withResolvers<void>();
+    const built: ScreencastBridge[] = [];
+    const makeFactory = (gate: Promise<void>) => () => {
+      const socket = new FakeSocket();
+      const origAdd = socket.addEventListener.bind(socket);
+      socket.addEventListener = (event, listener) => {
+        origAdd(event, listener);
+        if (event === "open") queueMicrotask(() => socket.open());
+      };
+      const b = new ScreencastBridge({
+        openSocket: () => socket,
+        fetchJson: async () => {
+          await gate;
+          return [{ type: "page", webSocketDebuggerUrl: "ws://x" }];
+        },
+        resolvePort: () => 9333
+      });
+      built.push(b);
+      return b;
+    };
+
+    // A starts and parks.
+    const startA = getOrStartBridge("setup-A", undefined, makeFactory(gateA.promise));
+    await Promise.resolve();
+    // Teardown for A: bumps the generation and clears the slot so a new owner
+    // can start. A will now reject as a stale start once it resolves.
+    await stopActiveBridge("setup-A");
+    // B starts and parks — it now owns startingBridge/startingOwner.
+    const startB = getOrStartBridge("setup-B", undefined, makeFactory(gateB.promise));
+    await Promise.resolve();
+    // Now let A resolve: its .then() throws ScreencastStaleStartError, then its
+    // .finally() runs. The token guard must keep it from clearing B's slot.
+    gateA.resolve();
+    await expect(startA).rejects.toThrow(ScreencastStaleStartError);
+    // A third B-owner caller must JOIN B's still-in-flight start (same promise),
+    // not launch a second bridge — proving B's slot survived A's settle.
+    const startBJoin = getOrStartBridge("setup-B", undefined, makeFactory(gateB.promise));
+    gateB.resolve();
+    const [b1, b2] = await Promise.all([startB, startBJoin]);
+    expect(b1).toBe(b2);
+    // Exactly two bridges were ever built: A (rejected/stopped) and the single
+    // B (shared by both B callers) — never a third from a wiped slot.
+    expect(built.length).toBe(2);
+    await stopActiveBridge("setup-B");
   });
 });
 
