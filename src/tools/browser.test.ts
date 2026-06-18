@@ -134,32 +134,12 @@ describe("browser safetyCheck", () => {
     expect(result).toContain("loopback");
   });
 
-  test("allowLoopback opts out of the loopback block for CDP-style callers", () => {
-    // browser-connect attaches over CDP to a local Chrome. The CDP
-    // endpoint is always loopback by design — refusing it would
-    // break legitimate browser attach. Pin that the opt-out works
-    // for representative loopback variants but the OTHER blocks
-    // (metadata, link-local) still fire.
-    expect(safetyCheck("http://127.0.0.1:9222/", { allowLoopback: true })).toBeUndefined();
-    expect(safetyCheck("http://localhost:9222/", { allowLoopback: true })).toBeUndefined();
-    expect(safetyCheck("http://[::1]:9222/", { allowLoopback: true })).toBeUndefined();
-    // Metadata IP is NOT loopback — still blocked even with the opt-out.
-    expect(safetyCheck("http://169.254.169.254/", { allowLoopback: true })).toBeDefined();
-  });
-
-  test("IPv4-mapped IPv6 loopback respects allowLoopback (CDP attach)", () => {
-    // CDP attach can legitimately receive [::ffff:127.0.0.1]:9222
-    // because Bun normalizes various IPv6 spellings. The decoder
-    // now translates the mapped IPv6 to its IPv4 form BEFORE the
-    // loopback check, so allowLoopback applies uniformly across
-    // [127.0.0.1], [::1], [::ffff:127.0.0.1] (dot-quad), and
-    // [::ffff:7f00:1] (hex). Without the decoder, the IPv6 branch
-    // would route the mapped form through the metadata path and
-    // refuse it even under allowLoopback.
-    expect(safetyCheck("http://[::ffff:127.0.0.1]:9222/", { allowLoopback: true })).toBeUndefined();
-    expect(safetyCheck("http://[::ffff:7f00:1]:9222/", { allowLoopback: true })).toBeUndefined();
-    // Same forms WITHOUT allowLoopback are still refused (with the
-    // correct loopback message, not the legacy metadata one).
+  test("IPv4-mapped IPv6 loopback forms are decoded and blocked", () => {
+    // Bun normalizes various IPv6 spellings; the decoder translates the
+    // mapped IPv6 to its IPv4 form BEFORE the loopback check, so a mapped
+    // loopback ([::ffff:127.0.0.1] dot-quad, [::ffff:7f00:1] hex) is refused
+    // with the correct loopback message rather than slipping through the
+    // metadata path.
     const blocked = safetyCheck("http://[::ffff:127.0.0.1]/");
     expect(blocked).toBeDefined();
     expect(blocked).toContain("loopback");

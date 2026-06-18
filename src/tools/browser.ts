@@ -766,10 +766,10 @@ async function getOrCreate(taskId: string): Promise<Session> {
     const contextHasSession = Array.from(sessions.values()).some((s) => s.context === context);
     const reusable = contextHasSession ? undefined : context.pages()[0];
     const page = reusable ?? (await context.newPage());
-    // Only mark the page as agent-owned when we just created it. A reused
-    // pre-existing page (CDP-attached user tab, managed-mode profile's
-    // initial tab) belongs to the user — closing it on session teardown
-    // would kill the user's window/tab.
+    // Only mark the page as agent-owned when we just created it. The reused
+    // pre-existing page is the spawned Chrome's initial about:blank tab —
+    // closing it on session teardown could tear down the shared context's
+    // first tab out from under a sibling session, so leave it unowned.
     const ownedPageIds = new Set<Page>();
     if (!reusable) ownedPageIds.add(page);
     const session: Session = {
@@ -1158,14 +1158,11 @@ export function hostnameIsLoopback(hostname: string): boolean {
 
 // Exported for direct unit testing in src/tools/browser.test.ts.
 // Returns undefined when the URL is allowed; otherwise a human-readable
-// reason starting with "Blocked:" or "Invalid URL:".
-// `allowLoopback` opts out of the loopback block for callers that
-// LEGITIMATELY need loopback access. The browser-connect CDP path
-// uses this — the runtime connects to a local Chrome over CDP
-// (always 127.0.0.1:9222 or similar), and that's exactly the
-// loopback target the SSRF block was added to refuse for agent
-// navigation. Two intents, one validator.
-export function safetyCheck(rawUrl: string, options: { allowLoopback?: boolean } = {}): string | undefined {
+// reason starting with "Blocked:" or "Invalid URL:". Loopback is always
+// refused — the spawned transport never navigates the agent to a local
+// address, and the sign-in screencast dials the spawned Chrome's debug port
+// directly without going through this gate.
+export function safetyCheck(rawUrl: string): string | undefined {
   // Run the secret-pattern scan against the raw input *before* attempting
   // to parse the URL. A malformed-but-secret-bearing input would otherwise
   // fall through to the `Invalid URL: ${rawUrl}` branch and leak the token
@@ -1225,14 +1222,11 @@ export function safetyCheck(rawUrl: string, options: { allowLoopback?: boolean }
   // Decode IPv4-mapped IPv6 forms to their embedded IPv4 BEFORE
   // running any checks, so a mapped loopback (e.g. ::ffff:127.0.0.1
   // or ::ffff:7f00:1) goes through the same loopback gate as the
-  // bare IPv4 form — and respects allowLoopback uniformly. Without
-  // this, the IPv6 branch's classifier would route mapped loopback
-  // through the metadata path and refuse it even under
-  // allowLoopback, breaking CDP attach to [::ffff:127.0.0.1]:9222.
+  // bare IPv4 form. Without this, the IPv6 branch's classifier would
+  // route mapped loopback through the metadata path.
   const host = decodeIpv4Mapped(rawHost) ?? rawHost;
   const loopbackHosts = new Set(LOOPBACK_HOSTS);
   if (hostnameIsLoopback(host)) {
-    if (options.allowLoopback) return undefined;
     return `Blocked: ${host} is a loopback address; the agent's browser may not reach the local BFF / runtime.`;
   }
   if (BLOCKED_HOSTNAMES.has(host)) {
@@ -1265,7 +1259,6 @@ export function safetyCheck(rawUrl: string, options: { allowLoopback?: boolean }
     const low = parseInt(compatHex[2]!, 16);
     const ipv4 = `${(high >> 8) & 0xff}.${high & 0xff}.${(low >> 8) & 0xff}.${low & 0xff}`;
     if (loopbackHosts.has(ipv4) || /^127\./.test(ipv4)) {
-      if (options.allowLoopback) return undefined;
       return `Blocked: ${host} maps to ${ipv4}, a loopback address.`;
     }
   }

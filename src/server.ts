@@ -87,10 +87,10 @@ await install(config);
 const installFinishedMs = performance.now();
 writePid(config);
 
-// Inform the browser session manager which instance to consult for the
-// optional CDP connection record. Without this the manager falls back to
-// the headless launch path (which is fine for unit tests that import the
-// tools directly).
+// Tell the browser session manager which instance this is, so the spawned
+// Chrome uses the per-instance profile dir. Without this the manager has no
+// instance to scope the profile to (which is fine for unit tests that import
+// the tools directly and never launch a real browser).
 setBrowserInstance(config.instance);
 // Opt-in browser session trace recording (OFF unless the config flag is
 // explicitly true). Read once at boot, like the instance registration.

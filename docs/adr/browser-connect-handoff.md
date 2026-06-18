@@ -15,7 +15,7 @@ The handoff mechanism was always mechanically general: the user acts on the SAME
 
 Handing the user a URL for their OWN browser is not a substitute: the agent's progress lives in the gateway Chrome profile, not in the user's browser.
 
-The handoff is one of three completion paths at the sensitive boundary (payment / PII the agent doesn't have); the others are `browser_fill_secrets` (see [browser-fill-secret.md](browser-fill-secret.md)) and step-by-step instructions. The instructions steer in `src/runtime/defaults/INSTRUCTIONS.md` tells the agent to offer the surface-appropriate subset via `ask_user`: the handoff only helps a user who is at the gateway machine, which the agent knows from the per-turn surface line (see [client-surface-context.md](client-surface-context.md)).
+The handoff is one of three completion paths at the sensitive boundary (payment / PII the agent doesn't have); the others are `browser_fill_secrets` (see [browser-fill-secret.md](browser-fill-secret.md)) and step-by-step instructions. The instructions steer in `src/runtime/defaults/INSTRUCTIONS.md` tells the agent to offer the surface-appropriate subset via `ask_user`: the handoff only helps a user whose surface can render the in-chat screencast (the web app — not mobile or a messaging bridge), which the agent knows from the per-turn surface line (see [client-surface-context.md](client-surface-context.md)).
 
 ## Mechanics
 

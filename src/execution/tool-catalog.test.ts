@@ -463,8 +463,9 @@ describe("buildToolCatalog", () => {
       expect(desc).toContain("Sensitive-step handoff");
       expect(desc).toContain("payment");
       expect(desc).toContain("I'm done");
-      // Handoff is only useful when the user is at the gateway machine.
-      expect(desc).toContain("gateway machine");
+      // Handoff is only useful when the user's surface can render the
+      // in-chat screencast (web app, not mobile / a messaging bridge).
+      expect(desc).toContain("render the in-chat screencast");
       // The mode parameter selects the completion-card wording.
       const props = tool!.function.parameters.properties as Record<string, { enum?: string[]; default?: string }>;
       expect(props.mode?.enum).toEqual(["sign-in", "handoff"]);
