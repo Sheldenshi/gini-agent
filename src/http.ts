@@ -223,6 +223,31 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
   // modal reconnecting into a permanent 409. The relaunch navigates to the
   // recorded target page through browserNavigate's SSRF / domain-policy gate,
   // exactly like /open-browser. Returns the bridge, or a JSON error Response.
+  // Ensure a spawned Chrome is live for a browser.connect sign-in, relaunching
+  // it headless and navigating to the recorded target page when it isn't (a
+  // gateway restart / Chrome crash drops the in-process handle while the
+  // durable setup row survives). Returns null on success, or a JSON error
+  // Response. The navigate runs the same SSRF / domain-policy gate as any tool
+  // navigation. Shared by /open-browser (stage 1) and the frames/input recovery
+  // path (a reconnect after a restart skips /open-browser).
+  async function ensureSpawnedBrowserForSignIn(
+    setup: { id: string; taskId?: string; payload: Record<string, unknown> }
+  ): Promise<Response | null> {
+    if (getScreencastPort() !== null) return null;
+    const targetUrl = typeof setup.payload.url === "string" ? setup.payload.url : "";
+    if (!targetUrl) {
+      return json({ error: "The agent's browser isn't running and no page URL is recorded; cannot start sign-in." }, 409);
+    }
+    const navResult = JSON.parse(await browserNavigate(setup.taskId ?? `browser-connect-${setup.id}`, { url: targetUrl }, config)) as {
+      success?: boolean;
+      error?: string;
+    };
+    if (!navResult.success || getScreencastPort() === null) {
+      return json({ error: navResult.error ?? "Could not start the agent's browser for sign-in." }, 409);
+    }
+    return null;
+  }
+
   async function resolveScreencastBridgeOrError(
     setup: { id: string; taskId?: string; payload: Record<string, unknown> }
   ): Promise<ScreencastBridge | Response> {
@@ -230,26 +255,36 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     // still-starting) bridge already held by this setup is reusable even if
     // getScreencastPort() momentarily reads null, so skip the relaunch and let
     // getOrStartBridge hand back the existing bridge.
-    if (getScreencastPort() === null && !hasLiveBridgeForOwner(setup.id)) {
-      const targetUrl = typeof setup.payload.url === "string" ? setup.payload.url : "";
-      if (!targetUrl) {
-        return json({ error: "The agent's browser isn't running and no page URL is recorded; cannot screencast." }, 409);
-      }
-      const navResult = JSON.parse(await browserNavigate(setup.taskId ?? `browser-connect-${setup.id}`, { url: targetUrl }, config)) as {
-        success?: boolean;
-        error?: string;
-      };
-      if (!navResult.success || getScreencastPort() === null) {
-        return json({ error: navResult.error ?? "Could not start the agent's browser for sign-in." }, 409);
-      }
+    if (!hasLiveBridgeForOwner(setup.id)) {
+      const relaunchError = await ensureSpawnedBrowserForSignIn(setup);
+      if (relaunchError) return relaunchError;
     }
     const preferUrl = setup.taskId ? peekCurrentBrowserUrl(setup.taskId) : undefined;
     const preferTargetId = setup.taskId ? await peekCurrentBrowserTargetId(setup.taskId) : undefined;
+    let bridge: ScreencastBridge;
     try {
-      return await getOrStartBridge(setup.id, { preferUrl, preferTargetId });
+      bridge = await getOrStartBridge(setup.id, { preferUrl, preferTargetId });
     } catch (error) {
       return json({ error: error instanceof Error ? error.message : String(error) }, 409);
     }
+    // Re-check the setup is STILL the active sign-in after the relaunch +
+    // bridge-build awaits: a /complete or /cancel can commit in that window,
+    // flipping the row terminal (and a cancel's stopActiveBridge bumps the
+    // generation BEFORE getOrStartBridge captured it, so the stale-start guard
+    // doesn't fire). Without this re-check we'd hand back a freshly-built bridge
+    // for a cancelled/completed setup — an orphaned CDP socket nothing tears
+    // down. Stop it and 404 so the caller (modal) stops reconnecting.
+    const current = readState(config.instance).setupRequests.find((s) => s.id === setup.id);
+    if (
+      !current ||
+      current.status !== "pending" ||
+      current.payload.screencast !== true ||
+      current.payload.signInStarted !== true
+    ) {
+      await stopActiveBridge(setup.id);
+      return json({ error: "Screencast setup request not active" }, 404);
+    }
+    return bridge;
   }
 
   const routes: Array<[string, RegExp, Handler]> = [
@@ -1197,38 +1232,14 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       }
       // Screencast is the ONLY sign-in path: the user signs in through the
       // in-chat modal that screencasts the agent's headless spawned Chrome over
-      // its CDP debug port. The agent and the user act on ONE browser the whole
-      // time. Usually the spawned Chrome is already live (the agent just hit a
-      // sign-in wall while browsing). But a gateway restart / Chrome crash /
-      // `gini browser disconnect` drops the in-process spawned handle while the
-      // setup request — being durable — survives, so getScreencastPort() can be
-      // null on a still-pending card. Rather than stranding the user on a card
-      // that can never open, relaunch the headless Chrome and navigate it to the
-      // target page (the spawn-only equivalent of the old managed relaunch — no
-      // visible window), then screencast that. The navigate lazily spawns Chrome
-      // via ensureShared and runs the same SSRF/domain-policy gate as any tool
-      // navigation.
-      let screencastPort = getScreencastPort();
-      if (screencastPort === null) {
-        if (!targetUrl) {
-          return json(
-            { ok: false, error: "The agent's browser isn't running and no page URL is recorded; cannot start sign-in." },
-            409
-          );
-        }
-        const relaunchTaskId = setup.taskId ?? `browser-connect-${setupId}`;
-        const navResult = JSON.parse(await browserNavigate(relaunchTaskId, { url: targetUrl }, config)) as {
-          success?: boolean;
-          error?: string;
-        };
-        screencastPort = getScreencastPort();
-        if (!navResult.success || screencastPort === null) {
-          return json(
-            { ok: false, error: navResult.error ?? "Could not start the agent's browser for sign-in." },
-            409
-          );
-        }
-      }
+      // its CDP debug port. Usually the spawned Chrome is already live (the
+      // agent just hit a sign-in wall while browsing). But a gateway restart /
+      // Chrome crash / `gini browser disconnect` drops the in-process handle
+      // while the durable setup row survives — relaunch it headless and navigate
+      // to the recorded page rather than stranding the user on a card that can
+      // never open (shared with the frames/input reconnect recovery).
+      const relaunchError = await ensureSpawnedBrowserForSignIn(setup);
+      if (relaunchError) return relaunchError;
       let stamped = false;
       await mutateState(config.instance, (state) => {
         const item = state.setupRequests.find((s) => s.id === setupId);
