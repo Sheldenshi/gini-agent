@@ -287,6 +287,10 @@ export async function cancelTask(
   // omit the arg and keep their original behavior.
   parentTaskId?: string
 ): Promise<Task> {
+  // Tool-call ids that were awaiting approval when the cancel landed. Filled
+  // inside the mutateState callback (before toolCallState is cleared) and
+  // read by the post-mutation chat-block emit to settle their tool_call rows.
+  let cancelledPendingToolCallIds: string[] = [];
   const task = await mutateState(config.instance, (state) => {
     const task = findTask(state, taskId);
     if (parentTaskId !== undefined && parentTaskId === taskId) {
@@ -310,6 +314,32 @@ export async function cancelTask(
       },
       { taskId }
     );
+    // Capture the gated tool-call ids BEFORE tearing down approvals / clearing
+    // the snapshot so the post-mutation emit can settle their still-`running`
+    // tool_call rows (the deny path does the same via emitToolCallStatus).
+    // Without this a task cancelled while waiting on an approval leaves the
+    // tool_call row spinning and the "Run shell command" card live after
+    // "Cancelled" — the UI says stopped, the rows say still-working (issue
+    // #395). The snapshot's `pending` is only persisted once the whole
+    // tool-dispatch loop pauses, so a cancel that lands BETWEEN the approval
+    // row being created and that snapshot write would miss the call. Union the
+    // snapshot ids with the tool-call ids on the durable pending
+    // authorization / setup-request rows for this task, which exist as soon as
+    // dispatch creates the gate.
+    const gatedToolCallIds = new Set<string>(
+      (task.toolCallState?.pending ?? []).map((p) => p.toolCallId)
+    );
+    for (const auth of state.authorizations) {
+      if (auth.taskId !== taskId || auth.status !== "pending") continue;
+      const callId = approvalToolCallId(auth.payload);
+      if (callId) gatedToolCallIds.add(callId);
+    }
+    for (const setup of state.setupRequests) {
+      if (setup.taskId !== taskId || setup.status !== "pending") continue;
+      const callId = approvalToolCallId(setup.payload);
+      if (callId) gatedToolCallIds.add(callId);
+    }
+    cancelledPendingToolCallIds = [...gatedToolCallIds];
     // Halt-siblings fix: cancelling a task that's waiting on multiple
     // pending approvals must also tear down those approvals so a later
     // approve doesn't run a tool against a cancelled task. Clear the
@@ -346,6 +376,13 @@ export async function cancelTask(
       const inFlight = findInFlightAssistantTextForTask(config.instance, taskId);
       if (inFlight) {
         finalizeAssistantText(emitCtx, inFlight.blockId, inFlight.text);
+      }
+      // Settle any tool_call row that was waiting on an approval when the
+      // cancel landed. Mirrors the deny path (emitToolCallStatus "denied")
+      // so the row stops spinning and the gate card reads as resolved
+      // rather than staying interactive after "Cancelled" (issue #395).
+      for (const callId of cancelledPendingToolCallIds) {
+        emitToolCallStatus(emitCtx, { callId, status: "denied" });
       }
       emitSystemNote(emitCtx, "Cancelled");
       emitPhase(emitCtx, "Cancelled");

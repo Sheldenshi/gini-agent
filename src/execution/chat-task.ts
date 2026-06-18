@@ -1958,6 +1958,14 @@ async function runLoop(
   const switchTurnToThread = async (): Promise<"switched" | "already-threaded" | "no-parent"> => {
     if (!emitCtx) return "no-parent";
     if (emitCtx.threadId) return "already-threaded";
+    // Don't re-route (or emit the main-chat "Completed" phase below) once the
+    // task is terminal. finalizeTurnRoute calls this AFTER the model returns,
+    // which is reachable post-cancel: a mid-stream cancel makes the flush bail
+    // before resolving the route, leaving routeResolved false so the route
+    // fires here instead. Without this guard a cancelled routed turn appends a
+    // "Completed" phase after cancelTask's "Cancelled" phase.
+    const task = readState(config.instance).tasks.find((t) => t.id === taskId);
+    if (!task || isTerminalTaskStatus(task.status)) return "no-parent";
     const parent = getMainChatUserTextBlockForTask(config.instance, emitCtx.sessionId, taskId);
     if (!parent) return "no-parent"; // No human message to branch from — stay in the main/channel timeline.
     const threadId = makeId("thread");
@@ -2170,6 +2178,26 @@ async function runLoop(
     routeResolved = !(isFirstModelCall && threadDetectionEnabled());
     const flush = async (): Promise<void> => {
       if (!pending) return;
+      // Cancel-during-stream guard. The provider call carries no AbortSignal,
+      // so a turn cancelled mid-stream keeps streaming deltas until the call
+      // returns. Without this check, a post-cancel flush would open a fresh
+      // assistant_text block (or keep growing one) that the cancelled
+      // bail-out path never settles — leaving a block stuck at streaming:true
+      // (the "stuck cursor" the user saw) and surfacing text the user asked
+      // to stop. Once the task is terminal, drop the buffered deltas and stop
+      // painting. cancelTask already settled whatever block existed at cancel
+      // time via findInFlightAssistantTextForTask; this closes the window
+      // where a new block would otherwise be born AFTER the cancel. A missing
+      // task row counts as terminal too, matching the top-of-loop guard.
+      const flushTask = readState(config.instance).tasks.find((t) => t.id === taskId);
+      if (!flushTask || isTerminalTaskStatus(flushTask.status)) {
+        pending = "";
+        // Bump lastFlush so onDelta's debounce doesn't re-enqueue a guarded
+        // flush (and its readState) on every subsequent delta while a
+        // cancelled provider keeps streaming until its call returns.
+        lastFlush = Date.now();
+        return;
+      }
       const delta = pending;
       pending = "";
       lastFlush = Date.now();
