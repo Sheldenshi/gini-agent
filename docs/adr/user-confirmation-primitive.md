@@ -113,11 +113,13 @@ synchronous error telling the agent NOT to proceed with the irreversible action
 and to ask for an explicit go-ahead as a regular message instead, so it never
 strands in `waiting_approval`. On mobile, `BlockSetupRequested` renders an
 actionable Confirm/Cancel card backed by a `useSetupRequests` query for
-pending/resolved state (the `chat.choice` choice card is actionable there too).
+pending/resolved state (the `chat.choice` choice card and the
+`browser.fill_secret` credential-fill card are actionable there too — the
+filled value travels through the request body, so it needs no gateway machine).
 The setup actions that stay read-only on mobile — `connector.request`,
-`browser.connect`, `browser.fill_secret`, messaging-bridge setup — do so because
-their flows (OAuth, the desktop browser handoff, secret entry) require the
-gateway machine, not because confirmation is web-only.
+`browser.connect`, messaging-bridge setup — do so because their flows (OAuth,
+the desktop browser handoff, bot-token entry) require the gateway machine, not
+because confirmation is web-only.
 
 ## Consequences
 
