@@ -30,7 +30,7 @@ gws ... 2>/dev/null | jq ...                    # correct: stderr dropped before
 gws ... 2>/dev/null | python3 -c 'import sys,json; json.load(sys.stdin)'
 ```
 
-Never use `2>&1` when piping into a parser — it folds the preamble onto the JSON and breaks it. Do not pass `--format text` either; it is invalid (valid formats are `json`, `table`, `yaml`, `csv`), and the raw `users.*` API already defaults to JSON. When you just need the data and don't need to parse it yourself, prefer the curated `+helpers`, which print clean output.
+Never use `2>&1` when piping into a parser — it folds the preamble onto the JSON and breaks it. Do not pass `--format text` either; it is invalid (valid formats are `json`, `table`, `yaml`, `csv`), and the raw `users.*` API already defaults to JSON. When you just need the data and don't need to parse it yourself, prefer the curated `+helpers`, which print clean output. Note that `2>/dev/null` also discards gws's own error messages, so if a command returns empty or unexpected output, re-run it without the redirect (or check the exit code) to see the actual error.
 
 ## Prerequisites
 
