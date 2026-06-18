@@ -163,6 +163,13 @@ function secretsEnvValues(body: string): string[] {
   return values;
 }
 
+// Email addresses are personal information. A crash error message can echo one
+// (a failed lookup, a validation error that includes user input), and no secret
+// pattern catches it. Mask local-part + domain to "[email]" while leaving the
+// surrounding text intact. The shape requires a dotted alphabetic TLD so package
+// specs and version strings ("pkg@1.2.3", "@scope/pkg") don't false-positive.
+const EMAIL_PATTERN = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g;
+
 // Mask the local OS username out of absolute filesystem paths. Crash reports
 // and shared logs carry source/state paths (e.g.
 // "/Users/jane/.gini/runtime/src/state/store.ts:93:3"); the path structure is
@@ -191,11 +198,15 @@ function redactHomePaths(text: string): string {
   return out;
 }
 
-// Redact secrets/tokens AND the OS username from arbitrary report text. Applies
-// the extended pattern list, scrubs the literal secrets-env values, then masks
+// Redact secrets/tokens AND personal information (OS username, email addresses)
+// from arbitrary report text. Applies the extended secret-pattern list, scrubs
+// the literal secrets-env values, masks email addresses, then masks
 // home-directory paths. Default to dropping rather than including: pattern
 // redaction runs first so a token is removed even when its literal value isn't
-// in the provided lists.
+// in the provided lists. NOTE: this scrubs known shapes (secrets, usernames,
+// emails) — it is NOT a general PII detector. Free text in error.message/stack
+// can still carry user-typed names, phone numbers, or non-home filenames; those
+// are bounded instead by the dropped `data` payload and consent-before-publish.
 export function redactReportText(text: string, opts: RedactOptions = {}): string {
   // A malformed log/error field can carry a non-string (e.g. a numeric
   // `message`). String.replace on a number throws, which would drop the whole
@@ -210,6 +221,7 @@ export function redactReportText(text: string, opts: RedactOptions = {}): string
   const literals: string[] = [];
   if (opts.secretsEnvBody) literals.push(...secretsEnvValues(opts.secretsEnvBody));
   if (literals.length > 0) out = redactSecretValuesFromString(out, literals);
+  out = out.replace(EMAIL_PATTERN, "[email]");
   out = redactHomePaths(out);
   return out;
 }

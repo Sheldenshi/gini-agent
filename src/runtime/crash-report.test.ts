@@ -151,6 +151,22 @@ describe("redactReportText", () => {
     expect(redactReportText(num)).toBe(num);
   });
 
+  test("masks an email address to [email], keeping surrounding text", () => {
+    const out = redactReportText("contact jane.doe+test@example.co.uk for help");
+    expect(out).not.toContain("jane.doe+test@example.co.uk");
+    expect(out).toContain("[email]");
+    expect(out).toContain("contact ");
+    expect(out).toContain(" for help");
+  });
+
+  test("does not mistake a package spec / version string for an email", () => {
+    // "@scope/pkg" and "pkg@1.2.3" share the @ shape but have no dotted
+    // alphabetic TLD; they must survive so the error stays readable.
+    const text = "loaded pkg@1.2.3 from @scope/pkg";
+    const out = redactReportText(text);
+    expect(out).toBe(text);
+  });
+
   test("collapses the running user's home dir to ~ (no OS username leaks), keeping path structure", () => {
     // The exact crash from issue #403: an absolute source path carrying the OS
     // username. The username is PII; the path structure is debugging signal and
