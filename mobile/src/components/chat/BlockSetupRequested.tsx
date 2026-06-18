@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { Alert, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
+import type { TextInputProps } from "react-native";
 import { useQueryClient } from "@tanstack/react-query";
 import { api } from "@/src/api";
 import { useSetupRequests } from "@/src/queries";
@@ -23,11 +24,11 @@ const CONFIRMATION_INVALIDATE_KEYS = [
 // SetupRequest bubble: user-actor gate. No risk pill — the rule is
 // structural per docs/adr/authorization-vs-setup-request.md.
 //
-// confirmation.request and chat.choice are interactive on mobile, mirroring
-// the web cards (see docs/adr/user-confirmation-primitive.md and
-// docs/adr/user-choice-prompt.md): the agent pauses for a user decision and
-// the user resolves it here. Every OTHER action (connector.request,
-// browser.connect, browser.fill_secret, messaging.*) stays read-only — those
+// confirmation.request, chat.choice, and browser.fill_secret are interactive
+// on mobile, mirroring the web cards (see docs/adr/user-confirmation-primitive.md
+// and docs/adr/user-choice-prompt.md): the agent pauses for a user decision /
+// credential and the user resolves it here. Every OTHER action
+// (connector.request, browser.connect, messaging.*) stays read-only — those
 // flows are driven from the web client / Gini on the Mac.
 export function BlockSetupRequested({
   block
@@ -39,6 +40,9 @@ export function BlockSetupRequested({
   }
   if (block.action === "chat.choice") {
     return <ChoiceCard block={block} />;
+  }
+  if (block.action === "browser.fill_secret") {
+    return <FillSecretCard block={block} />;
   }
   return <ReadOnlyCard block={block} />;
 }
@@ -53,17 +57,13 @@ function ReadOnlyCard({ block }: { block: SetupRequestedBlock }) {
       ? "Browser action needed"
       : isConnectorRequest
         ? "Connection setup needed"
-        : block.action === "browser.fill_secret"
-          ? "Credentials needed"
-          : block.action;
+        : block.action;
   const hint =
     isConnectorRequest
       ? "Finish this setup in Gini on your Mac. This chat is paused until the connection is completed or the turn is stopped."
       : block.action === "browser.connect"
         ? "Finish this step from Gini on your Mac. This chat is paused until setup is completed or the turn is stopped."
-        : block.action === "browser.fill_secret"
-          ? "Enter the requested value from Gini on your Mac. This chat is paused until the value is submitted or the turn is stopped."
-          : "Open Gini on your Mac to continue, or stop this turn from the composer.";
+        : "Open Gini on your Mac to continue, or stop this turn from the composer.";
   return (
     <View style={styles.row}>
       <View style={styles.header}>
@@ -356,6 +356,210 @@ function ChoiceCard({ block }: { block: SetupRequestedBlock }) {
   );
 }
 
+// Mirror of the web parser in web/src/lib/fill-secrets-types.ts (itself a
+// mirror of the gateway-side src/execution/browser-fill-secrets-types.ts). The
+// kind allowlist MUST match what the gateway dispatch / /complete handler
+// enforces, otherwise a malformed approval payload could widen the rendered
+// input type past what the gateway permits. If you change the parser or the
+// allowlist, update those files together.
+type FillSecretSlotKind = "text" | "password" | "email" | "tel" | "number" | "url";
+
+const FILL_SECRET_ALLOWED_KINDS: ReadonlySet<FillSecretSlotKind> = new Set([
+  "text",
+  "password",
+  "email",
+  "tel",
+  "number",
+  "url"
+]);
+
+type FillSecretSlot = {
+  name: string;
+  locator: string;
+  label: string;
+  kind: FillSecretSlotKind;
+};
+
+function parseFillSecretSlots(raw: unknown): FillSecretSlot[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.flatMap((entry) => {
+    if (!entry || typeof entry !== "object") return [];
+    const e = entry as { name?: unknown; locator?: unknown; label?: unknown; kind?: unknown };
+    if (typeof e.name !== "string" || typeof e.locator !== "string") return [];
+    const kind: FillSecretSlotKind =
+      typeof e.kind === "string" && (FILL_SECRET_ALLOWED_KINDS as ReadonlySet<string>).has(e.kind)
+        ? (e.kind as FillSecretSlotKind)
+        : "text";
+    const label = typeof e.label === "string" ? e.label : e.name;
+    return [{ name: e.name, locator: e.locator, label, kind }];
+  });
+}
+
+// Map a slot kind to RN TextInput keyboard/autocorrect props. Every secret is
+// non-autocapitalized and non-autocorrected; the gateway holds the locator, so
+// the client only ever submits name → value.
+function fillInputProps(kind: FillSecretSlotKind): Partial<TextInputProps> {
+  switch (kind) {
+    case "password":
+      return { secureTextEntry: true, autoCapitalize: "none", autoCorrect: false };
+    case "email":
+      return { keyboardType: "email-address", autoCapitalize: "none", autoCorrect: false };
+    case "tel":
+      return { keyboardType: "phone-pad", autoCapitalize: "none", autoCorrect: false };
+    case "number":
+      return { keyboardType: "number-pad", autoCapitalize: "none", autoCorrect: false };
+    case "url":
+      return { keyboardType: "url", autoCapitalize: "none", autoCorrect: false };
+    default:
+      return { autoCapitalize: "none", autoCorrect: false };
+  }
+}
+
+// Interactive credential-fill card for a pending browser.fill_secret
+// SetupRequest, mirroring the web fill_secret path. The slots come from the
+// TRUSTED setup payload the dispatcher minted (the block carries only the
+// summary); the "Fill destination" badge shows payload.approvedUrl ?? target —
+// the gateway-captured, non-spoofable trust anchor the agent cannot rewrite.
+// Submit POSTs { secrets: { [name]: value } } to /complete (the gateway pipes
+// each value into the live page); Cancel POSTs /cancel. Typed values live only
+// in local state and the POST body and are cleared on EVERY termination path so
+// a secret never lingers past the click. When the request resolves
+// (status !== "pending") the inputs give way to a past-tense outcome line.
+function FillSecretCard({ block }: { block: SetupRequestedBlock }) {
+  const qc = useQueryClient();
+  const setupRequests = useSetupRequests();
+  const [fillValues, setFillValues] = useState<Record<string, string>>({});
+  const [inFlight, setInFlight] = useState(false);
+
+  const setup = (setupRequests.data ?? []).find((s) => s.id === block.setupRequestId) ?? null;
+  const isPending = setup ? setup.status === "pending" : true;
+  const slots: FillSecretSlot[] = setup ? parseFillSecretSlots(setup.payload?.slots) : [];
+  const destination =
+    setup && typeof setup.payload?.approvedUrl === "string"
+      ? (setup.payload.approvedUrl as string)
+      : setup?.target;
+
+  const ready =
+    slots.length > 0
+    && slots.every((s) => typeof fillValues[s.name] === "string" && fillValues[s.name].trim().length > 0);
+
+  // Submit pipes the typed values into the live page via /complete; Cancel
+  // resumes the paused task with no fill. invalidate refreshes the card out of
+  // pending state and bumps the chat surface. The gateway resolves the setup
+  // request atomically BEFORE running fills, so always invalidate (on ok and
+  // !ok). Typed values are cleared in finally on every path — success, server
+  // ok:false, thrown error, cancel — so a secret never lingers in React state
+  // past the click.
+  const submit = async () => {
+    if (inFlight || !isPending || !ready) return;
+    setInFlight(true);
+    try {
+      const result = await api<{ ok: boolean; message?: string }>(
+        `/setup-requests/${block.setupRequestId}/complete`,
+        { method: "POST", body: JSON.stringify({ secrets: fillValues }) }
+      );
+      if (result?.ok === false) {
+        Alert.alert(
+          "Fill failed",
+          result.message ?? "Fill failed; the agent will decide whether to retry."
+        );
+      }
+      for (const key of CONFIRMATION_INVALIDATE_KEYS) {
+        qc.invalidateQueries({ queryKey: [key] });
+      }
+    } catch (err) {
+      Alert.alert("Submit failed", err instanceof Error ? err.message : String(err));
+    } finally {
+      setFillValues({});
+      setInFlight(false);
+    }
+  };
+
+  const cancel = async () => {
+    if (inFlight || !isPending) return;
+    setInFlight(true);
+    try {
+      await api(`/setup-requests/${block.setupRequestId}/cancel`, { method: "POST" });
+      for (const key of CONFIRMATION_INVALIDATE_KEYS) {
+        qc.invalidateQueries({ queryKey: [key] });
+      }
+    } catch (err) {
+      Alert.alert("Cancel failed", err instanceof Error ? err.message : String(err));
+    } finally {
+      setFillValues({});
+      setInFlight(false);
+    }
+  };
+
+  if (!isPending) {
+    // Submit is a /complete, Cancel a /cancel — so completed = submitted and
+    // cancelled = cancelled (mirrors the web fill_secret displaySummary).
+    return (
+      <View style={styles.row}>
+        <View style={styles.header}>
+          <Text style={styles.action}>Credentials needed</Text>
+        </View>
+        <Text style={styles.summary}>{block.summary}</Text>
+        <Text style={styles.outcome}>
+          {setup?.status === "completed" ? "Credentials submitted." : "Request cancelled."}
+        </Text>
+      </View>
+    );
+  }
+
+  return (
+    <View style={[styles.row, styles.pendingCard]}>
+      <View style={styles.header}>
+        <Text style={styles.action}>Credentials needed</Text>
+      </View>
+      <Text style={styles.summary}>{block.summary}</Text>
+      {destination ? (
+        <View style={styles.destinationBadge}>
+          <Text style={styles.destinationLabel}>Fill destination: </Text>
+          <Text style={styles.destinationValue}>{destination}</Text>
+        </View>
+      ) : null}
+      <View style={styles.optionList}>
+        {slots.map((slot) => (
+          <View key={slot.name} style={styles.fillField}>
+            <Text style={styles.fillLabel}>{slot.label}</Text>
+            <TextInput
+              value={fillValues[slot.name] ?? ""}
+              onChangeText={(text) => setFillValues((prev) => ({ ...prev, [slot.name]: text }))}
+              placeholderTextColor={theme.muted}
+              editable={!inFlight}
+              style={styles.otherInput}
+              {...fillInputProps(slot.kind)}
+            />
+          </View>
+        ))}
+      </View>
+      <View style={styles.actions}>
+        <Pressable
+          onPress={submit}
+          disabled={inFlight || !ready}
+          style={({ pressed }) => [
+            styles.confirmButton,
+            (pressed || inFlight || !ready) && styles.buttonDimmed
+          ]}
+        >
+          <Text style={styles.confirmText}>Submit</Text>
+        </Pressable>
+        <Pressable
+          onPress={cancel}
+          disabled={inFlight}
+          style={({ pressed }) => [
+            styles.cancelButton,
+            (pressed || inFlight) && styles.buttonDimmed
+          ]}
+        >
+          <Text style={styles.cancelText}>Cancel</Text>
+        </Pressable>
+      </View>
+    </View>
+  );
+}
+
 const styles = StyleSheet.create({
   row: {
     alignSelf: "stretch",
@@ -452,6 +656,40 @@ const styles = StyleSheet.create({
     color: theme.muted,
     fontFamily: family("HankenGrotesk", 500),
     fontSize: 13
+  },
+  // Amber band echoing the web "Fill destination" badge: the gateway-captured
+  // page URL is the only non-spoofable element on the card, so it gets a
+  // distinct treatment from the agent-authored labels/summary.
+  destinationBadge: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    alignItems: "center",
+    paddingHorizontal: 8,
+    paddingVertical: 5,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "rgba(251, 191, 36, 0.4)",
+    backgroundColor: theme.bg,
+    marginTop: 2
+  },
+  destinationLabel: {
+    color: theme.muted,
+    fontFamily: family("HankenGrotesk", 500),
+    fontSize: 11
+  },
+  destinationValue: {
+    color: theme.text,
+    fontFamily: family("JetBrainsMono"),
+    fontSize: 11,
+    flexShrink: 1
+  },
+  fillField: {
+    gap: 4
+  },
+  fillLabel: {
+    color: theme.muted,
+    fontFamily: family("HankenGrotesk", 500),
+    fontSize: 11
   },
   optionList: {
     gap: 6,
