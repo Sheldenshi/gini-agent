@@ -419,12 +419,12 @@ describe("browser domain policy enforcement", () => {
   });
 });
 
-// Smoke test for the CDP-vs-launch decision. We can't actually exercise
-// playwright-core's connectOverCDP / launch without spawning Chromium —
-// the real verification happens in the manual end-to-end run. What we CAN
-// verify here is that the session manager reads state.browser through the
-// instance registered via setBrowserInstance(), so the wiring between the
-// browser-connect capability and the tool layer is consistent.
+// Smoke test for the spawned-launch wiring. We can't actually exercise
+// playwright-core's launch without spawning Chromium — the real verification
+// happens in the manual end-to-end run. What we CAN verify here is that the
+// session manager resolves the per-instance profile dir through the instance
+// registered via setBrowserInstance(), so the spawned launch targets the right
+// instance's chrome-profile dir.
 describe("browser session manager state lookup", () => {
   const TEST_ROOT = "/tmp/gini-browser-state-tests";
   process.env["GINI_STATE_ROOT"] = TEST_ROOT;
@@ -438,32 +438,26 @@ describe("browser session manager state lookup", () => {
     rmSync(TEST_ROOT, { recursive: true, force: true });
   });
 
-  test("setBrowserInstance points readState at the right instance", async () => {
+  test("setBrowserInstance points the spawned profile dir at the right instance", () => {
     rmSync(`${TEST_ROOT}/instances/${instance}`, { recursive: true, force: true });
-    // Seed a connection record so the session manager would, on next
-    // browser tool call, attempt connectOverCDP() instead of launch().
-    // We don't actually trigger that branch (no real CDP endpoint) but
-    // the state shape it consumes is what we verify.
-    await mutateState(instance, (state) => {
-      state.browser = {
-        mode: "cdp",
-        cdpUrl: "ws://127.0.0.1:65535/devtools/browser/test",
-        pid: null,
-        dataDir: null,
-        chromePath: null,
-        startedAt: new Date().toISOString()
-      };
-    });
     setBrowserInstance(instance);
-    const state = readState(instance);
-    expect(state.browser?.cdpUrl).toContain("127.0.0.1:65535");
+    const dir = browserTest.spawnedProfileDirForTest();
+    expect(dir).toContain(instance);
+    expect(dir.endsWith("chrome-profile")).toBe(true);
+  });
+
+  test("spawnedProfileDir refuses to resolve when no instance is registered", () => {
+    browserTest.resetBrowserInstanceForTest();
+    expect(() => browserTest.spawnedProfileDirForTest()).toThrow(/No instance registered/);
+    // Restore for sibling tests in the same file.
+    setBrowserInstance("default");
   });
 });
 
-// Persistent-profile pivot: SharedHandle collapsed to { persistent | cdp }.
-// "headless" no longer exists as a separate variant — both the default
-// headless agent path and the visible Connect window share one persistent
-// BrowserContext arm; only the `headed` flag at launch differs.
+// Spawn-only transport (issue #420): the single SharedHandle variant is
+// `spawned`. Disconnect closes the spawned persistent BrowserContext, which
+// terminates the Chrome Playwright launched; the profile dir stays put so
+// sign-ins persist for the next-call relaunch.
 describe("browser disconnect lifecycle", () => {
   afterEach(() => {
     // Clean up any synthetic state the previous test installed so
@@ -485,43 +479,12 @@ describe("browser disconnect lifecycle", () => {
     expect(parsed.error).toMatch(/disconnecting/i);
   });
 
-  test("disconnectSharedBrowser does not call close() on a CDP browser missing disconnect()", async () => {
-    let closeCalled = false;
-    browserTest.installFakeCdpBrowserForTest({
-      // Intentionally no disconnect() — exactly the playwright-core
-      // shape that previously triggered the buggy fallback. close()
-      // over CDP terminates the user's Chrome, which we must avoid.
-      close: async () => {
-        closeCalled = true;
-      }
-    });
-    await disconnectSharedBrowser();
-    expect(closeCalled).toBe(false);
-  });
-
-  test("disconnectSharedBrowser calls disconnect() when available on CDP browser", async () => {
-    let disconnectCalled = false;
-    let closeCalled = false;
-    browserTest.installFakeCdpBrowserForTest({
-      disconnect: async () => {
-        disconnectCalled = true;
-      },
-      close: async () => {
-        closeCalled = true;
-      }
-    });
-    await disconnectSharedBrowser();
-    expect(disconnectCalled).toBe(true);
-    expect(closeCalled).toBe(false);
-  });
-
-  test("disconnectSharedBrowser closes the visible persistent context (terminating Chromium)", async () => {
-    // Visibility-toggle disconnect path: closing the BrowserContext is how
-    // we shut down the Chromium process Playwright launched. The same arm
-    // handles the next-call relaunch with `headless: true` against the
-    // same profile dir, so sign-ins persist.
+  test("disconnectSharedBrowser closes the spawned persistent context (terminating Chromium)", async () => {
+    // Closing the BrowserContext is how we shut down the Chromium process
+    // Playwright launched. The next browser_* call relaunches the same profile
+    // dir, so sign-ins persist.
     let contextCloseCalled = false;
-    browserTest.installFakeManagedContextForTest({
+    browserTest.installFakeSpawnedHandleForTest(9401, {
       close: async () => {
         contextCloseCalled = true;
       }
@@ -530,35 +493,20 @@ describe("browser disconnect lifecycle", () => {
     expect(contextCloseCalled).toBe(true);
   });
 
-  test("disconnectSharedBrowser also closes the HEADLESS persistent context", async () => {
-    // Same teardown arm regardless of headed flag — the headless
-    // persistent context that the default tool path materializes must
-    // come down on Disconnect just like the headed one. Tests the
-    // headed=false variant explicitly so we don't regress that branch.
+  test("closeAll closes the spawned persistent context", async () => {
     let contextCloseCalled = false;
-    browserTest.installFakeHeadlessPersistentContextForTest({
+    browserTest.installFakeSpawnedHandleForTest(9402, {
       close: async () => {
         contextCloseCalled = true;
-      }
-    });
-    await disconnectSharedBrowser();
-    expect(contextCloseCalled).toBe(true);
-  });
-
-  test("closeAll skips close() on a CDP browser missing disconnect()", async () => {
-    let closeCalled = false;
-    browserTest.installFakeCdpBrowserForTest({
-      close: async () => {
-        closeCalled = true;
       }
     });
     await closeAll();
-    expect(closeCalled).toBe(false);
+    expect(contextCloseCalled).toBe(true);
   });
 
   test("disconnectSharedBrowser drains in-flight before tearing down", async () => {
     let closeCalled = false;
-    browserTest.installFakeManagedContextForTest({
+    browserTest.installFakeSpawnedHandleForTest(9403, {
       close: async () => {
         closeCalled = true;
       }
@@ -584,8 +532,8 @@ describe("browser disconnect lifecycle", () => {
   test("disconnectSharedBrowser bounds a wedged context.close() and force-kills the child", async () => {
     // Reproduces the connect/disconnect hang: a Chromium wedged on a heavy
     // navigation never resolves context.close(). Teardown must give up at
-    // the bounded budget and reap the child by its profile-dir pid so the
-    // lock frees for the relaunch — instead of hanging for minutes.
+    // the bounded budget and reap the child by the handle's profile-dir pid so
+    // the lock frees for the relaunch — instead of hanging for minutes.
     setBrowserInstance("teardown-test-instance");
     browserTest.setTeardownCloseTimeoutForTest(50);
     let killerCalled = false;
@@ -595,14 +543,17 @@ describe("browser disconnect lifecycle", () => {
       killerDir = dir;
       return 1;
     });
-    browserTest.installFakeManagedContextForTest({
-      close: () => new Promise(() => {})
-    });
+    const profileDir = chromeProfileDirFor("teardown-test-instance");
+    browserTest.installFakeSpawnedHandleForTest(
+      9404,
+      { close: () => new Promise(() => {}) },
+      profileDir
+    );
     const started = Date.now();
     await disconnectSharedBrowser();
     const elapsed = Date.now() - started;
     expect(killerCalled).toBe(true);
-    expect(killerDir).toBe(chromeProfileDirFor("teardown-test-instance"));
+    expect(killerDir).toBe(profileDir);
     expect(elapsed).toBeLessThan(7_000);
   });
 
@@ -611,7 +562,7 @@ describe("browser disconnect lifecycle", () => {
     // is what lets disconnect reach the context teardown at all.
     browserTest.setTeardownCloseTimeoutForTest(50);
     let contextCloseCalled = false;
-    browserTest.installFakeManagedContextForTest({
+    browserTest.installFakeSpawnedHandleForTest(9405, {
       close: async () => {
         contextCloseCalled = true;
       }
@@ -2851,7 +2802,7 @@ describe("disconnectSharedBrowser pending-launch handling", () => {
   });
 
   test("waits for an in-flight pendingShared launch and clears the resulting handle", async () => {
-    // Build a pendingShared that resolves to a fake persistent context
+    // Build a pendingShared that resolves to a fake spawned context
     // AFTER disconnect has bumped the generation but before disconnect
     // has finished its drain. The natural ensureShared post-await
     // re-check would normally throw and tear down the freshly-built
@@ -2884,7 +2835,7 @@ describe("disconnectSharedBrowser pending-launch handling", () => {
     // Simulate a slow launch finishing AND installing itself into
     // shared. We have to do the install ourselves because the test
     // bypassed ensureShared's installer.
-    browserTest.installFakeHeadlessPersistentContextForTest(fakeContext);
+    browserTest.installFakeSpawnedHandleForTest(9410, fakeContext);
     resolvePending(fakeContext);
 
     await disconnectPromise;
@@ -2895,19 +2846,18 @@ describe("disconnectSharedBrowser pending-launch handling", () => {
 });
 
 // isHandleAlive must force a relaunch when the underlying Chrome died out
-// from under us. After an EXTERNAL kill (crash, or — now that the agent
-// launches the user's branded Chrome — the user quitting their everyday
-// Chrome) Playwright's context.pages() still returns [] without throwing, so
-// the old pages()-only probe reported the dead context as alive and wedged
-// every later tool call on a stale handle. The Browser's isConnected() is the
-// signal that actually flips on an external kill.
-describe("isHandleAlive persistent liveness", () => {
+// from under us. After an EXTERNAL kill (crash, or the user killing the
+// spawned Chrome) Playwright's context.pages() still returns [] without
+// throwing, so the old pages()-only probe reported the dead context as alive
+// and wedged every later tool call on a stale handle. The Browser's
+// isConnected() is the signal that actually flips on an external kill.
+describe("isHandleAlive spawned liveness", () => {
   afterEach(() => {
     browserTest.uninstallFakeBrowserForTest();
   });
 
-  test("reports dead when the persistent context's Browser disconnected", () => {
-    browserTest.installFakeHeadlessPersistentContextForTest({
+  test("reports dead when the spawned context's Browser disconnected", () => {
+    browserTest.installFakeSpawnedHandleForTest(9420, {
       close: async () => undefined,
       pages: () => [],
       browser: () => ({ isConnected: () => false })
@@ -2915,8 +2865,8 @@ describe("isHandleAlive persistent liveness", () => {
     expect(browserTest.isSharedHandleAliveForTest()).toBe(false);
   });
 
-  test("reports alive when the persistent context's Browser is connected", () => {
-    browserTest.installFakeHeadlessPersistentContextForTest({
+  test("reports alive when the spawned context's Browser is connected", () => {
+    browserTest.installFakeSpawnedHandleForTest(9421, {
       close: async () => undefined,
       pages: () => [],
       browser: () => ({ isConnected: () => true })
@@ -2925,7 +2875,7 @@ describe("isHandleAlive persistent liveness", () => {
   });
 
   test("assumes alive when no Browser handle is exposed (cannot probe)", () => {
-    browserTest.installFakeHeadlessPersistentContextForTest({
+    browserTest.installFakeSpawnedHandleForTest(9422, {
       close: async () => undefined,
       pages: () => []
     });
@@ -2968,7 +2918,7 @@ describe("spawned default browser launch", () => {
     let connectCalls = 0;
     browserTest.setSessionProviderForTest("spawned", {
       kind: "spawned",
-      connect: async (_record) => {
+      connect: async () => {
         connectCalls++;
         return {
           kind: "spawned",
@@ -3003,7 +2953,7 @@ describe("spawned default browser launch", () => {
     let connectCalls = 0;
     browserTest.setSessionProviderForTest("spawned", {
       kind: "spawned",
-      connect: async (_record) => {
+      connect: async () => {
         connectCalls++;
         return {
           kind: "spawned",
@@ -3277,290 +3227,20 @@ describe("spawned launch internals", () => {
   });
 });
 
-// The managed (visible Connect) and cdp (external attach) provider bodies are
-// reached via ensureShared when state.browser carries the matching record. The
-// agent's DEFAULT path no longer routes here (it spawns per-instance), so these
-// drive the providers directly with a mocked playwright-core.
-describe("ensureShared managed + cdp provider bodies", () => {
-  const TEST_ROOT = "/tmp/gini-shared-providers";
-
-  afterEach(async () => {
-    await disconnectSharedBrowser().catch(() => undefined);
-    mock.restore();
-    browserTest.uninstallFakeBrowserForTest();
-    browserTest.clearFakeSessionsForTest();
-    browserTest.clearPendingSharedForTest();
-    browserTest.setInFlightDisconnectsForTest(0);
-    browserTest.resetChromiumImportForTest();
+// The spawned provider refuses to acquire a browser when no runtime instance
+// has been registered (so the launch can't target an unknown profile dir).
+// Drives the provider's connect() directly through the seam.
+describe("spawned provider no-instance refusal", () => {
+  afterEach(() => {
+    browserTest.setSessionProviderForTest("spawned", null);
     browserTest.resetBrowserInstanceForTest();
-    delete process.env["GINI_STATE_ROOT"];
-    rmSync(TEST_ROOT, { recursive: true, force: true });
   });
 
-  test("a managed record launches a headed persistent context via launchPersistentContext", async () => {
-    process.env["GINI_STATE_ROOT"] = TEST_ROOT;
-    const instance = `managed-${process.pid}`;
-    rmSync(`${TEST_ROOT}/instances/${instance}`, { recursive: true, force: true });
-    setBrowserInstance(instance);
-    await mutateState(instance, (state) => {
-      state.browser = {
-        mode: "managed",
-        cdpUrl: "internal:managed",
-        pid: null,
-        dataDir: null,
-        chromePath: null,
-        startedAt: new Date().toISOString()
-      };
-    });
-
-    const launchCalls: Array<{ dataDir: string; options: Record<string, unknown> }> = [];
-    mock.module("playwright-core", () => ({
-      chromium: {
-        executablePath: () => "/fake/path/to/chromium",
-        launchPersistentContext: async (dataDir: string, options: Record<string, unknown>) => {
-          launchCalls.push({ dataDir, options });
-          return {
-            pages: () => [],
-            newPage: async () => ({
-              on: () => undefined,
-              close: () => Promise.resolve(),
-              goto: () => Promise.resolve(null),
-              url: () => "about:blank",
-              title: () => Promise.resolve(""),
-              evaluate: () => Promise.resolve([])
-            }),
-            close: async () => undefined,
-            browser: () => ({ isConnected: () => true })
-          };
-        }
-      }
-    }));
-    browserTest.resetChromiumImportForTest();
-
-    try {
-      await browserNavigate("managed-task", { url: "https://example.com/" });
-    } catch {
-      // Snapshot wiring may throw on the fake page; the launch is what's pinned.
-    }
-
-    expect(launchCalls.length).toBe(1);
-    // Managed = headed window, against the per-instance profile dir.
-    expect(launchCalls[0]!.options.headless).toBe(false);
-    expect(launchCalls[0]!.dataDir).toContain("chrome-profile");
-    expect(launchCalls[0]!.dataDir).toContain(instance);
-  });
-
-  test("a cdp record attaches via connectOverCDP and reuses the first context", async () => {
-    process.env["GINI_STATE_ROOT"] = TEST_ROOT;
-    const instance = `cdp-${process.pid}`;
-    rmSync(`${TEST_ROOT}/instances/${instance}`, { recursive: true, force: true });
-    setBrowserInstance(instance);
-    await mutateState(instance, (state) => {
-      state.browser = {
-        mode: "cdp",
-        cdpUrl: "ws://127.0.0.1:9322/devtools/browser/abc",
-        pid: null,
-        dataDir: null,
-        chromePath: null,
-        startedAt: new Date().toISOString()
-      };
-    });
-
-    let connectArgs: { url: string } | undefined;
-    const reusedContext = {
-      pages: () => [],
-      newPage: async () => ({
-        on: () => undefined,
-        close: () => Promise.resolve(),
-        goto: () => Promise.resolve(null),
-        url: () => "about:blank",
-        title: () => Promise.resolve(""),
-        evaluate: () => Promise.resolve([])
-      }),
-      close: async () => undefined,
-      browser: () => ({ isConnected: () => true })
-    };
-    mock.module("playwright-core", () => ({
-      chromium: {
-        connectOverCDP: async (url: string) => {
-          connectArgs = { url };
-          return {
-            isConnected: () => true,
-            contexts: () => [reusedContext],
-            disconnect: async () => undefined
-          };
-        }
-      }
-    }));
-    browserTest.resetChromiumImportForTest();
-
-    try {
-      await browserNavigate("cdp-task", { url: "https://example.com/" });
-    } catch {
-      // Snapshot wiring may throw; the attach is what's pinned.
-    }
-
-    expect(connectArgs?.url).toBe("ws://127.0.0.1:9322/devtools/browser/abc");
-  });
-
-  test("a cdp attach failure surfaces the friendly hang hint", async () => {
-    process.env["GINI_STATE_ROOT"] = TEST_ROOT;
-    const instance = `cdp-fail-${process.pid}`;
-    rmSync(`${TEST_ROOT}/instances/${instance}`, { recursive: true, force: true });
-    setBrowserInstance(instance);
-    await mutateState(instance, (state) => {
-      state.browser = {
-        mode: "cdp",
-        cdpUrl: "ws://127.0.0.1:9323/devtools/browser/def",
-        pid: null,
-        dataDir: null,
-        chromePath: null,
-        startedAt: new Date().toISOString()
-      };
-    });
-
-    mock.module("playwright-core", () => ({
-      chromium: {
-        connectOverCDP: async () => {
-          throw new Error("websocket connection closed");
-        }
-      }
-    }));
-    browserTest.resetChromiumImportForTest();
-
-    const result = await browserNavigate("cdp-fail-task", { url: "https://example.com/" });
-    const parsed = JSON.parse(result) as { success: boolean; error?: string };
-    expect(parsed.success).toBe(false);
-    expect(parsed.error).toMatch(/attach over CDP/i);
-  });
-
-  test("a managed record with an explicit dataDir launches against that dir and creates a context when none exists", async () => {
-    process.env["GINI_STATE_ROOT"] = TEST_ROOT;
-    const instance = `managed-dir-${process.pid}`;
-    rmSync(`${TEST_ROOT}/instances/${instance}`, { recursive: true, force: true });
-    setBrowserInstance(instance);
-    const explicitDir = `${TEST_ROOT}/explicit-profile`;
-    await mutateState(instance, (state) => {
-      state.browser = {
-        mode: "managed",
-        cdpUrl: "internal:managed",
-        pid: null,
-        dataDir: explicitDir,
-        chromePath: null,
-        startedAt: new Date().toISOString()
-      };
-    });
-
-    const launchCalls: Array<{ dataDir: string }> = [];
-    mock.module("playwright-core", () => ({
-      chromium: {
-        executablePath: () => "/fake/path/to/chromium",
-        launchPersistentContext: async (dataDir: string) => {
-          launchCalls.push({ dataDir });
-          return {
-            pages: () => [],
-            newPage: async () => ({
-              on: () => undefined,
-              close: () => Promise.resolve(),
-              goto: () => Promise.resolve(null),
-              url: () => "about:blank",
-              title: () => Promise.resolve(""),
-              evaluate: () => Promise.resolve([])
-            }),
-            close: async () => undefined,
-            browser: () => ({ isConnected: () => true })
-          };
-        }
-      }
-    }));
-    browserTest.resetChromiumImportForTest();
-
-    try {
-      await browserNavigate("managed-dir-task", { url: "https://example.com/" });
-    } catch {
-      // Snapshot wiring may throw; the dataDir is what's pinned.
-    }
-    expect(launchCalls.length).toBe(1);
-    expect(launchCalls[0]!.dataDir).toBe(explicitDir);
-  });
-
-  test("a cdp record missing cdpUrl fails with the reconnect hint", async () => {
-    process.env["GINI_STATE_ROOT"] = TEST_ROOT;
-    const instance = `cdp-nourl-${process.pid}`;
-    rmSync(`${TEST_ROOT}/instances/${instance}`, { recursive: true, force: true });
-    setBrowserInstance(instance);
-    await mutateState(instance, (state) => {
-      state.browser = {
-        // A cdp-mode record whose cdpUrl was somehow cleared — the provider
-        // must refuse rather than attach to nothing.
-        mode: "cdp",
-        cdpUrl: "",
-        pid: null,
-        dataDir: null,
-        chromePath: null,
-        startedAt: new Date().toISOString()
-      };
-    });
-    mock.module("playwright-core", () => ({ chromium: { connectOverCDP: async () => ({}) } }));
-    browserTest.resetChromiumImportForTest();
-
-    const result = await browserNavigate("cdp-nourl-task", { url: "https://example.com/" });
-    const parsed = JSON.parse(result) as { success: boolean; error?: string };
-    expect(parsed.success).toBe(false);
-    expect(parsed.error).toMatch(/missing cdpUrl/i);
-  });
-
-  test("a non-network cdp attach error is rethrown as-is (no hang hint)", async () => {
-    process.env["GINI_STATE_ROOT"] = TEST_ROOT;
-    const instance = `cdp-other-${process.pid}`;
-    rmSync(`${TEST_ROOT}/instances/${instance}`, { recursive: true, force: true });
-    setBrowserInstance(instance);
-    await mutateState(instance, (state) => {
-      state.browser = {
-        mode: "cdp",
-        cdpUrl: "ws://127.0.0.1:9324/devtools/browser/ghi",
-        pid: null,
-        dataDir: null,
-        chromePath: null,
-        startedAt: new Date().toISOString()
-      };
-    });
-    mock.module("playwright-core", () => ({
-      chromium: {
-        connectOverCDP: async () => {
-          // No timeout/websocket/protocol token, so the provider rethrows it
-          // verbatim rather than wrapping with the hang hint.
-          throw new Error("permission denied opening profile");
-        }
-      }
-    }));
-    browserTest.resetChromiumImportForTest();
-
-    const result = await browserNavigate("cdp-other-task", { url: "https://example.com/" });
-    const parsed = JSON.parse(result) as { success: boolean; error?: string };
-    expect(parsed.success).toBe(false);
-    expect(parsed.error).toMatch(/permission denied opening profile/i);
-  });
-
-  test("the persistent provider refuses to launch when no instance is registered", async () => {
-    // Drive the persistent provider directly with a managed record but no
-    // runtime instance and no explicit dataDir — it must throw the
-    // no-instance error rather than launch against an unknown dir.
+  test("connect() throws the no-instance error when no instance is registered", async () => {
     browserTest.resetBrowserInstanceForTest();
-    mock.module("playwright-core", () => ({
-      chromium: { executablePath: () => "/fake", launchPersistentContext: async () => ({}) }
-    }));
-    browserTest.resetChromiumImportForTest();
-    await expect(
-      browserTest.connectProviderForTest("persistent", {
-        mode: "managed",
-        cdpUrl: "internal:managed",
-        pid: null,
-        dataDir: null,
-        chromePath: null,
-        startedAt: new Date().toISOString()
-      })
-    ).rejects.toThrow(/No instance registered/);
+    await expect(browserTest.connectProviderForTest("spawned")).rejects.toThrow(
+      /No instance registered/
+    );
   });
 });
 
@@ -3595,7 +3275,7 @@ describe("browser session provider seam", () => {
     const disconnectedKinds: string[] = [];
     browserTest.setSessionProviderForTest("spawned", {
       kind: "spawned",
-      connect: async (_record) => {
+      connect: async () => {
         connectCalls++;
         return {
           kind: "spawned",
@@ -3665,7 +3345,7 @@ describe("browser session trace recording", () => {
   const installSpawnedTracingProvider = (context: unknown) => {
     browserTest.setSessionProviderForTest("spawned", {
       kind: "spawned",
-      connect: async (_record) => ({
+      connect: async () => ({
         kind: "spawned",
         context: context as never,
         port: 9333,
@@ -3682,7 +3362,6 @@ describe("browser session trace recording", () => {
     browserTest.uninstallFakeBrowserForTest();
     browserTest.clearFakeSessionsForTest();
     browserTest.clearPendingSharedForTest();
-    browserTest.resetChromiumImportForTest();
     setBrowserInstance("dev");
     rmSync(TEST_ROOT, { recursive: true, force: true });
   });
@@ -6662,14 +6341,12 @@ describe("dispatchToolCall(browser_connect)", () => {
     rmSync(ROOT, { recursive: true, force: true });
   });
 
-  // End-to-end coverage of the dispatch → approval → executor path. The
-  // dispatch must surface a pending approval; once the user approves
-  // (here via decideApproval, the same code path /approvals/<id>/approve
-  // takes), the executor calls connectBrowser with the strict-managed
-  // contract and the result reports `mode: "managed"`. A regression where
-  // the dispatch silently reused a stale CDP record (the round-9 finding 1
-  // bug) would show up here as `mode: "cdp"` in the executor result.
-  test("approving the dispatched approval invokes connectBrowser with mode managed", async () => {
+  // End-to-end coverage of the dispatch → approval → completion path. The
+  // dispatch must surface a pending approval; completing it (the same path the
+  // /complete HTTP route's non-screencast fallback takes) returns success with
+  // mode "spawned" and writes exactly one rich browser.connect audit row. There
+  // is no managed/cdp record (issue #420): completion never persists a record.
+  test("completing the dispatched approval returns mode spawned and writes one audit row", async () => {
     rmSync(ROOT, { recursive: true, force: true });
     mkdirSync(WORKSPACE, { recursive: true });
     const config = dispatchConfig("browser-connect-dispatch-approve");
@@ -6680,44 +6357,12 @@ describe("dispatchToolCall(browser_connect)", () => {
     });
     // browser_connect requires an already-open page; seed a live session so
     // the dispatch passes its navigate-first precondition before exercising
-    // the approval → executor path.
+    // the approval → completion path.
     browserTest.installFakeSessionWithPageForTest(taskId, {
       url: () => "https://console.cloud.google.com/welcome",
       close: () => Promise.resolve()
     });
 
-    // Seed an existing cdp-mode record so the strict-managed path has
-    // something to tear down. Without the strict-managed gate this is
-    // exactly the shape that would short-circuit and return cdp.
-    await mutateState(config.instance, (state) => {
-      state.browser = {
-        mode: "cdp",
-        cdpUrl: "ws://127.0.0.1:9222/devtools/browser/STALE",
-        pid: null,
-        dataDir: null,
-        chromePath: null,
-        startedAt: new Date().toISOString()
-      };
-    });
-
-    // Mock playwright-core so the executor's launchManaged path doesn't
-    // actually spawn Chrome. The fake context shape mirrors the one used
-    // in the strict-managed unit test.
-    const browserMod = await import("./browser");
-    browserMod.__test.installFakeCdpBrowserForTest({
-      disconnect: async () => undefined,
-      close: async () => undefined
-    });
-    mock.module("playwright-core", () => ({
-      chromium: {
-        executablePath: () => "/fake/path/to/chromium",
-        launchPersistentContext: async () => ({
-          browser: () => ({ process: () => ({ pid: 1212 }) }),
-          close: async () => undefined
-        })
-      }
-    }));
-    browserMod.__test.resetChromiumImportForTest();
     try {
       const result = await dispatchToolCall(
         config,
@@ -6744,16 +6389,12 @@ describe("dispatchToolCall(browser_connect)", () => {
       };
       expect(parsed.success).toBe(true);
       expect(parsed.connected).toBe(true);
-      // Strict-managed contract — the executor must NOT silently hand back
-      // the cdp record we seeded above.
-      expect(parsed.mode).toBe("managed");
-      // Persisted record matches.
-      const persisted = readState(config.instance).browser;
-      expect(persisted?.mode).toBe("managed");
+      expect(parsed.mode).toBe("spawned");
+      // No connection record is ever persisted — the spawned Chrome is the
+      // only transport and carries no state record.
+      expect(readState(config.instance).browser ?? null).toBeNull();
       // Exactly one browser.connect audit row — completeBrowserConnectSetup
-      // calls connectBrowser with skipAudit and writes the richer row
-      // itself. Two rows would mean the capability's reasonless row
-      // leaked alongside.
+      // writes the rich row itself.
       const connectRows = readState(config.instance).audit.filter(
         (row) => row.action === "browser.connect"
       );
@@ -6762,21 +6403,16 @@ describe("dispatchToolCall(browser_connect)", () => {
       expect(connectRows[0]!.approvalId).toBe(result.approvalId);
       expect(connectRows[0]!.target).toBe("Sign in to Google Cloud Console");
     } finally {
-      mock.restore();
-      browserMod.__test.uninstallFakeBrowserForTest();
-      browserMod.__test.clearFakeSessionsForTest();
-      browserMod.__test.resetChromiumImportForTest();
+      browserTest.clearFakeSessionsForTest();
       rmSync(ROOT, { recursive: true, force: true });
     }
   });
 
-  // Headless-after-signin: the Workspace setup skill calls
-  // browser_connect { headless: true } AFTER the user signs in
-  // (and after a browser_close) so the rest of Cloud Console runs
-  // invisibly. The dispatch must accept the headless flag from the
-  // tool args, carry it through the approval payload, and pass it
-  // to connectBrowser when the user approves.
-  test("dispatch with headless: true forwards the flag through approval to launchManaged", async () => {
+  // The headless flag still rides the approval payload from the tool args
+  // (the web card / completion contract reads it). With the spawn-only
+  // transport there is no managed relaunch, so completion ignores it and
+  // returns mode "spawned"; the flag's job is purely the card wording.
+  test("dispatch with headless: true forwards the flag through the approval payload", async () => {
     rmSync(ROOT, { recursive: true, force: true });
     mkdirSync(WORKSPACE, { recursive: true });
     const config = dispatchConfig("browser-connect-dispatch-headless");
@@ -6785,22 +6421,11 @@ describe("dispatchToolCall(browser_connect)", () => {
       upsertTask(state, task);
       return task.id;
     });
+    browserTest.installFakeSessionWithPageForTest(taskId, {
+      url: () => "https://console.cloud.google.com/welcome",
+      close: () => Promise.resolve()
+    });
 
-    const browserMod = await import("./browser");
-    const launchCalls: Array<{ dataDir: string; options: Record<string, unknown> }> = [];
-    mock.module("playwright-core", () => ({
-      chromium: {
-        executablePath: () => "/fake/path/to/chromium",
-        launchPersistentContext: async (dataDir: string, options: Record<string, unknown>) => {
-          launchCalls.push({ dataDir, options });
-          return {
-            browser: () => ({ process: () => ({ pid: 3232 }) }),
-            close: async () => undefined
-          };
-        }
-      }
-    }));
-    browserMod.__test.resetChromiumImportForTest();
     try {
       const result = await dispatchToolCall(
         config,
@@ -6829,24 +6454,14 @@ describe("dispatchToolCall(browser_connect)", () => {
         success: boolean;
         connected: boolean;
         mode?: string;
-        headless?: boolean;
       };
       expect(parsed.success).toBe(true);
       expect(parsed.connected).toBe(true);
-      expect(parsed.mode).toBe("managed");
-      expect(parsed.headless).toBe(true);
-      // Playwright was invoked with headless: true.
-      expect(launchCalls.length).toBe(1);
-      expect(launchCalls[0]!.options.headless).toBe(true);
-      // Persisted record carries the flag for future reconnects.
-      const persisted = readState(config.instance).browser;
-      expect(persisted?.mode).toBe("managed");
-      expect(persisted?.headless).toBe(true);
+      expect(parsed.mode).toBe("spawned");
+      // No record persisted regardless of the headless flag.
+      expect(readState(config.instance).browser ?? null).toBeNull();
     } finally {
-      mock.restore();
-      browserMod.__test.uninstallFakeBrowserForTest();
-      browserMod.__test.clearFakeSessionsForTest();
-      browserMod.__test.resetChromiumImportForTest();
+      browserTest.clearFakeSessionsForTest();
       rmSync(ROOT, { recursive: true, force: true });
     }
   });
@@ -6934,11 +6549,12 @@ describe("dispatchToolCall(browser_connect)", () => {
   });
 
   // Completion behavior is mode-independent: after the user finishes acting
-  // in the visible window (sign-in OR a handoff step like payment entry),
-  // /complete must return the browser to headless. signInStarted is the
-  // stage-1 marker for both modes, so a handoff payload completes through
-  // the exact same headless relaunch as sign-in.
-  test("handoff completion returns the browser to headless, same as sign-in", async () => {
+  // in the screencast (sign-in OR a handoff step like payment entry),
+  // /complete's non-screencast fallback returns success with mode "spawned".
+  // signInStarted is the stage-1 marker for both modes; a handoff payload
+  // completes through the exact same path as sign-in (the agent never left its
+  // spawned Chrome, so there is nothing to relaunch).
+  test("handoff completion returns mode spawned, same as sign-in", async () => {
     rmSync(ROOT, { recursive: true, force: true });
     mkdirSync(WORKSPACE, { recursive: true });
     const config = dispatchConfig("browser-connect-dispatch-handoff-complete");
@@ -6952,21 +6568,6 @@ describe("dispatchToolCall(browser_connect)", () => {
       close: () => Promise.resolve()
     });
 
-    const browserMod = await import("./browser");
-    const launchCalls: Array<{ options: Record<string, unknown> }> = [];
-    mock.module("playwright-core", () => ({
-      chromium: {
-        executablePath: () => "/fake/path/to/chromium",
-        launchPersistentContext: async (_dataDir: string, options: Record<string, unknown>) => {
-          launchCalls.push({ options });
-          return {
-            browser: () => ({ process: () => ({ pid: 4242 }) }),
-            close: async () => undefined
-          };
-        }
-      }
-    }));
-    browserMod.__test.resetChromiumImportForTest();
     try {
       const result = await dispatchToolCall(
         config,
@@ -6986,25 +6587,19 @@ describe("dispatchToolCall(browser_connect)", () => {
       const pendingSetup = readState(config.instance).setupRequests.find((s) => s.id === result.approvalId);
       if (!pendingSetup) throw new Error("setup request not minted");
       expect(pendingSetup.payload.mode).toBe("handoff");
-      // Stage 2 (the user clicked "I'm done"): complete relaunches headless.
+      // Stage 2 (the user clicked "I'm done"): complete acknowledges success.
       const { result: toolResult } = await completeBrowserConnectSetup(config, pendingSetup);
       const parsed = JSON.parse(toolResult) as {
         success: boolean;
         connected: boolean;
         mode?: string;
-        headless?: boolean;
       };
       expect(parsed.success).toBe(true);
       expect(parsed.connected).toBe(true);
-      expect(parsed.mode).toBe("managed");
-      expect(parsed.headless).toBe(true);
-      expect(launchCalls.length).toBe(1);
-      expect(launchCalls[0]!.options.headless).toBe(true);
+      expect(parsed.mode).toBe("spawned");
+      expect(readState(config.instance).browser ?? null).toBeNull();
     } finally {
-      mock.restore();
-      browserMod.__test.uninstallFakeBrowserForTest();
-      browserMod.__test.clearFakeSessionsForTest();
-      browserMod.__test.resetChromiumImportForTest();
+      browserTest.clearFakeSessionsForTest();
       rmSync(ROOT, { recursive: true, force: true });
     }
   });
@@ -7243,11 +6838,6 @@ describe("getScreencastPort", () => {
       close: () => Promise.resolve(),
       browser: () => ({ isConnected: () => false })
     } as never);
-    expect(getScreencastPort()).toBeNull();
-  });
-
-  test("returns null for a managed (non-spawned) handle", () => {
-    browserTest.installFakeManagedContextForTest({ close: () => Promise.resolve() } as never);
     expect(getScreencastPort()).toBeNull();
   });
 });

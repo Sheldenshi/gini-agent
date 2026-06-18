@@ -1438,20 +1438,12 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
       job.intervalSeconds = undefined;
     }
   }
-  // Browser connection record is purely opt-in — feature added after the
-  // initial state shape. Normalize obviously bad shapes to null so a
-  // hand-edited state file can't crash downstream consumers; valid records
-  // pass through untouched.
-  if (state.browser !== undefined && state.browser !== null) {
-    const candidate = state.browser as Partial<typeof state.browser> & { cdpUrl?: unknown; mode?: unknown };
-    if (
-      typeof candidate !== "object" ||
-      typeof candidate.cdpUrl !== "string" ||
-      (candidate.mode !== "managed" && candidate.mode !== "cdp")
-    ) {
-      state.browser = null;
-    }
-  }
+  // The runtime drives a single spawned per-instance Chrome that carries no
+  // state record (see issue #420) — there is no managed/cdp record-bearing
+  // mode anymore. Always coerce this slot to null on load so a legacy or
+  // hand-edited state file holding a stale `{mode:"managed"|"cdp",...}` record
+  // can't resurrect a removed transport or crash a downstream consumer.
+  state.browser = null;
   // Tunnel selection singleton is purely opt-in (see ADR
   // tunnel-connectivity.md). Backfill null so legacy state files and
   // hand-edited files alike present a consistent shape to consumers.

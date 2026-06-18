@@ -21,7 +21,6 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  __test as browserTest,
   browserConsole,
   browserDrag,
   browserFillByLocator,
@@ -132,12 +131,9 @@ function registerPage(path: string, html: string): string {
 
 describe.skipIf(!ENABLED)("browser tools — real Chromium integration", () => {
   beforeAll(() => {
-    // Other test files in the same `bun test` run mock playwright-core
-    // via `mock.module(...)` and reset it after; the session manager's
-    // module-level `chromiumImport` cache can still hold the stub if
-    // it was first imported under the mock. Reset it now so our tests
-    // land on the real playwright-core.
-    browserTest.resetChromiumImportForTest();
+    // The spawned launcher (launchSpawnedChrome) re-imports playwright-core on
+    // every launch with no module-level cache, so a sibling test's
+    // mock.module(...) stub cannot leak into these real-Chromium tests.
     pageServer = Bun.serve({
       port: 0,
       fetch(request) {

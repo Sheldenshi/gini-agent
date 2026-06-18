@@ -49,41 +49,6 @@ export type ImportSource = "hermes" | "openclaw";
 
 export type AgentStatus = "active" | "inactive";
 
-// Headed-browser connection mode. `managed` means the runtime spawned the
-// Chrome process and owns its lifecycle (PID + dedicated user-data-dir).
-// `cdp` means the user pointed us at an existing CDP endpoint (e.g. their
-// own already-running Chrome) and we never touch the process. The two modes
-// share most of the same record so the API stays uniform.
-export type BrowserConnectionMode = "managed" | "cdp";
-
-export interface BrowserConnectionRecord {
-  mode: BrowserConnectionMode;
-  // ws:// CDP debugger URL. For `managed` we discover it by polling the
-  // launched Chrome's /json/version endpoint; for `cdp` it's the value the
-  // user supplied. Stored normalized (no credentials in the path).
-  cdpUrl: string;
-  // PID of the Chrome we spawned. Null when mode === "cdp" because we
-  // don't own that process and must not signal it on disconnect.
-  pid: number | null;
-  // Profile directory passed to Chrome via --user-data-dir. Null for
-  // mode: "cdp". Survives disconnect so the user's signed-in state stays
-  // intact across reconnects.
-  dataDir: string | null;
-  // Absolute path of the Chrome binary the runtime launched. Null for cdp
-  // mode (we never resolved a binary). Useful for surfacing in the UI so
-  // users can confirm which install is being driven.
-  chromePath: string | null;
-  // ISO timestamp of when the connection record was created/updated.
-  startedAt: string;
-  // True when the managed Chrome was launched with headless: true (no
-  // window). Defaults to false / absent for visible managed launches and
-  // for cdp mode. Tracked on the record so an idempotent reconnect can
-  // detect a headed/headless visibility mismatch and tear down + relaunch
-  // when the caller asks for a different visibility than the current
-  // record has.
-  headless?: boolean;
-}
-
 export type RelayStatus = "disabled" | "configured" | "degraded" | "error";
 
 // Tunnel connectivity (see ADR tunnel-connectivity.md). The tunnel gateway
@@ -124,10 +89,10 @@ export interface TunnelState {
   message?: string;
 }
 
-// Persisted singleton on RuntimeState. Mirrors the BrowserConnectionRecord
-// opt-in shape: absent/null until the user first selects a provider. The
-// catalog itself is NOT persisted — it's rebuilt from code on every read so
-// adding a provider doesn't require a state migration.
+// Persisted singleton on RuntimeState. Opt-in shape: absent/null until the
+// user first selects a provider. The catalog itself is NOT persisted — it's
+// rebuilt from code on every read so adding a provider doesn't require a state
+// migration.
 export interface TunnelSelectionRecord {
   instance: Instance;
   selectedProvider: TunnelProviderId | null;
@@ -729,12 +694,13 @@ export interface RuntimeState {
   messagingMessages: MessagingMessageRecord[];
   runs: RunRecord[];
   planSteps: PlanStepRecord[];
-  // Optional headed-browser connection. Populated by the browser-connect
-  // capability and consumed by the session manager in src/tools/browser.ts
-  // to switch from headless `chromium.launch()` to `chromium.connectOverCDP()`
-  // so authenticated state lives in the user's Chrome profile, not the
-  // ephemeral test context. Purely opt-in; legacy state files omit it.
-  browser?: BrowserConnectionRecord | null;
+  // Legacy headed-browser connection slot. The runtime now drives a single
+  // spawned per-instance Chrome (src/tools/browser.ts) that carries no state
+  // record — there is no managed/cdp record-bearing mode anymore (see issue
+  // #420). normalizeState always coerces this to null on load, so the only
+  // value a fresh state ever holds here is null; the field is kept (null-only)
+  // so a hand-edited or legacy state file with a stale record still parses.
+  browser?: null;
   // Optional tunnel selection singleton (see ADR tunnel-connectivity.md).
   // Populated by the tunnel integration when the user selects/connects a
   // provider; null until then. Mirrors the `browser` opt-in field above.

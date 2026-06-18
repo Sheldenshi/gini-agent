@@ -3476,11 +3476,12 @@ describe("runtime api", () => {
     expect(after?.status).toBe("pending");
   });
 
-  // Round-1 review fix: browser-connect throws with prefixes that the
-  // gateway's catch-all previously mapped to 500. The webapp needs them as
-  // 4xx so it can render the original message instead of "internal error".
-  test("browser connect returns 400 for unsupported cdpUrl protocol", async () => {
-    const config = testConfig("browser-bad-proto");
+  // Spawn-only transport (issue #420): /api/browser/connect takes no
+  // connection parameters. A legacy body (cdpUrl, mode, headless) is ignored
+  // and the route returns the stable disconnected status — the spawned Chrome
+  // is launched lazily on the first browser tool call, not at connect time.
+  test("browser connect ignores a legacy cdpUrl body and returns disconnected", async () => {
+    const config = testConfig("browser-connect-ignores-body");
     const handler = createHandler(config);
     const response = await rawCall(
       handler,
@@ -3492,27 +3493,9 @@ describe("runtime api", () => {
       },
       config.token
     );
-    expect(response.status).toBe(400);
+    expect(response.status).toBe(201);
     const body = await response.json();
-    expect(body.error).toMatch(/Unsupported/);
-  });
-
-  test("browser connect returns 400 for garbage cdpUrl", async () => {
-    const config = testConfig("browser-bad-url");
-    const handler = createHandler(config);
-    const response = await rawCall(
-      handler,
-      config,
-      "/api/browser/connect",
-      {
-        method: "POST",
-        body: JSON.stringify({ cdpUrl: "not-a-url" })
-      },
-      config.token
-    );
-    expect(response.status).toBe(400);
-    const body = await response.json();
-    expect(body.error).toMatch(/Invalid cdpUrl/);
+    expect(body.connected).toBe(false);
   });
 
   test("PATCH /api/settings/auto-approve rejects out-of-union approvalMode with 400", async () => {
@@ -3553,26 +3536,14 @@ describe("runtime api", () => {
     expect(response.status).toBe(404);
   });
 
-  test("browser connect returns 400 when CDP endpoint is unreachable", async () => {
-    const config = testConfig("browser-unreachable");
+  test("GET /api/browser reports the stable disconnected status", async () => {
+    const config = testConfig("browser-status");
     const handler = createHandler(config);
-    // Port 1 is reserved; probe will time out. The point of this test is
-    // the status mapping, so use a short-lived test by aborting once we
-    // see the response.
-    const response = await rawCall(
-      handler,
-      config,
-      "/api/browser/connect",
-      {
-        method: "POST",
-        body: JSON.stringify({ cdpUrl: "http://127.0.0.1:1/" })
-      },
-      config.token
-    );
-    expect(response.status).toBe(400);
+    const response = await rawCall(handler, config, "/api/browser", {}, config.token);
+    expect(response.status).toBe(200);
     const body = await response.json();
-    expect(body.error).toMatch(/Could not reach CDP endpoint/);
-  }, 30_000);
+    expect(body.connected).toBe(false);
+  });
 
   test("stamps the active agent on records and filters listings by agentId", async () => {
     const config = testConfig("records-agentid");

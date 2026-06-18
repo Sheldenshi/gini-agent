@@ -1032,3 +1032,47 @@ describe("writeState atomic temp files", () => {
     expect(readState(instance).tasks[0]?.title).toBe("write-4");
   });
 });
+
+// The runtime drives a single spawned per-instance Chrome that carries no
+// state record (issue #420). normalizeState always coerces state.browser to
+// null on load, so a legacy or hand-edited state file holding a stale
+// managed/cdp record can't resurrect a removed transport or crash a consumer.
+describe("normalizeState always nulls the legacy browser connection record", () => {
+  test("a stale cdp-mode record loads as browser: null without crashing", () => {
+    const state = createEmptyState("stale-cdp");
+    // The `browser` field is typed null-only now, so a legacy record is an
+    // out-of-type value a hand-edited state file could hold — write it through
+    // a loose record to simulate that on-disk shape.
+    (state as unknown as Record<string, unknown>).browser = {
+      mode: "cdp",
+      cdpUrl: "ws://127.0.0.1:9222/devtools/browser/abc",
+      pid: null,
+      dataDir: null,
+      chromePath: null,
+      startedAt: "2026-01-01T00:00:00.000Z"
+    };
+    const normalized = normalizeState("stale-cdp", state);
+    expect(normalized.browser ?? null).toBeNull();
+  });
+
+  test("a stale managed-mode record loads as browser: null without crashing", () => {
+    const state = createEmptyState("stale-managed");
+    (state as unknown as Record<string, unknown>).browser = {
+      mode: "managed",
+      cdpUrl: "internal:managed",
+      pid: 4242,
+      dataDir: "/tmp/some-profile",
+      chromePath: "/fake/chrome",
+      startedAt: "2026-01-01T00:00:00.000Z",
+      headless: false
+    };
+    const normalized = normalizeState("stale-managed", state);
+    expect(normalized.browser ?? null).toBeNull();
+  });
+
+  test("an already-null record stays null (idempotent)", () => {
+    const state = createEmptyState("already-null");
+    const normalized = normalizeState("already-null", state);
+    expect(normalized.browser ?? null).toBeNull();
+  });
+});

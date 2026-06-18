@@ -6,7 +6,6 @@ import {
   CHROME_LAUNCH_ARGS,
   cleanChromeUserAgent,
   findChromePath,
-  launchPersistentChrome,
   platformCandidates,
   resolveBrowserLaunchTarget
 } from "./chrome-discovery";
@@ -209,63 +208,3 @@ describe("cleanChromeUserAgent", () => {
   });
 });
 
-describe("launchPersistentChrome", () => {
-  // GINI_CHROME_PATH pins the binary so resolveBrowserLaunchTarget is
-  // deterministic (branded=false), independent of what Chrome the host has.
-  test("headless launch uses the resolved binary, stealth args, and a clean UA", async () => {
-    await withVersionBinary("Google Chrome 142.0.7000.1", async (binary) => {
-      process.env["GINI_CHROME_PATH"] = binary;
-      let recorded: Record<string, unknown> | undefined;
-      const chromium = {
-        launchPersistentContext: async (_dir: string, options: Record<string, unknown>) => {
-          recorded = options;
-          return { sentinel: true };
-        }
-      };
-      const { context, chromePath } = await launchPersistentChrome(chromium, "/tmp/data", {
-        headless: true
-      });
-      expect((context as { sentinel: boolean }).sentinel).toBe(true);
-      expect(chromePath).toBe(binary);
-      expect(recorded!["executablePath"]).toBe(binary);
-      expect(recorded!["headless"]).toBe(true);
-      expect(recorded!["args"]).toContain("--disable-blink-features=AutomationControlled");
-      expect(recorded!["userAgent"]).toContain("Chrome/142.0.0.0");
-      expect(recorded!["userAgent"]).not.toContain("Headless");
-    });
-  });
-
-  test("headed launch sets no userAgent override", async () => {
-    await withVersionBinary("Google Chrome 142.0.7000.1", async (binary) => {
-      process.env["GINI_CHROME_PATH"] = binary;
-      let recorded: Record<string, unknown> | undefined;
-      const chromium = {
-        launchPersistentContext: async (_dir: string, options: Record<string, unknown>) => {
-          recorded = options;
-          return {};
-        }
-      };
-      await launchPersistentChrome(chromium, "/tmp/data", { headless: false });
-      expect(recorded!["userAgent"]).toBeUndefined();
-    });
-  });
-
-  // A non-branded target (here, the override) has no better fallback, so a
-  // launch failure rethrows instead of retrying on the bundled Chromium.
-  test("a non-branded target rethrows without a second launch attempt", async () => {
-    await withVersionBinary("Google Chrome 142.0.7000.1", async (binary) => {
-      process.env["GINI_CHROME_PATH"] = binary;
-      let calls = 0;
-      const chromium = {
-        launchPersistentContext: async () => {
-          calls += 1;
-          throw new Error("launch failed");
-        }
-      };
-      await expect(
-        launchPersistentChrome(chromium, "/tmp/data", { headless: true })
-      ).rejects.toThrow("launch failed");
-      expect(calls).toBe(1);
-    });
-  });
-});

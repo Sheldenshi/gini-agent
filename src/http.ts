@@ -38,7 +38,7 @@ import {
   isPlausibleMime,
   upsertDevice
 } from "./state";
-import { browserNavigate, getScreencastPort, peekCurrentBrowserTargetId, peekCurrentBrowserUrl, safetyCheck } from "./tools/browser";
+import { getScreencastPort, peekCurrentBrowserTargetId, peekCurrentBrowserUrl, safetyCheck } from "./tools/browser";
 import {
   getOrStartBridge,
   stopActiveBridge,
@@ -978,11 +978,10 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       }
 
       if (setup.action === "browser.connect") {
-        // Screencast path: the agent never left its headless Chrome — the user
-        // just signed in through the modal, so cookies are already in the
-        // shared context. Tear down the screencast bridge and resume the task
-        // headless with no relaunch (completeBrowserConnectSetup's managed
-        // relaunch only applies to the visible-window fallback).
+        // Screencast path (the only sign-in path): the agent never left its
+        // headless spawned Chrome — the user just signed in through the modal,
+        // so cookies are already in the shared context. Tear down the screencast
+        // bridge and resume the task headless with no relaunch.
         if (setup.payload.screencast === true) {
           const result = JSON.stringify({ success: true, connected: true, mode: "screencast" });
           // Mark the setup terminal BEFORE tearing the bridge down: a frames /
@@ -1120,14 +1119,15 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     // Stage 1 of the browser.connect two-stage flow. The chat UI's
     // "Connect" button POSTs here on a browser.connect SetupRequest:
     //   1. Validate the setup-request is browser.connect and pending.
-    //   2. Launch the per-instance managed Chrome (visible) via the same
-    //      connectBrowser capability. Idempotent — re-clicking is a no-op.
-    //   3. If the payload carries a url, navigate the visible window so
-    //      the user lands directly on the sign-in form.
-    //   4. Mark payload.signInStarted = true while keeping the row
-    //      pending. The UI re-renders with "I've signed in" / "Cancel"
-    //      buttons; "I've signed in" POSTs to /complete which switches
-    //      the browser to headless and resumes.
+    //   2. Confirm the agent's spawned headless Chrome is live (it always is
+    //      by this point — the agent asks to sign in only after hitting a wall
+    //      while browsing). Open an in-chat screencast of that same headless
+    //      Chrome over its CDP debug port. There is NO visible-window fallback:
+    //      the spawned Chrome is the only transport (issue #420).
+    //   3. Mark payload.signInStarted = true while keeping the row pending. The
+    //      UI re-renders with "I've signed in" / "Cancel" buttons; "I've signed
+    //      in" POSTs to /complete which tears the screencast bridge down and
+    //      resumes the task headless (cookies already in the shared profile).
     ["POST", /^\/api\/setup-requests\/([^/]+)\/open-browser$/, async (_request, params) => {
       const setupId = params[0];
       const before = readState(config.instance);
@@ -1144,88 +1144,19 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         const blocked = safetyCheck(targetUrl);
         if (blocked) return json({ error: blocked }, 400);
       }
-      // Screencast path: when the agent's default spawned headless Chrome is
-      // already live, do NOT launch a visible window — the user signs in
-      // through the in-chat modal that screencasts that same headless Chrome.
-      // This keeps the agent on one browser the whole time (no teardown /
-      // relaunch) and is the common case now that the default browser is the
-      // spawned per-instance Chrome. Falls back to the managed visible window
-      // when no spawned Chrome is running (e.g. a cdp-attach configuration).
+      // Screencast is the ONLY sign-in path: the user signs in through the
+      // in-chat modal that screencasts the agent's already-running headless
+      // spawned Chrome over its CDP debug port. The agent and the user act on
+      // ONE browser the whole time — no teardown, no relaunch, no record. When
+      // no spawned Chrome is live (the agent hasn't browsed yet) there is
+      // nothing to screencast: reject with 409 rather than opening a visible
+      // window (the managed-window transport was removed — issue #420).
       const screencastPort = getScreencastPort();
-      if (screencastPort !== null) {
-        await mutateState(config.instance, (state) => {
-          const item = state.setupRequests.find((s) => s.id === setupId);
-          if (!item) return;
-          item.payload = {
-            ...item.payload,
-            signInStarted: true,
-            screencast: true,
-            openedAt: new Date().toISOString()
-          };
-          const reasonTarget = typeof setup.payload.reason === "string" && setup.payload.reason.length > 0
-            ? setup.payload.reason
-            : setup.target;
-          addAudit(
-            state,
-            {
-              actor: "user",
-              action: "browser.connect",
-              target: reasonTarget,
-              risk: "medium",
-              taskId: setup.taskId,
-              runId: setup.taskId ? state.tasks.find((task) => task.id === setup.taskId)?.runId : undefined,
-              approvalId: setup.id,
-              evidence: { stage: "open-browser", mode: "screencast", headless: true }
-            },
-            setup.taskId ? { taskId: setup.taskId } : setup.agentId ? { agentId: setup.agentId } : { system: true }
-          );
-          if (item.taskId) {
-            appendTrace(config.instance, item.taskId, {
-              type: "approval",
-              message: "Browser connect: sign-in screencast opened, awaiting sign-in",
-              data: { setupRequestId: setupId }
-            });
-          }
-        });
-        const refreshedScreencast = readState(config.instance).setupRequests.find((s) => s.id === setupId);
-        return json({ ok: true, setupRequest: refreshedScreencast, screencast: true });
-      }
-      // skipAudit so the capability does not write a reasonless row;
-      // we write a setup-aware row below that carries the originating
-      // setup id and reason.
-      const status = await connectBrowser(config, { mode: "managed" }, { skipAudit: true });
-      if (!status.connected) {
-        return json({ ok: false, error: "Browser failed to launch." }, 500);
-      }
-      let openedUrl: string | undefined;
-      let navigateError: string | undefined;
-      if (targetUrl && setup.taskId) {
-        try {
-          // browserNavigate returns a JSON envelope rather than
-          // throwing on a soft failure (safetyCheck refusal of a
-          // loopback redirect target, an unsupported URL, etc.).
-          // The previous code only caught throws and set openedUrl
-          // unconditionally — so a refused navigation falsely
-          // reported "user landed on the page." Parse the envelope
-          // and treat success:false as an error path so the
-          // setup-request row records the navigateError truthfully.
-          const navResult = await browserNavigate(setup.taskId, { url: targetUrl });
-          let parsed: { success?: boolean; error?: string } | undefined;
-          try {
-            parsed = JSON.parse(navResult) as { success?: boolean; error?: string };
-          } catch {
-            // Non-JSON return: treat as success for back-compat
-            // with any caller that might not stringify.
-            parsed = { success: true };
-          }
-          if (parsed && parsed.success === false) {
-            navigateError = parsed.error ?? "browser navigation refused";
-          } else {
-            openedUrl = targetUrl;
-          }
-        } catch (error) {
-          navigateError = error instanceof Error ? error.message : String(error);
-        }
+      if (screencastPort === null) {
+        return json(
+          { ok: false, error: "The agent's browser isn't running; cannot start sign-in." },
+          409
+        );
       }
       await mutateState(config.instance, (state) => {
         const item = state.setupRequests.find((s) => s.id === setupId);
@@ -1233,9 +1164,8 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         item.payload = {
           ...item.payload,
           signInStarted: true,
-          openedAt: new Date().toISOString(),
-          openedUrl: openedUrl ?? null,
-          navigateError: navigateError ?? null
+          screencast: true,
+          openedAt: new Date().toISOString()
         };
         const reasonTarget = typeof setup.payload.reason === "string" && setup.payload.reason.length > 0
           ? setup.payload.reason
@@ -1250,31 +1180,20 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
             taskId: setup.taskId,
             runId: setup.taskId ? state.tasks.find((task) => task.id === setup.taskId)?.runId : undefined,
             approvalId: setup.id,
-            evidence: {
-              stage: "open-browser",
-              mode: status.record?.mode,
-              headless: status.record?.headless ?? false,
-              pid: status.record?.pid ?? null,
-              openedUrl: openedUrl ?? null,
-              navigateError: navigateError ?? null
-            }
+            evidence: { stage: "open-browser", mode: "screencast", headless: true }
           },
-          setup.taskId
-            ? { taskId: setup.taskId }
-            : setup.agentId
-              ? { agentId: setup.agentId }
-              : { system: true }
+          setup.taskId ? { taskId: setup.taskId } : setup.agentId ? { agentId: setup.agentId } : { system: true }
         );
         if (item.taskId) {
           appendTrace(config.instance, item.taskId, {
             type: "approval",
-            message: "Browser connect: visible window opened, awaiting sign-in",
-            data: { setupRequestId: setupId, openedUrl, navigateError }
+            message: "Browser connect: sign-in screencast opened, awaiting sign-in",
+            data: { setupRequestId: setupId }
           });
         }
       });
-      const refreshed = readState(config.instance).setupRequests.find((s) => s.id === setupId);
-      return json({ ok: true, setupRequest: refreshed, openedUrl: openedUrl ?? null, navigateError: navigateError ?? null });
+      const refreshedScreencast = readState(config.instance).setupRequests.find((s) => s.id === setupId);
+      return json({ ok: true, setupRequest: refreshedScreencast, screencast: true });
     }],
 
     // Live sign-in screencast: stream JPEG frames of the agent's headless
@@ -3455,15 +3374,9 @@ function statusFromErrorMessage(message: string): number {
   // agent is active. Map to 400 so callers see a clean user-input error
   // rather than a 500.
   if (message.includes("no active agent")) return 400;
-  // Browser-connect surfaces user-input failures with these prefixes;
-  // forward them to 400 so the webapp can surface the original error text
-  // rather than a generic "internal error". Connectivity failures
-  // (unreachable CDP) and discovery failures (no Chrome on PATH) are also
-  // user-correctable, not internal errors.
-  if (message.startsWith("Invalid cdpUrl")) return 400;
-  if (message.startsWith("Unsupported cdpUrl protocol")) return 400;
-  if (message.startsWith("Invalid port")) return 400;
-  if (message.startsWith("Could not reach CDP endpoint")) return 400;
+  // Browser discovery failures (no Chrome and no bundled Chromium to fall
+  // back to) are user-correctable, so forward them to 400 with the original
+  // text rather than a generic "internal error".
   if (message.startsWith("Could not locate")) return 400;
   if (message.startsWith("Web update is only available")) return 400;
   // updateRuntime's single-flight guard: a second POST /api/update while one

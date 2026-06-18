@@ -1,11 +1,12 @@
 // Cross-platform Chrome discovery and launch-identity selection. Two jobs:
 // (1) findChromePath probes the canonical install locations for Chrome /
 // Chromium / Edge on macOS, Linux, and Windows (plus an explicit override env
-// var) and returns an absolute path or null; (2) resolveBrowserLaunchTarget /
-// launchPersistentChrome choose the binary and args the managed/persistent
-// launches use so the agent browser launches the detected branded Chrome and
-// presents as a normal Chrome rather than "Google Chrome for Testing". See ADR
-// browser-stealth-identity.md (issue #218).
+// var) and returns an absolute path or null; (2) resolveBrowserLaunchTarget +
+// cleanChromeUserAgent + CHROME_LAUNCH_ARGS choose the binary, args, and UA the
+// spawned launch (launchSpawnedChrome in chrome-launch.ts) uses so the agent
+// browser launches the detected branded Chrome and presents as a normal Chrome
+// rather than "Google Chrome for Testing". See ADR browser-stealth-identity.md
+// (issue #218).
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { homedir, platform } from "node:os";
@@ -16,7 +17,7 @@ const execFileAsync = promisify(execFile);
 
 const ENV_OVERRIDE = "GINI_CHROME_PATH";
 
-// Shared Chromium launch args for every managed/persistent launch.
+// Shared Chromium launch args for the spawned launch.
 // - AutomationControlled toggle clears navigator.webdriver so sites with
 //   automation-integrity checks treat the browser like a normal Chrome.
 // - password-store=basic makes Chrome encrypt the cookie/credential store
@@ -115,7 +116,7 @@ async function playwrightChromiumPath(): Promise<string | null> {
 // Returns the first existing Chrome-compatible binary path, or null if none
 // of the candidates are present on disk. This is the bundled-first FALLBACK
 // chain (used by resolveBrowserLaunchTarget when no branded Chrome is
-// installed, and as launchPersistentChrome's recovery when a branded launch
+// installed, and as launchSpawnedChrome's recovery when a branded launch
 // fails). Precedence:
 //   1. GINI_CHROME_PATH env var (user override, wins unconditionally so an
 //      override pointing at a missing path returns null rather than
@@ -165,13 +166,13 @@ function brandedChromePath(plat: NodeJS.Platform = platform()): string | null {
   return null;
 }
 
-// The binary a managed/persistent launch should drive.
+// The binary the spawned launch should drive.
 export interface ChromeLaunchTarget {
-  // Binary to launch (also probed for the UA and stored as record.chromePath).
-  // Branded Chrome when installed, else the bundled-first discovery chain, else null.
+  // Binary to launch (also probed for the UA). Branded Chrome when installed,
+  // else the bundled-first discovery chain, else null.
   executablePath: string | null;
   // True only when executablePath is a branded Google Chrome chosen for a normal-Chrome
-  // identity. Gates the bundled retry in launchPersistentChrome: only a branded launch that
+  // identity. Gates the bundled retry in launchSpawnedChrome: only a branded launch that
   // can't drive (CDP protocol drift) falls back; an override or already-bundled target rethrows.
   branded: boolean;
 }
@@ -237,48 +238,3 @@ export function cleanChromeUserAgent(
   return computed;
 }
 
-// Launch a persistent context as a normal branded Chrome. Resolves the binary
-// (detected branded Chrome, override, or bundled fallback), applies the shared
-// stealth args, normalizes the headless UA per binary, and — when the resolved
-// target is a branded Chrome — falls back to the bundled Chromium if the branded
-// launch can't start or drive (e.g. CDP protocol drift) so the agent browser
-// stays available. Returns the live context plus the binary path that actually
-// backed it (for UI display). See ADR browser-stealth-identity.md.
-export async function launchPersistentChrome(
-  chromium: {
-    launchPersistentContext: (dir: string, options: Record<string, unknown>) => Promise<unknown>;
-  },
-  dataDir: string,
-  opts: { headless: boolean; extraOptions?: Record<string, unknown> }
-): Promise<{ context: unknown; chromePath: string | null }> {
-  const target = await resolveBrowserLaunchTarget();
-  // Build options per binary so a bundled fallback recomputes the headless UA
-  // from the bundled binary rather than reusing the branded binary's UA.
-  const buildOptions = async (execPath: string | null): Promise<Record<string, unknown>> => {
-    const userAgent = opts.headless ? await cleanChromeUserAgent(execPath) : undefined;
-    return {
-      headless: opts.headless,
-      args: [...CHROME_LAUNCH_ARGS],
-      ...(userAgent ? { userAgent } : {}),
-      ...(opts.extraOptions ?? {}),
-      executablePath: execPath ?? undefined
-    };
-  };
-  try {
-    const context = await chromium.launchPersistentContext(
-      dataDir,
-      await buildOptions(target.executablePath)
-    );
-    return { context, chromePath: target.executablePath };
-  } catch (error) {
-    // Only a branded launch retries on the bundled Chromium: a too-new system
-    // Chrome can drift from playwright-core's pinned CDP protocol and fail to
-    // drive. An override or already-bundled target has no better fallback, so
-    // it rethrows. The retry reuses dataDir — Playwright tears down the failed
-    // launch's process (releasing the profile lock) before control returns here.
-    if (!target.branded) throw error;
-    const fallback = await findChromePath();
-    const context = await chromium.launchPersistentContext(dataDir, await buildOptions(fallback));
-    return { context, chromePath: fallback };
-  }
-}

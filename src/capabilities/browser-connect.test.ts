@@ -1,7 +1,13 @@
-import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { __test, connectBrowser, disconnectBrowser, getBrowserConnection, type ConnectInput } from "./browser-connect";
+import {
+  __test,
+  completeBrowserConnectSetup,
+  connectBrowser,
+  disconnectBrowser,
+  getBrowserConnection
+} from "./browser-connect";
 import { readState } from "../state";
 import type { RuntimeConfig } from "../types";
 
@@ -28,1024 +34,153 @@ afterAll(() => {
   rmSync(TEST_ROOT, { recursive: true, force: true });
 });
 
+// The runtime drives a single spawned per-instance Chrome (issue #420): there
+// is no managed-window or cdp-attach transport and no state.browser record.
+// connect/disconnect are thin status acknowledgements; sign-in happens via the
+// in-chat screencast (exercised through the HTTP route in src/http.test.ts).
 describe("browser-connect helpers", () => {
-  test("redactUrlCredentials strips user:pass@", () => {
-    const result = __test.redactUrlCredentials("ws://alice:secret@127.0.0.1:9222/devtools/browser/abc");
-    expect(result).not.toContain("alice");
-    expect(result).not.toContain("secret");
-    expect(result).toContain("127.0.0.1");
-  });
-
-  test("redactUrlCredentials leaves credential-free URLs alone", () => {
-    const url = "ws://127.0.0.1:9222/devtools/browser/abc";
-    expect(__test.redactUrlCredentials(url)).toBe(url);
-  });
-
-  test("redactUrlCredentials returns sentinel for invalid URLs", () => {
-    const result = __test.redactUrlCredentials("not a url");
-    expect(result).toBe("<redacted>");
-  });
-
-  test("cdpHttpForm rewrites ws:// to http://", () => {
-    expect(__test.cdpHttpForm("ws://127.0.0.1:9222/devtools/browser/abc")).toBe("http://127.0.0.1:9222");
-  });
-
-  test("cdpHttpForm rewrites wss:// to https://", () => {
-    expect(__test.cdpHttpForm("wss://example.com:9443/devtools/browser/abc")).toBe("https://example.com:9443");
-  });
-
-  test("validateCdpUrl accepts ws/wss/http/https", () => {
-    expect(__test.validateCdpUrl("ws://localhost:9222/").ok).toBe(true);
-    expect(__test.validateCdpUrl("wss://example.com/").ok).toBe(true);
-    expect(__test.validateCdpUrl("http://localhost:9222/").ok).toBe(true);
-    expect(__test.validateCdpUrl("https://example.com/").ok).toBe(true);
-  });
-
-  test("validateCdpUrl rejects unsupported protocols", () => {
-    const result = __test.validateCdpUrl("file:///etc/passwd");
-    expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.error).toContain("Unsupported");
-  });
-
-  test("validateCdpUrl rejects garbage input", () => {
-    const result = __test.validateCdpUrl("not a url");
-    expect(result.ok).toBe(false);
-  });
-
   test("profileDirFor lives under the instance root", () => {
     const config = testConfig("profile-dir");
     const dir = __test.profileDirFor(config);
     expect(dir.endsWith("chrome-profile")).toBe(true);
     expect(dir.includes("profile-dir")).toBe(true);
   });
+
+  test("ensureProfileDir materializes the per-instance profile dir", () => {
+    const config = testConfig("ensure-profile-dir");
+    const dir = __test.ensureProfileDir(config);
+    expect(existsSync(dir)).toBe(true);
+    expect(dir.endsWith("chrome-profile")).toBe(true);
+  });
 });
 
 describe("browser-connect API surface", () => {
-  beforeEach(() => {
-    // No-op — each test creates its own config via testConfig() which
-    // wipes the per-instance directory.
-  });
-
-  test("status is disconnected by default", () => {
+  test("status reports the stable disconnected shape", () => {
     const config = testConfig("status-empty");
     const status = getBrowserConnection(config);
     expect(status.connected).toBe(false);
-    expect(status.record).toBeUndefined();
   });
 
-  test("connect with a bad cdpUrl protocol is rejected", async () => {
-    const config = testConfig("connect-bad-url");
-    await expect(connectBrowser(config, { cdpUrl: "file:///nope" })).rejects.toThrow(/Unsupported/);
+  test("connect is a no-op acknowledgement (spawn-only transport)", async () => {
+    const config = testConfig("connect-noop");
+    const status = await connectBrowser(config, {});
+    expect(status.connected).toBe(false);
+    // No state record is ever written — the spawned Chrome carries no record.
+    expect(readState(config.instance).browser ?? null).toBeNull();
   });
 
-  test("connect with garbage cdpUrl is rejected", async () => {
-    const config = testConfig("connect-garbage-url");
-    await expect(connectBrowser(config, { cdpUrl: "not-a-url" })).rejects.toThrow(/Invalid cdpUrl/);
+  test("connect ignores its input body and never writes a record", async () => {
+    const config = testConfig("connect-ignores-input");
+    // Even a fully-populated legacy body is ignored: no cdpUrl/managed handling.
+    const status = await connectBrowser(config, { mode: "managed", headless: true });
+    expect(status.connected).toBe(false);
+    expect(readState(config.instance).browser ?? null).toBeNull();
   });
 
-  test("connect with an unreachable cdpUrl fails after the probe timeout", async () => {
-    const config = testConfig("connect-unreachable");
-    // Port 1 is reserved and refused everywhere — the probe loop will never
-    // get a response. We shrink the probe deadline via the in-process
-    // `internal` arg (off-limits to network callers) so the failure path is
-    // exercised without burning the real 15s budget; production still
-    // defaults to PROBE_TIMEOUT_MS.
-    await expect(
-      connectBrowser(config, { cdpUrl: "http://127.0.0.1:1/" }, { probeTimeoutMs: 50, probeIntervalMs: 10 })
-    ).rejects.toThrow(/Could not reach CDP endpoint/);
-  }, 30_000);
+  test("connect with no args defaults the input and stays a no-op", async () => {
+    const config = testConfig("connect-default-args");
+    const status = await connectBrowser(config);
+    expect(status.connected).toBe(false);
+  });
 
-  test("disconnect on an empty state is a no-op", async () => {
+  test("disconnect drops the in-process handle and reports disconnected", async () => {
     const config = testConfig("disconnect-empty");
     const status = await disconnectBrowser(config);
     expect(status.connected).toBe(false);
-    const state = readState(config.instance);
-    expect(state.browser ?? null).toBeNull();
+    expect(readState(config.instance).browser ?? null).toBeNull();
   });
 
-  test("connectExisting persists redacted credentials in the audit row when state is mutated", async () => {
-    // We can't exercise the full connectExisting path without a real CDP
-    // endpoint, but we can directly verify the redaction helper covers
-    // the audit shape the capability writes. The mutateState-coupled
-    // happy path is exercised end-to-end in the integration smoke run.
-    const dirty = "ws://user:pass@127.0.0.1:9222/devtools/browser/abc";
-    expect(__test.redactUrlCredentials(dirty)).not.toContain("pass");
-    expect(__test.redactUrlCredentials(dirty)).toContain("127.0.0.1");
-  });
-
-  test("idempotent connect: an existing dead record is cleared before retrying", async () => {
-    const config = testConfig("idempotent-dead");
-    // Seed a fake CDP record pointing at an unreachable port. When
-    // connectBrowser sees an existing record it should re-probe, fail,
-    // clear the record, and only THEN attempt the requested path. We
-    // ask for a managed launch but the test environment has no Chrome,
-    // so we expect the call to fail at the launch step (or earlier).
-    // The success criterion is that the stale record was cleared.
-    const { mutateState } = await import("../state");
-    await mutateState(config.instance, (state) => {
-      state.browser = {
-        mode: "cdp",
-        cdpUrl: "ws://127.0.0.1:1/devtools/browser/dead",
-        pid: null,
-        dataDir: null,
-        chromePath: null,
-        startedAt: new Date().toISOString()
-      };
-    });
-
-    // Now call connect with a cdpUrl that's also unreachable. Both the
-    // pre-probe and the fresh attempt should fail; the important
-    // assertion is that the dead record was cleared mid-flight. The tiny
-    // probe deadline (in-process arg only) keeps both unreachable probes
-    // fast without changing the production default.
-    await expect(
-      connectBrowser(config, { cdpUrl: "http://127.0.0.1:1/" }, { probeTimeoutMs: 50, probeIntervalMs: 10 })
-    ).rejects.toThrow();
-    const state = readState(config.instance);
-    expect(state.browser ?? null).toBeNull();
-  }, 60_000);
-});
-
-describe("browser-connect round-1 hardening", () => {
-  test("safetyCheck blocks IPv4-mapped IPv6 metadata via ws://", async () => {
-    const config = testConfig("safety-mapped-metadata");
-    // The SSRF guard converts the ws:// URL to its http:// sibling and
-    // hands that off to safetyCheck. The IPv4-mapped IPv6 form of
-    // 169.254.169.254 is one of the cloud metadata bypasses we
-    // specifically must reject.
-    await expect(
-      connectBrowser(config, { cdpUrl: "ws://[::ffff:169.254.169.254]:9222/devtools/browser/abc" })
-    ).rejects.toThrow(/Invalid cdpUrl/);
-  });
-
-  test("safetyCheck blocks link-local IPv6 over wss://", async () => {
-    const config = testConfig("safety-linklocal-ipv6");
-    await expect(
-      connectBrowser(config, { cdpUrl: "wss://[fe80::1]:9222/devtools/browser/abc" })
-    ).rejects.toThrow(/Invalid cdpUrl/);
-  });
-
-  test("stripUrlCredentials drops user:pass@ for storage", () => {
-    const stripped = __test.stripUrlCredentials("ws://alice:secret@127.0.0.1:9222/devtools/browser/abc");
-    expect(stripped).not.toContain("alice");
-    expect(stripped).not.toContain("secret");
-    expect(stripped).toContain("127.0.0.1");
-  });
-
-  test("stripUrlCredentials leaves clean URLs untouched", () => {
-    const clean = "ws://127.0.0.1:9222/devtools/browser/abc";
-    expect(__test.stripUrlCredentials(clean)).toBe(clean);
-  });
-
-  test("idempotent connect refreshes cdpUrl from the probe response", async () => {
-    const config = testConfig("idempotent-refresh");
-    // Stand up a tiny HTTP server that pretends to be /json/version. We
-    // record a stale URL, then watch the connect flow refresh it to the
-    // new UUID the server reports.
-    let server: ReturnType<typeof Bun.serve> | undefined;
-    try {
-      server = Bun.serve({
-        port: 0,
-        async fetch(request) {
-          const url = new URL(request.url);
-          if (url.pathname === "/json/version") {
-            return Response.json({
-              Browser: "TestChrome/0.0",
-              webSocketDebuggerUrl: `ws://127.0.0.1:${server!.port}/devtools/browser/FRESH-UUID`
-            });
-          }
-          return new Response("nope", { status: 404 });
-        }
-      });
-      const { mutateState } = await import("../state");
-      await mutateState(config.instance, (state) => {
-        state.browser = {
-          mode: "cdp",
-          cdpUrl: `ws://127.0.0.1:${server!.port}/devtools/browser/OLD-STALE-UUID`,
-          pid: null,
-          dataDir: null,
-          chromePath: null,
-          startedAt: new Date().toISOString()
-        };
-      });
-
-      const result = await connectBrowser(config, {});
-      expect(result.connected).toBe(true);
-      expect(result.record?.cdpUrl).toContain("FRESH-UUID");
-      expect(result.record?.cdpUrl).not.toContain("OLD-STALE-UUID");
-      // State should also reflect the refresh.
-      const persisted = readState(config.instance).browser;
-      expect(persisted?.cdpUrl).toContain("FRESH-UUID");
-    } finally {
-      server?.stop(true);
-    }
-  });
-});
-
-describe("browser-connect round-2 hardening", () => {
-  test("mismatch-reconnect drops the in-process handle before fresh attempt", async () => {
-    const config = testConfig("mismatch-teardown");
-    const { mutateState } = await import("../state");
-    // Seed a managed record. The caller will request a different cdpUrl;
-    // the mismatch path must run the full teardown (clear state + drop
-    // the in-process Playwright handle via disconnectSharedBrowser) before
-    // attempting the fresh launch. Closing the context terminates the
-    // Chromium child Playwright launched — no separate PID kill needed.
-    // Install a fake context so disconnectSharedBrowser can call close()
-    // on it without spawning a real browser.
+  test("disconnect tears down the live spawned handle without touching the profile", async () => {
+    const config = testConfig("disconnect-live-handle");
     const browserMod = await import("../tools/browser");
-    let contextCloseCount = 0;
-    browserMod.__test.installFakeManagedContextForTest({
-      close: async () => {
-        contextCloseCount++;
-      }
-    });
-    await mutateState(config.instance, (state) => {
-      state.browser = {
-        mode: "managed",
-        cdpUrl: __test.MANAGED_CDP_SENTINEL,
-        pid: 424242,
-        dataDir: "/tmp/never-was-real",
-        chromePath: "/never/was/real/chrome",
-        startedAt: new Date().toISOString()
-      };
-    });
-
-    // Ask for a different cdpUrl. The fresh attach will fail (unreachable
-    // port), but the assertion is about the *teardown order*: the managed
-    // context's close() must have run BEFORE the launch attempt rejected,
-    // and state must be cleared on failure. Tiny probe deadline (in-process
-    // arg) keeps the unreachable fresh-attach probe fast; production default
-    // is unchanged.
-    await expect(
-      connectBrowser(
-        config,
-        { cdpUrl: "ws://127.0.0.1:1/devtools/browser/NEW" },
-        { probeTimeoutMs: 50, probeIntervalMs: 10 }
-      )
-    ).rejects.toThrow();
-    expect(contextCloseCount).toBe(1);
-    const persisted = readState(config.instance).browser;
-    expect(persisted ?? null).toBeNull();
-    browserMod.__test.uninstallFakeBrowserForTest();
-  }, 30_000);
-
-  test("concurrent disconnect calls run a single teardown sequence", async () => {
-    const config = testConfig("disconnect-coalesced");
-    const { mutateState } = await import("../state");
-    await mutateState(config.instance, (state) => {
-      state.browser = {
-        mode: "managed",
-        cdpUrl: __test.MANAGED_CDP_SENTINEL,
-        pid: 111111,
-        dataDir: "/tmp/coalesced-data-dir",
-        chromePath: "/never/real/chrome",
-        startedAt: new Date().toISOString()
-      };
-    });
-    const browserMod = await import("../tools/browser");
-    let closeCount = 0;
-    browserMod.__test.installFakeManagedContextForTest({
-      close: async () => {
-        closeCount++;
-        // Simulate a teardown that takes a moment so concurrent callers
-        // really do overlap. Without pendingDisconnect, the second caller
-        // would race the first.
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-    });
-    const [a, b] = await Promise.all([
-      disconnectBrowser(config),
-      disconnectBrowser(config)
-    ]);
-    expect(a.connected).toBe(false);
-    expect(b.connected).toBe(false);
-    // Both calls should coalesce onto the same pendingDisconnect: the
-    // managed context's close() runs exactly once.
-    expect(closeCount).toBe(1);
-    browserMod.__test.uninstallFakeBrowserForTest();
-  });
-});
-
-describe("browser-connect round-3 hardening", () => {
-  test("blocked replacement cdpUrl does NOT tear down existing managed record", async () => {
-    const config = testConfig("blocked-keeps-existing");
-    const { mutateState } = await import("../state");
-    // Seed a managed record. A bad-input connect must not tear down the
-    // user's Chrome before validation fires — the round-3 fix lifts
-    // validation to the top of connectBrowserInner so the SSRF/safety
-    // check happens BEFORE we even read `existing`.
-    const browserMod = await import("../tools/browser");
-    let closeCalled = false;
-    browserMod.__test.installFakeManagedContextForTest({
-      close: async () => {
-        closeCalled = true;
-      }
-    });
-    await mutateState(config.instance, (state) => {
-      state.browser = {
-        mode: "managed",
-        cdpUrl: __test.MANAGED_CDP_SENTINEL,
-        pid: 555555,
-        dataDir: "/tmp/keep-me",
-        chromePath: "/never/real/chrome",
-        startedAt: new Date().toISOString()
-      };
-    });
-    // IPv4-mapped IPv6 metadata bypass — safetyCheck rejects with a
-    // "Blocked: ..." message wrapped in "Invalid cdpUrl: ...".
-    await expect(
-      connectBrowser(config, { cdpUrl: "ws://[::ffff:169.254.169.254]:9222/" })
-    ).rejects.toThrow(/Invalid cdpUrl/);
-    expect(closeCalled).toBe(false);
-    // Old record is still there — we did not tear anything down.
-    const persisted = readState(config.instance).browser;
-    expect(persisted?.pid).toBe(555555);
-    expect(persisted?.dataDir).toBe("/tmp/keep-me");
-    browserMod.__test.uninstallFakeBrowserForTest();
-  });
-
-  test("malformed replacement cdpUrl does NOT tear down existing managed record", async () => {
-    const config = testConfig("malformed-keeps-existing");
-    const { mutateState } = await import("../state");
-    const browserMod = await import("../tools/browser");
-    let closeCalled = false;
-    browserMod.__test.installFakeManagedContextForTest({
-      close: async () => {
-        closeCalled = true;
-      }
-    });
-    await mutateState(config.instance, (state) => {
-      state.browser = {
-        mode: "managed",
-        cdpUrl: __test.MANAGED_CDP_SENTINEL,
-        pid: 555556,
-        dataDir: "/tmp/keep-me-malformed",
-        chromePath: "/never/real/chrome",
-        startedAt: new Date().toISOString()
-      };
-    });
-    await expect(connectBrowser(config, { cdpUrl: "not a url" })).rejects.toThrow(/Invalid cdpUrl/);
-    expect(closeCalled).toBe(false);
-    const persisted = readState(config.instance).browser;
-    expect(persisted?.pid).toBe(555556);
-    expect(persisted?.dataDir).toBe("/tmp/keep-me-malformed");
-    browserMod.__test.uninstallFakeBrowserForTest();
-  });
-
-  test("mismatch teardown of a cdp-mode record disconnects without close()", async () => {
-    const config = testConfig("cdp-mismatch-no-kill");
-    const { mutateState } = await import("../state");
-    // Seed a cdp-mode record (the user attached to an external Chrome).
-    // The caller then passes a *different* cdpUrl — the mismatch path
-    // must run teardown (clear state + disconnect the in-process handle)
-    // but must NOT close() the CDP Browser (close() over CDP terminates
-    // the user's Chrome).
-    const browserMod = await import("../tools/browser");
-    let disconnectCalled = false;
-    let closeCalled = false;
-    browserMod.__test.installFakeCdpBrowserForTest(
-      {
-        disconnect: async () => {
-          disconnectCalled = true;
-        },
-        close: async () => {
-          closeCalled = true;
-        }
-      }
-    );
-    await mutateState(config.instance, (state) => {
-      state.browser = {
-        mode: "cdp",
-        cdpUrl: "ws://127.0.0.1:9222/devtools/browser/EXTERNAL",
-        pid: null,
-        dataDir: null,
-        chromePath: null,
-        startedAt: new Date().toISOString()
-      };
-    });
-    // A different valid cdpUrl. The fresh attach will fail (unreachable
-    // port 1) but the assertion is about teardown selectivity. Tiny probe
-    // deadline (in-process arg) keeps the unreachable probe fast; production
-    // default is unchanged.
-    await expect(
-      connectBrowser(
-        config,
-        { cdpUrl: "ws://127.0.0.1:1/devtools/browser/OTHER" },
-        { probeTimeoutMs: 50, probeIntervalMs: 10 }
-      )
-    ).rejects.toThrow();
-    expect(disconnectCalled).toBe(true);
-    expect(closeCalled).toBe(false);
-    // State cleared by the teardown.
-    const persisted = readState(config.instance).browser;
-    expect(persisted ?? null).toBeNull();
-    browserMod.__test.uninstallFakeBrowserForTest();
-  }, 30_000);
-
-  test("mismatch teardown writes a browser.disconnect audit row", async () => {
-    const config = testConfig("mismatch-audit");
-    const { mutateState } = await import("../state");
-    const browserMod = await import("../tools/browser");
-    browserMod.__test.installFakeManagedContextForTest({
-      close: async () => undefined
-    });
-    await mutateState(config.instance, (state) => {
-      state.browser = {
-        mode: "managed",
-        cdpUrl: __test.MANAGED_CDP_SENTINEL,
-        pid: 777777,
-        dataDir: "/tmp/audit-old-dir",
-        chromePath: "/never/real/chrome",
-        startedAt: new Date().toISOString()
-      };
-    });
-    await expect(
-      connectBrowser(
-        config,
-        { cdpUrl: "ws://127.0.0.1:1/devtools/browser/NEW" },
-        { probeTimeoutMs: 50, probeIntervalMs: 10 }
-      )
-    ).rejects.toThrow();
-    const state = readState(config.instance);
-    const disconnects = state.audit.filter((row) => row.action === "browser.disconnect");
-    expect(disconnects.length).toBeGreaterThanOrEqual(1);
-    // The latest audit row should reference the old record's data dir
-    // as its target (managed-mode target convention).
-    expect(disconnects[0]!.target).toBe("/tmp/audit-old-dir");
-    browserMod.__test.uninstallFakeBrowserForTest();
-  }, 30_000);
-
-  test("pendingDisconnect coalesces concurrent disconnects and clears for the next call", async () => {
-    // With the managed-launchPersistentContext pivot, the session manager
-    // owns the close path and swallows teardown errors so the user is
-    // never left in a half-disconnected state. We can no longer assert
-    // that teardown errors propagate (they don't — by design). Instead
-    // verify the round-2 coalescing invariant: concurrent disconnects
-    // share a single in-flight promise, and the slot clears so a
-    // subsequent disconnect runs independently.
-    const config = testConfig("pending-disconnect-coalesce");
-    const { mutateState } = await import("../state");
-    const browserMod = await import("../tools/browser");
-    let closeCount = 0;
-    browserMod.__test.installFakeManagedContextForTest({
-      close: async () => {
-        closeCount++;
-        // Hold long enough that both concurrent callers latch onto the
-        // same pendingDisconnect promise.
-        await new Promise((resolve) => setTimeout(resolve, 20));
-      }
-    });
-    await mutateState(config.instance, (state) => {
-      state.browser = {
-        mode: "managed",
-        cdpUrl: __test.MANAGED_CDP_SENTINEL,
-        pid: 888888,
-        dataDir: "/tmp/coalesce-test",
-        chromePath: "/never/real/chrome",
-        startedAt: new Date().toISOString()
-      };
-    });
-    const [a, b] = await Promise.all([
-      disconnectBrowser(config),
-      disconnectBrowser(config)
-    ]);
-    expect(a.connected).toBe(false);
-    expect(b.connected).toBe(false);
-    expect(closeCount).toBe(1);
-
-    // pendingDisconnect cleared — a subsequent disconnect should re-run.
-    browserMod.__test.uninstallFakeBrowserForTest();
-    let secondCloseCount = 0;
-    browserMod.__test.installFakeManagedContextForTest({
-      close: async () => {
-        secondCloseCount++;
-      }
-    });
-    await mutateState(config.instance, (state) => {
-      state.browser = {
-        mode: "managed",
-        cdpUrl: __test.MANAGED_CDP_SENTINEL,
-        pid: 999999,
-        dataDir: "/tmp/coalesce-test-2",
-        chromePath: "/never/real/chrome",
-        startedAt: new Date().toISOString()
-      };
-    });
-    const followup = await disconnectBrowser(config);
-    expect(followup.connected).toBe(false);
-    expect(secondCloseCount).toBe(1);
-    browserMod.__test.uninstallFakeBrowserForTest();
-  });
-});
-
-describe("browser-connect managed launch via playwright", () => {
-  test("launchManaged calls chromium.launchPersistentContext and stores the record", async () => {
-    const config = testConfig("playwright-launch");
-    const launchCalls: Array<{ dataDir: string; options: Record<string, unknown> }> = [];
-    // Mock playwright-core so we exercise launchManaged without actually
-    // spawning Chrome. The fake context exposes browser()->process()->pid
-    // and a no-op close so the post-launch PID extraction path works.
-    mock.module("playwright-core", () => ({
-      chromium: {
-        executablePath: () => "/fake/path/to/chromium",
-        launchPersistentContext: async (dataDir: string, options: Record<string, unknown>) => {
-          launchCalls.push({ dataDir, options });
-          return {
-            browser: () => ({ process: () => ({ pid: 4242 }) }),
-            close: async () => undefined
-          };
-        }
-      }
-    }));
-    try {
-      const result = await connectBrowser(config, {});
-      expect(result.connected).toBe(true);
-      expect(result.record?.mode).toBe("managed");
-      expect(result.record?.pid).toBe(4242);
-      expect(result.record?.dataDir).toContain("chrome-profile");
-      expect(result.record?.cdpUrl).toBe(__test.MANAGED_CDP_SENTINEL);
-      expect(launchCalls.length).toBe(1);
-      expect(launchCalls[0]!.dataDir).toContain("chrome-profile");
-      expect(launchCalls[0]!.options.headless).toBe(false);
-      expect(Array.isArray(launchCalls[0]!.options.args)).toBe(true);
-      // Stealth arg is present so navigator.webdriver reads false.
-      expect(launchCalls[0]!.options.args as string[]).toContain(
-        "--disable-blink-features=AutomationControlled"
-      );
-      // Downloads land in the per-instance state dir, not ~/Downloads —
-      // macOS sandboxes ~/Downloads so the agent can't read files saved
-      // there. Saving under the instance dir keeps any download
-      // immediately accessible to Gini.
-      expect(launchCalls[0]!.options.acceptDownloads).toBe(true);
-      expect(typeof launchCalls[0]!.options.downloadsPath).toBe("string");
-      expect(launchCalls[0]!.options.downloadsPath as string).toMatch(/\/downloads$/);
-      expect(launchCalls[0]!.options.downloadsPath as string).toContain(config.instance);
-    } finally {
-      mock.restore();
-      const browserMod = await import("../tools/browser");
-      browserMod.__test.uninstallFakeBrowserForTest();
-    }
-  });
-
-  test("disconnect closes the managed context (which terminates Chromium)", async () => {
-    const config = testConfig("playwright-disconnect");
-    const { mutateState } = await import("../state");
-    const browserMod = await import("../tools/browser");
+    browserMod.setBrowserInstance(config.instance);
+    // Materialize a profile dir + sentinel cookie to prove disconnect leaves
+    // on-disk sign-ins intact.
+    const dir = __test.ensureProfileDir(config);
+    const sentinel = join(dir, "Cookies");
+    writeFileSync(sentinel, "fake-cookie-data");
     let contextClosed = false;
-    browserMod.__test.installFakeManagedContextForTest({
+    browserMod.__test.installFakeSpawnedHandleForTest(9333, {
       close: async () => {
         contextClosed = true;
       }
     });
-    await mutateState(config.instance, (state) => {
-      state.browser = {
-        mode: "managed",
-        cdpUrl: __test.MANAGED_CDP_SENTINEL,
-        pid: 5252,
-        dataDir: "/tmp/playwright-disconnect-data",
-        chromePath: "/fake/path/to/chromium",
-        startedAt: new Date().toISOString()
-      };
-    });
-    const status = await disconnectBrowser(config);
-    expect(status.connected).toBe(false);
-    expect(contextClosed).toBe(true);
-    const persisted = readState(config.instance).browser;
-    expect(persisted ?? null).toBeNull();
-    browserMod.__test.uninstallFakeBrowserForTest();
-  });
-});
-
-// The visible Connect flow still launches a headed persistent context via
-// chromium.launchPersistentContext against the per-instance chrome-profile
-// dir (the agent's DEFAULT browser path now spawns its own per-instance Chrome,
-// covered in src/tools/browser.test.ts — it shares this same per-instance
-// chrome-profile dir). This pins that Connect keeps using
-// launchPersistentContext, headed, against the per-instance profile so user
-// sign-ins persist there.
-describe("Connect launches a headed persistent context on the per-instance profile dir", () => {
-  test("Connect uses launchPersistentContext(headless: false) against the per-instance chrome-profile dir", async () => {
-    const config = testConfig("profile-stable");
-    const launchCalls: Array<{ dataDir: string; options: Record<string, unknown> }> = [];
-    mock.module("playwright-core", () => ({
-      chromium: {
-        executablePath: () => "/fake/path/to/chromium",
-        launchPersistentContext: async (dataDir: string, options: Record<string, unknown>) => {
-          launchCalls.push({ dataDir, options });
-          return {
-            pages: () => [],
-            newPage: async () => ({
-              on: () => undefined,
-              close: () => Promise.resolve(),
-              goto: () => Promise.resolve(null),
-              url: () => "about:blank",
-              title: () => Promise.resolve(""),
-              evaluate: () => Promise.resolve([])
-            }),
-            browser: () => ({ process: () => ({ pid: 9999 }) }),
-            close: async () => undefined
-          };
-        }
-      }
-    }));
-    const browserMod = await import("../tools/browser");
-    browserMod.__test.resetChromiumImportForTest();
-    browserMod.setBrowserInstance(config.instance);
     try {
-      const connectResult = await connectBrowser(config, {});
-      expect(connectResult.connected).toBe(true);
-      const disconnectResult = await disconnectBrowser(config);
-      expect(disconnectResult.connected).toBe(false);
-
-      expect(launchCalls.length).toBe(1);
-      const call = launchCalls[0]!;
-      expect(call.dataDir).toContain("chrome-profile");
-      expect(call.dataDir).toContain(config.instance);
-      // Connect opens a visible (headed) window.
-      expect(call.options.headless).toBe(false);
+      const status = await disconnectBrowser(config);
+      expect(status.connected).toBe(false);
+      expect(contextClosed).toBe(true);
+      // The on-disk profile (and its cookies) survive the disconnect.
+      expect(existsSync(sentinel)).toBe(true);
     } finally {
-      mock.restore();
       browserMod.__test.uninstallFakeBrowserForTest();
-      browserMod.__test.clearFakeSessionsForTest();
-      browserMod.__test.resetChromiumImportForTest();
       browserMod.setBrowserInstance("dev");
     }
   });
 });
 
-// Round-1 fix 3: state.browser must be cleared on runtime startup so a
-// stale managed record from a previous run doesn't make GET /api/browser
-// report `connected: true` and trigger an unprompted headed Chrome launch
-// on the next agent tool call. This test exercises the same mutateState
-// shape that src/server.ts runs at startup; the on-disk profile dir is
-// independent and stays put.
-describe("startup clears stale browser connection record", () => {
-  test("mutateState(state.browser = null) leaves on-disk profile untouched", async () => {
-    const config = testConfig("startup-clear-stale");
+// completeBrowserConnectSetup runs the non-screencast `/complete` fallback.
+// Sign-in normally happens in-place via the screencast bridge (handled in the
+// HTTP route), so this records that the user finished acting in the agent's
+// spawned Chrome and writes the rich browser.connect audit row.
+describe("completeBrowserConnectSetup", () => {
+  test("returns success and writes a single rich browser.connect audit row", async () => {
+    const config = testConfig("complete-setup");
+    const { result, ok } = await completeBrowserConnectSetup(config, {
+      id: "setup-1",
+      target: "fallback target",
+      taskId: undefined,
+      agentId: undefined,
+      payload: { reason: "Sign in to the store" }
+    });
+    expect(ok).toBe(true);
+    const parsed = JSON.parse(result) as { success: boolean; connected: boolean; mode?: string };
+    expect(parsed.success).toBe(true);
+    expect(parsed.connected).toBe(true);
+    expect(parsed.mode).toBe("spawned");
+
+    const rows = readState(config.instance).audit.filter((row) => row.action === "browser.connect");
+    expect(rows.length).toBe(1);
+    // The rich row carries the user-facing reason and the originating setup id.
+    expect(rows[0]!.target).toBe("Sign in to the store");
+    expect(rows[0]!.approvalId).toBe("setup-1");
+    expect(rows[0]!.evidence).toMatchObject({ success: true, mode: "spawned" });
+  });
+
+  test("falls back to setup.target when no reason is supplied, and binds task scope", async () => {
+    const config = testConfig("complete-setup-no-reason");
     const { mutateState } = await import("../state");
-    // Materialize a profile dir on disk to prove the wipe is independent
-    // of clearing the record.
-    const dir = __test.profileDirFor(config);
-    mkdirSync(dir, { recursive: true });
-    const sentinel = join(dir, "Cookies");
-    writeFileSync(sentinel, "fake-cookie-data");
-
-    // Seed a stale managed record (as if a previous runtime had a
-    // visible Chrome window before crashing/restarting).
-    await mutateState(config.instance, (state) => {
-      state.browser = {
-        mode: "managed",
-        cdpUrl: __test.MANAGED_CDP_SENTINEL,
-        pid: 424242,
-        dataDir: dir,
-        chromePath: "/fake/path",
-        startedAt: new Date().toISOString()
-      };
+    const { createTask, upsertTask } = await import("../state");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "complete", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
     });
-    expect(readState(config.instance).browser).not.toBeNull();
-
-    // Same shape src/server.ts runs at startup.
-    const existing = readState(config.instance).browser ?? null;
-    if (existing) {
-      await mutateState(config.instance, (state) => {
-        state.browser = null;
-      });
-    }
-
-    // Record gone, profile dir + sentinel cookie file untouched.
-    expect(readState(config.instance).browser ?? null).toBeNull();
-    expect(existsSync(sentinel)).toBe(true);
-  });
-});
-
-// Round-1 fix 1: launchManaged wraps disconnect-then-launch in
-// withTeardownLock so a parallel agent admission can't sneak in between
-// the two awaits and re-acquire the profile lock. We verify the lock by
-// installing a fake launchPersistentContext that, mid-launch, kicks off a
-// browserNavigate admission and asserts it rejects with the standard
-// "Browser disconnecting" sentinel.
-describe("launchManaged holds the teardown lock across the disconnect-then-launch sequence", () => {
-  test("a browserNavigate admission landing during launch is rejected", async () => {
-    const config = testConfig("launch-lock-admission");
-    const browserMod = await import("../tools/browser");
-    browserMod.setBrowserInstance(config.instance);
-    let admissionResultJson: string | undefined;
-    mock.module("playwright-core", () => ({
-      chromium: {
-        executablePath: () => "/fake/path/to/chromium",
-        launchPersistentContext: async () => {
-          // Mid-launch: simulate a browserNavigate landing while the lock
-          // is held. With the lock active, withSession should reject this
-          // immediately with the disconnecting sentinel — proving no agent
-          // tool call can sneak in between disconnectSharedBrowser and
-          // launchPersistentContext.
-          admissionResultJson = await browserMod.browserNavigate(
-            "launch-lock-admission-task",
-            { url: "https://example.com/" }
-          );
-          return {
-            pages: () => [],
-            newPage: async () => ({
-              on: () => undefined,
-              close: () => Promise.resolve(),
-              goto: () => Promise.resolve(null),
-              url: () => "about:blank",
-              title: () => Promise.resolve(""),
-              evaluate: () => Promise.resolve([])
-            }),
-            browser: () => ({ process: () => ({ pid: 7777 }) }),
-            close: async () => undefined
-          };
-        }
-      }
-    }));
-    browserMod.__test.resetChromiumImportForTest();
-    try {
-      await connectBrowser(config, {});
-      expect(admissionResultJson).toBeDefined();
-      const parsed = JSON.parse(admissionResultJson!) as { success: boolean; error?: string };
-      expect(parsed.success).toBe(false);
-      expect(parsed.error).toMatch(/disconnecting/i);
-    } finally {
-      mock.restore();
-      browserMod.__test.uninstallFakeBrowserForTest();
-      browserMod.__test.clearFakeSessionsForTest();
-      browserMod.__test.setInFlightDisconnectsForTest(0);
-      browserMod.__test.resetChromiumImportForTest();
-      browserMod.setBrowserInstance("dev");
-    }
-  });
-});
-
-// Strict-managed mode: the `browser_connect` tool dispatch promises a
-// visible managed Chrome to the user (via the approval card). When the
-// caller passes `mode: "managed"` and a non-managed record already exists
-// (typically a `cdp`-mode record from a previous /api/browser/connect),
-// the capability must tear down the stale record and launch a fresh
-// managed Chrome — NOT short-circuit and return the CDP record.
-describe("browser-connect strict managed mode", () => {
-  test("existing reachable cdp record + mode: 'managed' triggers teardown + fresh managed launch", async () => {
-    const config = testConfig("strict-managed-replaces-cdp");
-    // Stand up a real /json/version responder so the cdp record looks
-    // alive on probe. Without `mode: "managed"`, connectBrowser would
-    // happily refresh and return this cdp record — the exact silent-reuse
-    // bug from round-9 finding 1. With `mode: "managed"`, the capability
-    // must instead disconnect the in-process handle, clear state, and
-    // launch a fresh managed Chrome.
-    let server: ReturnType<typeof Bun.serve> | undefined;
-    const browserMod = await import("../tools/browser");
-    let cdpDisconnectCalled = false;
-    let cdpCloseCalled = false;
-    browserMod.__test.installFakeCdpBrowserForTest({
-      disconnect: async () => {
-        cdpDisconnectCalled = true;
-      },
-      close: async () => {
-        // close() over CDP would terminate the user's Chrome — must NOT
-        // be called by the strict-managed teardown path.
-        cdpCloseCalled = true;
-      }
+    const { ok } = await completeBrowserConnectSetup(config, {
+      id: "setup-2",
+      target: "the literal target",
+      taskId,
+      agentId: undefined,
+      payload: {}
     });
-    const launchCalls: Array<{ dataDir: string; options: Record<string, unknown> }> = [];
-    try {
-      server = Bun.serve({
-        port: 0,
-        async fetch(request) {
-          const url = new URL(request.url);
-          if (url.pathname === "/json/version") {
-            return Response.json({
-              Browser: "ExternalChrome/0.0",
-              webSocketDebuggerUrl: `ws://127.0.0.1:${server!.port}/devtools/browser/REACHABLE`
-            });
-          }
-          return new Response("nope", { status: 404 });
-        }
-      });
-      const { mutateState } = await import("../state");
-      await mutateState(config.instance, (state) => {
-        state.browser = {
-          mode: "cdp",
-          cdpUrl: `ws://127.0.0.1:${server!.port}/devtools/browser/EXTERNAL`,
-          pid: null,
-          dataDir: null,
-          chromePath: null,
-          startedAt: new Date().toISOString()
-        };
-      });
+    expect(ok).toBe(true);
+    const rows = readState(config.instance).audit.filter((row) => row.action === "browser.connect");
+    expect(rows.length).toBe(1);
+    expect(rows[0]!.target).toBe("the literal target");
+    expect(rows[0]!.taskId).toBe(taskId);
+  });
 
-      mock.module("playwright-core", () => ({
-        chromium: {
-          executablePath: () => "/fake/path/to/chromium",
-          launchPersistentContext: async (dataDir: string, options: Record<string, unknown>) => {
-            launchCalls.push({ dataDir, options });
-            return {
-              browser: () => ({ process: () => ({ pid: 4343 }) }),
-              close: async () => undefined
-            };
-          }
-        }
-      }));
-      browserMod.__test.resetChromiumImportForTest();
-
-      const result = await connectBrowser(config, { mode: "managed" });
-      // Result must be a fresh managed record — not the seeded cdp one.
-      expect(result.connected).toBe(true);
-      expect(result.record?.mode).toBe("managed");
-      expect(result.record?.pid).toBe(4343);
-      expect(result.record?.cdpUrl).toBe(__test.MANAGED_CDP_SENTINEL);
-      // Teardown of the existing cdp record happened (disconnect, not close).
-      expect(cdpDisconnectCalled).toBe(true);
-      expect(cdpCloseCalled).toBe(false);
-      // A managed launchPersistentContext fired.
-      expect(launchCalls.length).toBe(1);
-      expect(launchCalls[0]!.options.headless).toBe(false);
-      // Persisted state reflects the new managed record.
-      const persisted = readState(config.instance).browser;
-      expect(persisted?.mode).toBe("managed");
-      expect(persisted?.cdpUrl).toBe(__test.MANAGED_CDP_SENTINEL);
-    } finally {
-      server?.stop(true);
-      mock.restore();
-      browserMod.__test.uninstallFakeBrowserForTest();
-      browserMod.__test.clearFakeSessionsForTest();
-      browserMod.__test.resetChromiumImportForTest();
-    }
+  test("binds agent scope when only an agentId is present", async () => {
+    const config = testConfig("complete-setup-agent");
+    const { ok } = await completeBrowserConnectSetup(config, {
+      id: "setup-3",
+      target: "agent target",
+      taskId: undefined,
+      agentId: "agent-xyz",
+      payload: { reason: "Agent sign-in" }
+    });
+    expect(ok).toBe(true);
+    const rows = readState(config.instance).audit.filter((row) => row.action === "browser.connect");
+    expect(rows.length).toBe(1);
+    expect(rows[0]!.agentId).toBe("agent-xyz");
   });
 });
-
-// Headless-after-signin support: the Google Workspace setup skill
-// pivots from a visible Chrome (user signs in) to a headless one
-// (Gini continues the rest of Cloud Console invisibly) reusing the
-// SAME per-instance profile dir so cookies replay. This test exercises
-// the round-trip:
-//   1. connectBrowser({ mode: "managed" }) → headed launch, headless=false
-//   2. disconnectBrowser → close visible context, profile dir stays
-//   3. connectBrowser({ mode: "managed", headless: true }) → headless
-//      launch against the IDENTICAL data dir; persisted record stays
-//      mode === "managed" but carries headless: true.
-describe("browser-connect headless reuses signed-in profile", () => {
-  test("headed → close → headless relaunch hits same profile dir with headless: true", async () => {
-    const config = testConfig("headless-after-signin");
-    const launchCalls: Array<{ dataDir: string; options: Record<string, unknown> }> = [];
-    const browserMod = await import("../tools/browser");
-    let contextCloseCount = 0;
-    mock.module("playwright-core", () => ({
-      chromium: {
-        executablePath: () => "/fake/path/to/chromium",
-        launchPersistentContext: async (dataDir: string, options: Record<string, unknown>) => {
-          launchCalls.push({ dataDir, options });
-          return {
-            browser: () => ({ process: () => ({ pid: 4242 }) }),
-            close: async () => {
-              contextCloseCount++;
-            }
-          };
-        }
-      }
-    }));
-    browserMod.__test.resetChromiumImportForTest();
-    try {
-      // Step 1: visible managed connect (the "user signs in" step).
-      const headed = await connectBrowser(config, { mode: "managed" });
-      expect(headed.connected).toBe(true);
-      expect(headed.record?.mode).toBe("managed");
-      expect(headed.record?.headless ?? false).toBe(false);
-      expect(launchCalls.length).toBe(1);
-      expect(launchCalls[0]!.options.headless).toBe(false);
-
-      // Step 2: disconnect — closes the visible window, profile dir is
-      // untouched on disk.
-      const disconnect = await disconnectBrowser(config);
-      expect(disconnect.connected).toBe(false);
-      expect(contextCloseCount).toBe(1);
-
-      // Step 3: reconnect with headless: true and the SAME mode.
-      const headlessResult = await connectBrowser(config, { mode: "managed", headless: true });
-      expect(headlessResult.connected).toBe(true);
-      // Still managed mode — headless is a launch-time flag on the
-      // SAME managed lifecycle, not a distinct connection mode.
-      expect(headlessResult.record?.mode).toBe("managed");
-      expect(headlessResult.record?.headless).toBe(true);
-
-      // Two launches total, both against the IDENTICAL data dir (this
-      // is what makes cookie replay work — Chromium read the cookies
-      // the visible session wrote to that profile).
-      expect(launchCalls.length).toBe(2);
-      expect(launchCalls[1]!.dataDir).toBe(launchCalls[0]!.dataDir);
-      expect(launchCalls[1]!.dataDir).toContain("chrome-profile");
-      expect(launchCalls[1]!.dataDir).toContain(config.instance);
-      // The headless flag landed on the second launch's Playwright
-      // options.
-      expect(launchCalls[1]!.options.headless).toBe(true);
-      // downloadsPath stays set on the headless launch too — downloads
-      // from headless still need a readable destination.
-      expect(launchCalls[1]!.options.acceptDownloads).toBe(true);
-      expect(typeof launchCalls[1]!.options.downloadsPath).toBe("string");
-    } finally {
-      mock.restore();
-      browserMod.__test.uninstallFakeBrowserForTest();
-      browserMod.__test.clearFakeSessionsForTest();
-      browserMod.__test.resetChromiumImportForTest();
-    }
-  });
-
-  test("visibility mismatch on idempotent connect triggers teardown + fresh launch", async () => {
-    // When a headed managed record already exists and the caller asks
-    // for headless (or vice versa), the capability cannot short-circuit
-    // — it must tear down the live context and relaunch with the new
-    // visibility flag. Otherwise the caller's "I want this to be
-    // invisible now" intent is silently dropped.
-    const config = testConfig("headless-mismatch");
-    const launchCalls: Array<{ dataDir: string; options: Record<string, unknown> }> = [];
-    const browserMod = await import("../tools/browser");
-    let contextCloseCount = 0;
-    mock.module("playwright-core", () => ({
-      chromium: {
-        executablePath: () => "/fake/path/to/chromium",
-        launchPersistentContext: async (dataDir: string, options: Record<string, unknown>) => {
-          launchCalls.push({ dataDir, options });
-          return {
-            browser: () => ({ process: () => ({ pid: 5252 }) }),
-            close: async () => {
-              contextCloseCount++;
-            }
-          };
-        }
-      }
-    }));
-    browserMod.__test.resetChromiumImportForTest();
-    try {
-      // First: a headed managed launch lives on disk + in-process.
-      const headed = await connectBrowser(config, { mode: "managed" });
-      expect(headed.record?.headless ?? false).toBe(false);
-      expect(launchCalls.length).toBe(1);
-
-      // Second: ask for headless WITHOUT a disconnect in between. The
-      // visibility mismatch must force teardown and a fresh launch.
-      const headlessResult = await connectBrowser(config, { mode: "managed", headless: true });
-      expect(headlessResult.record?.headless).toBe(true);
-      expect(launchCalls.length).toBe(2);
-      expect(launchCalls[1]!.options.headless).toBe(true);
-      // The headed context was closed before the headless launch (so
-      // Chromium's profile-dir lock is free).
-      expect(contextCloseCount).toBeGreaterThanOrEqual(1);
-    } finally {
-      mock.restore();
-      browserMod.__test.uninstallFakeBrowserForTest();
-      browserMod.__test.clearFakeSessionsForTest();
-      browserMod.__test.resetChromiumImportForTest();
-    }
-  });
-});
-
-// Defense-in-depth: even if an authenticated HTTP caller sends
-// `{"skipAudit": true}` in the POST /api/browser/connect body, the
-// capability MUST still write its browser.connect audit row. The HTTP
-// route hands the body straight to connectBrowser without filtering, so
-// the field-level guarantee is that `skipAudit` does not exist on the
-// public `ConnectInput` type — only the in-process `internal` (third) arg
-// reads it. A regression that re-introduced `skipAudit` on `ConnectInput`
-// would let any token-holding client silently suppress its own audit
-// trail, breaking the tamper-resistance contract.
-describe("browser-connect audit row cannot be suppressed via input", () => {
-  test("smuggled skipAudit in input is ignored — capability still writes its audit row", async () => {
-    const config = testConfig("input-skip-audit-defense");
-    const browserMod = await import("../tools/browser");
-    mock.module("playwright-core", () => ({
-      chromium: {
-        executablePath: () => "/fake/path/to/chromium",
-        launchPersistentContext: async () => ({
-          browser: () => ({ process: () => ({ pid: 9090 }) }),
-          close: async () => undefined
-        })
-      }
-    }));
-    browserMod.__test.resetChromiumImportForTest();
-    try {
-      // Cast to any so we can simulate a malicious HTTP body that includes
-      // an unknown `skipAudit` key. TypeScript would reject this at the
-      // public boundary now that `ConnectInput` does not declare the
-      // field, but the JSON body parser doesn't — only our type contract
-      // (and the fact that we don't read `input.skipAudit` anywhere) does.
-      const status = await connectBrowser(
-        config,
-        { mode: "managed", skipAudit: true } as unknown as ConnectInput
-      );
-      expect(status.connected).toBe(true);
-      expect(status.record?.mode).toBe("managed");
-      // The audit row MUST have landed despite the smuggled flag.
-      const auditRows = readState(config.instance).audit.filter(
-        (row) => row.action === "browser.connect"
-      );
-      expect(auditRows.length).toBe(1);
-      expect(auditRows[0]!.evidence).toMatchObject({ mode: "managed" });
-    } finally {
-      mock.restore();
-      browserMod.__test.uninstallFakeBrowserForTest();
-      browserMod.__test.clearFakeSessionsForTest();
-      browserMod.__test.resetChromiumImportForTest();
-    }
-  });
-});
-

@@ -7,15 +7,13 @@
 // Playwright drives a persistent context over its PIPE transport
 // (`--remote-debugging-pipe`), which works under Bun; attaching to a
 // TCP CDP endpoint via connectOverCDP hangs on the WebSocket handshake under
-// playwright-core 1.60 + Bun (the same flakiness documented for the `cdp`
-// provider). We still inject a free `--remote-debugging-port` into the launch
-// args so the spawned Chrome ALSO exposes a debug endpoint — the sign-in
-// screencast bridge attaches to it over raw CDP — without routing the agent's
-// automation through that endpoint.
+// playwright-core 1.60 + Bun. We still inject a free `--remote-debugging-port`
+// into the launch args so the spawned Chrome ALSO exposes a debug endpoint —
+// the sign-in screencast bridge attaches to it over raw CDP — without routing
+// the agent's automation through that endpoint.
 //
-// Why this over the launchPersistentChrome helper: it free-picks the debug
-// port (which launchPersistentChrome does not) and owns the launch directly.
-// The caller (the spawned BrowserSessionProvider in browser.ts) passes the
+// This launcher free-picks the debug port and owns the launch directly. The
+// caller (the spawned BrowserSessionProvider in browser.ts) passes the
 // per-instance profile dir, so there is one shared browser per instance. The
 // user's own Chrome on the conventional :9222 is never launched onto, attached
 // to, or killed — we pick a port strictly above it.
@@ -197,7 +195,7 @@ export async function launchSpawnedChrome(options: LaunchSpawnedChromeOptions): 
     // Only a BRANDED launch retries on the bundled Chromium: a too-new system
     // Chrome can drift from playwright-core's pinned CDP protocol and fail to
     // drive. An override or already-bundled target has no better fallback, so
-    // it rethrows. Mirrors launchPersistentChrome in chrome-discovery.ts.
+    // it rethrows.
     if (!target.branded) throw error instanceof Error ? error : new Error(String(error));
     const fallback = await deps.findChromePath();
     if (!fallback) throw error instanceof Error ? error : new Error(String(error));
