@@ -129,6 +129,13 @@ follow-up race codex flagged: a side effect that started under a
 won claim race no longer survives a sibling denial or a runtime
 failure.
 
+This registry aborts the **side effect** of an approved tool. The
+parallel mechanism that aborts the **model call** of a chat turn lives
+in `src/execution/turn-abort.ts`; the same three terminal-transition
+paths fire it (via `recordInFlightAborted`) alongside
+`abortApprovalsForTask`. See
+[turn-model-call-abort.md](turn-model-call-abort.md) for that protocol.
+
 ## Errors
 
 Two distinct error classes drive the dispatcher's race-loss handling

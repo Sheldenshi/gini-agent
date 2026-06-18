@@ -25,6 +25,7 @@ Each file in this directory captures one architecture decision: the context, the
 - [Skills As Packages, Connectors As Credentials](skills-and-connectors.md)
 - [Typed, Named Credentials Referenced By Name](typed-named-credentials.md)
 - [Approval Execution Abort Protocol](approval-execution-abort.md)
+- [Turn Model-Call Abort Protocol](turn-model-call-abort.md)
 - [Runtime Update Surface And Automatic Restart](runtime-update-surface.md)
 - [Always-Up Supervision For launchd-Managed Instances](always-up-supervision.md)
 - [Sha-Keyed Production Serving For The Web Control Plane](web-production-serving.md)
