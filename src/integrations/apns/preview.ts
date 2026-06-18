@@ -48,8 +48,12 @@ export interface NotificationPreview {
 // Dependencies the builder reads, injected so the route handler passes the
 // live state lookups and tests pin them without a SQLite layer.
 export interface PreviewDeps {
-  // Latest non-empty assistant reply text for a session, or null.
+  // Latest non-empty assistant reply text for a session's MAIN chat, or null.
   latestAssistantText: (instance: Instance, sessionId: string) => string | null;
+  // Latest non-empty assistant reply WITHIN a thread, or null. Used when a
+  // completion push carries a threadId so the preview shows the thread's
+  // own reply rather than stale main-chat text.
+  latestAssistantTextForThread: (instance: Instance, sessionId: string, threadId: string) => string | null;
   // The session's human title (chat name), or null when not found.
   sessionTitle: (instance: Instance, sessionId: string) => string | null;
   // The pending authorization by id, or null when resolved / not found.
@@ -78,13 +82,19 @@ export function condense(text: string, max = MAX_BODY_CHARS): string {
 // 404 so the NSE falls back to the generic as-sent banner.
 export function buildNotificationPreview(
   instance: Instance,
-  params: { event: PreviewEvent; sessionId: string; approvalId?: string },
+  params: { event: PreviewEvent; sessionId: string; approvalId?: string; threadId?: string },
   deps: PreviewDeps
 ): NotificationPreview | null {
   const title = deps.sessionTitle(instance, params.sessionId);
 
   if (params.event === "message_completed") {
-    const text = deps.latestAssistantText(instance, params.sessionId);
+    // A threaded completion's reply lives under its threadId; resolve that
+    // so the banner shows the thread's own text, not stale main-chat text.
+    // Un-threaded completions read the main chat. (Both deep-link to the
+    // session on tap.)
+    const text = params.threadId
+      ? deps.latestAssistantTextForThread(instance, params.sessionId, params.threadId)
+      : deps.latestAssistantText(instance, params.sessionId);
     if (!text || text.trim().length === 0) return null;
     return {
       // Fall back to the generic title when the session has no name yet.

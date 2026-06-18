@@ -118,7 +118,8 @@ class NotificationService: UNNotificationServiceExtension {
             baseUrl: creds.baseUrl,
             event: event,
             sessionId: sessionId,
-            approvalId: routing?["approvalId"] as? String
+            approvalId: routing?["approvalId"] as? String,
+            threadId: routing?["threadId"] as? String
         ) else {
             nseLog.error("skip enrich: previewURL nil (baseUrl rejected by transport guard or unparseable)")
             deliver(bestAttempt)
@@ -248,7 +249,8 @@ class NotificationService: UNNotificationServiceExtension {
         baseUrl: String,
         event: String,
         sessionId: String,
-        approvalId: String?
+        approvalId: String?,
+        threadId: String?
     ) -> URL? {
         guard var components = URLComponents(string: baseUrl),
               let scheme = components.scheme?.lowercased(),
@@ -262,6 +264,11 @@ class NotificationService: UNNotificationServiceExtension {
         ]
         if let approvalId = approvalId, !approvalId.isEmpty {
             items.append(URLQueryItem(name: "approvalId", value: approvalId))
+        }
+        // Present only for a threaded completion; lets the gateway resolve
+        // the thread's own reply instead of stale main-chat text.
+        if let threadId = threadId, !threadId.isEmpty {
+            items.append(URLQueryItem(name: "threadId", value: threadId))
         }
         components.queryItems = items
         return components.url

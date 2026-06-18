@@ -12,6 +12,7 @@ import {
   createSetupRequest,
   getDevice,
   latestAssistantTextForSession,
+  latestAssistantTextForThread,
   listChatBlocks,
   listChatBlocksAfter,
   listThreadBlocks,
@@ -1692,6 +1693,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       const sessionId = (params.get("sessionId") ?? "").trim();
       const event = (params.get("event") ?? "").trim();
       const approvalId = (params.get("approvalId") ?? "").trim() || undefined;
+      const threadId = (params.get("threadId") ?? "").trim() || undefined;
       if (!sessionId) return json({ error: "sessionId is required" }, 400);
       if (event !== "message_completed" && event !== "authorization_requested" && event !== "setup_requested") {
         return json({ error: "event must be message_completed, authorization_requested, or setup_requested" }, 400);
@@ -1703,9 +1705,10 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       if (!session) return json({ error: `Chat session not found: ${sessionId}` }, 404);
       const preview = buildNotificationPreview(
         config.instance,
-        { event: event as PreviewEvent, sessionId, approvalId },
+        { event: event as PreviewEvent, sessionId, approvalId, threadId },
         {
           latestAssistantText: latestAssistantTextForSession,
+          latestAssistantTextForThread,
           sessionTitle: (_inst, id) =>
             readState(config.instance).chatSessions.find((s) => s.id === id)?.title ?? null,
           authorization: (_inst, id) =>

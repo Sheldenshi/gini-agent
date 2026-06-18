@@ -18,6 +18,7 @@ import {
   getMemoryDb,
   insertChatBlock,
   latestAssistantTextForSession,
+  latestAssistantTextForThread,
   listChatBlocks,
   listChatBlocksAfter,
   listThreadBlocks,
@@ -649,6 +650,40 @@ describe("chat-blocks persistence", () => {
     // No finalized reply yet → no preview (the generic banner stands until
     // the turn completes and its own push lands).
     expect(latestAssistantTextForSession(instance, sessionId)).toBeNull();
+  });
+
+  test("latestAssistantTextForThread returns the thread's own finalized reply", () => {
+    const instance = "chat-blocks-thread-latest";
+    const sessionId = "chat_threaded";
+    const root = insertChatBlock(instance, {
+      kind: "assistant_text", sessionId, text: "main chat reply", streaming: false
+    });
+    insertChatBlock(instance, {
+      kind: "assistant_text", sessionId, text: "thread reply one", streaming: false,
+      threadId: "thread_1", parentBlockId: root.id
+    });
+    insertChatBlock(instance, {
+      kind: "assistant_text", sessionId, text: "thread reply two", streaming: false,
+      threadId: "thread_1", parentBlockId: root.id
+    });
+    // Newest reply WITHIN the thread — never the main-chat block.
+    expect(latestAssistantTextForThread(instance, sessionId, "thread_1")).toBe("thread reply two");
+    // And it doesn't bleed across threads.
+    expect(latestAssistantTextForThread(instance, sessionId, "thread_other")).toBeNull();
+  });
+
+  test("latestAssistantTextForThread skips an in-flight streaming thread reply", () => {
+    const instance = "chat-blocks-thread-streaming";
+    const sessionId = "chat_threaded_stream";
+    insertChatBlock(instance, {
+      kind: "assistant_text", sessionId, text: "finalized thread reply", streaming: false,
+      threadId: "thread_2"
+    });
+    insertChatBlock(instance, {
+      kind: "assistant_text", sessionId, text: "partial", streaming: true,
+      threadId: "thread_2"
+    });
+    expect(latestAssistantTextForThread(instance, sessionId, "thread_2")).toBe("finalized thread reply");
   });
 
   test("rows persist taskId, runId, and agentId for indexable joins", () => {

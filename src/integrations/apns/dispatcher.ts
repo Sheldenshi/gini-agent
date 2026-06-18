@@ -145,12 +145,16 @@ export function buildMessageCompletedPayload(
     // Routing fields under `body` so expo-notifications surfaces them
     // as `content.data` on the client (see comment in
     // buildApprovalPayload). `silent: false` lets the client classifier
-    // branch uniformly on `data.silent`.
+    // branch uniformly on `data.silent`. `threadId` rides along when the
+    // completed turn was in a thread so the NSE's preview fetch can
+    // resolve the THREAD's own reply (the main-chat lookup would surface
+    // stale main-chat text); absent for ordinary main-chat completions.
     body: {
       sessionId: block.sessionId,
       blockId: block.id,
       event: "message_completed",
-      silent: false
+      silent: false,
+      ...(block.threadId ? { threadId: block.threadId } : {})
     }
   };
 }

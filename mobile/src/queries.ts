@@ -669,21 +669,26 @@ export function useChatStream(
       cancelled = true;
       closeStream();
       if (appStateSub) appStateSub.remove();
-      // Navigated away from this chat (sessionId/threadId change) or the
-      // screen unmounted — we've stopped watching THIS session. closeStream()
-      // closes our SSE end, but behind a relay the gateway-side socket can
-      // linger (see the AppState beacon above), leaving this session's
-      // watch-state stale and suppressing its completion pushes. Beacon a
-      // SESSION-SCOPED unwatch so the gateway drops only this session — not
-      // the whole device — which is critical here because the very next
-      // chat's stream is opening concurrently and a device-wide clear could
-      // race-wipe its fresh registration. Best-effort; the reopened chat
-      // re-registers via its own SSE handshake regardless.
-      if (sessionId) {
-        void api(`/push/unwatch?sessionId=${encodeURIComponent(sessionId)}`, { method: "POST" }).catch(() => {});
-      }
     };
   }, [sessionId, threadId]);
+
+  // Session-change / unmount unwatch beacon. Kept in its own effect keyed
+  // ONLY on sessionId (not threadId) so it fires when the user leaves a
+  // chat for good — not when they toggle between that chat's main view and
+  // a thread, which reuses the SAME /chat/:id/stream and must not have its
+  // watch-state cleared. closeStream() (in the effect above) closes our SSE
+  // end, but behind a relay the gateway-side socket can linger, leaving
+  // this session's watch-state stale and suppressing its completion pushes.
+  // A SESSION-SCOPED unwatch drops only this session (clearSessionWatch),
+  // never the whole device — the next chat's stream is opening concurrently
+  // and a device-wide clear could race-wipe its fresh registration.
+  // Best-effort; a reopened chat re-registers via its own SSE handshake.
+  useEffect(() => {
+    if (!sessionId) return;
+    return () => {
+      void api(`/push/unwatch?sessionId=${encodeURIComponent(sessionId)}`, { method: "POST" }).catch(() => {});
+    };
+  }, [sessionId]);
 
   // Gate the rendered value on the loaded-for sessionId. Between the
   // moment `sessionId` flips (chat A → chat B) and the reset effect

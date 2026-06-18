@@ -112,6 +112,7 @@ export {
   findInFlightAssistantTextForTask,
   taskProducedAssistantText,
   latestAssistantTextForSession,
+  latestAssistantTextForThread,
   getLatestMessagesBySession,
   subscribeChatBlocks,
   subscribeAllChatBlocks

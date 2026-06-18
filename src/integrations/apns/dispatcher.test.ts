@@ -634,6 +634,28 @@ describe("apns dispatcher", () => {
     expect(body.blockId).toBe("b1");
     expect(body.event).toBe("message_completed");
     expect(body.silent).toBe(false);
+    // No threadId on a main-chat completion.
+    expect(body.threadId).toBeUndefined();
+  });
+
+  test("buildMessageCompletedPayload carries threadId for a threaded completion", () => {
+    // So the NSE's preview fetch resolves the thread's own reply rather
+    // than stale main-chat text.
+    const payload = buildMessageCompletedPayload({
+      id: "b2",
+      sessionId: "chat_x",
+      instance: "test-inst" as Instance,
+      ordinal: 2,
+      createdAt: new Date().toISOString(),
+      kind: "phase",
+      label: "Completed",
+      taskId: "task_y",
+      threadId: "thread_9"
+    });
+    const body = payload.body as Record<string, unknown>;
+    expect(body.threadId).toBe("thread_9");
+    expect(body.sessionId).toBe("chat_x");
+    expect(body.event).toBe("message_completed");
   });
 
   test("buildApprovalPayload produces a stable, privacy-safe shape", () => {

@@ -559,15 +559,49 @@ export function latestAssistantTextForSession(
   instance: Instance,
   sessionId: string
 ): string | null {
+  return scanLatestFinalizedAssistantText(
+    instance,
+    `SELECT payload_json FROM chat_blocks
+     WHERE session_id = ? AND kind = 'assistant_text' AND thread_id IS NULL
+       AND json_extract(payload_json, '$.streaming') = 0
+     ORDER BY ordinal DESC`,
+    [sessionId]
+  );
+}
+
+// Thread variant: the newest finalized assistant reply WITHIN a specific
+// thread. The push dispatcher emits a `message_completed` alert for a
+// threaded turn too (the turn produced a real reply), but that reply lives
+// under a thread_id — so the main-chat lookup above would surface stale
+// main-chat text or nothing. The notification-preview endpoint calls this
+// instead when the push carries a threadId, so a threaded completion shows
+// the thread's own reply.
+export function latestAssistantTextForThread(
+  instance: Instance,
+  sessionId: string,
+  threadId: string
+): string | null {
+  return scanLatestFinalizedAssistantText(
+    instance,
+    `SELECT payload_json FROM chat_blocks
+     WHERE session_id = ? AND thread_id = ? AND kind = 'assistant_text'
+       AND json_extract(payload_json, '$.streaming') = 0
+     ORDER BY ordinal DESC`,
+    [sessionId, threadId]
+  );
+}
+
+// Shared scan: run the query (already ordered newest-first), return the
+// first row whose payload `text` is non-empty after trimming, else null.
+// Skips whitespace-only and malformed rows. Both the main-chat and thread
+// lookups above differ only in their WHERE clause, so they share this.
+function scanLatestFinalizedAssistantText(
+  instance: Instance,
+  sql: string,
+  params: string[]
+): string | null {
   const db = getMemoryDb(instance);
-  const rows = db
-    .query<{ payload_json: string }, [string]>(
-      `SELECT payload_json FROM chat_blocks
-       WHERE session_id = ? AND kind = 'assistant_text' AND thread_id IS NULL
-         AND json_extract(payload_json, '$.streaming') = 0
-       ORDER BY ordinal DESC`
-    )
-    .all(sessionId);
+  const rows = db.query<{ payload_json: string }, string[]>(sql).all(...params);
   for (const r of rows) {
     try {
       const payload = JSON.parse(r.payload_json) as { text?: unknown };

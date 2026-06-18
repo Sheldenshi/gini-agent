@@ -49,6 +49,7 @@ function buildSetup(overrides?: Partial<SetupRequest>): SetupRequest {
 function deps(overrides?: Partial<PreviewDeps>): PreviewDeps {
   return {
     latestAssistantText: () => null,
+    latestAssistantTextForThread: () => null,
     sessionTitle: () => null,
     authorization: () => null,
     setupRequest: () => null,
@@ -155,6 +156,33 @@ describe("buildNotificationPreview — message_completed", () => {
       })
     );
     expect(preview?.body).toBe("Line one. Line two. Line three.");
+  });
+
+  test("a threaded completion reads the THREAD's reply, not the main chat", () => {
+    const preview = buildNotificationPreview(
+      INST,
+      { event: "message_completed", sessionId: "chat_x", threadId: "thread_7" },
+      deps({
+        // Main-chat lookup must NOT be used for a threaded completion.
+        latestAssistantText: () => "stale main-chat message",
+        latestAssistantTextForThread: (_i, _s, tid) =>
+          tid === "thread_7" ? "the thread's own reply" : null,
+        sessionTitle: () => "Research"
+      })
+    );
+    expect(preview).toEqual({ title: "Research", body: "the thread's own reply" });
+  });
+
+  test("a threaded completion with no thread reply yet returns null (no stale main-chat leak)", () => {
+    const preview = buildNotificationPreview(
+      INST,
+      { event: "message_completed", sessionId: "chat_x", threadId: "thread_7" },
+      deps({
+        latestAssistantText: () => "stale main-chat message",
+        latestAssistantTextForThread: () => null
+      })
+    );
+    expect(preview).toBeNull();
   });
 });
 
