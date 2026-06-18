@@ -80,7 +80,7 @@ command -v gcloud
 
 ### Critical: where the binaries must land
 
-`terminal_exec` runs each command in `zsh -lc`, which does **not** source `~/.zshrc`. The gateway bakes `~/.local/bin` into `$PATH`, so any binary installed elsewhere (the gws release binary, the gcloud tarball under `~/google-cloud-sdk/bin`) must be moved or symlinked there; Homebrew installs are already on `$PATH`.
+`terminal_exec` runs each command in `zsh -lc`, which does **not** source `~/.zshrc`. The gateway bakes `~/.local/bin` into `$PATH`, so a binary installed elsewhere must be reachable from there (Homebrew installs already are). Move or symlink the `gws` release binary into `~/.local/bin`. Only **symlink** `gcloud` (`ln -s ~/google-cloud-sdk/bin/gcloud ~/.local/bin/`) — it's a launcher that finds its SDK relative to its real path, so moving it breaks it.
 
 ### Verify
 
