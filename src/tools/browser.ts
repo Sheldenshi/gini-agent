@@ -878,12 +878,10 @@ async function closeSession(taskId: string): Promise<void> {
   // shared handle.
 }
 
-// Drop the in-process Playwright handle without killing the underlying
-// browser process. Used by the browser-connect capability when the user
-// disconnects a CDP-attached Chrome: the next browser tool call should
-// re-read state and either re-attach (if a fresh record is set up) or
-// fall back to the headless launch path. Safe no-op when no shared
-// browser is held.
+// Drop the in-process Playwright handle and tear down the spawned Chrome it
+// holds. Used by the browser-connect capability's disconnect: the next browser
+// tool call lazily relaunches the SAME per-instance profile via ensureShared,
+// so the user's sign-ins survive. Safe no-op when no shared browser is held.
 export async function disconnectSharedBrowser(): Promise<void> {
   // Bump the generation FIRST so any in-flight admissions and any
   // pendingBrowser launch capture-and-compare can detect the disconnect
