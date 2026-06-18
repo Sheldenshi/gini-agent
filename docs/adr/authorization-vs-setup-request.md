@@ -72,6 +72,8 @@ No `/api/approvals*` alias is exposed; the legacy endpoint family is removed and
 
 `connector.request` and `chat.choice` cancellations resume the paused chat loop with a negative tool result (continue without the connector / continue past the skipped question) so the agent can keep going or explain what input is still required. Setup actions without an explicit continuation contract may mark the task failed on cancel rather than inventing a generic fallback.
 
+**Expiry.** A pending `SetupRequest` the user never acts on is not left to strand its task indefinitely. A periodic runtime sweep (`runSetupRequestSweep`, wired alongside the connector re-probe loop in `src/server.ts`) auto-cancels any request older than a TTL (`GINI_SETUP_REQUEST_TTL_MS`, default 24h) through the same `cancel` resolution as a manual dismissal, passing `actor: "runtime"` and `awaitResume: false` so the per-action continuation runs in the background and one slow or failing resume can't stall the pass. Per-action resolution still applies — connector/choice/confirmation requests resume as declined, fill-secret/login requests fail the task. The TTL is deliberately long: the queue serialization above already covers the live-reply case, so the sweep only reaps genuinely abandoned requests.
+
 ## Consequences
 
 - Three Web UI surfaces (home pending list, `/permissions`, in-chat card) render two sections backed by two queries.
