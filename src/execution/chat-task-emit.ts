@@ -287,9 +287,11 @@ export function setToolCallRunningHint(
 }
 
 // Flip a tool_call row's status (running → ok | error | denied). The
-// lookup is by (sessionId, callId) so callers don't need to remember
-// the block id — the chat-task loop and the approval-resume path both
-// know the call id.
+// lookup is by (sessionId, callId) scoped to ctx.taskId so callers don't
+// need the block id — the chat-task loop and the approval-resume path both
+// know the call id. The task scope matters because callId is not unique
+// within a session (the codex text-backstop synthesizes a deterministic id
+// that recurs across turns), so a settle must confine to its own turn's row.
 export function emitToolCallStatus(
   ctx: ChatEmitContext | undefined,
   params: {
