@@ -19,6 +19,7 @@ import {
   createAuthorization,
   createChatSession,
   createTask,
+  deleteChatSession,
   getMemoryDb,
   healOrphanedStreamingBlocks,
   insertChatBlock,
@@ -748,5 +749,216 @@ describe("per-turn AbortSignal", () => {
     await cancelTask(config, task.id);
     expect(countCancelledPhases()).toBe(1);
     expect(countCancelledNotes()).toBe(1);
+  });
+
+  // Interrupt-context marker: a cancelled chat turn persists a model-facing
+  // user-role row so the NEXT turn's replay tells the model the prior response
+  // was stopped by the user — matching Claude Code's [Request interrupted by
+  // user] / [Request interrupted by user for tool use]. priorChatMessages reads
+  // the durable chatMessages, so asserting on those rows is asserting on what
+  // the next turn replays to the provider.
+  const interruptMarkers = (instance: string, sessionId: string) =>
+    readState(instance).chatMessages.filter(
+      (m) =>
+        m.sessionId === sessionId &&
+        m.role === "user" &&
+        typeof m.content === "string" &&
+        m.content.startsWith("[Request interrupted by user")
+    );
+
+  test("cancelling a mid-stream turn persists a plain [Request interrupted by user] marker for the next turn", async () => {
+    const config = buildConfig(makeWorkspace(), uniqueInstance("interrupt-marker-plain"));
+    const provider = normalizeProvider(config.provider);
+    const session = await mutateState(config.instance, (state) =>
+      createChatSession(state, "interrupt-marker-plain", undefined, "agent_im")
+    );
+    // A held, tool-less model call so the cancel lands mid-stream (no tool use).
+    setEchoToolCallingResponse(
+      { provider, text: "answering slowly...", toolCalls: [], finishReason: "stop" },
+      undefined,
+      { delayMs: 3000 }
+    );
+
+    const task = await submitTask(config, "tell me a long story", { mode: "chat", chatSessionId: session.id });
+    await waitFor(() => readState(config.instance).tasks.find((t) => t.id === task.id)?.status === "running");
+    await cancelTask(config, task.id);
+    await waitFor(() => !__turnSnapshot(config.instance).some((e) => e.taskId === task.id), 3000);
+
+    const markers = interruptMarkers(config.instance, session.id);
+    expect(markers.length).toBe(1);
+    // Plain variant — no tool was in flight.
+    expect(markers[0]?.content).toBe("[Request interrupted by user]");
+    // Model-facing only: tagged tool_transcript so it's excluded from the human
+    // chat views and never becomes the session summary.
+    expect(markers[0]?.kind).toBe("tool_transcript");
+    expect(markers[0]?.taskId).toBe(task.id);
+    // It does NOT surface as a chat block in the UI stream (only the Cancelled
+    // system_note/phase do).
+    const blocks = listChatBlocks(config.instance, session.id);
+    expect(blocks.some((b) => "text" in b && typeof b.text === "string" && b.text.startsWith("[Request interrupted"))).toBe(false);
+  });
+
+  test("cancelling a turn parked on an approval gate persists the [...for tool use] marker variant", async () => {
+    const config = buildConfig(makeWorkspace(), uniqueInstance("interrupt-marker-tool"), "strict");
+    const provider = normalizeProvider(config.provider);
+    const session = await mutateState(config.instance, (state) =>
+      createChatSession(state, "interrupt-marker-tool", undefined, "agent_it")
+    );
+    // The model asks to run a shell command — gates in strict mode, parking the
+    // task at waiting_approval with a live tool gate. Cancelling there is a
+    // tool-use interrupt.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_x", type: "function", function: { name: "terminal_exec", arguments: JSON.stringify({ command: "echo hi" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+
+    const task = await submitTask(config, "run echo hi", { mode: "chat", chatSessionId: session.id });
+    await waitFor(() => readState(config.instance).tasks.find((t) => t.id === task.id)?.status === "waiting_approval");
+    await cancelTask(config, task.id);
+
+    const markers = interruptMarkers(config.instance, session.id);
+    expect(markers.length).toBe(1);
+    expect(markers[0]?.content).toBe("[Request interrupted by user for tool use]");
+  });
+
+  // The mid-dispatch window (issue #395): a gate row already exists but the
+  // loop hasn't yet persisted the task's `waiting_approval` status or its
+  // tool-call snapshot, so the first-approximation signal (status / snapshot)
+  // reads "no tool use" while a pending authorization proves otherwise.
+  // cancelTask folds that pending-gate set into the variant choice, so the
+  // marker is still `…for tool use`, not the plain one.
+  test("cancelling in the mid-dispatch window (pending gate, not yet waiting_approval) still gets the [...for tool use] variant", async () => {
+    const config = buildConfig(makeWorkspace(), uniqueInstance("interrupt-marker-middispatch"));
+    const seeded = await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "interrupt-marker-middispatch", undefined, "agent_md");
+      const t = createTask(config.instance, "run a gated command", undefined, undefined, undefined, undefined, undefined, session.id);
+      // Deliberately NOT waiting_approval and NO toolCallState snapshot — this
+      // is exactly the window the first-approximation signal misses.
+      t.status = "running";
+      t.mode = "chat";
+      // The only durable evidence a tool is in flight: a live pending gate row.
+      const pending = createAuthorization(state, {
+        taskId: t.id,
+        action: "terminal.exec",
+        target: "echo hi",
+        risk: "medium",
+        reason: "Run shell command",
+        payload: { command: "echo hi", toolCallId: "call_middispatch" }
+      });
+      t.approvalIds.push(pending.id);
+      state.tasks.push(t);
+      return { sessionId: session.id, taskId: t.id };
+    });
+
+    await cancelTask(config, seeded.taskId);
+
+    const markers = interruptMarkers(config.instance, seeded.sessionId);
+    expect(markers.length).toBe(1);
+    expect(markers[0]?.content).toBe("[Request interrupted by user for tool use]");
+  });
+
+  // A NON-gated tool (file_read, web_fetch, browser_*, …) executes outside any
+  // mutateState, between the loop committing a `running` recentToolCalls entry
+  // and flipping it to done/error. It creates no gate row and never populates
+  // toolCallState.pending, so the only in-state evidence it is mid-flight is the
+  // `running` recentToolCalls entry. A cancel landing there must still get the
+  // `…for tool use` variant — the plain marker would lose the tool-use nuance.
+  test("cancelling during a non-gated tool's execution (running recentToolCall, no gate) gets the [...for tool use] variant", async () => {
+    const config = buildConfig(makeWorkspace(), uniqueInstance("interrupt-marker-nongated"));
+    const seeded = await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "interrupt-marker-nongated", undefined, "agent_ng");
+      const t = createTask(config.instance, "read a big file", undefined, undefined, undefined, undefined, undefined, session.id);
+      // Mid-execution of a sync tool: running, no gate, no snapshot — only a
+      // `running` recentToolCalls entry marks the in-flight tool.
+      t.status = "running";
+      t.mode = "chat";
+      t.recentToolCalls = [
+        { id: "call_fileread", name: "file_read", argsPreview: "big.md", status: "running", startedAt: new Date().toISOString() }
+      ];
+      state.tasks.push(t);
+      return { sessionId: session.id, taskId: t.id };
+    });
+
+    await cancelTask(config, seeded.taskId);
+
+    const markers = interruptMarkers(config.instance, seeded.sessionId);
+    expect(markers.length).toBe(1);
+    expect(markers[0]?.content).toBe("[Request interrupted by user for tool use]");
+  });
+
+  // A completed (status:"done") recentToolCall is NOT in-flight: a tool that ran
+  // earlier in the turn and finished, then the model streamed a text answer that
+  // got cancelled, is a PLAIN interrupt — the tool wasn't running at cancel time.
+  test("cancelling with only a completed recentToolCall (tool already finished) gets the plain variant", async () => {
+    const config = buildConfig(makeWorkspace(), uniqueInstance("interrupt-marker-doneonly"));
+    const seeded = await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "interrupt-marker-doneonly", undefined, "agent_do");
+      const t = createTask(config.instance, "read then answer", undefined, undefined, undefined, undefined, undefined, session.id);
+      t.status = "running";
+      t.mode = "chat";
+      t.recentToolCalls = [
+        { id: "call_done", name: "file_read", argsPreview: "big.md", status: "done", startedAt: new Date().toISOString(), completedAt: new Date().toISOString() }
+      ];
+      state.tasks.push(t);
+      return { sessionId: session.id, taskId: t.id };
+    });
+
+    await cancelTask(config, seeded.taskId);
+
+    const markers = interruptMarkers(config.instance, seeded.sessionId);
+    expect(markers.length).toBe(1);
+    expect(markers[0]?.content).toBe("[Request interrupted by user]");
+  });
+
+  // deleteChatSession removes a session and its chatMessages but does not
+  // cancel the session's in-flight tasks, so a task can be cancelled after its
+  // session is gone. The marker write must skip in that case — createChatMessage
+  // would otherwise push a row that links to no session, recreating the orphan
+  // the delete just cleared (there is no orphan-chatMessages sweep to reclaim
+  // it). The session-existence guard runs inside the same mutateState as the
+  // delete, so the check is decisive.
+  test("cancelling a task whose chat session was already deleted does NOT recreate an orphan marker", async () => {
+    const config = buildConfig(makeWorkspace(), uniqueInstance("interrupt-marker-orphan"));
+    const seeded = await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "interrupt-marker-orphan", undefined, "agent_orph");
+      const t = createTask(config.instance, "a turn that outlives its session", undefined, undefined, undefined, undefined, undefined, session.id);
+      t.status = "running";
+      t.mode = "chat";
+      state.tasks.push(t);
+      return { sessionId: session.id, taskId: t.id };
+    });
+    // Delete the session out from under the still-running task.
+    await mutateState(config.instance, (state) => {
+      deleteChatSession(state, seeded.sessionId);
+    });
+
+    await cancelTask(config, seeded.taskId);
+
+    // No marker row was recreated for the deleted session.
+    expect(interruptMarkers(config.instance, seeded.sessionId).length).toBe(0);
+    // And no orphan chatMessage (one with no surviving session) leaked at all.
+    const orphans = readState(config.instance).chatMessages.filter(
+      (m) => !readState(config.instance).chatSessions.some((s) => s.id === m.sessionId)
+    );
+    expect(orphans.length).toBe(0);
+  });
+
+  test("a turn that completes normally does NOT get an interrupt marker", async () => {
+    const config = buildConfig(makeWorkspace(), uniqueInstance("interrupt-marker-none"));
+    const provider = normalizeProvider(config.provider);
+    const session = await mutateState(config.instance, (state) =>
+      createChatSession(state, "interrupt-marker-none", undefined, "agent_in")
+    );
+    // Fast, tool-less completion — never cancelled.
+    setEchoToolCallingResponse({ provider, text: "done.", toolCalls: [], finishReason: "stop" });
+
+    const task = await submitTask(config, "say done", { mode: "chat", chatSessionId: session.id });
+    await waitFor(() => readState(config.instance).tasks.find((t) => t.id === task.id)?.status === "completed");
+
+    expect(interruptMarkers(config.instance, session.id).length).toBe(0);
   });
 });
