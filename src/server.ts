@@ -5,6 +5,7 @@ import { resolveSessionFromCookie } from "./governance/pairing";
 import "./hooks/builtins"; // registers trusted hook handlers (skill-script) before the scheduler/backfill run
 import { runDueJobs } from "./jobs";
 import { runConnectorReprobe } from "./jobs/connector-reprobe";
+import { runSetupRequestSweep } from "./jobs/setup-request-sweep";
 import { runConnectorDetection } from "./jobs/connector-detection";
 import { runDailyReview } from "./learning/daily-review";
 import { syncProviderMcpServers } from "./integrations/mcp-sync";
@@ -413,6 +414,26 @@ const reprobeDone: Promise<void> = (async function reprobeLoop(): Promise<void> 
   }
 })();
 
+// Periodic setup-request sweep. Runs alongside the re-probe loop and
+// auto-cancels pending setup requests older than the TTL (default 24h) so
+// a genuinely-abandoned request doesn't strand its task in
+// `waiting_approval` forever. Cadence: every minute.
+const SETUP_SWEEP_TICK_INTERVAL_MS = Number(process.env.GINI_SETUP_SWEEP_TICK_MS ?? 60_000);
+let setupSweepStopped = false;
+const setupSweepDone: Promise<void> = (async function setupSweepLoop(): Promise<void> {
+  while (!setupSweepStopped) {
+    try {
+      await runSetupRequestSweep(config);
+    } catch (error) {
+      appendLog(config.instance, "setup-request.sweep.error", {
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+    if (setupSweepStopped) break;
+    await sleepUnlessStopping(SETUP_SWEEP_TICK_INTERVAL_MS);
+  }
+})();
+
 // Messaging inbound supervisor cadence. Shared across every bridge
 // supervisor (Telegram long-poll reconcile + Discord REST-poll
 // reconcile). A bridge added at runtime is picked up within one
@@ -517,6 +538,7 @@ async function shutdown(signal: "SIGTERM" | "SIGINT"): Promise<void> {
   appendLog(config.instance, "runtime.stopped", { signal });
   schedulerStopped = true;
   reprobeStopped = true;
+  setupSweepStopped = true;
   telegramStopped = true;
   discordStopped = true;
   skillReviewStopped = true;
@@ -570,6 +592,7 @@ async function shutdown(signal: "SIGTERM" | "SIGINT"): Promise<void> {
     Promise.all([
       schedulerDone.catch(() => {}),
       reprobeDone.catch(() => {}),
+      setupSweepDone.catch(() => {}),
       skillReviewDone.catch(() => {}),
       telegramDone.catch(() => {}),
       telegramSupervisor.stopAll().catch(() => {}),
