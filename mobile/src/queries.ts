@@ -811,7 +811,10 @@ export interface ThreadReplyInput {
 export function useReplyToThread(sessionId: string | null, threadId: string | null) {
   const qc = useQueryClient();
   return useMutation<
-    { sessionId: string; threadId: string; runId: string; taskId: string; status: string },
+    // A reply runs immediately, or queues behind a live turn (ADR
+    // chat-message-queue.md) and returns the pending id instead.
+    | { sessionId: string; threadId: string; runId: string; taskId: string; status: string }
+    | { sessionId: string; queued: true; pendingId: string },
     Error,
     ThreadReplyInput
   >({
