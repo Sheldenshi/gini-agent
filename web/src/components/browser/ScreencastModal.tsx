@@ -63,6 +63,12 @@ export function ScreencastModal({
   // trusted signal for which site they're typing credentials into.
   const [origin, setOrigin] = useState<string | null>(null);
   const dragStart = useRef<{ x: number; y: number; clientX: number; clientY: number; mods: number } | null>(null);
+  // Latest text selected on the REMOTE page. The server returns it after every
+  // selection-causing action (double/triple-click, drag, copy/cut/select-all),
+  // so a native Cmd+C/Cmd+X on the focused capture field can write it to the
+  // operator's clipboard synchronously — no async clipboard API (which is
+  // unavailable over plain HTTP) needed.
+  const remoteSelection = useRef("");
   // Move-coalescing: pointer move fires far faster than a round-trip, so cap it
   // to one in-flight POST and remember only the latest position, flushed when
   // the in-flight one returns. Keeps hover responsive without flooding the one
@@ -106,6 +112,22 @@ export function ScreencastModal({
         method: "POST",
         body: JSON.stringify(payload)
       }).catch(() => undefined);
+    },
+    [setupRequestId]
+  );
+
+  // Like sendInput, but captures the remote page's selection from the response
+  // (selection-causing actions) so a subsequent native copy/cut can serve it.
+  const sendInputCapturingSelection = useCallback(
+    (payload: Record<string, unknown>) => {
+      void api<{ ok: boolean; selection?: string }>(`/browser/screencast/${setupRequestId}/input`, {
+        method: "POST",
+        body: JSON.stringify(payload)
+      })
+        .then((res) => {
+          if (typeof res?.selection === "string") remoteSelection.current = res.selection;
+        })
+        .catch(() => undefined);
     },
     [setupRequestId]
   );
@@ -160,9 +182,14 @@ export function ScreencastModal({
     const end = toPage(e);
     const moved = Math.abs(e.clientX - start.clientX) > 4 || Math.abs(e.clientY - start.clientY) > 4;
     if (moved) {
-      sendInput({ kind: "dragselect", x0: start.x, y0: start.y, x1: end.x, y1: end.y, modifiers: start.mods });
+      // Drag-select and double/triple-click select text — capture the resulting
+      // remote selection so a following Cmd+C copies it.
+      sendInputCapturingSelection({ kind: "dragselect", x0: start.x, y0: start.y, x1: end.x, y1: end.y, modifiers: start.mods });
     } else {
-      sendInput({ kind: "click", x: start.x, y: start.y, clickCount: e.detail || 1, modifiers: start.mods });
+      const clickCount = e.detail || 1;
+      const click = { kind: "click", x: start.x, y: start.y, clickCount, modifiers: start.mods };
+      if (clickCount >= 2) sendInputCapturingSelection(click);
+      else sendInput(click);
     }
   };
   const onWheel = (e: React.WheelEvent) => {
@@ -170,7 +197,18 @@ export function ScreencastModal({
     sendInput({ kind: "scroll", x: p.x, y: p.y, dx: e.deltaX, dy: e.deltaY, modifiers: cdpModifiers(e) });
   };
   const onKeyDown = (e: React.KeyboardEvent) => {
+    const cmd = e.metaKey || e.ctrlKey;
+    const k = e.key.toLowerCase();
+    // Let the browser's own copy/cut/paste events fire for these — do NOT
+    // preventDefault, or the clipboard handlers below never run.
+    if (cmd && (k === "c" || k === "x" || k === "v")) return;
     e.preventDefault();
+    // Cmd+A selects all on the remote page (and the server returns the selection
+    // so a following Cmd+C copies it).
+    if (cmd && k === "a") {
+      sendInputCapturingSelection({ kind: "selectall" });
+      return;
+    }
     const mods = cdpModifiers(e);
     const printable = e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey;
     sendInput({
@@ -182,10 +220,30 @@ export function ScreencastModal({
       modifiers: mods
     });
   };
+  // Native clipboard events on the focused capture field cross the boundary and
+  // work even over plain HTTP (where navigator.clipboard is undefined).
+  // COPY OUT: write the cached remote selection into the operator's clipboard.
+  const onCopy = (e: React.ClipboardEvent) => {
+    if (!remoteSelection.current) return;
+    e.clipboardData.setData("text/plain", remoteSelection.current);
+    e.preventDefault();
+  };
+  const onCut = (e: React.ClipboardEvent) => {
+    if (!remoteSelection.current) return;
+    e.clipboardData.setData("text/plain", remoteSelection.current);
+    e.preventDefault();
+    sendInput({ kind: "cut" }); // delete the selection on the remote side
+  };
+  // PASTE IN: ship the operator's clipboard text to the remote page's field.
+  const onPaste = (e: React.ClipboardEvent) => {
+    const text = e.clipboardData.getData("text");
+    e.preventDefault();
+    if (text) sendInput({ kind: "paste", text });
+  };
 
   return (
     <Dialog open onOpenChange={(open) => { if (!open && !completing) onCancel(); }}>
-      <DialogContent className="max-w-[860px]">
+      <DialogContent className="flex h-[92vh] w-[96vw] max-w-[96vw] flex-col sm:max-w-[96vw]">
         <DialogHeader>
           <DialogTitle>{title}</DialogTitle>
           <DialogDescription>
@@ -201,7 +259,12 @@ export function ScreencastModal({
             {origin ?? "…"}
           </span>
         </div>
-        <div className="relative flex justify-center">
+        {/* Image area flexes to fill all leftover vertical space; min-h-0 lets it
+            shrink inside the flex column. The image fits within this box with
+            both dimensions capped (max-h/max-w-full) so its element box hugs the
+            painted pixels — required for the toPage() click mapping, which is why
+            object-contain (letterboxing inside a larger box) is NOT used. */}
+        <div className="relative flex min-h-0 flex-1 items-center justify-center">
           {/* Hidden field that holds keyboard focus so key events land here. */}
           <textarea
             ref={captureRef}
@@ -209,13 +272,16 @@ export function ScreencastModal({
             tabIndex={-1}
             className="absolute -left-[9999px] h-px w-px opacity-0"
             onKeyDown={onKeyDown}
+            onCopy={onCopy}
+            onCut={onCut}
+            onPaste={onPaste}
             onInput={(e) => { (e.target as HTMLTextAreaElement).value = ""; }}
           />
           {/* eslint-disable-next-line @next/next/no-img-element -- live screencast frames, not a static asset */}
           <img
             ref={imgRef}
             alt="agent browser screen"
-            className="max-h-[60vh] w-auto cursor-crosshair rounded border border-border bg-black"
+            className="max-h-full max-w-full cursor-crosshair rounded border border-border bg-black"
             draggable={false}
             onMouseDown={onMouseDown}
             onMouseUp={onMouseUp}

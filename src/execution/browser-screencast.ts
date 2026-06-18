@@ -39,12 +39,22 @@ const TARGET_WATCH_INTERVAL_MS = 700;
 // reached, and a free URL bar would bypass the agent's SSRF / domain-policy
 // gate (which lives on browser_navigate). Sign-in links are followed by
 // clicking them on the page, which Chrome routes normally.
+//
+// The clipboard kinds (paste/copy/cut/selectall) cross the operator↔page
+// boundary as TEXT only — `paste` inserts the operator's local clipboard text
+// via Input.insertText; `copy`/`cut`/`selectall` read the remote page's current
+// selection so the modal can write it to the operator's clipboard. None of them
+// carry a URL or trigger navigation, so the SSRF/no-navigate invariant holds.
 export type ScreencastInput =
   | { kind: "click"; x: number; y: number; clickCount?: number; modifiers?: number }
   | { kind: "move"; x: number; y: number; modifiers?: number }
   | { kind: "scroll"; x: number; y: number; dx: number; dy: number; modifiers?: number }
   | { kind: "dragselect"; x0: number; y0: number; x1: number; y1: number; modifiers?: number }
-  | { kind: "key"; text?: string; key?: string; code?: string; vk?: number; modifiers?: number };
+  | { kind: "key"; text?: string; key?: string; code?: string; vk?: number; modifiers?: number }
+  | { kind: "paste"; text: string }
+  | { kind: "copy" }
+  | { kind: "cut" }
+  | { kind: "selectall" };
 
 export interface CdpVersionTarget {
   id?: string;
@@ -158,17 +168,18 @@ export class ScreencastBridge {
     this.targetWatchMs = targetWatchMs;
   }
 
-  // Open the raw CDP socket to the spawned Chrome's first page target and start
-  // the screencast. Throws when no spawned Chrome is live (the caller surfaces
-  // that as "the agent's browser isn't running").
-  // `preferUrl` is the URL of the page the requesting task is actually on
-  // (from peekCurrentBrowserUrl). Because the spawned Chrome is a single
-  // shared context that can hold several page targets (other tasks, agent-
-  // opened tabs), we attach to the target whose URL matches the requesting
-  // task rather than blindly taking the first page — otherwise the operator
-  // could sign in on the wrong tab. Falls back to the first page target when
-  // no preferred URL is given or none matches.
-  async start(preferUrl?: string): Promise<void> {
+  // Open the raw CDP socket to the page target the requesting task is driving
+  // and start the screencast. Throws when no spawned Chrome is live (the caller
+  // surfaces that as "the agent's browser isn't running").
+  //
+  // The spawned Chrome is a single shared context that can hold several page
+  // targets (other concurrent tasks, agent-opened tabs). To show the operator
+  // the SAME page the agent's task is on — never a sibling task's tab — we bind
+  // by the task's CDP `targetId` (from peekCurrentBrowserTargetId, the id of
+  // session.page). That is unambiguous even when two tabs share a URL. `preferUrl`
+  // is a fallback hint (used when the targetId couldn't be resolved); the first
+  // page target is the last resort.
+  async start(preferUrl?: string, preferTargetId?: string): Promise<void> {
     const port = this.deps.resolvePort();
     if (port === null) {
       throw new Error("No spawned browser is running to screencast.");
@@ -176,7 +187,9 @@ export class ScreencastBridge {
     const targets = await this.deps.fetchJson(`http://127.0.0.1:${port}/json`);
     const pages = targets.filter((t) => t.type === "page" && t.webSocketDebuggerUrl);
     const pageTarget =
-      (preferUrl ? pages.find((t) => t.url === preferUrl) : undefined) ?? pages[0];
+      (preferTargetId ? pages.find((t) => t.id === preferTargetId) : undefined) ??
+      (preferUrl ? pages.find((t) => t.url === preferUrl) : undefined) ??
+      pages[0];
     if (!pageTarget?.webSocketDebuggerUrl) {
       throw new Error("No page target available on the spawned browser.");
     }
@@ -226,6 +239,9 @@ export class ScreencastBridge {
       void (async () => {
         try {
           await this.send("Page.enable");
+          // Runtime is needed for the clipboard copy/cut/selectall path, which
+          // reads the page's current selection via Runtime.evaluate.
+          await this.send("Runtime.enable");
           // A backgrounded headless tab is throttled and won't paint, so bring
           // it to the foreground before starting the screencast or the stream
           // yields zero frames.
@@ -542,26 +558,33 @@ export class ScreencastBridge {
   // control-panel mapping: printable chars with no Ctrl/Meta go through as
   // typed text; everything else (Enter/Tab/Backspace/arrows and any Cmd+<key>)
   // is a real key event carrying the modifier bitmask so page shortcuts fire.
-  async dispatchInput(m: ScreencastInput): Promise<void> {
-    const mods = m.modifiers ?? 0;
+  // Returns the remote page's current text selection for the selection-causing
+  // kinds (double/triple-click, dragselect, copy, cut, selectall), so the modal
+  // can write it to the operator's clipboard on a native copy/cut. Other kinds
+  // return undefined.
+  async dispatchInput(m: ScreencastInput): Promise<{ selection?: string }> {
+    const mods = "modifiers" in m ? (m.modifiers ?? 0) : 0;
     switch (m.kind) {
       case "click": {
         const clickCount = m.clickCount ?? 1;
         await this.send("Input.dispatchMouseEvent", { type: "mousePressed", x: m.x, y: m.y, button: "left", clickCount, modifiers: mods });
         await this.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: m.x, y: m.y, button: "left", clickCount, modifiers: mods });
-        break;
+        // A double/triple-click selects a word/line — surface the selection so a
+        // following operator Cmd+C copies it (mirrors the control panel).
+        if (clickCount >= 2) return { selection: await this.readSelection() };
+        return {};
       }
       case "move":
         await this.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: m.x, y: m.y, modifiers: mods });
-        break;
+        return {};
       case "scroll":
         await this.send("Input.dispatchMouseEvent", { type: "mouseWheel", x: m.x, y: m.y, deltaX: m.dx, deltaY: m.dy, modifiers: mods });
-        break;
+        return {};
       case "dragselect":
         await this.send("Input.dispatchMouseEvent", { type: "mousePressed", x: m.x0, y: m.y0, button: "left", clickCount: 1, modifiers: mods });
         await this.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: m.x1, y: m.y1, button: "left", modifiers: mods });
         await this.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: m.x1, y: m.y1, button: "left", clickCount: 1, modifiers: mods });
-        break;
+        return { selection: await this.readSelection() };
       case "key":
         if (m.text && m.text.length === 1 && (mods & CTRL_OR_META) === 0) {
           await this.send("Input.dispatchKeyEvent", { type: "char", text: m.text, modifiers: mods });
@@ -570,8 +593,57 @@ export class ScreencastBridge {
           await this.send("Input.dispatchKeyEvent", { type: "keyDown", ...base });
           await this.send("Input.dispatchKeyEvent", { type: "keyUp", ...base });
         }
-        break;
+        return {};
+      case "paste":
+        // Operator's LOCAL clipboard text, inserted into the remote page's
+        // focused field. Text only — no navigation, no SSRF surface.
+        await this.send("Input.insertText", { text: m.text });
+        return {};
+      case "selectall":
+        await this.selectAllRemote();
+        return { selection: await this.readSelection() };
+      case "copy":
+        return { selection: await this.readSelection() };
+      case "cut": {
+        const selection = await this.readSelection();
+        // Replace the selection with nothing = delete it (the "cut" half).
+        await this.send("Input.insertText", { text: "" });
+        return { selection };
+      }
     }
+  }
+
+  // Read the page's current selection — works for <input>/<textarea>
+  // (selectionStart/End) and ordinary DOM selection. Best-effort: returns "" on
+  // any evaluation failure so a clipboard action never throws.
+  private async readSelection(): Promise<string> {
+    try {
+      const res = (await this.send("Runtime.evaluate", {
+        expression: `(() => {
+          const el = document.activeElement;
+          if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') && el.selectionStart != null)
+            return el.value.substring(el.selectionStart, el.selectionEnd);
+          const s = window.getSelection();
+          return s ? s.toString() : '';
+        })()`,
+        returnByValue: true
+      })) as { result?: { value?: unknown } } | undefined;
+      const value = res?.result?.value;
+      return typeof value === "string" ? value : "";
+    } catch {
+      return "";
+    }
+  }
+
+  // Select all in the focused field (or the whole document) on the remote page.
+  private async selectAllRemote(): Promise<void> {
+    await this.send("Runtime.evaluate", {
+      expression: `(() => {
+        const el = document.activeElement;
+        if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')) { el.select(); return; }
+        if (document.execCommand) document.execCommand('selectAll', false, null);
+      })()`
+    });
   }
 
   isClosed(): boolean {
@@ -648,12 +720,12 @@ export class ScreencastBusyError extends Error {
 // Get the live bridge for `owner` (the setupRequest id), creating + starting one
 // if none is active (or the previous one closed). A request from a DIFFERENT
 // owner while the bridge is held throws ScreencastBusyError → 409, so two
-// concurrent sign-ins can't cross-wire onto one page. `preferUrl` is forwarded
-// to start() so the bridge attaches to the requesting task's page. Test seam:
-// pass a factory to inject a fake bridge.
+// concurrent sign-ins can't cross-wire onto one page. `prefer` (targetId +/or
+// url) is forwarded to start() so the bridge binds to the requesting task's
+// exact page. Test seam: pass a factory to inject a fake bridge.
 export async function getOrStartBridge(
   owner: string,
-  preferUrl?: string,
+  prefer?: { preferUrl?: string; preferTargetId?: string },
   factory: () => ScreencastBridge = () => new ScreencastBridge()
 ): Promise<ScreencastBridge> {
   if (activeBridge && !activeBridge.isClosed()) {
@@ -668,7 +740,7 @@ export async function getOrStartBridge(
   const startedAtGeneration = bridgeGeneration;
   startingOwner = owner;
   startingBridge = bridge
-    .start(preferUrl)
+    .start(prefer?.preferUrl, prefer?.preferTargetId)
     .then(() => {
       // A teardown landed while we were starting — don't install this bridge;
       // stop it so its CDP socket isn't orphaned.

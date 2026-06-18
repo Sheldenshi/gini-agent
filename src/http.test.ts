@@ -2778,7 +2778,11 @@ describe("runtime api", () => {
         onFrame({ data: "QUJD", meta: { deviceWidth: 800 } });
         return () => undefined;
       },
-      dispatchInput: async (m: unknown) => { dispatched.push(m); },
+      dispatchInput: async (m: { kind?: string }) => {
+        dispatched.push(m);
+        // Mirror the real bridge: selection-causing kinds return a selection.
+        return m.kind === "copy" ? { selection: "picked text" } : {};
+      },
       start: async () => undefined,
       stop: async () => undefined
     };
@@ -2811,6 +2815,15 @@ describe("runtime api", () => {
       });
       expect(inputRes.ok).toBe(true);
       expect(dispatched).toEqual([{ kind: "click", x: 10, y: 20, clickCount: 1 }]);
+
+      // A copy relays the remote selection back in the response body so the
+      // modal can serve it to the operator's clipboard.
+      const copyRes = await call(handler, config, `/api/browser/screencast/${setup.id}/input`, {
+        method: "POST",
+        body: JSON.stringify({ kind: "copy" })
+      });
+      expect(copyRes.ok).toBe(true);
+      expect(copyRes.selection).toBe("picked text");
     } finally {
       sc.__resetActiveBridgeForTest();
     }

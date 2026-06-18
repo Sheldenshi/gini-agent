@@ -28,6 +28,8 @@ import {
   disconnectSharedBrowser,
   domainPolicyBlockReason,
   hostnameIsLoopback,
+  peekCurrentBrowserTargetId,
+  peekCurrentBrowserUrl,
   redactSecretValuesFromString,
   safetyCheck,
   sanitizeDownloadFilename,
@@ -7618,5 +7620,68 @@ describe("browserVision loopback guard", () => {
     ) as { success: boolean; error?: string };
     expect(out.success).toBe(false);
     expect(out.error).toContain("loopback");
+  });
+});
+
+describe("peekCurrentBrowserUrl / peekCurrentBrowserTargetId", () => {
+  afterEach(() => {
+    browserTest.clearFakeSessionsForTest();
+  });
+
+  test("peekCurrentBrowserUrl returns the session page's url, or undefined with no session", () => {
+    expect(peekCurrentBrowserUrl("peek-none")).toBeUndefined();
+    browserTest.installFakeSessionWithPageForTest("peek-url", {
+      url: (() => "https://signin.example/login") as unknown as import("playwright-core").Page["url"]
+    });
+    expect(peekCurrentBrowserUrl("peek-url")).toBe("https://signin.example/login");
+  });
+
+  test("peekCurrentBrowserUrl returns undefined when page.url() throws", () => {
+    browserTest.installFakeSessionWithPageForTest("peek-url-throw", {
+      url: (() => {
+        throw new Error("page gone");
+      }) as unknown as import("playwright-core").Page["url"]
+    });
+    expect(peekCurrentBrowserUrl("peek-url-throw")).toBeUndefined();
+  });
+
+  test("peekCurrentBrowserTargetId resolves the page's CDP targetId", async () => {
+    const page = { url: (() => "https://x.example/") as unknown as import("playwright-core").Page["url"] };
+    const context: Partial<import("playwright-core").BrowserContext> = {
+      newCDPSession: (async () => ({
+        send: async (method: string) =>
+          method === "Target.getTargetInfo" ? { targetInfo: { targetId: "TARGET-123" } } : {},
+        detach: async () => undefined
+      })) as unknown as import("playwright-core").BrowserContext["newCDPSession"]
+    };
+    browserTest.installFakeSessionWithPageAndContextForTest("peek-tid", page, context);
+    expect(await peekCurrentBrowserTargetId("peek-tid")).toBe("TARGET-123");
+  });
+
+  test("peekCurrentBrowserTargetId returns undefined with no session", async () => {
+    expect(await peekCurrentBrowserTargetId("peek-tid-none")).toBeUndefined();
+  });
+
+  test("peekCurrentBrowserTargetId returns undefined when the CDP lookup fails", async () => {
+    const page = { url: (() => "https://x.example/") as unknown as import("playwright-core").Page["url"] };
+    const context: Partial<import("playwright-core").BrowserContext> = {
+      newCDPSession: (async () => {
+        throw new Error("no CDP");
+      }) as unknown as import("playwright-core").BrowserContext["newCDPSession"]
+    };
+    browserTest.installFakeSessionWithPageAndContextForTest("peek-tid-fail", page, context);
+    expect(await peekCurrentBrowserTargetId("peek-tid-fail")).toBeUndefined();
+  });
+
+  test("peekCurrentBrowserTargetId returns undefined when targetInfo lacks a string id", async () => {
+    const page = { url: (() => "https://x.example/") as unknown as import("playwright-core").Page["url"] };
+    const context: Partial<import("playwright-core").BrowserContext> = {
+      newCDPSession: (async () => ({
+        send: async () => ({ targetInfo: {} }),
+        detach: async () => undefined
+      })) as unknown as import("playwright-core").BrowserContext["newCDPSession"]
+    };
+    browserTest.installFakeSessionWithPageAndContextForTest("peek-tid-noid", page, context);
+    expect(await peekCurrentBrowserTargetId("peek-tid-noid")).toBeUndefined();
   });
 });

@@ -33,7 +33,7 @@ import {
   isPlausibleMime,
   upsertDevice
 } from "./state";
-import { browserNavigate, getScreencastPort, peekCurrentBrowserUrl, safetyCheck } from "./tools/browser";
+import { browserNavigate, getScreencastPort, peekCurrentBrowserTargetId, peekCurrentBrowserUrl, safetyCheck } from "./tools/browser";
 import {
   getOrStartBridge,
   stopActiveBridge,
@@ -1262,12 +1262,15 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       ) {
         return json({ error: "Screencast setup request not active" }, 404);
       }
-      // Attach to the page the requesting task is actually on, not whatever
-      // tab happens to be first, so the operator signs in on the right page.
+      // Bind to the exact page the requesting task is driving (its session.page
+      // CDP targetId), not whatever tab happens to be first or shares a URL, so
+      // the operator signs in on the right page even with sibling tabs open.
+      // The URL is a fallback hint when the targetId can't be resolved.
       const preferUrl = setup.taskId ? peekCurrentBrowserUrl(setup.taskId) : undefined;
+      const preferTargetId = setup.taskId ? await peekCurrentBrowserTargetId(setup.taskId) : undefined;
       let bridge;
       try {
-        bridge = await getOrStartBridge(setup.id, preferUrl);
+        bridge = await getOrStartBridge(setup.id, { preferUrl, preferTargetId });
       } catch (error) {
         return json({ error: error instanceof Error ? error.message : String(error) }, 409);
       }
@@ -1357,14 +1360,18 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         return json({ error: "Invalid JSON body" }, 400);
       }
       const preferUrl = setup.taskId ? peekCurrentBrowserUrl(setup.taskId) : undefined;
+      const preferTargetId = setup.taskId ? await peekCurrentBrowserTargetId(setup.taskId) : undefined;
       let bridge;
       try {
-        bridge = await getOrStartBridge(setup.id, preferUrl);
+        bridge = await getOrStartBridge(setup.id, { preferUrl, preferTargetId });
       } catch (error) {
         return json({ error: error instanceof Error ? error.message : String(error) }, 409);
       }
-      await bridge.dispatchInput(body);
-      return json({ ok: true });
+      // Relay the remote page's selection back (present for copy/cut/selectall
+      // and double/drag selection) so the modal can serve it to the operator's
+      // clipboard on a native copy/cut event.
+      const { selection } = await bridge.dispatchInput(body);
+      return json(selection !== undefined ? { ok: true, selection } : { ok: true });
     }],
 
     ["GET", /^\/api\/audit$/, (request) => {

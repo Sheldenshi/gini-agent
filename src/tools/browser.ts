@@ -71,6 +71,32 @@ export function peekCurrentBrowserUrl(taskId: string): string | undefined {
   }
 }
 
+// Resolve the CDP targetId of the task's CURRENT page (session.page) — the exact
+// tab the agent is driving. The screencast binds to this target so it shows the
+// requesting task's page, never a sibling task's tab that happens to share a URL
+// in the shared per-instance context (matching the old single-window behavior,
+// where the user acted on the agent's actual page). The id equals the `id` field
+// Chrome's /json reports for that target. Returns undefined when there's no live
+// session or the CDP lookup fails — the caller then falls back to the URL hint.
+export async function peekCurrentBrowserTargetId(taskId: string): Promise<string | undefined> {
+  const session = sessions.get(taskId);
+  if (!session) return undefined;
+  try {
+    const cdp = await session.context.newCDPSession(session.page);
+    try {
+      const info = (await cdp.send("Target.getTargetInfo")) as {
+        targetInfo?: { targetId?: string };
+      };
+      const id = info?.targetInfo?.targetId;
+      return typeof id === "string" ? id : undefined;
+    } finally {
+      await cdp.detach().catch(() => undefined);
+    }
+  } catch {
+    return undefined;
+  }
+}
+
 // Synchronously read the accessibility role + name a snapshot recorded for
 // a ref, if the task's session still holds it. Used by the chat tool_call
 // preview so a click row reads `button "Buy a License"` instead of the

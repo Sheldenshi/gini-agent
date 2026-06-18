@@ -19,6 +19,9 @@ class FakeSocket implements WebSocketLike {
   private listeners: Record<string, ((ev: { data?: unknown }) => void)[]> = {};
   autoReply = true;
   closed = false;
+  // Per-method canned RPC results (e.g. Runtime.evaluate → a selection). When a
+  // method isn't listed, the auto-reply returns an empty result.
+  replyResult: Record<string, unknown> = {};
 
   addEventListener(event: string, listener: (ev: { data?: unknown }) => void): void {
     (this.listeners[event] ??= []).push(listener);
@@ -28,7 +31,8 @@ class FakeSocket implements WebSocketLike {
     this.sent.push(msg as Record<string, unknown>);
     // Auto-resolve RPCs so awaited sends complete.
     if (this.autoReply && typeof msg.id === "number") {
-      queueMicrotask(() => this.fire("message", { data: JSON.stringify({ id: msg.id, result: {} }) }));
+      const result = (msg.method && msg.method in this.replyResult) ? this.replyResult[msg.method] : {};
+      queueMicrotask(() => this.fire("message", { data: JSON.stringify({ id: msg.id, result }) }));
     }
   }
   close(): void {
@@ -158,9 +162,55 @@ describe("ScreencastBridge.start", () => {
         { type: "page", url: "https://other.example/", webSocketDebuggerUrl: "ws://first" },
         { type: "page", url: "https://signin.example/", webSocketDebuggerUrl: "ws://wanted" }
       ],
-      resolvePort: () => 9333
+      resolvePort: () => 9333,
+      // No discovery socket, so `dialed` reflects only the page attach.
+      fetchBrowserWsUrl: async () => null
     });
     await startWithOpen(bridge, socket, "https://signin.example/");
+    expect(dialed).toBe("ws://wanted");
+  });
+
+  test("binds to preferTargetId even when sibling tabs share the URL", async () => {
+    // Three tabs on the SAME url (the duplicate-tab case): URL match is
+    // ambiguous, so the bridge must pick by targetId — the exact tab the
+    // requesting task drives.
+    const socket = new FakeSocket();
+    let dialed = "";
+    const bridge = new ScreencastBridge({
+      openSocket: (url) => { dialed = url; return socket; },
+      fetchJson: async () => [
+        { type: "page", id: "t-a", url: "https://x.example/", webSocketDebuggerUrl: "ws://a" },
+        { type: "page", id: "t-b", url: "https://x.example/", webSocketDebuggerUrl: "ws://b" },
+        { type: "page", id: "t-c", url: "https://x.example/", webSocketDebuggerUrl: "ws://c" }
+      ],
+      resolvePort: () => 9333,
+      fetchBrowserWsUrl: async () => null
+    });
+    const p = bridge.start("https://x.example/", "t-b");
+    await Promise.resolve();
+    socket.open();
+    await p;
+    expect(dialed).toBe("ws://b"); // the task's own tab, not the first URL match
+  });
+
+  test("falls back to preferUrl when the targetId is no longer present", async () => {
+    // The task's page closed/changed between mint and attach: targetId misses,
+    // so the URL hint is the next-best selector (still better than pages[0]).
+    const socket = new FakeSocket();
+    let dialed = "";
+    const bridge = new ScreencastBridge({
+      openSocket: (url) => { dialed = url; return socket; },
+      fetchJson: async () => [
+        { type: "page", id: "t-1", url: "https://a.example/", webSocketDebuggerUrl: "ws://first" },
+        { type: "page", id: "t-2", url: "https://signin.example/", webSocketDebuggerUrl: "ws://wanted" }
+      ],
+      resolvePort: () => 9333,
+      fetchBrowserWsUrl: async () => null
+    });
+    const p = bridge.start("https://signin.example/", "t-gone");
+    await Promise.resolve();
+    socket.open();
+    await p;
     expect(dialed).toBe("ws://wanted");
   });
 
@@ -173,7 +223,9 @@ describe("ScreencastBridge.start", () => {
         { type: "page", url: "https://a.example/", webSocketDebuggerUrl: "ws://first" },
         { type: "page", url: "https://b.example/", webSocketDebuggerUrl: "ws://second" }
       ],
-      resolvePort: () => 9333
+      resolvePort: () => 9333,
+      // No discovery socket, so `dialed` reflects only the page attach.
+      fetchBrowserWsUrl: async () => null
     });
     await startWithOpen(bridge, socket, "https://nomatch.example/");
     expect(dialed).toBe("ws://first");
@@ -285,6 +337,70 @@ describe("ScreencastBridge.dispatchInput", () => {
     await bridge.dispatchInput({ kind: "move", x: 1, y: 1 });
     // No new sends after close.
     expect(socket.sent.filter((m) => m["method"] === "Input.dispatchMouseEvent").length).toBe(0);
+  });
+
+  test("paste inserts the operator's clipboard text via Input.insertText", async () => {
+    const { bridge, socket } = await ready();
+    const res = await bridge.dispatchInput({ kind: "paste", text: "hunter2" });
+    const insert = socket.sent.find((m) => m["method"] === "Input.insertText");
+    expect(insert).toBeDefined();
+    expect((insert!["params"] as Record<string, unknown>)["text"]).toBe("hunter2");
+    expect(res.selection).toBeUndefined(); // paste returns no selection
+  });
+
+  test("copy returns the remote page's current selection", async () => {
+    const { bridge, socket } = await ready();
+    socket.replyResult["Runtime.evaluate"] = { result: { value: "selected text" } };
+    const res = await bridge.dispatchInput({ kind: "copy" });
+    expect(res.selection).toBe("selected text");
+    // copy is read-only: it must NOT mutate the page (no insertText).
+    expect(socket.sent.some((m) => m["method"] === "Input.insertText")).toBe(false);
+  });
+
+  test("cut returns the selection and deletes it (insertText empty)", async () => {
+    const { bridge, socket } = await ready();
+    socket.replyResult["Runtime.evaluate"] = { result: { value: "doomed" } };
+    const res = await bridge.dispatchInput({ kind: "cut" });
+    expect(res.selection).toBe("doomed");
+    const insert = socket.sent.find((m) => m["method"] === "Input.insertText");
+    expect(insert).toBeDefined();
+    expect((insert!["params"] as Record<string, unknown>)["text"]).toBe("");
+  });
+
+  test("selectall selects on the page then returns the selection", async () => {
+    const { bridge, socket } = await ready();
+    socket.replyResult["Runtime.evaluate"] = { result: { value: "everything" } };
+    const res = await bridge.dispatchInput({ kind: "selectall" });
+    // Two Runtime.evaluate calls: the select-all, then the selection read.
+    expect(socket.sent.filter((m) => m["method"] === "Runtime.evaluate").length).toBe(2);
+    expect(res.selection).toBe("everything");
+  });
+
+  test("a double-click returns the selected word; a single click does not", async () => {
+    const { bridge, socket } = await ready();
+    socket.replyResult["Runtime.evaluate"] = { result: { value: "word" } };
+    expect((await bridge.dispatchInput({ kind: "click", x: 1, y: 1, clickCount: 2 })).selection).toBe("word");
+    expect((await bridge.dispatchInput({ kind: "click", x: 1, y: 1, clickCount: 1 })).selection).toBeUndefined();
+  });
+
+  test("dragselect returns the selection", async () => {
+    const { bridge, socket } = await ready();
+    socket.replyResult["Runtime.evaluate"] = { result: { value: "dragged" } };
+    const res = await bridge.dispatchInput({ kind: "dragselect", x0: 0, y0: 0, x1: 9, y1: 9 });
+    expect(res.selection).toBe("dragged");
+  });
+
+  test("readSelection returns empty string when the evaluate result has no string value", async () => {
+    const { bridge, socket } = await ready();
+    socket.replyResult["Runtime.evaluate"] = { result: { value: 42 } }; // non-string
+    expect((await bridge.dispatchInput({ kind: "copy" })).selection).toBe("");
+  });
+
+  test("attach enables Runtime (for the selection read path)", async () => {
+    const { bridge, socket } = bridgeWith();
+    await startWithOpen(bridge, socket);
+    expect(socket.sent.some((m) => m["method"] === "Runtime.enable")).toBe(true);
+    await bridge.stop();
   });
 });
 
