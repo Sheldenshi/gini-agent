@@ -1,7 +1,7 @@
 // Unit tests for the APNs dispatcher. Pins:
-//   - approval_requested blocks fan out to every registered device
+//   - authorization_requested blocks fan out to every registered device
 //     with the right payload + topic
-//   - non-approval blocks (user_text, assistant_text, etc.) are
+//   - non-prompt blocks (user_text, assistant_text, etc.) are
 //     ignored — no push, no device list scan
 //   - a 410 Unregistered response triggers token cleanup so the
 //     dead token can't keep accruing pushes
@@ -61,7 +61,7 @@ function buildDevice(overrides?: Partial<PushDevice>): PushDevice {
 }
 
 describe("apns dispatcher", () => {
-  test("fans approval_requested out to every registered device with the privacy-safe payload", async () => {
+  test("fans authorization_requested out to every registered device with the privacy-safe payload", async () => {
     const { client, calls } = buildFakeClient();
     const devices = [
       buildDevice({ token: "tok_a", bundleId: "ai.lilaclabs.gini.mobile" }),
@@ -118,6 +118,44 @@ describe("apns dispatcher", () => {
     expect(serialized).not.toContain("Run `rm -rf foo`");
     expect(serialized).not.toContain("terminal_exec");
 
+    dispatcher.stop();
+  });
+
+  test("setup_requested fans out WITHOUT the approve/deny category", async () => {
+    // A setup request is a user-action flow (open browser, fill form),
+    // not an approve/deny gate. Attaching APPROVAL_REQUEST would render
+    // Approve/Deny buttons whose handler POSTs to /authorizations/:id —
+    // a route that can't resolve a setup id. So the payload must omit the
+    // category; the user taps in to complete the step.
+    const { client, calls } = buildFakeClient();
+    const dispatcher = createApnsDispatcher("test-inst" as Instance, {
+      client,
+      listDevices: () => [buildDevice({ token: "tok_a" })],
+      subscribe: () => () => { /* noop */ }
+    });
+
+    await dispatcher.dispatch({
+      id: "block_setup",
+      sessionId: "chat_xyz",
+      instance: "test-inst" as Instance,
+      ordinal: 5,
+      createdAt: new Date().toISOString(),
+      kind: "setup_requested",
+      setupRequestId: "setup_1",
+      action: "browser.connect",
+      summary: "Sign in to your email"
+    });
+
+    expect(calls.length).toBe(1);
+    const aps = calls[0]!.payload.aps as Record<string, unknown>;
+    // Still mutable (the NSE enriches the preview) and an alert, but no
+    // approve/deny category.
+    expect(aps["mutable-content"]).toBe(1);
+    expect((aps.alert as Record<string, unknown>).title).toBe("Gini needs you to finish a step");
+    expect(aps.category).toBeUndefined();
+    const body = calls[0]!.payload.body as Record<string, unknown>;
+    expect(body.event).toBe("setup_requested");
+    expect(body.approvalId).toBe("setup_1");
     dispatcher.stop();
   });
 
@@ -596,6 +634,28 @@ describe("apns dispatcher", () => {
     expect(body.blockId).toBe("b1");
     expect(body.event).toBe("message_completed");
     expect(body.silent).toBe(false);
+    // No threadId on a main-chat completion.
+    expect(body.threadId).toBeUndefined();
+  });
+
+  test("buildMessageCompletedPayload carries threadId for a threaded completion", () => {
+    // So the NSE's preview fetch resolves the thread's own reply rather
+    // than stale main-chat text.
+    const payload = buildMessageCompletedPayload({
+      id: "b2",
+      sessionId: "chat_x",
+      instance: "test-inst" as Instance,
+      ordinal: 2,
+      createdAt: new Date().toISOString(),
+      kind: "phase",
+      label: "Completed",
+      taskId: "task_y",
+      threadId: "thread_9"
+    });
+    const body = payload.body as Record<string, unknown>;
+    expect(body.threadId).toBe("thread_9");
+    expect(body.sessionId).toBe("chat_x");
+    expect(body.event).toBe("message_completed");
   });
 
   test("buildApprovalPayload produces a stable, privacy-safe shape", () => {

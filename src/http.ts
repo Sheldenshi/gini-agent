@@ -5,10 +5,15 @@ import { pidPath } from "./paths";
 import {
   addAudit,
   addSseSubscription,
+  clearDeviceWatch,
+  clearSessionWatch,
+  clearStreamWatch,
   appendTrace,
   assertInsideWorkspace,
   createSetupRequest,
   getDevice,
+  latestAssistantTextForSession,
+  latestAssistantTextForThread,
   listChatBlocks,
   listChatBlocksAfter,
   listThreadBlocks,
@@ -38,6 +43,7 @@ import { runFillSecretConnect } from "./execution/browser-fill-secrets";
 import { runMessagingBridgeConnect } from "./execution/messaging-bridge-connect";
 import { runMessagingPairingConnect } from "./execution/messaging-pairing-connect";
 import { runMessagingRemoveConnect } from "./execution/messaging-remove-connect";
+import { buildNotificationPreview, type PreviewEvent } from "./integrations/apns/preview";
 import { dailyUsage, mobileBootstrap, publicState } from "./runtime/views";
 import { checkConnector, createConnector, credentialTemplateForProvider, deleteConnector, firstUngrantedCredential, isSkillActive, updateConnector } from "./integrations/connectors";
 import { gwsSessionStatus } from "./integrations/connectors/gws-session";
@@ -561,7 +567,12 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       // suppression registry, which is correct — no push is ever sent
       // to them anyway.
       const deviceToken = deviceTokenFromRequest(config, request, credential);
-      return chatBlockStream(config, request, params[0], deviceToken);
+      // Optional client-named stream id. When present it's woven into the
+      // watch handle so POST /push/unwatch?streamId= can clear exactly
+      // this stream (the screen that opened it) without disturbing a
+      // sibling stream the client holds on the same session.
+      const streamId = (new URL(request.url).searchParams.get("streamId") ?? "").trim() || null;
+      return chatBlockStream(config, request, params[0], deviceToken, streamId);
     }],
     ["GET", /^\/api\/runs$/, () => json(listRuns(config))],
     ["GET", /^\/api\/runs\/([^/]+)$/, (_request, params) => json(getRun(config, params[0]))],
@@ -1708,6 +1719,84 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       // either leaks information about other credentials' devices.
       if (!removed) return json({ error: "Device not found" }, 404);
       return json({ ok: true });
+    }],
+    // Notification-preview endpoint for the iOS Notification Service
+    // Extension (NSE). When a `mutable-content: 1` push lands, the NSE
+    // runs on-device and calls this to fetch the real, human-readable
+    // title + body, then rewrites the lock-screen banner before display.
+    // The APNs wire payload carries only ids + a generic string, so this
+    // is the path that surfaces the actual message text WITHOUT it ever
+    // transiting Apple's servers (see ADR mobile-push-notifications.md).
+    // Bearer-gated like every other /api route; the NSE reads the bearer
+    // from the App Group shared container the main app writes on auth.
+    ["GET", /^\/api\/push\/preview$/, async (request) => {
+      const credential = await resolveCredentialFromBearer(config, bearerFromRequest(request));
+      if (!credential) return json({ error: "Unauthorized" }, 401);
+      const params = new URL(request.url).searchParams;
+      const sessionId = (params.get("sessionId") ?? "").trim();
+      const event = (params.get("event") ?? "").trim();
+      const approvalId = (params.get("approvalId") ?? "").trim() || undefined;
+      const threadId = (params.get("threadId") ?? "").trim() || undefined;
+      if (!sessionId) return json({ error: "sessionId is required" }, 400);
+      if (event !== "message_completed" && event !== "authorization_requested" && event !== "setup_requested") {
+        return json({ error: "event must be message_completed, authorization_requested, or setup_requested" }, 400);
+      }
+      // Validate the session belongs to this instance so a stale or
+      // foreign sessionId 404s rather than leaking a generic empty preview.
+      const state = readState(config.instance);
+      const session = state.chatSessions.find((s) => s.id === sessionId);
+      if (!session) return json({ error: `Chat session not found: ${sessionId}` }, 404);
+      const preview = buildNotificationPreview(
+        config.instance,
+        { event: event as PreviewEvent, sessionId, approvalId, threadId },
+        {
+          latestAssistantText: latestAssistantTextForSession,
+          latestAssistantTextForThread,
+          sessionTitle: (_inst, id) =>
+            readState(config.instance).chatSessions.find((s) => s.id === id)?.title ?? null,
+          authorization: (_inst, id) =>
+            readState(config.instance).authorizations.find((a) => a.id === id && a.status === "pending") ?? null,
+          setupRequest: (_inst, id) =>
+            readState(config.instance).setupRequests.find((s) => s.id === id && s.status === "pending") ?? null
+        }
+      );
+      // No preview ⇒ the underlying content is gone (resolved approval,
+      // not-yet-persisted message). 404 tells the NSE to keep the generic
+      // as-sent banner instead of blanking it.
+      if (!preview) return json({ error: "No preview available" }, 404);
+      return json(preview);
+    }],
+    // Explicit "I've stopped watching" beacon. The SSE stream's own
+    // cancel() clears a device's watch-state on disconnect, but behind a
+    // relay the gateway-side socket can stay open after the phone is gone
+    // (keepalive writes keep succeeding into the relay buffer), so cancel()
+    // may never fire and the stale entry permanently suppresses completion
+    // pushes for that session. Three callers, narrowest-scope-wins:
+    //   - background: app posts with NO sessionId → clear the whole device
+    //     bucket (it's watching nothing).
+    //   - screen unmount: app posts WITH ?sessionId&streamId → clear only
+    //     the one stream that screen opened, leaving a sibling stream on the
+    //     SAME session (e.g. the main chat under a Thread View card) intact.
+    //   - ?sessionId without streamId (legacy/web): clear the whole session
+    //     for the device.
+    // Best-effort and idempotent; device-scoped like /read and /badge.
+    ["POST", /^\/api\/push\/unwatch$/, async (request) => {
+      const credential = await resolveCredentialFromBearer(config, bearerFromRequest(request));
+      if (!credential) return json({ error: "Unauthorized" }, 401);
+      const dev = requireDeviceToken(config, request, credential);
+      if (!dev.ok) return json({ error: dev.reason }, dev.status);
+      const params = new URL(request.url).searchParams;
+      const sessionId = (params.get("sessionId") ?? "").trim();
+      const streamId = (params.get("streamId") ?? "").trim();
+      let cleared: number;
+      if (sessionId && streamId) {
+        cleared = clearStreamWatch(config.instance, dev.token, sessionId, streamId);
+      } else if (sessionId) {
+        cleared = clearSessionWatch(config.instance, dev.token, sessionId);
+      } else {
+        cleared = clearDeviceWatch(config.instance, dev.token);
+      }
+      return json({ ok: true, cleared });
     }],
     // Chat read-state + badge endpoints. The mobile app POSTs to
     // /read every time the user lands on a chat detail so the gateway
@@ -3301,7 +3390,8 @@ function chatBlockStream(
   config: RuntimeConfig,
   request: Request,
   sessionId: string,
-  deviceToken: string | null
+  deviceToken: string | null,
+  streamId: string | null = null
 ): Response {
   let closed = false;
   let keepalive: Timer | undefined;
@@ -3344,7 +3434,7 @@ function chatBlockStream(
       // suppress pushes to a foregrounded mobile device sharing the
       // same credential.
       if (deviceToken) {
-        unregisterSubscription = addSseSubscription(config.instance, deviceToken, sessionId);
+        unregisterSubscription = addSseSubscription(config.instance, deviceToken, sessionId, streamId ?? undefined);
       }
       // Two enqueue paths:
       //   - `enqueueBackfill` dedupes by block id so an initial replay

@@ -113,6 +113,8 @@ export {
   deleteChatBlock,
   findInFlightAssistantTextForTask,
   taskProducedAssistantText,
+  latestAssistantTextForSession,
+  latestAssistantTextForThread,
   getLatestMessagesBySession,
   subscribeChatBlocks,
   subscribeAllChatBlocks
@@ -130,7 +132,10 @@ export type { PushDevice, UpsertDeviceInput, DeviceOrigin } from "./devices";
 export {
   addSseSubscription,
   isDeviceWatching,
-  hasAnyActiveSubscription
+  hasAnyActiveSubscription,
+  clearDeviceWatch,
+  clearSessionWatch,
+  clearStreamWatch
 } from "./sse-subscriptions";
 export {
   subscribeChatSession,

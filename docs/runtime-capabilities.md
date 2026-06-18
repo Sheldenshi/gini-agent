@@ -54,6 +54,7 @@ bun run gini evidence
 | Observability | `gini trace`, `gini audit`, `gini events`, `/api/events/stream`, `gini evidence` |
 | Web control plane | Next.js app at `web/`, launched by `gini start` or `gini run` unless `--no-web` is set |
 | Off-LAN access (tunnel) | `gini tunnel [select <provider> \| connect [provider] \| cancel \| disconnect]`, `/api/tunnel{,/select,/connect,/cancel,/disconnect}`. The gini-relay provider runs an OAuth-loopback login on the host, assigns a per-device subdomain, and runs a supervised `frpc` child exposing the gateway port (the single origin fronting UI + API) at `https://<subdomain>.<relayDomain>`; `tailscale`/`ngrok`/`cloudflare` are detection-gated native drivers (`tailscale serve` / `ngrok http` / a cloudflared named-or-quick tunnel) whose connected fronts are origin-trusted automatically; connecting a provider without its prerequisite rejects with `provider_unavailable` and the web UI opens that provider's guide (`docs/remote-access/<id>.md`). See [remote-access.md](remote-access.md) for the per-provider guides and mode confirmation, and [tunnel-connectivity.md](adr/tunnel-connectivity.md) for the contract |
+| Push notifications (iOS) | The gateway signs APNs ES256 JWTs and pushes directly to Apple for `authorization_requested` / `setup_requested` prompts and `phase: Completed/Failed` turns; an iOS Notification Service Extension enriches the banner on-device via `GET /api/push/preview` (real title/body fetched over the device's own authenticated connection, so chat text never transits Apple), and a per-device SSE watch registry suppresses completion pushes while the device is actively streaming the session. `POST /api/push/devices` (register), `DELETE /api/push/devices/:token` (deregister on sign-out), `GET /api/push/preview` (NSE enrichment), `POST /api/push/unwatch` (watch-clear beacon). Lock-screen Approve/Deny actions require device unlock for Approve. See [mobile-push-notifications.md](adr/mobile-push-notifications.md) |
 
 ## Runtime Contracts
 
@@ -83,4 +84,4 @@ Separately, web-bound `/api/runtime/*` calls arriving on a non-loopback (relay/a
 
 ## Boundaries
 
-Current runtime work is local-first, with off-LAN reach available through the gini-relay tunnel (see the capability map above). Future mobile, push notifications, and richer live external transports should consume these contracts rather than adding a second source of truth.
+Current runtime work is local-first, with off-LAN reach available through the gini-relay tunnel (see the capability map above). The mobile client and APNs push notifications already consume these contracts directly; further mobile surfaces and richer live external transports should do the same rather than adding a second source of truth.

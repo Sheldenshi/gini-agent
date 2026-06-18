@@ -155,11 +155,41 @@ export async function saveCredentials(creds: AuthCredentials): Promise<void> {
   }
   await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(normalized));
   broadcast(normalized);
+  // Mirror the gateway base URL + bearer into the App Group shared
+  // container so the iOS Notification Service Extension can fetch the
+  // notification preview on-device. Best-effort; the device token is
+  // folded in later by push registration. Lazy require keeps the
+  // auth → shared-credentials → react-native chain out of non-RN bundles.
+  writeSharedCredentialsForAuth(normalized);
   // First-time sign-in (no prior creds, nothing to deregister): just re-arm push so
   // the new gateway gets a fresh registration. Without this the in-process "already
   // registered" guard in push.ts would suppress re-registration. The swap path above
   // already re-armed via tryDeregisterCachedDevice.
   if (changed && !hadPrior) resetPushRegistrationForSwap();
+}
+
+// Mirror credentials into the App Group shared container for the NSE.
+// Lazy require (mirroring resetPushRegistrationForSwap) keeps the auth
+// module free of a static react-native / expo-file-system import so
+// non-RN test/web bundles that import auth.ts don't pull the native
+// surface at load time. Best-effort: never throws into the auth flow.
+function writeSharedCredentialsForAuth(creds: AuthCredentials): void {
+  try {
+    const shared = require("./shared-credentials") as {
+      writeSharedCredentials?: (c: { baseUrl: string; token: string; deviceToken?: string }) => void;
+    };
+    // Fold in the cached device token when push registration already ran
+    // for this credential, so a credential re-save doesn't drop it.
+    const pushModule = require("./push") as { getCachedDeviceToken?: () => string | null };
+    const deviceToken = pushModule.getCachedDeviceToken?.() ?? undefined;
+    shared.writeSharedCredentials?.({
+      baseUrl: creds.baseUrl,
+      token: creds.token,
+      deviceToken: deviceToken || undefined
+    });
+  } catch {
+    // require can throw in non-RN envs — best effort.
+  }
 }
 
 // Re-arm push registration after a credential swap. Lazy `require` (mirroring
@@ -188,6 +218,15 @@ export async function clearCredentials(): Promise<void> {
   await tryDeregisterCachedDevice();
   await AsyncStorage.removeItem(STORAGE_KEY);
   broadcast(null);
+  // Drop the shared-container credentials so a backgrounded NSE can't keep
+  // fetching previews with the signed-out bearer. Best-effort; lazy require
+  // keeps non-RN bundles clean.
+  try {
+    const shared = require("./shared-credentials") as { clearSharedCredentials?: () => void };
+    shared.clearSharedCredentials?.();
+  } catch {
+    // require can throw in non-RN envs — best effort.
+  }
 }
 
 export async function tryDeregisterCachedDevice(): Promise<void> {
@@ -300,4 +339,17 @@ export async function primeCredentials(): Promise<AuthCredentials | null> {
   const value = await loadFromStorage();
   cached = value;
   return value;
+}
+
+// Re-mirror the cached credentials into the App Group shared container on
+// cold start. The shared container is otherwise written only on sign-in
+// (saveCredentials) and after push registration — neither of which runs on
+// a plain relaunch of an already-signed-in user who doesn't open a chat. An
+// existing user (or anyone signed in before this feature shipped) would then
+// have an empty container and the NSE would silently fall back to the generic
+// banner. Call this from the root-layout prime sequence AFTER the device
+// token has been primed so writeSharedCredentialsForAuth folds it in. No-op
+// when signed out; best-effort (writeSharedCredentialsForAuth never throws).
+export function mirrorCachedCredentialsToSharedContainer(): void {
+  if (cached) writeSharedCredentialsForAuth(cached);
 }

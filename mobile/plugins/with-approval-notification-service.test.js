@@ -35,6 +35,27 @@ describe("with-approval-notification-service", () => {
     expect(opts.iosDeployment).toBe("16.0");
   });
 
+  test("resolveOptions derives the App Group from the host bundle id", () => {
+    const opts = plugin.resolveOptions({}, "ai.lilaclabs.gini.mobile");
+    expect(opts.appGroup).toBe("group.ai.lilaclabs.gini.mobile");
+  });
+
+  test("resolveOptions falls back to the default bundle id when none is passed", () => {
+    const opts = plugin.resolveOptions({});
+    expect(opts.appGroup).toBe("group.ai.lilaclabs.gini.mobile");
+  });
+
+  test("resolveOptions respects an explicit appGroup override", () => {
+    const opts = plugin.resolveOptions({ appGroup: "group.custom.id" }, "ai.lilaclabs.gini.mobile");
+    expect(opts.appGroup).toBe("group.custom.id");
+  });
+
+  test("buildExtensionEntitlements carries the App Group membership", () => {
+    const opts = plugin.resolveOptions({}, "ai.lilaclabs.gini.mobile");
+    const ent = plugin.buildExtensionEntitlements(opts);
+    expect(ent[plugin.APP_GROUPS_ENTITLEMENT]).toEqual(["group.ai.lilaclabs.gini.mobile"]);
+  });
+
   test("buildExtensionInfoPlist sets the two required NSE keys", () => {
     const info = plugin.buildExtensionInfoPlist(plugin.resolveOptions({}));
     expect(info.NSExtension.NSExtensionPointIdentifier).toBe(
@@ -46,6 +67,28 @@ describe("with-approval-notification-service", () => {
     expect(info.NSExtension.NSExtensionPrincipalClass).toBe(
       "$(PRODUCT_MODULE_NAME).NotificationService"
     );
+  });
+
+  test("buildExtensionInfoPlist writes concrete version literals (EAS rewrites CFBundleVersion server-side)", () => {
+    // CFBundleShortVersionString must equal the app's marketing version
+    // (Apple rejects an app/extension mismatch). CFBundleVersion is a "1"
+    // literal that EAS's server-side version sync rewrites to the app's
+    // autoIncremented build number on production builds (it only rewrites
+    // physical Info.plist files — so these must be literals, not
+    // $(BUILD_SETTING) refs, which would resolve empty locally).
+    const info = plugin.buildExtensionInfoPlist(plugin.resolveOptions({}, "ai.lilaclabs.gini.mobile", "2.3.4"));
+    expect(info.CFBundleShortVersionString).toBe("2.3.4");
+    expect(info.CFBundleVersion).toBe("1");
+  });
+
+  test("resolveOptions takes the host app version for the NSE marketing version", () => {
+    const opts = plugin.resolveOptions({}, "ai.lilaclabs.gini.mobile", "0.0.6");
+    expect(opts.marketingVersion).toBe("0.0.6");
+  });
+
+  test("resolveOptions falls back to 1.0 when no host version is resolvable", () => {
+    const opts = plugin.resolveOptions({});
+    expect(opts.marketingVersion).toBe("1.0");
   });
 
   test("readCanonicalSwiftSource returns the on-disk NSE source", () => {
@@ -69,9 +112,11 @@ describe("with-approval-notification-service", () => {
 
       const swiftPath = path.join(tempRoot, "ios", opts.targetName, "NotificationService.swift");
       const plistPath = path.join(tempRoot, "ios", opts.targetName, `${opts.targetName}-Info.plist`);
+      const entitlementsPath = path.join(tempRoot, "ios", opts.targetName, `${opts.targetName}.entitlements`);
 
       expect(fs.existsSync(swiftPath)).toBe(true);
       expect(fs.existsSync(plistPath)).toBe(true);
+      expect(fs.existsSync(entitlementsPath)).toBe(true);
 
       // The written Swift must match the canonical source byte-for-byte —
       // no munging during the copy, so an Xcode-side debug session
@@ -84,6 +129,13 @@ describe("with-approval-notification-service", () => {
       expect(parsed.NSExtension.NSExtensionPointIdentifier).toBe(
         "com.apple.usernotifications.service"
       );
+
+      // The NSE entitlements carry the shared App Group so the extension
+      // can reach the container the app writes credentials into.
+      const entitlements = plist.parse(fs.readFileSync(entitlementsPath, "utf8"));
+      expect(entitlements[plugin.APP_GROUPS_ENTITLEMENT]).toEqual([
+        "group.ai.lilaclabs.gini.mobile"
+      ]);
     } finally {
       fs.rmSync(tempRoot, { recursive: true, force: true });
     }

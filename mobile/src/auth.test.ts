@@ -29,8 +29,18 @@ mock.module("./push", () => ({
   __resetRegistrationForSignOut: signOutResetSpy
 }));
 
+// Capture shared-container writes so the cold-start mirror is observable
+// without the native bridge (which throws under bun:test and is swallowed).
+const sharedWriteSpy = mock((_c: { baseUrl: string; token: string; deviceToken?: string }) => {});
+const sharedClearSpy = mock(() => {});
+mock.module("./shared-credentials", () => ({
+  writeSharedCredentials: sharedWriteSpy,
+  clearSharedCredentials: sharedClearSpy
+}));
+
 import {
   isLocalGatewayHost,
+  mirrorCachedCredentialsToSharedContainer,
   normalizeBaseUrl,
   PUBLIC_HTTP_REJECTION,
   saveCredentials
@@ -216,5 +226,30 @@ describe("saveCredentials push-registration handling on swap", () => {
     });
     await saveCredentials({ baseUrl: "https://swap2.gini-relay.lilaclabs.ai", token: "q0" });
     expect(signOutResetSpy).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("mirrorCachedCredentialsToSharedContainer (cold-start NSE creds)", () => {
+  test("writes the cached credentials into the shared container when signed in", async () => {
+    // Establish a signed-in identity (populates the module cache).
+    await saveCredentials({ baseUrl: "https://mirror.gini-relay.lilaclabs.ai", token: "m1" });
+    sharedWriteSpy.mockClear();
+    // A cold-start relaunch re-mirrors the rehydrated creds so the NSE has
+    // something to authenticate with even without a sign-in or chat open.
+    mirrorCachedCredentialsToSharedContainer();
+    expect(sharedWriteSpy).toHaveBeenCalledTimes(1);
+    expect(sharedWriteSpy.mock.calls[0][0]).toMatchObject({
+      baseUrl: "https://mirror.gini-relay.lilaclabs.ai",
+      token: "m1"
+    });
+  });
+
+  test("is a no-op when signed out (no cached credentials)", async () => {
+    // Drive the module to a known signed-out state, then mirror.
+    const { clearCredentials } = await import("./auth");
+    await clearCredentials();
+    sharedWriteSpy.mockClear();
+    mirrorCachedCredentialsToSharedContainer();
+    expect(sharedWriteSpy).toHaveBeenCalledTimes(0);
   });
 });

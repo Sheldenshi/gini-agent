@@ -179,17 +179,31 @@ runs prebuild under the hood and includes the NSE target.
 
 When an APNs payload arrives with `mutable-content: 1` (set by the
 server-side dispatcher in `src/integrations/apns/dispatcher.ts` for
-`approval_requested` blocks), the OS spawns the NSE for up to 30s
-before showing the notification. The NSE attaches
-`categoryIdentifier = "APPROVAL_REQUEST"`, which pairs with the
-category the main app registers on launch via
-`Notifications.setNotificationCategoryAsync` — and that's what makes
-the Approve / Deny buttons appear on the lock screen / banner /
-notification center.
+`authorization_requested`, `setup_requested`, and `message_completed`
+blocks), the OS spawns the NSE for up to 30s before showing the
+notification. The NSE does two things:
 
-When the user taps an action button, `mobile/src/push-dispatch.ts`
-posts directly to `/api/approvals/:id/approve` or `/deny` without
-foregrounding the app. The user can act without unlocking the device.
+1. **Enriches the banner.** It reads the gateway base URL + bearer the
+   app mirrored into the App Group shared container
+   (`mobile/src/shared-credentials.ts`), calls
+   `GET /api/push/preview` on the gateway over the device's own
+   authenticated connection, and rewrites the title + body — so the
+   real message text shows without tapping in, yet never transits
+   Apple. On any failure it falls back to the generic as-sent banner.
+2. **Attaches the approve/deny category** for `authorization_requested`
+   only. `categoryIdentifier = "APPROVAL_REQUEST"` pairs with the
+   category the main app registers on launch via
+   `Notifications.setNotificationCategoryAsync` — that's what makes the
+   Approve / Deny buttons appear. Setup requests need the app (open a
+   browser, fill a form), so they deep-link on tap instead of carrying
+   action buttons.
+
+When the user taps an Approve / Deny button, `mobile/src/push-dispatch.ts`
+posts directly to `/api/authorizations/:id/approve` or `/deny` without
+foregrounding the app. Approve is registered with `isAuthenticationRequired`,
+so iOS requires an unlock (Face ID / Touch ID / passcode) before the approve
+action runs — a locked phone can't authorize a high-risk action on its own.
+Deny is fail-safe and needs no unlock.
 
 The action handler runs only if the app is at least suspended; if the
 user has fully killed the app from the app switcher, iOS records the

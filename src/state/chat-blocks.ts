@@ -533,6 +533,88 @@ export function taskProducedAssistantText(
   return false;
 }
 
+// Returns the full text of the most recent non-empty, FINALIZED
+// assistant_text block in a session, or null when the session has none.
+// The push notification-preview endpoint consults this so the iOS
+// Notification Service Extension can show the latest assistant reply on
+// the lock screen. Because it reads the latest row by ordinal (not by
+// task), a notification collapsed onto a single session entry always
+// reflects the newest completed message even across multiple agent turns.
+//
+// Only finalized rows (`streaming = false`) are considered: the NSE
+// fetches this asynchronously after a turn's `Completed` push, and by then
+// a *newer* turn may already be mid-stream (a quick user follow-up or a
+// job firing on the same session). Without the finalized filter the
+// preview could surface that newer turn's half-streamed partial text under
+// the older turn's "new message" banner — confusing, even though it would
+// eventually converge. A streaming block carries the full accreted text on
+// every delta and flips to `streaming = false` on its terminal delta, so
+// filtering to finalized rows yields the last *complete* reply.
+//
+// Thread replies are excluded so the preview tracks the main chat the
+// notification deep-links to. Rows are scanned newest-first (ordinal DESC)
+// and the loop stops at the first non-empty text, skipping trailing
+// whitespace-only blocks — in the common case that's a single row.
+export function latestAssistantTextForSession(
+  instance: Instance,
+  sessionId: string
+): string | null {
+  return scanLatestFinalizedAssistantText(
+    instance,
+    `SELECT payload_json FROM chat_blocks
+     WHERE session_id = ? AND kind = 'assistant_text' AND thread_id IS NULL
+       AND json_extract(payload_json, '$.streaming') = 0
+     ORDER BY ordinal DESC`,
+    [sessionId]
+  );
+}
+
+// Thread variant: the newest finalized assistant reply WITHIN a specific
+// thread. The push dispatcher emits a `message_completed` alert for a
+// threaded turn too (the turn produced a real reply), but that reply lives
+// under a thread_id — so the main-chat lookup above would surface stale
+// main-chat text or nothing. The notification-preview endpoint calls this
+// instead when the push carries a threadId, so a threaded completion shows
+// the thread's own reply.
+export function latestAssistantTextForThread(
+  instance: Instance,
+  sessionId: string,
+  threadId: string
+): string | null {
+  return scanLatestFinalizedAssistantText(
+    instance,
+    `SELECT payload_json FROM chat_blocks
+     WHERE session_id = ? AND thread_id = ? AND kind = 'assistant_text'
+       AND json_extract(payload_json, '$.streaming') = 0
+     ORDER BY ordinal DESC`,
+    [sessionId, threadId]
+  );
+}
+
+// Shared scan: run the query (already ordered newest-first), return the
+// first row whose payload `text` is non-empty after trimming, else null.
+// Skips whitespace-only and malformed rows. Both the main-chat and thread
+// lookups above differ only in their WHERE clause, so they share this.
+function scanLatestFinalizedAssistantText(
+  instance: Instance,
+  sql: string,
+  params: string[]
+): string | null {
+  const db = getMemoryDb(instance);
+  const rows = db.query<{ payload_json: string }, string[]>(sql).all(...params);
+  for (const r of rows) {
+    try {
+      const payload = JSON.parse(r.payload_json) as { text?: unknown };
+      if (typeof payload.text === "string" && payload.text.trim().length > 0) {
+        return payload.text;
+      }
+    } catch {
+      // malformed row — skip and keep scanning older blocks
+    }
+  }
+  return null;
+}
+
 // Updates an existing assistant_text block's text + updated_at without
 // allocating a new ordinal. Used by the streaming-delta path: the first
 // delta inserts the block via insertChatBlock; subsequent deltas flow

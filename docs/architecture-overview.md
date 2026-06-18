@@ -123,6 +123,7 @@ The current capability map is in [Runtime Capabilities](./runtime-capabilities.m
 - `/api/memory/retain`, `/api/memory/recall`, `/api/memory/reflect`, `/api/memory/units`, `/api/memory/banks`, `/api/embedding/*`, `/api/reranker/status`
 - `/api/skills`, `/api/jobs`, `/api/connectors`, `/api/toolsets`
 - `/api/pairing`, `/api/pairing/request*` (relay device pairing), `/api/devices`, `/api/mobile/bootstrap`
+- `/api/push/devices`, `/api/push/preview`, `/api/push/unwatch` (APNs registration, on-device NSE preview enrichment, watch-suppression beacon)
 - `/api/messaging`, `/api/mcp`, `/api/subagents`, `/api/agents`
 - `/api/tunnel`, `/api/tunnel/select`, `/api/tunnel/connect`, `/api/tunnel/cancel`, `/api/tunnel/disconnect`
 - `/api/audit`, `/api/events`, `/api/events/stream`, `/api/logs`
@@ -136,10 +137,10 @@ On macOS a launchd-managed instance is supervised to stay up across crashes, cle
 
 Off-LAN access is available through **four runtime-driven tunnel providers** — gini-relay (the managed, zero-prerequisite default), Tailscale, ngrok, and Cloudflare. The user picks a provider and connects (`gini tunnel`, or the web tunnel panel over `/api/tunnel*`). For **gini-relay**, the gateway runs an OAuth-loopback login in a browser on the host, the relay assigns the device a session and a subdomain, and a supervised native `frpc` child exposes the instance's gateway port (the single origin fronting UI + API) at `https://<subdomain>.<relayDomain>` (`relayDomain` default `gini-relay.lilaclabs.ai`, overridable via `GINI_RELAY_DOMAIN`). `tailscale`, `ngrok`, and `cloudflare` are equally drivable when their host prerequisite is detected — the runtime runs `tailscale serve`, `ngrok http`, or a cloudflared tunnel itself; a connect attempt on a provider whose prerequisite is missing is rejected with the machine-readable `provider_unavailable` code, which the web UI uses to open that provider's self-contained guide inline (per-provider pages under [Remote Access](./remote-access.md)). The gateway owns the relay / runtime-tunnel / loopback / `GINI_TRUSTED_ORIGINS` trust decision for web-bound requests — a runtime-managed tunnel's connected URL is trusted automatically, exactly while connected — and rewrites `Host`/`Origin` to loopback before proxying, so the inner web child (BFF) stays relay-agnostic. On top of that host trust, a web request on a non-loopback front must also be **paired**: it needs a `gini_session` cookie minted through an operator-approved device-pairing handshake, or its page navigations are redirected to `/pair` and its `/api/runtime/*` calls 401. Loopback is trusted with no pairing. See [Tunnel Connectivity](./adr/tunnel-connectivity.md), [BFF Trust Boundary](./adr/bff-trust-boundary.md), and [Device-Pairing Authentication](./adr/device-pairing-auth.md).
 
-## Not Yet Built
-
-- Push notification delivery.
+## Mobile + Push
 
 A basic Expo mobile client lives under `mobile/` — agent picker, per-agent chat list, and chat detail with task polling. It speaks the same `/api/*` contract directly with its own bearer token (no BFF), so it does not change the runtime/source-of-truth model.
 
-Those should build on the existing gateway contract rather than changing the runtime/source-of-truth model.
+Push notification delivery is built: the gateway signs APNs JWTs and pushes directly to Apple, an iOS Notification Service Extension enriches the banner on-device (fetching the real title/body over the device's own authenticated connection so chat text never transits Apple), and a per-device SSE watch registry suppresses redundant completion pushes while a device is actively streaming the session. See [Mobile Push Notifications](./adr/mobile-push-notifications.md).
+
+Future work should build on the existing gateway contract rather than changing the runtime/source-of-truth model.

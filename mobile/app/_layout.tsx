@@ -22,7 +22,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { View } from "react-native";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { SafeAreaProvider } from "react-native-safe-area-context";
-import { primeCredentials, useAuth } from "@/src/auth";
+import { mirrorCachedCredentialsToSharedContainer, primeCredentials, useAuth } from "@/src/auth";
 import { primePendingPair } from "@/src/pending-pair";
 import { LinkContextMenuHost } from "@/src/components/chat/linkContextMenu";
 import { FilePreviewProvider } from "@/src/components/FilePreview";
@@ -77,6 +77,11 @@ export default function RootLayout() {
       // instead of bouncing to /setup on a cold relaunch.
       await primePendingPair();
       await primeDeviceTokenFromStorage();
+      // Device token is primed now, so mirror the rehydrated credentials
+      // (with that token folded in) into the App Group container — an
+      // already-signed-in user who relaunches without opening a chat would
+      // otherwise leave the NSE with no creds to enrich previews.
+      mirrorCachedCredentialsToSharedContainer();
       await registerApprovalCategoryAsync();
       if (active) setPrimed(true);
     })();

@@ -1,7 +1,7 @@
 // APNs dispatcher. Subscribes to the chat-blocks instance-wide emitter
 // and translates two kinds of blocks into APNs pushes:
-//   - `approval_requested` → alert push (always sent; the user needs to
-//     decide and may not be in the app).
+//   - `authorization_requested` → alert push (always sent; the user needs
+//     to decide and may not be in the app).
 //   - `phase` with a terminal label → routed by label and by whether the
 //     task produced a user-visible message:
 //       * `Completed` AND the task emitted ≥1 non-empty `assistant_text`
@@ -137,28 +137,31 @@ export function buildMessageCompletedPayload(
       // Group multiple message notifications for the same chat under
       // one stack on the lock screen (same convention as approvals).
       "thread-id": block.sessionId,
-      // `mutable-content: 1` keeps the door open for a future NSE that
-      // wants to enrich the payload (e.g. attach a preview snippet from
-      // a privileged on-device fetch). The current NSE is approval-only
-      // and treats this as a no-op.
+      // `mutable-content: 1` makes iOS invoke the NSE before display, which
+      // fetches the real message text from /api/push/preview on-device and
+      // rewrites this banner — the text never rides the wire payload.
       "mutable-content": 1
     },
     // Routing fields under `body` so expo-notifications surfaces them
     // as `content.data` on the client (see comment in
     // buildApprovalPayload). `silent: false` lets the client classifier
-    // branch uniformly on `data.silent`.
+    // branch uniformly on `data.silent`. `threadId` rides along when the
+    // completed turn was in a thread so the NSE's preview fetch can
+    // resolve the THREAD's own reply (the main-chat lookup would surface
+    // stale main-chat text); absent for ordinary main-chat completions.
     body: {
       sessionId: block.sessionId,
       blockId: block.id,
       event: "message_completed",
-      silent: false
+      silent: false,
+      ...(block.threadId ? { threadId: block.threadId } : {})
     }
   };
 }
 
-// Builds the per-call APNs payload + headers for an approval_requested
-// block. Exported for tests that want to assert payload shape without
-// mocking the entire dispatcher.
+// Builds the per-call APNs payload + headers for an authorization_requested
+// (or setup_requested) prompt block. Exported for tests that want to assert
+// payload shape without mocking the entire dispatcher.
 type PendingPromptBlock =
   | (ChatBlock & { kind: "authorization_requested" })
   | (ChatBlock & { kind: "setup_requested" });
@@ -169,27 +172,32 @@ function promptIdOf(block: PendingPromptBlock): string {
 
 export function buildApprovalPayload(block: PendingPromptBlock): APNsPayload {
   const isSetup = block.kind === "setup_requested";
-  return {
-    aps: {
-      alert: {
-        title: isSetup ? "Gini needs you to finish a step" : "Gini needs your approval",
-        body: "Tap to review"
-      },
-      sound: "default",
-      // `thread-id` groups multiple notifications under a single
-      // stack in iOS's notification center. Using sessionId means a
-      // chat with several approvals collapses to one stack instead
-      // of flooding the lock screen.
-      "thread-id": block.sessionId,
-      // `mutable-content: 1` lets the Notification Service Extension
-      // (Step 4) modify the payload before display — required for
-      // the inline Approve/Deny actions to be wired up later.
-      "mutable-content": 1,
-      // `category` ties the notification to the iOS-side
-      // UNNotificationCategory that defines the Approve/Deny
-      // actions. The mobile app registers the category on launch.
-      category: "APPROVAL_REQUEST"
+  const aps: Record<string, unknown> = {
+    alert: {
+      title: isSetup ? "Gini needs you to finish a step" : "Gini needs your approval",
+      body: "Tap to review"
     },
+    sound: "default",
+    // `thread-id` groups multiple notifications under a single
+    // stack in iOS's notification center. Using sessionId means a
+    // chat with several approvals collapses to one stack instead
+    // of flooding the lock screen.
+    "thread-id": block.sessionId,
+    // `mutable-content: 1` lets the Notification Service Extension
+    // modify the payload before display — required both for the
+    // inline Approve/Deny actions and for the on-device preview fetch.
+    "mutable-content": 1
+  };
+  // `category` ties the notification to the iOS-side
+  // UNNotificationCategory that defines the Approve/Deny actions —
+  // attach it ONLY for authorization_requested. A setup_requested is a
+  // user-action flow (open a browser, fill a form) with no approve/deny
+  // semantics, and its id is a setup id that the Approve/Deny handler's
+  // POST /api/authorizations/:id route can't resolve. Setup pushes
+  // deep-link into the app on tap instead.
+  if (!isSetup) aps.category = "APPROVAL_REQUEST";
+  return {
+    aps,
     // expo-notifications reads remote-push custom data from
     // userInfo["body"], not top-level userInfo keys — top-level fields
     // are dropped on the client. Wrapping our routing payload in a
@@ -332,7 +340,10 @@ export function createApnsDispatcher(instance: Instance, deps?: DispatcherDeps):
     // is per-device (keyed by APNs token) because two iOS installs
     // of the same human can be in different app states; the
     // backgrounded install still needs the silent wake (or alert)
-    // even when the foregrounded one is already watching.
+    // even when the foregrounded one is already watching. The device
+    // POSTs /api/push/unwatch when it backgrounds to clear its
+    // watch-state, so a relay holding the SSE socket open past
+    // backgrounding can't leave a stale entry that over-suppresses.
     await Promise.all(devices.map((device) => {
       if (isWatching(instance, device.token, block.sessionId)) {
         return Promise.resolve();

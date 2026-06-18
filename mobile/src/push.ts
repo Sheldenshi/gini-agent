@@ -13,15 +13,15 @@
 //      hex-encoded APNs token, NOT the Expo Push token — we send
 //      directly to APNs from the gateway.
 //   4. POST the token to `/api/push/devices` so the gateway can fan
-//      `approval_requested` notifications out to it.
+//      `authorization_requested` notifications out to it.
 //   5. Subscribe to `addPushTokenListener` so a rotated token
 //      (rare, but happens on restore-from-backup) re-registers.
 //   6. Subscribe to `addNotificationResponseReceivedListener` for tap +
 //      action handling. The category registered below pairs with the
-//      NSE attached on the server-side `approval_requested` payload —
+//      NSE attached on the server-side `authorization_requested` payload —
 //      the OS shows Approve / Deny buttons on the lock screen, and
-//      this listener routes each action to the right /api/approvals
-//      endpoint without forcing the app to foreground.
+//      this listener routes each action to the right
+//      /api/authorizations endpoint without forcing the app to foreground.
 //
 // Action handling caveat: `opensAppToForeground: false` means the OS
 // only invokes the response listener if the app is backgrounded
@@ -44,6 +44,7 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import { api, ApiError } from "./api";
 import {
   APPROVAL_CATEGORY,
+  APPROVAL_CATEGORY_ACTIONS,
   APPROVE_ACTION,
   DENY_ACTION,
   dispatchNotificationResponse
@@ -82,7 +83,7 @@ export type {
 // Foreground presentation rule. Silent (content-available) pushes
 // must never surface a banner or play a sound — the badge update is
 // what they're for, and we manage that explicitly via refreshBadge
-// rather than letting APS set it. Alert payloads (approval_requested
+// rather than letting APS set it. Alert payloads (authorization_requested
 // and message_completed) keep their banner so the user notices the
 // signal without unlocking the device. Setting this once at module
 // load means every received notification is classified at delivery.
@@ -143,27 +144,13 @@ export function registerApprovalCategoryAsync(): Promise<void> {
   categoryRegistration = (async () => {
     if (Platform.OS !== "ios") return;
     try {
-      await Notifications.setNotificationCategoryAsync(APPROVAL_CATEGORY, [
-        {
-          identifier: APPROVE_ACTION,
-          buttonTitle: "Approve",
-          options: {
-            opensAppToForeground: false,
-            isAuthenticationRequired: false,
-            isDestructive: false
-          }
-        },
-        {
-          identifier: DENY_ACTION,
-          buttonTitle: "Deny",
-          options: {
-            opensAppToForeground: false,
-            isAuthenticationRequired: false,
-            // Deny is the destructive choice — iOS highlights it red.
-            isDestructive: true
-          }
-        }
-      ]);
+      // Action specs (including the Approve auth-required invariant) live
+      // in push-dispatch.ts so they're unit-testable without the native
+      // module. expo-notifications wants a mutable array, so copy it.
+      await Notifications.setNotificationCategoryAsync(
+        APPROVAL_CATEGORY,
+        APPROVAL_CATEGORY_ACTIONS.map((action) => ({ ...action }))
+      );
     } catch {
       // setNotificationCategoryAsync can throw on the very first launch
       // before the native module is ready. Clear the cached promise so
@@ -411,20 +398,26 @@ export async function registerForPushAsync(opts: RegisterPushOptions = {}): Prom
       // Response listener: handles three cases via dispatchNotificationResponse.
       //   - Default tap (no actionIdentifier set, or
       //     UNNotificationDefaultActionIdentifier) → deep-link to chat.
-      //   - APPROVE action → POST /api/approvals/:id/approve.
-      //   - DENY action → POST /api/approvals/:id/deny.
-      // Both action endpoints are existing routes (src/http.ts:201-202)
-      // — they pre-date the push surface and already enforce auth +
-      // ownership. The action handler runs in the background while the
-      // app is suspended; iOS gives ~30s of JS time which is plenty for
-      // a single POST round-trip.
+      //   - APPROVE action → POST /api/authorizations/:id/approve.
+      //   - DENY action → POST /api/authorizations/:id/deny.
+      // Both action endpoints are existing routes — they pre-date the push
+      // surface and already enforce auth + ownership. The action handler
+      // runs in the background while the app is suspended; iOS gives up to
+      // 30s of JS time, plenty for a single POST round-trip.
       if (!responseSub) {
         responseSub = Notifications.addNotificationResponseReceivedListener((response) => {
           void dispatchNotificationResponse(response, {
             apiCall: (path, init) => api(path, init),
-            navigate: (sessionId) => {
+            navigate: (sessionId, threadId) => {
               // expo-router uses dynamic segments via the bracketed path.
-              router.push(`/chat/${sessionId}`);
+              // A threaded completion deep-links into the thread view — the
+              // main chat filters threaded blocks out, so opening it would
+              // hide the reply the banner previewed.
+              router.push(
+                threadId
+                  ? `/chat/${sessionId}/thread/${threadId}`
+                  : `/chat/${sessionId}`
+              );
             },
             notifyFailure: notifyActionFailure
           });
@@ -483,6 +476,31 @@ async function postDevice(token: string, bundleId: string): Promise<void> {
     method: "POST",
     body: JSON.stringify({ token, platform: "ios", bundleId })
   });
+  // Fold the freshly-registered device token into the App Group shared
+  // container alongside the gateway base URL + bearer so the iOS
+  // Notification Service Extension can send X-Device-Token when it fetches
+  // the notification preview. Best-effort — a failure here must not fail
+  // registration, and the NSE's preview endpoint works without the header.
+  mirrorDeviceTokenToSharedContainer(token);
+}
+
+// Rewrite the App Group shared credentials to include the device token.
+// Reads the live gateway base URL + bearer from the auth cache (the same
+// pair the NSE authenticates with) and re-writes the shared file. Lazy
+// requires keep the import graph acyclic (auth → push → api) and let
+// non-RN bundles skip the native file write.
+function mirrorDeviceTokenToSharedContainer(deviceToken: string): void {
+  try {
+    const auth = require("./auth") as { readCachedCredentials?: () => { baseUrl: string; token: string } | null };
+    const creds = auth.readCachedCredentials?.();
+    if (!creds) return;
+    const shared = require("./shared-credentials") as {
+      writeSharedCredentials?: (c: { baseUrl: string; token: string; deviceToken?: string }) => void;
+    };
+    shared.writeSharedCredentials?.({ baseUrl: creds.baseUrl, token: creds.token, deviceToken });
+  } catch {
+    // require can throw in non-RN envs — best effort.
+  }
 }
 
 // Reads the bundle id from expo-constants. Falls back to null when
