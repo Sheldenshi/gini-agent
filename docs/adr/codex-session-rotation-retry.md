@@ -39,7 +39,7 @@ The `originator` header (`codex_cli_rs`) is unchanged and the version placeholde
 
 The codex CLI's non-atomic rewrite of `auth.json` typically completes in microseconds. The 50 ms wait is two-to-three orders of magnitude longer than the writer's window, so retry observes a flushed file with overwhelming probability. The cost is negligible — the user only pays 50 ms when a retry was already going to fire, never on the happy path — and the alternative (a long-running parse-retry loop inside `readCodexCredentials`) would muddle the read API and propagate async-ness through every caller.
 
-50 ms is also short enough that the chat-task layer's existing status-flip cancellation model doesn't materially suffer: a user cancel during the delay still results in a wasted attempt-2 request (no `AbortSignal` is plumbed through the provider pipeline today), but the chat-task loop's post-await terminal-status re-check drops the result. Wiring full `AbortSignal` propagation through the provider layer is out of scope for this ADR.
+50 ms is also short enough that cancellation doesn't materially suffer. The provider pipeline now carries the chat-task turn's `AbortSignal` (see `src/execution/turn-abort.ts`): a user cancel during the 50 ms delay aborts the retry's fetch at the source so attempt 2 is not even sent, and the chat-task loop's post-await terminal-status re-check remains as defense-in-depth. (The retry closure passes the same `signal` through on each attempt.)
 
 ## Why CodexAuthRaceError Is Separate From CodexSessionExpiredError
 
@@ -71,7 +71,7 @@ Retry behavior is pinned in `src/provider.test.ts`:
 
 ## Out Of Scope
 
-- **AbortSignal plumbing.** Cancellation currently rides on chat-task status flips; provider-layer signal propagation is a separate, larger change.
+- **AbortSignal plumbing.** No longer out of scope — the provider pipeline now carries the turn's `AbortSignal` end to end (see `src/execution/turn-abort.ts` and the codex `/responses` fetch + reader), so a cancel aborts the in-flight request (including a session-rotation retry) at the source. The chat-task status-flip re-check remains as defense-in-depth.
 - **Multi-retry strategy.** A second consecutive session-expired usually means the CLI hasn't yet refreshed; looping further would burn quota without helping. The fixed cap-at-one stays.
 - **Caching the parsed `auth.json`.** Every request re-reads. Caching would require an invalidation surface; the cost is one `readFileSync` per request, which is negligible compared to the model call.
 - **ADR for the chat-task post-await cancellation model.** That contract lives in `src/execution/chat-task.ts` comments today; promoting it to an ADR is independent of this one.

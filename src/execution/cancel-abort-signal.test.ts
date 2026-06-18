@@ -424,4 +424,54 @@ describe("per-turn AbortSignal", () => {
     // terminal task without emitting ok, so cancelTask must settle it).
     expect(ran?.kind === "tool_call" && ran.status).toBe("ok");
   });
+
+  test("cancel settles a DENIED approval's tool_call as denied, not ok", async () => {
+    const config = buildConfig(makeWorkspace(), uniqueInstance("cancel-denied-auth"));
+
+    // A non-`pending` authorization is NOT proof the side effect ran — it can
+    // be `denied`, meaning the action was refused and never executed. cancel
+    // must settle such a row as `denied`, never `ok` (emitting ok would mislabel
+    // a refused, never-run action as successful — an audit-trust hazard).
+    const seeded = await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "cancel-denied-auth", undefined, "agent_d");
+      const t = createTask(config.instance, "gated work", undefined, undefined, undefined, undefined, undefined, session.id);
+      t.status = "waiting_approval";
+      t.mode = "chat";
+      const auth = createAuthorization(state, {
+        taskId: t.id,
+        action: "terminal.exec",
+        target: "echo nope",
+        risk: "medium",
+        reason: "Run shell command",
+        payload: { command: "echo nope", toolCallId: "call_denied" }
+      });
+      auth.status = "denied"; // refused — side effect never ran.
+      t.toolCallState = {
+        messages: [],
+        toolsHash: "h",
+        iterations: 1,
+        pending: [{ toolCallId: "call_denied", toolName: "terminal_exec", approvalId: auth.id }]
+      };
+      t.approvalIds.push(auth.id);
+      state.tasks.push(t);
+      return { sessionId: session.id, taskId: t.id };
+    });
+    insertChatBlock(config.instance, {
+      kind: "tool_call",
+      toolName: "terminal_exec",
+      displayLabel: "Run shell command",
+      argsPreview: "echo nope",
+      argsFull: { command: "echo nope" },
+      status: "running",
+      callId: "call_denied",
+      sessionId: seeded.sessionId,
+      taskId: seeded.taskId
+    });
+
+    await cancelTask(config, seeded.taskId);
+
+    const toolCalls = listChatBlocks(config.instance, seeded.sessionId).filter((b) => b.kind === "tool_call");
+    const denied = toolCalls.find((b) => b.kind === "tool_call" && b.callId === "call_denied");
+    expect(denied?.kind === "tool_call" && denied.status).toBe("denied");
+  });
 });

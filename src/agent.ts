@@ -362,15 +362,23 @@ export async function cancelTask(
       if (auth.taskId !== taskId) continue;
       const callId = approvalToolCallId(auth.payload);
       if (!callId) continue;
-      if (auth.status === "pending") gatedToolCallIds.add(callId);
-      else resolvedCallIds.add(callId); // approved/denied — side effect ran or is running.
+      // `pending` → still gated, deny it. `approved` → the side effect ran (or
+      // is running) and the resume path owns settling it `ok`; record it as
+      // "ran" so the emit flips a stuck `running` row to `ok` rather than
+      // `denied`. `denied` → the side effect NEVER ran, so it must stay denied
+      // (treating it as "ran" would mislabel a refused action as ok); fall
+      // through to deny it like a pending call.
+      if (auth.status === "approved") resolvedCallIds.add(callId);
+      else gatedToolCallIds.add(callId); // pending or denied → deny.
     }
     for (const setup of state.setupRequests) {
       if (setup.taskId !== taskId) continue;
       const callId = approvalToolCallId(setup.payload);
       if (!callId) continue;
-      if (setup.status === "pending") gatedToolCallIds.add(callId);
-      else resolvedCallIds.add(callId); // completed/cancelled — owned by the resume path.
+      // `completed` → the user finished the setup and the side effect ran →
+      // settle `ok`. `pending`/`cancelled` → never completed → deny.
+      if (setup.status === "completed") resolvedCallIds.add(callId);
+      else gatedToolCallIds.add(callId);
     }
     // Deny the genuinely-unresolved gated calls; the calls whose owner already
     // left `pending` (side effect ran) are settled to `ok` instead — the resume

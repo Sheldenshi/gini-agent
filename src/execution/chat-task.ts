@@ -2448,8 +2448,11 @@ async function runLoop(
           } catch (error) {
             // Turn-abort: the in-flight compaction aux call was cancelled. Bail
             // to the cancelled terminal path rather than the partial-result
-            // exit (which would wrongly mark the task completed).
-            if (isAbortError(error)) {
+            // exit (which would wrongly mark the task completed). Gate on our
+            // OWN turnSignal so an unrelated AbortError (a provider aborting
+            // for its own reasons) isn't mistaken for a turn cancel — that
+            // would return the loop while the task is still non-terminal.
+            if (isAbortError(error) && turnSignal?.aborted) {
               await flushChain;
               return bailOnTurnAbort();
             }
@@ -2528,8 +2531,10 @@ async function runLoop(
         // queued flush, then bail to the cancelled terminal path — the abort is
         // NOT a context overflow (don't compact-and-retry) nor an auth failure
         // (don't record needs-reauth). cancelTask owns the terminal status flip
-        // and the "Cancelled" block emission; we just stop the loop here.
-        if (isAbortError(error)) {
+        // and the "Cancelled" block emission; we just stop the loop here. Gate
+        // on our OWN turnSignal so an unrelated AbortError isn't mistaken for a
+        // turn cancel (which would return the loop on a still-running task).
+        if (isAbortError(error) && turnSignal?.aborted) {
           await flushChain;
           return bailOnTurnAbort();
         }
@@ -3487,8 +3492,9 @@ async function runLoop(
     } catch (error) {
       // Turn-abort: the exhaustion-summary call was cancelled. Bail to the
       // cancelled terminal path — this runs after the main loop, so there is no
-      // in-flight flush to drain.
-      if (isAbortError(error)) {
+      // in-flight flush to drain. Gate on our OWN turnSignal so an unrelated
+      // AbortError isn't mistaken for a turn cancel.
+      if (isAbortError(error) && turnSignal?.aborted) {
         return bailOnTurnAbort();
       }
       // Same provider-auth tagging as the main loop call, so an expired token

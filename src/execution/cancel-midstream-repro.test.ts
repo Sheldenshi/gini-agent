@@ -330,7 +330,7 @@ describe("issue #395 — cancel mid-stream", () => {
   // deliberately undefined).
   for (const variant of ["authorization", "setup-request"] as const) {
     test(`cancel settles a gated tool_call from the durable ${variant} row even before the loop snapshot is persisted`, async () => {
-      const config = buildConfig(makeWorkspace(), `cancel-mid-dispatch-${variant}`, "strict");
+      const config = buildConfig(makeWorkspace(), uniqueInstance(`cancel-mid-dispatch-${variant}`), "strict");
 
       const setup = await mutateState(config.instance, (state) => {
         const session = createChatSession(state, `cancel-mid-dispatch-${variant}`, undefined, "agent_m");
