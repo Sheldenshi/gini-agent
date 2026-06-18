@@ -531,7 +531,8 @@ export function isAbortError(error: unknown): boolean {
 // a turn mid-call and observe the same deterministic AbortError a real provider
 // fetch would raise. Rejects with the signal's reason (an AbortError-shaped
 // DOMException) so isAbortError classifies it. No signal → a plain sleep.
-export async function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
+// Module-private: only the echo branch uses it.
+async function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
   if (!signal) {
     await Bun.sleep(ms);
     return;

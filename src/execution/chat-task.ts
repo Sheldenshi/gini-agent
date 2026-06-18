@@ -3757,6 +3757,25 @@ export async function resumeChatTask(
       message: "Resume request ignored: task is terminal",
       data: { toolCallId, taskStatus: stage.task.status }
     });
+    // The task was cancelled (or failed) while this approved tool's side effect
+    // was running — resume is being called WITH its result, so the side effect
+    // genuinely completed. Settle the tool_call row to `ok` (and surface the
+    // result) here, because the loop won't re-enter to do it and cancelTask
+    // deliberately doesn't touch approved-but-unsettled rows. Without this the
+    // row stays stuck `running` after "Cancelled" for a tool that succeeded
+    // (issue #395). Best-effort.
+    try {
+      const termCtx = resolveEmitContext(config, taskId);
+      if (termCtx) {
+        emitToolCallStatus(termCtx, { callId: toolCallId, status: "ok" });
+        emitToolResult(termCtx, { callId: toolCallId, result: toolResult });
+      }
+    } catch (error) {
+      appendLog(config.instance, "chat.resume_terminal_block.emit_failed", {
+        taskId,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
     return stage.task;
   }
   if (!stage.hasState) {

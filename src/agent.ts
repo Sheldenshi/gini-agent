@@ -288,16 +288,13 @@ export async function cancelTask(
   // omit the arg and keep their original behavior.
   parentTaskId?: string
 ): Promise<Task> {
-  // Tool-call ids that were awaiting approval when the cancel landed. Filled
-  // inside the mutateState callback (before toolCallState is cleared) and
-  // read by the post-mutation chat-block emit to settle their tool_call rows:
-  // `cancelledPendingToolCallIds` are genuinely-unresolved gated calls (settle
-  // to `denied`); `cancelledRanToolCallIds` are calls whose approval already
-  // ran (owner left `pending`) but whose result the resume path hadn't yet
-  // recorded — settle to `ok`, since the side effect happened and the resume
-  // path will bail on the now-terminal task without emitting it.
+  // Tool-call ids of genuinely-pending gated calls when the cancel landed.
+  // Filled inside the mutateState callback (before toolCallState is cleared)
+  // and read by the post-mutation chat-block emit to settle their tool_call
+  // rows to `denied`. Calls whose approval already left `pending` are NOT
+  // collected — their row is owned by executeApprovedAction (skip → denied) or
+  // resumeChatTask (ran → ok), since only those sites know the real outcome.
   let cancelledPendingToolCallIds: string[] = [];
-  let cancelledRanToolCallIds: string[] = [];
   const task = await mutateState(config.instance, (state) => {
     const task = findTask(state, taskId);
     if (parentTaskId !== undefined && parentTaskId === taskId) {
@@ -321,72 +318,52 @@ export async function cancelTask(
       },
       { taskId }
     );
-    // Capture the gated tool-call ids BEFORE tearing down approvals / clearing
-    // the snapshot so the post-mutation emit can settle their still-`running`
-    // tool_call rows (the deny path does the same via emitToolCallStatus).
-    // Without this a task cancelled while waiting on an approval leaves the
-    // tool_call row spinning and the "Run shell command" card live after
-    // "Cancelled" — the UI says stopped, the rows say still-working (issue
-    // #395). The snapshot's `pending` is only persisted once the whole
-    // tool-dispatch loop pauses, so a cancel that lands BETWEEN the approval
-    // row being created and that snapshot write would miss the call. Union the
-    // snapshot ids with the tool-call ids on the durable pending
-    // authorization / setup-request rows for this task, which exist as soon as
-    // dispatch creates the gate.
-    // Only deny entries that are still UNRESOLVED. An approval resolving in
-    // parallel (resolveAuthorization → executeApprovedAction → resumeChatTask)
-    // runs its side effect and then settles the tool_call row as `ok`; a cancel
-    // racing that must not re-flip the settled (or about-to-settle) row to
-    // `denied`, which would mislabel a tool that genuinely ran. Two signals
-    // mark a call as already-resolved-or-running, and the deny set must skip
-    // BOTH:
-    //   (a) the snapshot entry already carries a `result` (resumeChatTask's
-    //       stageResume recorded it) — the post-record window; and
-    //   (b) the owning authorization/setup row is NO LONGER `pending` (it
-    //       flipped to approved/completed when the side effect started/ran) —
-    //       the pre-record window, between the side effect committing + the
-    //       in-flight registry releasing and stageResume writing the result.
-    //       In (b) the result isn't on the snapshot yet, so (a)'s filter alone
-    //       would still collect it; the abort is also a no-op (registry already
-    //       released), so the side effect genuinely ran. Excluding non-pending
-    //       owners leaves the resume path to settle the row as `ok`.
-    // `resolvedCallIds` collects (b)'s callids so the final set can subtract
-    // them after the union below.
-    const resolvedCallIds = new Set<string>();
+    // Settle the tool_call rows of GENUINELY-PENDING gated calls to `denied`.
+    // These are calls whose approval is still `pending` (never approved/run) —
+    // the real issue-#395 case: a task cancelled while a gate is live leaves
+    // the tool_call row spinning and the card interactive after "Cancelled".
+    //
+    // We deliberately do NOT try to settle calls whose approval has already
+    // left `pending` (approved / completed). `approved` is set BEFORE the side
+    // effect runs (resolveAuthorization), so it is NOT proof of execution — the
+    // side effect may run, or may be skipped because the task went terminal.
+    // Guessing the row's terminal status from approval state here is what
+    // produced a string of wrong labels (ok-on-a-skipped-action,
+    // denied-on-a-ran-action). Instead, the two sites that KNOW the real
+    // outcome own the settle: executeApprovedAction settles the row `denied`
+    // when it skips the side effect on a terminal task, and resumeChatTask
+    // settles it `ok` when the side effect ran (even if the task was cancelled
+    // before the loop re-entered). So cancelTask only touches still-pending
+    // gates. The snapshot's `pending` is persisted only once the loop pauses,
+    // so union the snapshot ids (filtered to entries with no result yet) with
+    // the tool-call ids on the durable pending authorization / setup-request
+    // rows, which exist as soon as dispatch creates the gate.
     const gatedToolCallIds = new Set<string>(
       (task.toolCallState?.pending ?? [])
         .filter((p) => typeof p.result !== "string")
         .map((p) => p.toolCallId)
     );
+    // A call whose owning approval/setup row has LEFT `pending` (approved /
+    // completed / denied / cancelled) is no longer a live gate cancelTask
+    // should touch: its outcome is owned elsewhere. Collect those callids and
+    // subtract them from the deny set, so an approved-but-unrecorded call (no
+    // snapshot result yet) isn't wrongly denied via the snapshot path above.
+    const resolvedCallIds = new Set<string>();
     for (const auth of state.authorizations) {
       if (auth.taskId !== taskId) continue;
       const callId = approvalToolCallId(auth.payload);
       if (!callId) continue;
-      // `pending` → still gated, deny it. `approved` → the side effect ran (or
-      // is running) and the resume path owns settling it `ok`; record it as
-      // "ran" so the emit flips a stuck `running` row to `ok` rather than
-      // `denied`. `denied` → the side effect NEVER ran, so it must stay denied
-      // (treating it as "ran" would mislabel a refused action as ok); fall
-      // through to deny it like a pending call.
-      if (auth.status === "approved") resolvedCallIds.add(callId);
-      else gatedToolCallIds.add(callId); // pending or denied → deny.
+      if (auth.status === "pending") gatedToolCallIds.add(callId);
+      else resolvedCallIds.add(callId);
     }
     for (const setup of state.setupRequests) {
       if (setup.taskId !== taskId) continue;
       const callId = approvalToolCallId(setup.payload);
       if (!callId) continue;
-      // `completed` → the user finished the setup and the side effect ran →
-      // settle `ok`. `pending`/`cancelled` → never completed → deny.
-      if (setup.status === "completed") resolvedCallIds.add(callId);
-      else gatedToolCallIds.add(callId);
+      if (setup.status === "pending") gatedToolCallIds.add(callId);
+      else resolvedCallIds.add(callId);
     }
-    // Deny the genuinely-unresolved gated calls; the calls whose owner already
-    // left `pending` (side effect ran) are settled to `ok` instead — the resume
-    // path would otherwise leave their tool_call row stuck `running` because it
-    // bails on the now-terminal task before emitting. Subtract the resolved set
-    // from the deny set so no call is both denied and ok'd.
     cancelledPendingToolCallIds = [...gatedToolCallIds].filter((id) => !resolvedCallIds.has(id));
-    cancelledRanToolCallIds = [...resolvedCallIds];
     // Halt-siblings fix: cancelling a task that's waiting on multiple
     // pending approvals must also tear down those approvals so a later
     // approve doesn't run a tool against a cancelled task. Clear the
@@ -424,20 +401,14 @@ export async function cancelTask(
       if (inFlight) {
         finalizeAssistantText(emitCtx, inFlight.blockId, inFlight.text);
       }
-      // Settle any tool_call row that was waiting on an approval when the
-      // cancel landed. A genuinely-unresolved gated call is flipped to
-      // `denied` (mirrors the deny path) so the row stops spinning and the
-      // gate card reads resolved rather than staying interactive after
-      // "Cancelled" (issue #395). A call whose approval already ran (owner left
-      // `pending`) is flipped to `ok`: the side effect happened, but the resume
-      // path bails on the now-terminal task before emitting, so without this
-      // the row would stay stuck `running` — re-creating the #395 symptom on a
-      // tool that actually succeeded.
+      // Settle the still-pending gated calls' tool_call rows to `denied` so
+      // they stop spinning and the gate card reads resolved rather than staying
+      // interactive after "Cancelled" (issue #395). Calls whose approval has
+      // already left `pending` are intentionally untouched here — their row is
+      // settled by the site that knows the outcome (executeApprovedAction on a
+      // skip, resumeChatTask on a completed run).
       for (const callId of cancelledPendingToolCallIds) {
         emitToolCallStatus(emitCtx, { callId, status: "denied" });
-      }
-      for (const callId of cancelledRanToolCallIds) {
-        emitToolCallStatus(emitCtx, { callId, status: "ok" });
       }
       emitSystemNote(emitCtx, "Cancelled");
       emitPhase(emitCtx, "Cancelled");
@@ -1895,6 +1866,24 @@ async function executeApprovedAction(
           message: "Skipping approved action: task already terminal",
           data: { approvalId: approval.id, taskStatus: guard.taskStatus }
         });
+        // Settle the gated tool_call row to `denied` here: the task went
+        // terminal before this approved action could run, so the side effect
+        // is SKIPPED (the guard flipped the approval back to denied). cancelTask
+        // intentionally leaves approved-but-unrun rows to this site — it can't
+        // tell a skipped action from a completed one. Without this the row
+        // would stay stuck `running` after "Cancelled" (issue #395). Best-
+        // effort: a chat-block failure must not break the lifecycle.
+        if (chatToolCallId) {
+          try {
+            const emitCtx = resolveEmitContext(config, approval.taskId);
+            if (emitCtx) emitToolCallStatus(emitCtx, { callId: chatToolCallId, status: "denied" });
+          } catch (error) {
+            appendLog(config.instance, "chat.skip_block.emit_failed", {
+              taskId: approval.taskId,
+              error: error instanceof Error ? error.message : String(error)
+            });
+          }
+        }
       }
       return undefined;
     }
