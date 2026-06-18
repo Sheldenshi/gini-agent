@@ -453,6 +453,38 @@ async function dispatchToolCallInner(
           })
         };
       }
+      // Surface-reachability guard (mirrors browser_fill_secrets / request_connector):
+      // the Connect card's screencast renders only in a live WEB chat session.
+      // A sessionless task (subagent / scheduled job / deleted session) or a
+      // messaging-bridge conversation (Telegram/Discord) can't show or complete
+      // the card, so minting one would park the task in waiting_approval with no
+      // way to resolve it. Refuse up-front with a recoverable tool_result.
+      // (The mobile app renders chat but not the screencast — that case is
+      // steered in INSTRUCTIONS via the per-turn surface note, like the handoff.)
+      const connectState = readState(config.instance);
+      const connectTask = findTask(connectState, taskId);
+      const connectSession = connectTask.chatSessionId
+        ? connectState.chatSessions.find((s) => s.id === connectTask.chatSessionId)
+        : undefined;
+      const connectSurfaceKind = connectSession?.source?.kind ?? connectSession?.outboundMirror?.kind;
+      if (!connectSession) {
+        return {
+          kind: "sync",
+          result: JSON.stringify({
+            ok: false,
+            error: "browser_connect surfaces an in-chat Connect card, which needs a web chat session — this task isn't attached to one (subagent child, scheduled job, or other headless run). Don't call browser_connect here; complete the browsing without the user, or route this through the parent web chat."
+          })
+        };
+      }
+      if (connectSurfaceKind === "telegram" || connectSurfaceKind === "discord") {
+        return {
+          kind: "sync",
+          result: JSON.stringify({
+            ok: false,
+            error: `browser_connect's in-chat browser view only works in the web chat (this conversation is over ${connectSurfaceKind}). Reply in text asking the user to open the web chat to sign in / complete the step, then continue once they confirm.`
+          })
+        };
+      }
       // Loop guard: cap Connect cards per sign-in wall (host) per task. The
       // first card pauses the task for the user; minting it always resolves
       // before a second connect can be dispatched, so a binary "already asked"

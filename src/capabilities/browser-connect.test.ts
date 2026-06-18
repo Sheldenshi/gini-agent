@@ -196,6 +196,33 @@ describe("cdp attach", () => {
     }
   });
 
+  test("a failed re-attach to a dead same-host record clears state (no stale connected record lingers)", async () => {
+    const config = testConfig("cdp-reconnect-failed-clears");
+    const { mutateState, now } = await import("../state");
+    await mutateState(config.instance, (state) => {
+      state.browser = { mode: "cdp", cdpUrl: "ws://127.0.0.1:9222/devtools/browser/dead", startedAt: now() };
+    });
+    const originalFetch = globalThis.fetch;
+    // Every probe fails: the same-host liveness re-probe AND the fresh attach.
+    globalThis.fetch = (async () => {
+      throw new Error("ECONNREFUSED");
+    }) as unknown as typeof fetch;
+    try {
+      await expect(
+        connectBrowser(
+          config,
+          { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/anything" },
+          { probeIntervalMs: 10, probeTimeoutMs: 60 }
+        )
+      ).rejects.toThrow(/Could not reach CDP endpoint/);
+      // The dead record was cleared, so GET /api/browser won't lie about being
+      // connected and the next tool call won't burn a 60s connectOverCDP on it.
+      expect(readState(config.instance).browser ?? null).toBeNull();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   test("bare connect (no cdpUrl) clears an active cdp record so tools fall back to the spawned default", async () => {
     const config = testConfig("cdp-bare-connect-clears");
     const { mutateState, now } = await import("../state");

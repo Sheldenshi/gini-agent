@@ -48,7 +48,7 @@ import {
   setEchoAuxTextResponse,
   setEchoVisionResponse
 } from "../provider";
-import { createAgentRecord, createTask, mutateState, readState, readTrace, upsertTask } from "../state";
+import { createAgentRecord, createChatSession, createTask, mutateState, readState, readTrace, upsertTask } from "../state";
 import type { RuntimeConfig } from "../types";
 
 // Direct unit coverage for the URL safety guard. We exercise the function
@@ -6137,7 +6137,8 @@ describe("dispatchToolCall(browser_connect)", () => {
     mkdirSync(WORKSPACE, { recursive: true });
     const config = dispatchConfig("browser-connect-dispatch");
     const taskId = await mutateState(config.instance, (state) => {
-      const task = createTask(state.instance, "connect test", undefined, undefined, undefined, undefined);
+      const session = createChatSession(state, "connect test chat");
+      const task = createTask(state.instance, "connect test", undefined, undefined, undefined, undefined, undefined, session.id);
       upsertTask(state, task);
       return task.id;
     });
@@ -6181,7 +6182,8 @@ describe("dispatchToolCall(browser_connect)", () => {
     mkdirSync(WORKSPACE, { recursive: true });
     const config = dispatchConfig("browser-connect-dispatch-cdp");
     const taskId = await mutateState(config.instance, (state) => {
-      const task = createTask(state.instance, "connect on cdp", undefined, undefined, undefined, undefined);
+      const session = createChatSession(state, "connect on cdp chat");
+      const task = createTask(state.instance, "connect on cdp", undefined, undefined, undefined, undefined, undefined, session.id);
       upsertTask(state, task);
       // A live cdp attach record makes the active transport "cdp".
       state.browser = { mode: "cdp", cdpUrl: "ws://127.0.0.1:9222/devtools/browser/abc", startedAt: new Date().toISOString() };
@@ -6204,6 +6206,55 @@ describe("dispatchToolCall(browser_connect)", () => {
     expect(parsed.ok).toBe(false);
     expect(parsed.error).toMatch(/attached their own Chrome over CDP/i);
     // No Connect card was minted.
+    expect(readState(config.instance).setupRequests.filter((s) => s.action === "browser.connect").length).toBe(0);
+    rmSync(ROOT, { recursive: true, force: true });
+  });
+
+  test("refuses (no card) on a sessionless task — the screencast needs a web chat session", async () => {
+    rmSync(ROOT, { recursive: true, force: true });
+    mkdirSync(WORKSPACE, { recursive: true });
+    const config = dispatchConfig("browser-connect-dispatch-sessionless");
+    const taskId = await mutateState(config.instance, (state) => {
+      // No chatSessionId — a subagent / scheduled-job / headless run.
+      const task = createTask(state.instance, "connect sessionless", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+    browserTest.installFakeSessionWithPageForTest(taskId, {
+      url: () => "https://example.com/login",
+      close: () => Promise.resolve()
+    });
+    const result = await dispatchToolCall(config, taskId, "browser_connect", "call_sessionless", JSON.stringify({ reason: "Sign in" }));
+    expect(result.kind).toBe("sync");
+    if (result.kind !== "sync") throw new Error("unreachable");
+    const parsed = JSON.parse(result.result) as { ok: boolean; error?: string };
+    expect(parsed.ok).toBe(false);
+    expect(parsed.error).toMatch(/needs a web chat session/i);
+    expect(readState(config.instance).setupRequests.filter((s) => s.action === "browser.connect").length).toBe(0);
+    rmSync(ROOT, { recursive: true, force: true });
+  });
+
+  test("refuses (no card) when the conversation is over a messaging bridge (telegram)", async () => {
+    rmSync(ROOT, { recursive: true, force: true });
+    mkdirSync(WORKSPACE, { recursive: true });
+    const config = dispatchConfig("browser-connect-dispatch-telegram");
+    const taskId = await mutateState(config.instance, (state) => {
+      // A Telegram-sourced chat session can't render or complete the screencast card.
+      const session = createChatSession(state, "tg chat", { kind: "telegram", bridgeId: "bridge_1", chatId: 7, target: "7" });
+      const task = createTask(state.instance, "connect tg", undefined, undefined, undefined, undefined, undefined, session.id);
+      upsertTask(state, task);
+      return task.id;
+    });
+    browserTest.installFakeSessionWithPageForTest(taskId, {
+      url: () => "https://example.com/login",
+      close: () => Promise.resolve()
+    });
+    const result = await dispatchToolCall(config, taskId, "browser_connect", "call_tg", JSON.stringify({ reason: "Sign in" }));
+    expect(result.kind).toBe("sync");
+    if (result.kind !== "sync") throw new Error("unreachable");
+    const parsed = JSON.parse(result.result) as { ok: boolean; error?: string };
+    expect(parsed.ok).toBe(false);
+    expect(parsed.error).toMatch(/over telegram/i);
     expect(readState(config.instance).setupRequests.filter((s) => s.action === "browser.connect").length).toBe(0);
     rmSync(ROOT, { recursive: true, force: true });
   });
@@ -6289,7 +6340,8 @@ describe("dispatchToolCall(browser_connect)", () => {
     mkdirSync(WORKSPACE, { recursive: true });
     const config = dispatchConfig("browser-connect-dispatch-loop");
     const taskId = await mutateState(config.instance, (state) => {
-      const task = createTask(state.instance, "connect loop", undefined, undefined, undefined, undefined);
+      const session = createChatSession(state, "connect loop chat");
+      const task = createTask(state.instance, "connect loop", undefined, undefined, undefined, undefined, undefined, session.id);
       upsertTask(state, task);
       return task.id;
     });
@@ -6371,7 +6423,8 @@ describe("dispatchToolCall(browser_connect)", () => {
     mkdirSync(WORKSPACE, { recursive: true });
     const config = dispatchConfig("browser-connect-dispatch-perhost");
     const taskId = await mutateState(config.instance, (state) => {
-      const task = createTask(state.instance, "connect per-host", undefined, undefined, undefined, undefined);
+      const session = createChatSession(state, "connect per-host chat");
+      const task = createTask(state.instance, "connect per-host", undefined, undefined, undefined, undefined, undefined, session.id);
       upsertTask(state, task);
       return task.id;
     });
@@ -6465,7 +6518,8 @@ describe("dispatchToolCall(browser_connect)", () => {
     mkdirSync(WORKSPACE, { recursive: true });
     const config = dispatchConfig("browser-connect-dispatch-approve");
     const taskId = await mutateState(config.instance, (state) => {
-      const task = createTask(state.instance, "connect approve", undefined, undefined, undefined, undefined);
+      const session = createChatSession(state, "connect approve chat");
+      const task = createTask(state.instance, "connect approve", undefined, undefined, undefined, undefined, undefined, session.id);
       upsertTask(state, task);
       return task.id;
     });
@@ -6531,7 +6585,8 @@ describe("dispatchToolCall(browser_connect)", () => {
     mkdirSync(WORKSPACE, { recursive: true });
     const config = dispatchConfig("browser-connect-dispatch-headless");
     const taskId = await mutateState(config.instance, (state) => {
-      const task = createTask(state.instance, "connect headless", undefined, undefined, undefined, undefined);
+      const session = createChatSession(state, "connect headless chat");
+      const task = createTask(state.instance, "connect headless", undefined, undefined, undefined, undefined, undefined, session.id);
       upsertTask(state, task);
       return task.id;
     });
@@ -6592,7 +6647,8 @@ describe("dispatchToolCall(browser_connect)", () => {
     mkdirSync(WORKSPACE, { recursive: true });
     const config = dispatchConfig("browser-connect-dispatch-mode");
     const taskId = await mutateState(config.instance, (state) => {
-      const task = createTask(state.instance, "connect mode", undefined, undefined, undefined, undefined);
+      const session = createChatSession(state, "connect mode chat");
+      const task = createTask(state.instance, "connect mode", undefined, undefined, undefined, undefined, undefined, session.id);
       upsertTask(state, task);
       return task.id;
     });
@@ -6673,7 +6729,8 @@ describe("dispatchToolCall(browser_connect)", () => {
     mkdirSync(WORKSPACE, { recursive: true });
     const config = dispatchConfig("browser-connect-dispatch-handoff-complete");
     const taskId = await mutateState(config.instance, (state) => {
-      const task = createTask(state.instance, "handoff complete", undefined, undefined, undefined, undefined);
+      const session = createChatSession(state, "handoff complete chat");
+      const task = createTask(state.instance, "handoff complete", undefined, undefined, undefined, undefined, undefined, session.id);
       upsertTask(state, task);
       return task.id;
     });

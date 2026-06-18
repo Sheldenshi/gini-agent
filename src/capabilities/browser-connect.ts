@@ -266,8 +266,16 @@ async function connectBrowserInner(
       await disconnectSharedBrowser();
       return { connected: true, record };
     }
-    // Stale record (the user's Chrome went away) — fall through to a fresh
-    // attach so we don't report a dead endpoint as connected.
+    // Stale record (the user's Chrome went away) — clear it BEFORE the fresh
+    // attach so that if the fresh attach also fails (endpoint truly gone),
+    // state is left cleanly disconnected rather than holding a dead record that
+    // GET /api/browser still reports as connected and that the next tool call
+    // wastes a 60s connectOverCDP timeout on. The liveness probe above already
+    // ran a short window and returned null, so we've decided this endpoint is
+    // dead — clearing here matches the pre-rewrite contract.
+    await mutateState(config.instance, (state) => {
+      state.browser = null;
+    });
   }
 
   const result = await connectExisting(config, validated.url, {
