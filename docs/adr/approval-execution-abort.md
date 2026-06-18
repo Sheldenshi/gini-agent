@@ -120,15 +120,24 @@ Per-action behaviour:
   lifecycle.
 - **`skill.run`** — an approval-gated skill script (declared
   `requires.approval`) runs as a Bun subprocess via
-  `invokeSkillScript`. A pre-spawn `signal.aborted` check skips a
-  script whose cancel landed before execution. The signal is threaded
-  into `invokeSkillScript`: an abort mid-run SIGTERMs the immediate
-  process (the same `proc.kill()` the 5-minute timeout uses), so a
-  cancelled approved `skill.run` stops at the source instead of
-  running to its full timeout. Because the script's result carries no
-  `winner`-of-race signal (unlike `terminal.exec`), the executor sets
-  `verdict.aborted` from a post-await `signal.aborted` check so the
-  gated tool_call row settles `denied`, not `ok`. Detached
+  `invokeSkillScript`, which the signal is threaded into. Two
+  pre-execution `signal.aborted` checks guard the side effect: the
+  first runs BEFORE `resolveSkillEnv` so a cancelled run never even
+  decrypts the skill's connector secrets, the second runs after the
+  env resolve and before `spawn`. Once spawned, the abort race is wired
+  up BEFORE the first post-spawn await (the stdin write): the abort
+  sentinel re-checks `signal.aborted` synchronously at registration
+  (an `addEventListener` on an already-fired signal never fires, so a
+  cancel landing in the spawn→listener window would otherwise be
+  missed) and also kills the proc as soon as the abort wins. Like
+  `terminal.exec`, `invokeSkillScript` races `proc.exited` against the
+  abort and returns an explicit `aborted` verdict that is true ONLY
+  when the abort won the race (`winner === "aborted"`); a signal that
+  fires after a clean exit (the drain window) loses the race, so a
+  completed script is never mislabeled. The executor sets
+  `verdict.aborted` from that returned `result.aborted` (NOT the racy
+  caller-side `signal.aborted`), so the gated tool_call row settles
+  `denied` on a genuine kill and `ok` on a real success. Detached
   grandchildren inside a shell script survive — the same SIGTERM-the-
   immediate-proc limitation as `terminal.exec` below.
 

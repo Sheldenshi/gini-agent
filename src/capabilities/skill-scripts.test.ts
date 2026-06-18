@@ -289,6 +289,32 @@ process.stdout.write(JSON.stringify({ ok: true, slept: true }));
     expect(result.exitCode).toBe(-1);
   });
 
+  test("a cancel landing during env-resolve (after entry, before spawn) skips the spawn", async () => {
+    const instance = "skinv-abort-midsetup";
+    const skillDir = `${ROOT}/${instance}-skills/sleeper3`;
+    writeScript(join(skillDir, "scripts"), "sleep.ts", `
+await Bun.sleep(30000);
+process.stdout.write(JSON.stringify({ ok: true, slept: true }));
+`);
+    await mutateState(instance, (s) => {
+      pushSkill(s, { name: "sleeper3", manifestPath: `${skillDir}/SKILL.md` });
+    });
+    const handle = findSkillScript(readState(instance), "sleeper3", "sleep");
+    const controller = new AbortController();
+    // Start the invoke (NOT aborted at entry, so the entry check passes), then
+    // abort on the next macrotask — during the awaited resolveSkillEnv window,
+    // before the spawn. The second pre-spawn `signal.aborted` check catches it.
+    const startedAt = Date.now();
+    const promise = invokeSkillScript(config(instance), handle!, {}, { signal: controller.signal });
+    setTimeout(() => controller.abort(), 0);
+    const result = await promise;
+    // The script (30s sleep) never ran to completion — the spawn was skipped or
+    // killed at the source well under the sleep.
+    expect(Date.now() - startedAt).toBeLessThan(5000);
+    expect(result.ok).toBe(false);
+    expect(result.aborted).toBe(true);
+  });
+
   test("a signal that fires AFTER the script already completed does NOT mark it aborted (drain window)", async () => {
     const instance = "skinv-abort-drain";
     const skillDir = `${ROOT}/${instance}-skills/quick`;

@@ -143,6 +143,25 @@ export interface SkillScriptResult {
   aborted: boolean;
 }
 
+// The result for a skill.run skipped because the cancel already landed (at
+// either pre-spawn boundary). Reported `aborted: true` so the caller settles
+// the gated tool_call row `denied`. A trace row records the skip when there's
+// a task to attribute it to.
+function abortedSkillResult(
+  config: RuntimeConfig,
+  handle: SkillScriptHandle,
+  taskId: string | undefined
+): SkillScriptResult {
+  if (taskId) {
+    appendTrace(config.instance, taskId, {
+      type: "tool",
+      message: `Skill script ${handle.skill.name}/${handle.scriptName} skipped: task was cancelled`,
+      data: { skill: handle.skill.name, script: handle.scriptName, aborted: true }
+    });
+  }
+  return { ok: false, stdout: "", stderr: "", exitCode: -1, parsed: null, error: "Skill script aborted: task was cancelled.", aborted: true };
+}
+
 // Spawn the script with the right interpreter, pipe JSON args via stdin,
 // capture stdout, parse as JSON. Non-zero exits, missing JSON, and
 // timeouts all surface as { ok: false } — callers never throw.
@@ -155,6 +174,13 @@ export async function invokeSkillScript(
   if (!existsSync(handle.scriptPath)) {
     throw new Error(`Skill script not found on disk: ${handle.scriptPath}`);
   }
+  const { signal } = options;
+  // Honor an already-landed cancel BEFORE resolving connector env: a cancelled
+  // run must not even load the skill's secrets (resolveSkillEnv can decrypt
+  // connector credentials), let alone spawn the script. This is the earliest
+  // cancellation boundary; the same check repeats just before spawn to catch a
+  // cancel that lands during the env resolve.
+  if (signal?.aborted) return abortedSkillResult(config, handle, options.taskId);
   const connectorEnv = await resolveSkillEnv(config, handle.skill, options.taskId);
   const env: Record<string, string> = {
     PATH: process.env.PATH ?? "",
@@ -185,22 +211,11 @@ export async function invokeSkillScript(
     }
   });
 
-  const { signal } = options;
-  // Skip the spawn entirely when the cancel already landed: starting a
-  // high-risk script (connector env, workspace access) only to SIGTERM it a
-  // tick later is a needless side effect, and mirrors terminal.exec's
-  // pre-spawn `signal.aborted` guard. Reported as aborted so the caller settles
-  // the row `denied`.
-  if (signal?.aborted) {
-    if (options.taskId) {
-      appendTrace(config.instance, options.taskId, {
-        type: "tool",
-        message: `Skill script ${handle.skill.name}/${handle.scriptName} skipped: task was cancelled`,
-        data: { skill: handle.skill.name, script: handle.scriptName, aborted: true }
-      });
-    }
-    return { ok: false, stdout: "", stderr: "", exitCode: -1, parsed: null, error: "Skill script aborted: task was cancelled.", aborted: true };
-  }
+  // Skip the spawn entirely when the cancel landed during the env resolve:
+  // starting a high-risk script (connector env, workspace access) only to
+  // SIGTERM it a tick later is a needless side effect, and mirrors
+  // terminal.exec's pre-spawn `signal.aborted` guard.
+  if (signal?.aborted) return abortedSkillResult(config, handle, options.taskId);
 
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const proc = spawn(cmd, {
@@ -211,35 +226,45 @@ export async function invokeSkillScript(
     cwd: dirname(handle.scriptPath)
   });
 
+  // Wire the abort race BEFORE the first post-spawn await (the stdin write):
+  // `addEventListener` on an ALREADY-aborted signal never fires, so a cancel
+  // landing between the spawn and the listener registration would otherwise be
+  // missed and leave the proc running. The sentinel re-checks `signal.aborted`
+  // synchronously so a signal already fired at registration resolves the race
+  // immediately; the listener catches a later abort. Race `proc.exited` against
+  // it for a TRUTHFUL verdict: `winner === "aborted"` only when the abort
+  // settled the race BEFORE the proc exited on its own. A signal that fires
+  // AFTER a clean exit (the drain window) loses the race, so a completed run is
+  // never mislabeled aborted — the same microtask discipline terminal.exec uses.
+  let onAbort: (() => void) | undefined;
+  const exitedSentinel = proc.exited.then(() => "exited" as const);
+  const abortSentinel = new Promise<"aborted">((resolve) => {
+    if (!signal) return; // never resolves — proc.exited always wins
+    if (signal.aborted) { resolve("aborted"); return; }
+    onAbort = (): void => resolve("aborted");
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  // Kill on abort as soon as it wins, even if the stdin write below is still
+  // pending. The race is set up first so no abort window is unobserved.
+  void abortSentinel.then(() => {
+    try { proc.kill(); } catch { /* already exited */ }
+  });
+
   const stdinJson = JSON.stringify(args ?? {});
   const writer = proc.stdin as { write: (data: Uint8Array) => Promise<number>; end: () => void };
-  await writer.write(new TextEncoder().encode(stdinJson));
-  writer.end();
+  // The write can reject if the proc was already killed by an abort that won
+  // the race during setup — swallow it; the race/exit handling below is the
+  // source of truth.
+  try {
+    await writer.write(new TextEncoder().encode(stdinJson));
+    writer.end();
+  } catch { /* proc already killed by abort */ }
 
   const timeoutHandle = setTimeout(() => {
     try { proc.kill(); } catch { /* already exited */ }
   }, timeoutMs);
 
-  // Honor the caller's abort signal: a cancel mid-run SIGTERMs the immediate
-  // process so the script stops at the source. Race `proc.exited` against the
-  // abort to derive a TRUTHFUL aborted verdict: `winner === "aborted"` only
-  // when the signal settled the race BEFORE the proc exited on its own. A
-  // signal that fires AFTER the proc already exited cleanly (the drain window)
-  // loses the race, so a completed run is never mislabeled aborted — the same
-  // microtask-ordered discipline terminal.exec uses. `Promise.race` is
-  // resilient to listener-timing: the abort sentinel can only win if it
-  // resolves first, regardless of when removeEventListener runs.
-  let onAbort: (() => void) | undefined;
-  const exitedSentinel = proc.exited.then(() => "exited" as const);
-  const abortSentinel = new Promise<"aborted">((resolve) => {
-    if (!signal) return; // never resolves — proc.exited always wins
-    onAbort = (): void => resolve("aborted");
-    signal.addEventListener("abort", onAbort, { once: true });
-  });
   const winner = await Promise.race([exitedSentinel, abortSentinel]);
-  if (winner === "aborted") {
-    try { proc.kill(); } catch { /* already exited */ }
-  }
   const aborted = winner === "aborted";
 
   let stdout = "";
