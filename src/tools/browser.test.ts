@@ -1281,6 +1281,47 @@ describe("snapshot walker — cursor-interactive clickables", () => {
     }
   });
 
+  test("synthesizes a name for nameless self-qualified / icon-only clickables so they earn a ref", async () => {
+    // <div onclick="menu()"><svg/></div>          ← self-qualified, icon child
+    // <div style="cursor:pointer"><svg aria-label="More options"/></div>
+    //                                              ← cursor-qualified, icon carries the label
+    // <div style="cursor:pointer">Has a name       ← cursor-qualified WITH a name (existing path)
+    //   <span></span>                              ← nameless, no icon, no own handler → still skipped
+    // </div>
+    const svgBare = makeEl({ tagName: "SVG" });
+    const iconMenu = makeEl({ tagName: "DIV", textContent: "", attrs: { onclick: "menu()" }, children: [svgBare] });
+    const svgLabeled = makeEl({ tagName: "SVG", attrs: { "aria-label": "More options" } });
+    const iconLabeled = makeEl({ tagName: "DIV", cursor: "pointer", textContent: "", children: [svgLabeled] });
+    const namelessChild = makeEl({ tagName: "SPAN", cursor: "pointer", textContent: "" });
+    const namedWrapper = makeEl({ tagName: "DIV", cursor: "pointer", textContent: "Has a name", children: [namelessChild] });
+    const body = makeEl({ tagName: "BODY", children: [iconMenu, iconLabeled, namedWrapper] });
+    const restore = installFakeDom(body);
+    try {
+      const result = await browserTest.snapshotForTest(makeFakePage(), false);
+      const clickableLines = result.text.split("\n").filter((line) => line.includes(" clickable "));
+      // The self-qualified <svg> wrapper falls back to the generic handle…
+      expect(result.text).toContain('clickable "icon button"');
+      // …and the labeled icon's aria-label is lifted onto the wrapper.
+      expect(result.text).toContain('clickable "More options"');
+      // Exactly three clickables — the two synthesized icon controls plus
+      // the named wrapper. The wrapper's nameless cursor:pointer <span> child
+      // neither self-qualifies nor wraps an icon, so it stays skipped (no
+      // div-soup regression: a fallback name is NOT minted for it).
+      expect(clickableLines.length).toBe(3);
+      expect(result.text).toContain('clickable "Has a name"');
+      // Both synthesized clickables resolve like any other ref.
+      const synthesized = clickableLines.filter((line) => /"(icon button|More options)"/.test(line));
+      expect(synthesized.length).toBe(2);
+      for (const line of synthesized) {
+        const ref = /\[(@e\d+)\]/.exec(line)?.[1];
+        expect(ref).toBeDefined();
+        expect(result.refs.has(ref!)).toBe(true);
+      }
+    } finally {
+      restore();
+    }
+  });
+
   test("hidden radio/checkbox with a visible label is force-emitted past the hidden budget", async () => {
     // Fill the hidden budget (50) with hidden role=dialog divs so the
     // hidden-element fallback path can't be what emits the toggles — only

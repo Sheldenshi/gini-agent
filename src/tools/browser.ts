@@ -1972,6 +1972,41 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
         return text.slice(0, 120);
       };
 
+      // A nameless clickable that wraps only an icon (an <svg>, or a known
+      // icon <i>/font-icon child) carries no accessible name, so nameOf
+      // returns "". Detect that case so the walker can synthesize a stable
+      // clickable handle instead of dropping the control. Class names like
+      // "icon", "fa-", "material-icons" are the conventional font-icon
+      // signals; the check is shallow on purpose — an icon nested several
+      // structural levels deep belongs to a different control.
+      const hasIconChild = (el: Element): boolean => {
+        for (const child of Array.from(el.children)) {
+          if (child.tagName === "SVG") return true;
+          if (child.tagName === "I") {
+            const cls = child.getAttribute("class") ?? "";
+            if (/(^|\s)(icon|fa-|material-icons|glyphicon)/.test(cls)) return true;
+          }
+        }
+        return false;
+      };
+      // Synthesize a name for a nameless-but-clearly-interactive clickable
+      // (icon-only menu, three-dot button, etc.) so it earns a ref. Priority:
+      // a descendant's aria-label/title (the icon usually carries it), then
+      // the element's own title/aria-label, then test/automation hooks
+      // (data-testid/data-test/name), else a generic handle. The name only
+      // has to be a stable, human-recognizable click target — not perfect.
+      const iconFallbackName = (el: Element): string => {
+        for (const child of Array.from(el.children)) {
+          const childAria = child.getAttribute("aria-label") ?? child.getAttribute("title");
+          if (childAria && childAria.trim()) return childAria.trim();
+        }
+        const own = el.getAttribute("title") ?? el.getAttribute("aria-label");
+        if (own && own.trim()) return own.trim();
+        const hook = el.getAttribute("data-testid") ?? el.getAttribute("data-test") ?? el.getAttribute("name");
+        if (hook && hook.trim()) return hook.trim();
+        return hasIconChild(el) ? "icon button" : "button";
+      };
+
       const isVisible = (el: Element): boolean => {
         const rect = (el as HTMLElement).getBoundingClientRect?.();
         if (!rect) return false;
@@ -2283,11 +2318,20 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
           // cursor:pointer card would emit every child); an element's OWN
           // onclick/tabindex always does.
           const qualifies = selfQualified || (cursorPointer && !underCursorClickable);
-          // Empty-name clickables are un-targetable noise — skipped, and a
-          // skipped element does not suppress its descendants (a child may
-          // carry the only usable name, e.g. an aria-label inside an
-          // icon-only wrapper).
-          const name = qualifies ? nameOf(el) : "";
+          // Empty-name clickables are usually un-targetable noise, so a bare
+          // inherited-cursor:pointer descendant with no name stays skipped
+          // (and a skipped element does not suppress its descendants — a
+          // child may carry the only usable name, e.g. an aria-label inside
+          // an icon-only wrapper). But an icon-only control the user can
+          // really click — one that SELF-qualifies (own onclick/tabindex) or
+          // qualifies AND wraps an <svg>/font-icon — has no first-class click
+          // handle without a ref, forcing raw DOM dispatch. For those narrow
+          // cases synthesize a name (see iconFallbackName) so they still earn
+          // a ref instead of vanishing from the snapshot.
+          let name = qualifies ? nameOf(el) : "";
+          if (qualifies && !name && (selfQualified || hasIconChild(el))) {
+            name = iconFallbackName(el);
+          }
           if (qualifies && name) {
             clickableTotal++;
             if (clickableEmitted < clickableBudget) {
