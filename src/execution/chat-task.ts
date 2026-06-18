@@ -2290,17 +2290,31 @@ async function runLoop(
       const cleanedFull = routeRawText.slice(routeStrippedPrefix);
       const cleanedDelta = cleanedFull.slice(routeSurfacedLen);
       routeSurfacedLen = cleanedFull.length;
-      if (cleanedDelta) {
-        await mutateState(config.instance, (state) => {
-          appendTaskPartial(state, taskId, cleanedDelta);
-        });
-      }
+      // The line-2255 terminal guard above is lock-free, so a cancel can still
+      // land in the window between that read and this write. Re-check terminal
+      // status INSIDE the mutateState — which the per-instance lock serializes
+      // with cancelTask's status flip — and skip the append when the task went
+      // terminal. `wrote` reports whether the partial actually landed; the
+      // block emit below is gated on it, so a post-cancel flush can NEVER open
+      // or grow an assistant_text block after the cancel. This closes the race
+      // at the source rather than relying on the boot-time heal to settle a
+      // leaked streaming block later.
+      // Nothing new to surface this flush (e.g. the accreted text was all
+      // route-directive prefix) — no partial write, no block emit.
+      if (!cleanedDelta) return;
+      const wrote = await mutateState(config.instance, (state) => {
+        const t = state.tasks.find((task) => task.id === taskId);
+        if (!t || isTerminalTaskStatus(t.status)) return false;
+        appendTaskPartial(state, taskId, cleanedDelta);
+        return true;
+      });
       // Mirror the same flush boundary to the assistant_text block so
       // SSE subscribers see the same cadence the partialSummary path
       // exposes today. The block carries the FULL accreted (cleaned) text
       // (not the delta), so a reconnect always observes a monotonically
-      // growing string and never needs to splice deltas itself.
-      if (emitCtx && cleanedFull) {
+      // growing string and never needs to splice deltas itself. Gated on
+      // `wrote`: once the task is terminal, no block is born or grown.
+      if (wrote && emitCtx && cleanedFull) {
         inFlightAssistantText = cleanedFull;
         if (!inFlightAssistantBlockId) {
           const block = emitAssistantTextStart(emitCtx, inFlightAssistantText);
