@@ -56,9 +56,12 @@ boundary cannot attribute spend on its own — the caller must.
   ledger entry. The chart sums the ledger only; it never also sums `task.cost`.
   `browser_vision` still folds into `task.cost` for the live display *and* is
   recorded once in the ledger — the chart reads only the latter.
-- **Attribution.** Most call sites carry `agentId`; `/api/usage?agentId=` scopes
-  to one agent but **includes** unattributed shared overhead (some
-  title/aux generation), so a per-agent total never silently drops real spend.
+- **Attribution.** Most call sites carry `agentId`. The home chart sums across
+  **all** agents by default (`GET /api/usage` with no `agentId`); an agent
+  dropdown narrows it via `/api/usage?agentId=`, which scopes to one agent but
+  **includes** unattributed shared overhead (some title/aux generation), so a
+  per-agent total never silently drops real spend (and the all-agents sum counts
+  that shared overhead once, not once per agent).
 - **Pricing is maintained.** `MODEL_PRICING` is list-price data; add a row (with
   a source) when a provider/model is added or a price changes. Anthropic values
   are verified; OpenAI/DeepSeek rows should be re-verified before relying on the
@@ -83,4 +86,6 @@ boundary cannot attribute spend on its own — the caller must.
   each with input/output/total/USD and a `bySource` breakdown.
 - The home Token usage chart's headline equals the rightmost bar and includes
   memory/title/vision spend, not just chat-task `task.cost`.
+- The home chart defaults to the all-agents sum; selecting an agent from its
+  dropdown re-scopes the bars and headline to that agent's spend.
 - `bun run typecheck`, `bun run test`, and the web suite stay green.
