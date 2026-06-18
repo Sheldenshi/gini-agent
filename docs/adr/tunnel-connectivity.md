@@ -10,7 +10,7 @@ The catalog carries four drivable providers. `gini-relay` is always enabled; `ta
 
 An instance runs on the user's machine bound to loopback. To reach it from a phone or a remote device, the gateway needs a publicly reachable URL fronted by a tunnel. Users pick among several tunnel providers (the hosted Gini Relay, their own Tailscale network, ngrok, Cloudflare); the hosted relay shipped first, and the Tailscale/ngrok/Cloudflare drivers followed as detection-gated catalog rows. The UI needs the full provider catalog up front — including the disabled ones and why they're disabled — so it can render the selection panel in one pass, and it needs the live connection status to decide which view to show.
 
-The browser-connect capability (`src/capabilities/browser-connect.ts`, ADR-less but mirrored here) established the pattern this follows: an opt-in singleton on `RuntimeState` (`state.browser`), a behavior module exposing thin functions, HTTP routes that delegate to it, and a CLI shim that goes through the gateway. Tunnel connectivity reuses that shape (`state.tunnel`).
+Tunnel connectivity follows the established capability pattern: an opt-in singleton on `RuntimeState` (`state.tunnel`), a behavior module exposing thin functions, HTTP routes that delegate to it, and a CLI shim that goes through the gateway. (The browser-connect capability once carried a parallel `state.browser` singleton; issue #420 made the browser a spawned-on-demand internal handle with no persisted record, so tunnel is now the canonical example of this shape.)
 
 ## Trust boundary
 
@@ -77,7 +77,7 @@ RPC action style, matching `/api/browser/*` and `/api/relays/*`. Every route ret
 
 ## Persistence
 
-The singleton `TunnelSelectionRecord` lives at `state.tunnel` in the atomic JSON `state.json` (not `jsc:serialize`), mirroring `state.browser`:
+The singleton `TunnelSelectionRecord` lives at `state.tunnel` in the atomic JSON `state.json` (not `jsc:serialize`):
 
 ```ts
 interface TunnelSelectionRecord {

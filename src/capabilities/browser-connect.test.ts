@@ -99,7 +99,10 @@ describe("browser-connect API surface", () => {
       expect(existsSync(sentinel)).toBe(true);
     } finally {
       browserMod.__test.uninstallFakeBrowserForTest();
-      browserMod.setBrowserInstance("dev");
+      // Reset the module-level instance to undefined rather than restoring a
+      // hard-coded "dev" — leaving a non-default instance set would leak into
+      // sibling tests that import the browser module and read it.
+      browserMod.__test.resetBrowserInstanceForTest();
     }
   });
 });

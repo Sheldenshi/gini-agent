@@ -1598,10 +1598,11 @@ export interface Authorization {
 // connect-only: their side effect (addMessagingBridge / allowChat /
 // removeMessagingBridge) runs inside the /complete handler AFTER the row is
 // atomically claimed pending → completed — the same claim-first ordering as
-// connector.request's create+probe. browser.connect is the inverse: its side
-// effect runs before the resolve. See SETUP_COMPLETE_EMITS_WORKING_PHASE in
-// src/agent.ts. They carry no approve/deny semantics, so they live here
-// rather than on AuthorizationAction.
+// connector.request's create+probe. browser.connect also claims first now:
+// /complete claims the row, then writes the audit row / tears down the
+// screencast bridge. See SETUP_COMPLETE_EMITS_WORKING_PHASE in src/agent.ts.
+// They carry no approve/deny semantics, so they live here rather than on
+// AuthorizationAction.
 export type SetupRequestAction =
   | "browser.connect"
   | "connector.request"
