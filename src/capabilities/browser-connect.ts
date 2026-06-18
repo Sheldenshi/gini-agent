@@ -236,16 +236,27 @@ async function connectBrowserInner(
     // Same endpoint already recorded — re-probe its liveness in one short poll
     // window rather than waiting out a cold start.
     const probe = await probeCdp(cdpHttpForm(existing.cdpUrl), probeIntervalMs * 2, probeIntervalMs);
-    if (probe) return { connected: true, record: existing };
+    if (probe) {
+      // Drop any cached in-process handle (e.g. a previously-spawned Chrome)
+      // so the NEXT browser tool call re-reads this cdp record and attaches via
+      // the cdp branch rather than reusing the stale spawned handle.
+      await disconnectSharedBrowser();
+      return { connected: true, record: existing };
+    }
     // Stale record (the user's Chrome went away) — fall through to a fresh
     // attach so we don't report a dead endpoint as connected.
   }
 
-  return connectExisting(config, validated.url, {
+  const result = await connectExisting(config, validated.url, {
     skipAudit: internal.skipAudit,
     probeTimeoutMs,
     probeIntervalMs
   });
+  // The cdp record is now persisted; drop the cached in-process handle so
+  // ensureShared rebuilds via the cdp branch (connectOverCDP) on the next tool
+  // call instead of reusing a previously-spawned headless Chrome.
+  await disconnectSharedBrowser();
+  return result;
 }
 
 // Compare the caller's requested endpoint against the existing record. True
