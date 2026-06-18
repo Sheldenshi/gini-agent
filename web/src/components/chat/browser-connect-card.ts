@@ -1,5 +1,5 @@
 // Completion-button label for a browser.connect setup card. The card is
-// two-stage: before the visible window opens the button reads "Connect";
+// two-stage: before the in-chat screencast opens the button reads "Connect";
 // after open-browser flips payload.signInStarted the button signals
 // completion. The completion wording is driven by the payload's `mode`,
 // stamped by the dispatcher: the default sign-in unblock keeps the

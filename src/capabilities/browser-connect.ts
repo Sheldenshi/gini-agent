@@ -205,20 +205,27 @@ async function connectBrowserInner(
   input: ConnectInput,
   internal: InternalConnectOptions
 ): Promise<Status> {
-  // No cdpUrl → the default spawned transport. A bare connect means "use the
-  // default": if a cdp record is still persisted, leaving it would let the next
-  // tool call keep attaching to the user's external Chrome, contradicting the
-  // {connected:false} we return here. Drop it (and the in-process handle, and
-  // write the disconnect audit row) so the next call relaunches spawned.
-  // Otherwise it's a pure no-op acknowledgement — the spawned Chrome launches
-  // lazily on the first browser_* tool call.
-  if (typeof input.cdpUrl !== "string" || input.cdpUrl.length === 0) {
+  // ABSENT cdpUrl (undefined / null) → the default spawned transport. A bare
+  // connect means "use the default": if a cdp record is still persisted,
+  // leaving it would let the next tool call keep attaching to the user's
+  // external Chrome, contradicting the {connected:false} we return here. Drop
+  // it (and the in-process handle, and write the disconnect audit row) so the
+  // next call relaunches spawned. Otherwise it's a pure no-op acknowledgement —
+  // the spawned Chrome launches lazily on the first browser_* tool call.
+  if (input.cdpUrl === undefined || input.cdpUrl === null) {
     // Route through the public disconnectBrowser so the teardown shares the
     // pendingDisconnect single-flight (a concurrent /api/browser/disconnect
     // folds into the same promise rather than double-tearing-down + writing a
     // duplicate audit row).
     if (readState(config.instance).browser) return await disconnectBrowser(config);
     return { connected: false };
+  }
+  // PRESENT but not a non-empty string → malformed input. Reject it as a 400
+  // (the route maps "Invalid cdpUrl" → 400) WITHOUT touching existing state — a
+  // {cdpUrl: 123} or {cdpUrl: ""} must not silently disconnect an active cdp
+  // attach the way an absent cdpUrl does.
+  if (typeof input.cdpUrl !== "string" || input.cdpUrl.length === 0) {
+    throw new Error(`Invalid cdpUrl: ${JSON.stringify(input.cdpUrl)}`);
   }
 
   // Validate caller input BEFORE touching any existing state.

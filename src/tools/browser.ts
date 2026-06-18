@@ -1059,9 +1059,9 @@ export async function disconnectSharedBrowser(): Promise<void> {
       // (no-op unless this task holds the trace). Never throws.
       await stopSessionTrace(id, session.context);
       try {
-        // Persistent and cdp both share a single context — close just the
-        // pages we own. teardownHandle below closes the whole context for
-        // persistent mode (so agent-opened pages would go away anyway), but
+        // Spawned and cdp both share a single context — close just the
+        // pages we own. teardownHandle below closes the whole context for the
+        // spawned transport (so agent-opened pages would go away anyway), but
         // in CDP mode the user's browser process stays alive, so any
         // agent-opened tabs we don't close here would survive disconnect
         // as orphan tabs in the user's window. Bound each close so a wedged

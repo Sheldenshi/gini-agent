@@ -247,6 +247,21 @@ describe("cdp attach", () => {
     expect(readState(config.instance).audit.filter((r) => r.action === "browser.disconnect").length).toBe(0);
   });
 
+  test("a malformed (non-string) cdpUrl is a 400-style error and does NOT disconnect an active cdp record", async () => {
+    const config = testConfig("cdp-malformed-no-disconnect");
+    const { mutateState, now } = await import("../state");
+    await mutateState(config.instance, (state) => {
+      state.browser = { mode: "cdp", cdpUrl: "ws://127.0.0.1:9222/devtools/browser/abc", startedAt: now() };
+    });
+    // A present-but-non-string cdpUrl is malformed input, distinct from an
+    // ABSENT cdpUrl (which means "use the spawned default" and clears the
+    // record). It must reject without touching the active attach.
+    await expect(connectBrowser(config, { cdpUrl: 123 as unknown as string })).rejects.toThrow(/Invalid cdpUrl/);
+    // The active cdp record is untouched (not disconnected by the bad input).
+    expect(readState(config.instance).browser?.mode).toBe("cdp");
+    expect(readState(config.instance).audit.filter((r) => r.action === "browser.disconnect").length).toBe(0);
+  });
+
   test("connect re-attaches when the existing record's endpoint is no longer reachable", async () => {
     const config = testConfig("cdp-reconnect-stale");
     const { mutateState, now } = await import("../state");

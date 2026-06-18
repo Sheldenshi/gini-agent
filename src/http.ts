@@ -225,21 +225,24 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
   async function ensureSpawnedBrowserForSignIn(
     setup: { id: string; taskId?: string; payload: Record<string, unknown> }
   ): Promise<Response | null> {
-    if (getScreencastPort() !== null) return null;
-    // No spawned Chrome to screencast. If the user has attached their OWN Chrome
-    // over CDP, do NOT relaunch/navigate — the relaunch would resolve the cdp
-    // transport and drive the user's external Chrome to the recorded URL (a
-    // stale Connect card racing a later cdp attach), which is a surprising
-    // side effect with no screencast to show. Refuse before the navigate; the
-    // user completes the step in their own visible Chrome. (The dispatch guard
-    // stops NEW cards on cdp; this covers an already-minted card hitting
-    // /open-browser or a stamped card's frames/input reconnect.)
+    // The persisted cdp record is the authoritative transport signal — check it
+    // FIRST, before the spawned-screencast fast path. When the user has
+    // attached their OWN Chrome over CDP, there is no spawned screencast to
+    // show, and relaunch/navigate would drive their external Chrome to the
+    // recorded URL (a stale Connect card racing a cdp attach). A narrow window
+    // exists where a cdp record is persisted but a previously-spawned handle is
+    // still live (getScreencastPort would briefly report non-null); checking cdp
+    // first makes the record win deterministically rather than screencasting a
+    // soon-to-be-torn-down spawned Chrome. The dispatch guard stops NEW cards on
+    // cdp; this covers an already-minted card hitting /open-browser or a stamped
+    // card's frames/input reconnect.
     if ((readState(config.instance).browser?.mode ?? null) === "cdp") {
       return json(
         { error: "Your own Chrome is attached over CDP, so there's no in-chat browser to open. Complete this step directly in your Chrome window, then continue." },
         409
       );
     }
+    if (getScreencastPort() !== null) return null;
     const targetUrl = typeof setup.payload.url === "string" ? setup.payload.url : "";
     if (!targetUrl) {
       return json({ error: "The agent's browser isn't running and no page URL is recorded; cannot start sign-in." }, 409);
