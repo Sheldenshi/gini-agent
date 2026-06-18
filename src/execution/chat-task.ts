@@ -2290,8 +2290,9 @@ async function runLoop(
       const cleanedFull = routeRawText.slice(routeStrippedPrefix);
       const cleanedDelta = cleanedFull.slice(routeSurfacedLen);
       routeSurfacedLen = cleanedFull.length;
-      // The line-2255 terminal guard above is lock-free, so a cancel can still
-      // land in the window between that read and this write. Re-check terminal
+      // The early terminal guard at the top of flush() is lock-free, so a
+      // cancel can still land in the window between that read and this write.
+      // Re-check terminal
       // status INSIDE the mutateState — which the per-instance lock serializes
       // with cancelTask's status flip — and skip the append when the task went
       // terminal. `wrote` reports whether the partial actually landed; the
