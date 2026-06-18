@@ -23,7 +23,7 @@ import { ApiError, uploadImage, type UploadRef } from "@/src/api";
 import { AttachmentSheet } from "@/src/components/AttachmentSheet";
 import { AgentAvatar, agentSwatch } from "@/src/components/chat/AgentAvatar";
 import { BlockRenderer } from "@/src/components/chat/BlockRenderer";
-import { BlockThinking } from "@/src/components/chat/BlockThinking";
+import { BlockToolCallsCollapsed } from "@/src/components/chat/BlockToolCallsCollapsed";
 import { GeneratedFilesCard } from "@/src/components/chat/GeneratedFilesCard";
 import { groupExchanges, type ChatRenderItem } from "@/src/group-exchanges";
 import {
@@ -412,21 +412,18 @@ export default function ThreadViewScreen() {
               {renderItems.length > 0 ? (
                 renderItems.map((item) => {
                   if (item.kind === "tool_group") {
-                    // tool_group items only appear after groupExchanges
-                    // folds a completed exchange; replay the process
-                    // inline — tool calls via BlockRenderer, the model's
-                    // pre-tool narration as a "Thinking" row — to keep
-                    // the thread surface in parity with the main chat.
-                    return item.steps.map((step) =>
-                      step.kind === "tool_call" ? (
-                        <BlockRenderer
-                          key={step.block.id}
-                          block={step.block}
-                          toolResult={toolResultsByCallId.get(step.block.callId)}
-                        />
-                      ) : (
-                        <BlockThinking key={step.block.id} block={step.block} />
-                      )
+                    // A completed exchange's tool calls and the model's
+                    // pre-tool narration collapse into one foldable group —
+                    // matching the main chat and the web Thread panel —
+                    // rather than replaying every step inline, which made a
+                    // long browser run scroll on forever.
+                    return (
+                      <BlockToolCallsCollapsed
+                        key={item.id}
+                        calls={item.calls}
+                        steps={item.steps}
+                        resultsByCallId={toolResultsByCallId}
+                      />
                     );
                   }
                   if (item.kind === "file_artifact") {
