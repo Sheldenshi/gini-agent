@@ -593,8 +593,8 @@ function resolveBundleId(): string | null {
 // fetch, POST /push/devices, listener re-subscription). The cached
 // token is cleared too — the new credential's gateway has a
 // different devices table and we must not reuse a stale token under
-// the wrong credential. Subscription handles are removed so they
-// don't double up on the next register.
+// the wrong credential. Credential-scoped subscription handles are
+// removed so they don't double up on the next register.
 export function __resetRegistrationForSignOut(): void {
   registrationStarted = false;
   void deviceTokenStore.clear();
@@ -621,8 +621,16 @@ export function __resetRegistrationForSignOut(): void {
   // short-circuits via the entryGeneration check.
   bumpGeneration();
   if (tokenSub) { tokenSub.remove(); tokenSub = null; }
-  if (responseSub) { responseSub.remove(); responseSub = null; }
   if (receivedSub) { receivedSub.remove(); receivedSub = null; }
+  // NOTE: responseSub is deliberately NOT torn down. It's installed once at
+  // root (app/_layout.tsx) as process-level routing infrastructure and
+  // captures no credential-scoped state — only the module-level `api` (which
+  // reads the CURRENT credential at call time) and the pure navigateToChat.
+  // The root effect runs once per process, so removing it here would leave a
+  // signed-out → signed-in user with no live tap routing until they happened
+  // to open a chat detail. A tap handled while signed out self-heals: it
+  // pushes the chat, the chat screen 401s, clears creds, and redirects to
+  // /setup. Test isolation tears it down via __resetForTests instead.
 }
 
 // Call right before `saveCredentials` swaps the persisted base URL +
@@ -630,10 +638,12 @@ export function __resetRegistrationForSignOut(): void {
 // runtime instance (different devices table, different APNs topic), so
 // every short-circuit gate from the prior session must drop:
 // registrationStarted, the cached token, the generation counter, and
-// the listener subscriptions. Functionally equivalent to
-// __resetRegistrationForSignOut but exported under a name that says
-// what the caller means at a credential-swap boundary; idempotent —
-// calling on a freshly-mounted process with nothing cached is a no-op.
+// the credential-scoped subscriptions (token + received; the response
+// listener is process-level and stays — see __resetRegistrationForSignOut).
+// Functionally equivalent to __resetRegistrationForSignOut but exported
+// under a name that says what the caller means at a credential-swap
+// boundary; idempotent — calling on a freshly-mounted process with nothing
+// cached is a no-op.
 export function resetRegistrationForCredentialSwap(): void {
   __resetRegistrationForSignOut();
 }
