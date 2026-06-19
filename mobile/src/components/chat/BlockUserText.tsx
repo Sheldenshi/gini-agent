@@ -98,6 +98,19 @@ export function seekFractionFromTouch(x: number, trackWidth: number): number {
   return Math.min(1, Math.max(0, x / trackWidth));
 }
 
+// VoiceOver "adjustable" increment/decrement step. A swipe up/down moves the
+// playhead by this fraction of the clip; 0.1 gives 11 reachable stops (0%, 10%,
+// …, 100%), enough to scrub a short voice message without VoiceOver users
+// needing the touch track (which they can't see to aim at).
+const SEEK_STEP = 0.1;
+
+// Clamped next position for an accessibility increment/decrement. Pure so the
+// stepping is unit-testable without a VoiceOver harness.
+export function steppedSeekFraction(current: number, action: "increment" | "decrement"): number {
+  const next = action === "increment" ? current + SEEK_STEP : current - SEEK_STEP;
+  return Math.min(1, Math.max(0, next));
+}
+
 export function VoiceBubble({ audio }: { audio: AudioAttachment }) {
   const player = useAudioPlayer({ uri: uploadUrl(audio.id), headers: authHeader() });
   const status = useAudioPlayerStatus(player);
@@ -188,6 +201,19 @@ export function VoiceBubble({ audio }: { audio: AudioAttachment }) {
   // first to activate wins.
   const scrub = Gesture.Race(pan, tap);
 
+  // VoiceOver can't aim at the touch track, so expose the same seek as
+  // increment/decrement actions: a swipe up/down on the focused control steps
+  // the playhead by SEEK_STEP. Reads the live displayed `progress` so each step
+  // is relative to where the playhead actually is.
+  const onAccessibilityAction = (event: {
+    nativeEvent: { actionName: string };
+  }): void => {
+    const name = event.nativeEvent.actionName;
+    if (name === "increment" || name === "decrement") {
+      seekToFraction(steppedSeekFraction(progress, name));
+    }
+  };
+
   return (
     <View style={styles.voiceBubble}>
       <Pressable
@@ -207,10 +233,16 @@ export function VoiceBubble({ audio }: { audio: AudioAttachment }) {
         {/* Taller transparent hit area so the 3px track is easy to grab; the
             visible bar sits centered inside it. */}
         <View
+          // `accessible` collapses the track into one focusable node (without
+          // it the role/actions can be flattened away inside GestureDetector)
+          // and makes VoiceOver expose it as a single adjustable slider.
+          accessible
           style={styles.voiceTrackHit}
           accessibilityRole="adjustable"
           accessibilityLabel="Seek voice message"
           accessibilityValue={{ now: Math.round(progress * 100), min: 0, max: 100 }}
+          accessibilityActions={[{ name: "increment" }, { name: "decrement" }]}
+          onAccessibilityAction={onAccessibilityAction}
         >
           <View style={styles.voiceTrack} onLayout={onTrackLayout}>
             <View style={[styles.voiceProgress, { width: `${progress * 100}%` }]} />

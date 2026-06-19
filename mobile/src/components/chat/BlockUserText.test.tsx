@@ -107,7 +107,7 @@ mock.module("react-native-gesture-handler", () => ({
   GestureDetector
 }));
 
-const { VoiceBubble, BlockUserText, seekFractionFromTouch } = await import(
+const { VoiceBubble, BlockUserText, seekFractionFromTouch, steppedSeekFraction } = await import(
   "@/src/components/chat/BlockUserText"
 );
 
@@ -348,6 +348,85 @@ describe("VoiceBubble scrub-to-seek", () => {
     );
     expect(fill).toBeTruthy();
     expect(textLabels(tree)).toContain("0:06");
+  });
+});
+
+describe("steppedSeekFraction", () => {
+  test("increments and decrements by 0.1, clamped to [0,1]", () => {
+    expect(steppedSeekFraction(0.5, "increment")).toBeCloseTo(0.6, 5);
+    expect(steppedSeekFraction(0.5, "decrement")).toBeCloseTo(0.4, 5);
+    // Clamp at the ends.
+    expect(steppedSeekFraction(0.95, "increment")).toBe(1);
+    expect(steppedSeekFraction(0.05, "decrement")).toBe(0);
+    expect(steppedSeekFraction(1, "increment")).toBe(1);
+    expect(steppedSeekFraction(0, "decrement")).toBe(0);
+  });
+});
+
+describe("VoiceBubble accessibility (VoiceOver adjustable)", () => {
+  // The seek control must be operable without sight of the touch track: it's an
+  // adjustable slider whose increment/decrement actions step the playhead.
+  function getSeekControl(tree: El) {
+    return flatten(tree).find(
+      (n) => (n.props as { accessibilityRole?: string }).accessibilityRole === "adjustable"
+    );
+  }
+
+  test("the track is an accessible adjustable with a percent value and step actions", () => {
+    playerStatus = { playing: false, currentTime: 2, duration: 8, didJustFinish: false };
+    const tree = (VoiceBubble as unknown as (p: { audio: unknown }) => El)({
+      audio: { id: "abc", mimeType: "audio/wav", size: 1000, durationMs: 8000 }
+    });
+    const seek = getSeekControl(tree);
+    expect(seek).toBeTruthy();
+    expect(seek!.props.accessible).toBe(true);
+    expect(seek!.props.accessibilityLabel).toBe("Seek voice message");
+    // 2s of 8s → 25%.
+    expect(seek!.props.accessibilityValue).toEqual({ now: 25, min: 0, max: 100 });
+    expect(seek!.props.accessibilityActions).toEqual([{ name: "increment" }, { name: "decrement" }]);
+    expect(typeof seek!.props.onAccessibilityAction).toBe("function");
+  });
+
+  test("an increment action steps the playhead forward by 10% of the clip", () => {
+    // Playhead at 2s of 8s (25%); increment → 35% → 2.8s.
+    playerStatus = { playing: false, currentTime: 2, duration: 8, didJustFinish: false };
+    const tree = (VoiceBubble as unknown as (p: { audio: unknown }) => El)({
+      audio: { id: "abc", mimeType: "audio/wav", size: 1000, durationMs: 8000 }
+    });
+    const seek = getSeekControl(tree)!;
+    (seek.props.onAccessibilityAction as (e: { nativeEvent: { actionName: string } }) => void)({
+      nativeEvent: { actionName: "increment" }
+    });
+    expect(player.seekTo).toHaveBeenCalledWith(2.8);
+  });
+
+  test("a decrement action steps the playhead back by 10% of the clip", () => {
+    // Playhead at 4s of 10s (40%); decrement → 30% → 3s.
+    playerStatus = { playing: true, currentTime: 4, duration: 10, didJustFinish: false };
+    const tree = (VoiceBubble as unknown as (p: { audio: unknown }) => El)({
+      audio: { id: "abc", mimeType: "audio/wav", size: 1000, durationMs: 10000 }
+    });
+    const seek = getSeekControl(tree)!;
+    (seek.props.onAccessibilityAction as (e: { nativeEvent: { actionName: string } }) => void)({
+      nativeEvent: { actionName: "decrement" }
+    });
+    // 30% of 10s → 3s (float-tolerant: 0.4-0.1 carries IEEE error).
+    expect(player.seekTo).toHaveBeenCalledTimes(1);
+    expect(player.seekTo.mock.calls[0][0]).toBeCloseTo(3, 5);
+    // A11y seek doesn't change play/pause state.
+    expect(player.pause).not.toHaveBeenCalled();
+  });
+
+  test("an unknown accessibility action is ignored (no seek)", () => {
+    playerStatus = { playing: false, currentTime: 2, duration: 8, didJustFinish: false };
+    const tree = (VoiceBubble as unknown as (p: { audio: unknown }) => El)({
+      audio: { id: "abc", mimeType: "audio/wav", size: 1000, durationMs: 8000 }
+    });
+    const seek = getSeekControl(tree)!;
+    (seek.props.onAccessibilityAction as (e: { nativeEvent: { actionName: string } }) => void)({
+      nativeEvent: { actionName: "activate" }
+    });
+    expect(player.seekTo).not.toHaveBeenCalled();
   });
 });
 
