@@ -10,8 +10,10 @@ import {
   findActiveDeviceByToken,
   findActiveSessionByToken,
   getPairingRequest,
+  isSamePairedDevice,
   listPendingPairingRequests,
   MAX_PENDING_PAIRING_REQUESTS,
+  pairedDeviceIdentityKey,
   PairingCapExceededError,
   pollPairingRequest,
   redactPairingRequest,
@@ -19,6 +21,7 @@ import {
   revokeDevice,
   touchSessionLastSeen
 } from "./records";
+import type { PairedDevice } from "../types";
 
 const SECRET = "bind-secret-abc";
 const BIND = hashSecret(SECRET);
@@ -515,5 +518,117 @@ describe("approved request lifecycle (not terminal)", () => {
     // The approved row is ACTIVE (not terminal) so it survives; terminal capped at 50.
     expect(state.pairingRequests.find((r) => r.id === approved.id)?.status).toBe("approved");
     expect(state.pairingRequests.filter((r) => r.status === "rejected").length).toBe(50);
+  });
+});
+
+// Mint a fully-claimed session for a given UA + relayHost so a test can control
+// the derived name (UA) and origin (relayHost) — the two fields that decide
+// whether two sessions are the same device.
+function mintClaimed(state: RuntimeStateForTest, userAgent: string, relayHost: string) {
+  const request = createPairingRequest(state, { userAgent, relayHost, bindSecret: SECRET });
+  approvePairingRequest(state, request.id);
+  const result = claimPairingRequest(state, request.id, SECRET);
+  if (!result.ok) throw new Error("expected claim to succeed");
+  return result.device;
+}
+type RuntimeStateForTest = ReturnType<typeof createEmptyState>;
+
+const CHROME_MAC =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+const CHROME_MAC_NEWER =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
+const RELAY_A = "aaa.gini-relay.lilaclabs.ai";
+const RELAY_B = "bbb.gini-relay.lilaclabs.ai";
+
+describe("pairedDeviceIdentityKey / isSamePairedDevice", () => {
+  function device(overrides: Partial<PairedDevice>): PairedDevice {
+    return {
+      id: "device_x",
+      instance: "sandbox",
+      name: "Chrome · Mac",
+      tokenHash: "hash",
+      status: "active",
+      scopes: [],
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      origin: RELAY_A,
+      ...overrides
+    };
+  }
+
+  test("keys on origin + name", () => {
+    expect(pairedDeviceIdentityKey(device({}))).toBe(`${RELAY_A}\nChrome · Mac`);
+  });
+
+  test("an originless device (legacy code-claimed bearer) keys to null", () => {
+    expect(pairedDeviceIdentityKey(device({ origin: undefined }))).toBeNull();
+  });
+
+  test("same origin + same name match; differing origin OR name do not", () => {
+    expect(isSamePairedDevice(device({}), device({ id: "device_y" }))).toBe(true);
+    expect(isSamePairedDevice(device({}), device({ origin: RELAY_B }))).toBe(false);
+    expect(isSamePairedDevice(device({}), device({ name: "Safari · iPhone" }))).toBe(false);
+  });
+
+  test("two originless devices never match (null key is not equal to null key)", () => {
+    expect(isSamePairedDevice(device({ origin: undefined }), device({ origin: undefined }))).toBe(false);
+  });
+});
+
+describe("supersede prior session on re-pair", () => {
+  test("re-pairing the same device revokes the prior active session", () => {
+    const state = createEmptyState("sandbox");
+    const first = mintClaimed(state, CHROME_MAC, RELAY_A);
+    // A browser auto-update changes the UA version but not the derived label.
+    const second = mintClaimed(state, CHROME_MAC_NEWER, RELAY_A);
+
+    const firstRow = state.devices.find((d) => d.id === first.id)!;
+    const secondRow = state.devices.find((d) => d.id === second.id)!;
+    expect(firstRow.status).toBe("revoked");
+    expect(firstRow.revokedAt).toBeString();
+    expect(secondRow.status).toBe("active");
+    // Exactly one active session remains for this device/origin.
+    expect(state.devices.filter((d) => d.status === "active").length).toBe(1);
+  });
+
+  test("emits a device.superseded audit naming the new session", () => {
+    const state = createEmptyState("sandbox");
+    const first = mintClaimed(state, CHROME_MAC, RELAY_A);
+    const second = mintClaimed(state, CHROME_MAC_NEWER, RELAY_A);
+    const audit = state.audit.find(
+      (e) => e.action === "device.superseded" && e.target === first.id
+    );
+    expect(audit).toBeDefined();
+    expect(audit?.evidence?.supersededBy).toBe(second.id);
+  });
+
+  test("does NOT revoke a different device on the same relay (distinct name)", () => {
+    const state = createEmptyState("sandbox");
+    const mac = mintClaimed(state, CHROME_MAC, RELAY_A);
+    const iphone = mintClaimed(state, SAFARI_IPHONE, RELAY_A);
+    expect(state.devices.find((d) => d.id === mac.id)!.status).toBe("active");
+    expect(state.devices.find((d) => d.id === iphone.id)!.status).toBe("active");
+  });
+
+  test("does NOT revoke the same label on a DIFFERENT relay origin", () => {
+    const state = createEmptyState("sandbox");
+    const onA = mintClaimed(state, CHROME_MAC, RELAY_A);
+    const onB = mintClaimed(state, CHROME_MAC, RELAY_B);
+    expect(state.devices.find((d) => d.id === onA.id)!.status).toBe("active");
+    expect(state.devices.find((d) => d.id === onB.id)!.status).toBe("active");
+  });
+
+  test("leaves an already-revoked prior row untouched (no re-revoke)", () => {
+    const state = createEmptyState("sandbox");
+    const first = mintClaimed(state, CHROME_MAC, RELAY_A);
+    const firstRevokedAt = state.devices.find((d) => d.id === first.id)!;
+    // Second claim revokes the first.
+    mintClaimed(state, CHROME_MAC, RELAY_A);
+    const stamp = firstRevokedAt.revokedAt;
+    // A third claim must not touch the already-revoked first row again.
+    mintClaimed(state, CHROME_MAC, RELAY_A);
+    expect(firstRevokedAt.revokedAt).toBe(stamp);
+    // Only the latest session is active.
+    expect(state.devices.filter((d) => d.status === "active").length).toBe(1);
   });
 });

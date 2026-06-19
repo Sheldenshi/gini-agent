@@ -1082,3 +1082,109 @@ describe("normalizeState browser connection record", () => {
     expect(normalized.browser ?? null).toBeNull();
   });
 });
+
+// Pre-existing stale-duplicate session pileup: every re-pair of the same device
+// minted a fresh session and left the prior "active" forever (before supersede-
+// on-re-pair). normalizeState collapses each (origin + name) group to the most-
+// recently-seen active session, revoking the older siblings.
+describe("dedupeStaleDeviceSessions (stale-duplicate session backfill)", () => {
+  function pushDevice(
+    state: RuntimeState,
+    overrides: Partial<RuntimeState["devices"][number]> & { id: string }
+  ) {
+    state.devices.push({
+      instance: state.instance,
+      name: "Chrome · Mac",
+      tokenHash: `hash-${overrides.id}`,
+      status: "active",
+      scopes: [],
+      origin: "aaa.gini-relay.lilaclabs.ai",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      ...overrides
+    });
+  }
+
+  test("collapses duplicate active sessions to the most-recently-seen, revoking the rest", () => {
+    const state = createEmptyState("dedupe-collapse");
+    pushDevice(state, { id: "device_old", lastSeenAt: "2026-06-01T00:00:00.000Z" });
+    pushDevice(state, { id: "device_mid", lastSeenAt: "2026-06-10T00:00:00.000Z" });
+    pushDevice(state, { id: "device_new", lastSeenAt: "2026-06-18T00:00:00.000Z" });
+
+    const normalized = normalizeState(state.instance, state);
+
+    const byId = (id: string) => normalized.devices.find((d) => d.id === id)!;
+    expect(byId("device_new").status).toBe("active");
+    expect(byId("device_old").status).toBe("revoked");
+    expect(byId("device_mid").status).toBe("revoked");
+    expect(byId("device_old").revokedAt).toBeString();
+    expect(normalized.devices.filter((d) => d.status === "active").length).toBe(1);
+
+    const audit = normalized.audit.find(
+      (e) => e.action === "device.superseded" && e.evidence?.reason === "stale.duplicate.session.backfill"
+    );
+    expect(audit?.evidence?.revoked).toBe(2);
+  });
+
+  test("falls back to updatedAt then createdAt when lastSeenAt is absent", () => {
+    const state = createEmptyState("dedupe-fallback");
+    // No lastSeenAt on either — survivor is chosen by updatedAt.
+    pushDevice(state, { id: "device_stale", updatedAt: "2026-06-01T00:00:00.000Z" });
+    pushDevice(state, { id: "device_fresh", updatedAt: "2026-06-15T00:00:00.000Z" });
+
+    const normalized = normalizeState(state.instance, state);
+    expect(normalized.devices.find((d) => d.id === "device_fresh")!.status).toBe("active");
+    expect(normalized.devices.find((d) => d.id === "device_stale")!.status).toBe("revoked");
+  });
+
+  test("keeps distinct devices (different name, or different origin) all active", () => {
+    const state = createEmptyState("dedupe-distinct");
+    pushDevice(state, { id: "device_mac", name: "Chrome · Mac" });
+    pushDevice(state, { id: "device_iphone", name: "Safari · iPhone" });
+    pushDevice(state, { id: "device_other_relay", origin: "bbb.gini-relay.lilaclabs.ai" });
+
+    const normalized = normalizeState(state.instance, state);
+    expect(normalized.devices.every((d) => d.status === "active")).toBe(true);
+    expect(normalized.audit.some((e) => e.evidence?.reason === "stale.duplicate.session.backfill")).toBe(false);
+  });
+
+  test("never touches originless legacy bearer devices (null identity key)", () => {
+    const state = createEmptyState("dedupe-originless");
+    // Two code-claimed mobile bearer devices with no origin and the same name.
+    pushDevice(state, { id: "device_legacy_a", origin: undefined });
+    pushDevice(state, { id: "device_legacy_b", origin: undefined });
+
+    const normalized = normalizeState(state.instance, state);
+    expect(normalized.devices.every((d) => d.status === "active")).toBe(true);
+    expect(normalized.audit.some((e) => e.evidence?.reason === "stale.duplicate.session.backfill")).toBe(false);
+  });
+
+  test("leaves already-revoked siblings alone and never collapses a lone active session", () => {
+    const state = createEmptyState("dedupe-revoked-mix");
+    pushDevice(state, { id: "device_live", lastSeenAt: "2026-06-18T00:00:00.000Z" });
+    pushDevice(state, { id: "device_dead", status: "revoked", revokedAt: "2026-05-01T00:00:00.000Z" });
+
+    const normalized = normalizeState(state.instance, state);
+    // Only one ACTIVE session in the group → nothing to collapse.
+    expect(normalized.devices.find((d) => d.id === "device_live")!.status).toBe("active");
+    // The pre-existing revoked row keeps its original timestamp (untouched).
+    expect(normalized.devices.find((d) => d.id === "device_dead")!.revokedAt).toBe("2026-05-01T00:00:00.000Z");
+    expect(normalized.audit.some((e) => e.evidence?.reason === "stale.duplicate.session.backfill")).toBe(false);
+  });
+
+  test("is idempotent — a second normalize collapses nothing new", () => {
+    const state = createEmptyState("dedupe-idempotent");
+    pushDevice(state, { id: "device_old", lastSeenAt: "2026-06-01T00:00:00.000Z" });
+    pushDevice(state, { id: "device_new", lastSeenAt: "2026-06-18T00:00:00.000Z" });
+
+    const once = normalizeState(state.instance, state);
+    const revokedStamp = once.devices.find((d) => d.id === "device_old")!.revokedAt;
+    expect(revokedStamp).toBeString();
+
+    const twice = normalizeState(state.instance, once);
+    expect(twice.devices.find((d) => d.id === "device_old")!.revokedAt).toBe(revokedStamp);
+    expect(
+      twice.audit.filter((e) => e.evidence?.reason === "stale.duplicate.session.backfill").length
+    ).toBe(1);
+  });
+});

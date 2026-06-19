@@ -65,6 +65,29 @@ it is a human-comparison artifact shown on both the device and the operator
 panel, not a secret to be entered — the credential is the cookie minted on
 claim, which is hashed.
 
+### Re-pairing supersedes the device's prior session
+
+A claim mints a **new** `PairedDevice` row each time; the device only ever holds
+the freshly-minted token. Without intervention, re-pairing the same browser or
+app (after a sign-out, reinstall, cookie clear, or a relay reconnect) would
+leave the prior row `active` until its `expiresAt`, so the operator's Active
+Sessions list would accumulate one dead entry per re-pair — all sharing a relay
+origin and an identical derived label. `claimPairingRequest` therefore calls
+`supersedePriorDeviceSessions`: any OTHER `active` session that is the **same
+device** is revoked (`status: "revoked"`, stamped `revokedAt`) as the new one is
+minted. "Same device" is `isSamePairedDevice` — equal relay `origin` AND equal
+`name` (the `pairedDeviceIdentityKey`, `origin\nname`). A session with **no
+origin** (a legacy code-claimed mobile bearer device, which is long-lived and
+originless) keys to `null` and is never a supersession target — re-pairing must
+not retire a standing bearer credential. Revocation (not deletion) preserves the
+audit trail (`device.superseded`); the new device's existing `kind: "pairing"`
+tick already refreshes every admin client's `["devices"]` query. The only false
+match is two genuinely distinct same-model devices on one relay, which is fully
+recoverable by re-pairing (and those rows are visually identical to the operator
+anyway). A one-time `normalizeState` sweep (`dedupeStaleDeviceSessions`) heals
+instances that pre-date this rule, collapsing each identity group to its
+most-recently-seen active session.
+
 ## Trust tiers of the pairing routes
 
 The device-pairing routes live on the native `/api/pairing/*` surface and are
@@ -296,7 +319,13 @@ pairing screen.
 - Local use is unchanged: loopback is never asked for a cookie.
 - Remote access requires an explicit, per-device, human-approved step. Sessions
   are listed (device label, front, last-seen) and individually revocable in the
-  Active Sessions UI.
+  Active Sessions UI. The list shows only `active`/`pending`/`expired` sessions;
+  revoked rows survive in durable state for the audit trail but are filtered out
+  of the UI (`isListedSession`, `web/.../deviceStatus.ts`) — a revoked device can
+  never become active again.
+- Re-pairing a device replaces its prior session rather than stacking a second
+  live one beside it, so the Active Sessions list reflects the count of distinct
+  devices, not the number of times each was paired.
 - `GINI_TRUSTED_ORIGINS` hosts are treated as non-loopback and therefore require
   pairing too — the most conservative reading of "any remote front pairs."
 - The operator must compare the displayed code before approving (see pitfalls).
@@ -335,7 +364,14 @@ pairing screen.
   `/api/pairing/*` and succeeds — the deliberate mirror of loopback (a paired
   session can approve/add devices exactly like 127.0.0.1).
 - `revokeDevice` on a session immediately 302s its pages and 401s its API on the
-  next request (unified revocation).
+  next request (unified revocation). A revoked session drops out of the Active
+  Sessions list while remaining in durable state.
+- Claiming a second session for the same `(origin, name)` revokes the first
+  (`supersedePriorDeviceSessions`): the device's prior row reads `revoked`, the
+  new one `active`, leaving exactly one active session per device. A distinct
+  label, a distinct origin, or an originless legacy bearer row is left active.
+  `normalizeState`'s `dedupeStaleDeviceSessions` collapses a pre-existing
+  duplicate pileup to one active session per identity group and is idempotent.
 - `/pair` renders with provider setup incomplete and emits no authenticated
   `/api/runtime/*` calls.
 - A native client (opt-in header, no `Sec-Fetch-*`) creates with no `Origin`
@@ -346,7 +382,10 @@ pairing screen.
   no body token.
 - `GET /.well-known/apple-app-site-association` returns the AASA JSON (with the
   configured app id) unpaired on both relay and loopback fronts, with no redirect.
-- State mutators are pinned by `src/state/pairing-requests.test.ts`; the routes,
+- State mutators are pinned by `src/state/pairing-requests.test.ts` (including
+  supersede-on-re-pair and the `pairedDeviceIdentityKey`/`isSamePairedDevice`
+  predicates) and the heal sweep by `src/state/store.test.ts`
+  (`dedupeStaleDeviceSessions`); the routes,
   gate, cookies, loopback enforcement, native-client path, AASA, and rate limiter
   by `src/http-pairing.test.ts`; the governance wrappers by
   `src/governance/pairing-requests.test.ts`; cookie + rate-limit helpers by

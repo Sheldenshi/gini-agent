@@ -4,6 +4,7 @@ import { ensureDir, instanceRoot, statePath } from "../paths";
 import { now } from "./ids";
 import { defaultAgent, defaultTools, defaultToolsets } from "./defaults";
 import { addAudit } from "./audit";
+import { pairedDeviceIdentityKey } from "./records";
 import { getMemoryDb, memoryDbPath } from "./memory-db";
 import { canonicalCredentialName, getProvider } from "../integrations/connectors/registry";
 
@@ -858,6 +859,64 @@ function archiveOrphanJobChannels(state: RuntimeState): void {
   }
 }
 
+// One-time heal for the stale-duplicate session pileup: before supersede-on-
+// re-pair existed, every re-pair of the same device minted a fresh session and
+// left the prior one "active" forever, so an operator's Active Sessions list
+// grew an entry per re-pair (same label, same relay origin). Collapse each
+// identity group (origin + derived name; see pairedDeviceIdentityKey) down to
+// the single most-recently-seen ACTIVE session, revoking the older siblings.
+// Originless rows (legacy code-claimed mobile bearer devices) key to null and
+// are skipped — they are long-lived credentials, never supersession targets.
+// Revocation (not deletion) preserves the audit trail; the isListedSession UI
+// filter drops the revoked rows. Idempotent: once a group has one active
+// session, a re-run finds no second active sibling to revoke.
+function dedupeStaleDeviceSessions(state: RuntimeState): void {
+  if (!Array.isArray(state.devices) || state.devices.length === 0) return;
+  // Group active sessions by identity key, preserving array order.
+  const groups = new Map<string, RuntimeState["devices"]>();
+  for (const device of state.devices) {
+    if (device.status !== "active") continue;
+    const key = pairedDeviceIdentityKey(device);
+    if (key === null) continue;
+    const group = groups.get(key);
+    if (group) group.push(device);
+    else groups.set(key, [device]);
+  }
+  // Most-recent-activity timestamp for picking the survivor: lastSeenAt when
+  // present, else updatedAt, else createdAt. Higher wins.
+  const activityAt = (d: RuntimeState["devices"][number]): number =>
+    new Date(d.lastSeenAt ?? d.updatedAt ?? d.createdAt).getTime();
+  let revoked = 0;
+  for (const group of groups.values()) {
+    if (group.length < 2) continue;
+    // Keep the freshest; revoke the rest.
+    let survivor = group[0]!;
+    for (const candidate of group) {
+      if (activityAt(candidate) > activityAt(survivor)) survivor = candidate;
+    }
+    for (const device of group) {
+      if (device === survivor) continue;
+      device.status = "revoked";
+      device.updatedAt = now();
+      device.revokedAt = device.updatedAt;
+      revoked += 1;
+    }
+  }
+  if (revoked > 0) {
+    addAudit(
+      state,
+      {
+        actor: "runtime",
+        action: "device.superseded",
+        target: state.instance,
+        risk: "low",
+        evidence: { reason: "stale.duplicate.session.backfill", revoked }
+      },
+      { system: true }
+    );
+  }
+}
+
 // Backfill Task.chatSessionId from the chatMessages join for records that
 // pre-date the field. The Tasks page reads task.chatSessionId directly so it
 // no longer has to pull /state for the chatMessages list — but state files
@@ -1362,6 +1421,10 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
   // session that just gained `kind:"channel"` is in scope, and after
   // `state.jobs` is defaulted so the surviving-job reference scan is safe.
   archiveOrphanJobChannels(state);
+  // Collapse the pre-existing stale-duplicate session pileup (one row per
+  // re-pair) now that supersede-on-re-pair prevents new ones. Runs after
+  // `state.devices` is defaulted above so the array is always present.
+  dedupeStaleDeviceSessions(state);
   for (const run of state.runs) {
     run.planStepIds ??= [];
     run.childRunIds ??= [];
