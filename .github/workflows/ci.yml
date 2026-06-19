@@ -21,7 +21,7 @@ jobs:
     # slowest observed run, so the cap only ever fires on a genuine hang.
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # Install zsh because terminal_exec / code_exec wrap commands
       # through `zsh -lc` (src/agent.ts:buildPtySpawnArgs and the
