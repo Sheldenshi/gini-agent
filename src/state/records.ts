@@ -784,6 +784,56 @@ export function claimPairingCode(
   return { device, token };
 }
 
+// Stable identity for collapsing a physical device/front's repeated pairings:
+// its relay origin + derived label. The relay subdomain is stable per gateway,
+// so for one operator `origin` is effectively constant and `name` is the
+// discriminator; pinning both keeps a match from ever spanning two relay fronts.
+// Returns null for a session with NO origin (a legacy code-claimed mobile bearer
+// device, which is long-lived and originless) so those are deliberately exempt
+// from supersession — a re-pair must never retire a standing bearer credential.
+// Two genuinely distinct same-model devices on one relay are the only false
+// match, and that is fully recoverable by re-pairing.
+export function pairedDeviceIdentityKey(device: PairedDevice): string | null {
+  if (!device.origin) return null;
+  return `${device.origin}\n${device.name}`;
+}
+
+export function isSamePairedDevice(a: PairedDevice, b: PairedDevice): boolean {
+  const key = pairedDeviceIdentityKey(a);
+  return key !== null && key === pairedDeviceIdentityKey(b);
+}
+
+// Retire any prior ACTIVE session that represents the same physical device as
+// the freshly-claimed one. Re-pairing the same browser/app mints a brand-new
+// session row (claimPairingRequest below) while the device only ever holds the
+// new token, so without this the old row lingers as "active" forever — the
+// stale-duplicate pileup an operator sees as old devices that "won't go away".
+// Revocation (not deletion) keeps the row in durable state for the audit trail;
+// the existing isListedSession filter drops it from the Active Sessions list.
+// The caller emits one kind:"pairing" tick for the new device, which already
+// invalidates the whole ["devices"] query, so no per-row event is needed here.
+function supersedePriorDeviceSessions(state: RuntimeState, fresh: PairedDevice): void {
+  for (const prior of state.devices) {
+    if (prior.id === fresh.id) continue;
+    if (prior.status !== "active") continue;
+    if (!isSamePairedDevice(prior, fresh)) continue;
+    prior.status = "revoked" satisfies DeviceStatus;
+    prior.updatedAt = now();
+    prior.revokedAt = prior.updatedAt;
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: "device.superseded",
+        target: prior.id,
+        risk: "low",
+        evidence: { name: prior.name, origin: prior.origin, supersededBy: fresh.id }
+      },
+      { system: true }
+    );
+  }
+}
+
 export function revokeDevice(state: RuntimeState, deviceId: string): PairedDevice {
   const device = state.devices.find((item) => item.id === deviceId);
   if (!device) throw new Error(`Device not found: ${deviceId}`);
@@ -1064,6 +1114,9 @@ export function claimPairingRequest(
   request.resolvedAt = at;
   request.deviceId = device.id;
   state.devices.unshift(device);
+  // Retire the same device's prior active session(s) so a re-pair replaces the
+  // old row instead of stacking a second live session beside it.
+  supersedePriorDeviceSessions(state, device);
   addAudit(
     state,
     {
