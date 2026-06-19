@@ -247,6 +247,18 @@ export function uploadsDir(instance: Instance): string {
   return join(instanceRoot(instance), "uploads");
 }
 
+// Content-addressed side store for large payloads pulled OUT of the durable
+// state document — specifically the inline base64 image/document strings that
+// a paused (`waiting_approval`) task would otherwise keep inside
+// `toolCallState.messages`, bloating state.json and taxing every read. Each
+// file is named by the SHA-256 of the EXACT payload string it holds, so an
+// identical payload de-duplicates and a reference can be byte-verified on read.
+// Instance-scoped like uploads/ so removing the instance dir removes these too.
+// See ADR toolcall-payload-externalization.md.
+export function toolCallPayloadsDir(instance: Instance): string {
+  return join(instanceRoot(instance), "toolcall-payloads");
+}
+
 // Files the agent's browser saves via the approval-gated browser_download
 // tool. Instance-scoped (like uploads/) so removing the instance dir removes
 // every downloaded artifact with it. See ADR browser-automation-engine.md.

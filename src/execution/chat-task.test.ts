@@ -311,6 +311,66 @@ describe("chat-task loop", () => {
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
 
+  test("toolCallState image payload is externalized out of state.json and rehydrated byte-exact", async () => {
+    // Integration check for ADR toolcall-payload-externalization.md against the
+    // REAL persistence path (mutateState → writeState → disk). A vision turn
+    // produces an inline base64 image part in the working messages; when the
+    // task pauses, that payload must not land in state.json, and on resume the
+    // exact bytes must come back.
+    const { dehydrateMessages, rehydrateMessages, isPayloadRef } = await import("../state/toolcall-payloads");
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-img-extern");
+    // Seed an empty state on disk so writeState has somewhere to land.
+    await mutateState(config.instance, () => {});
+
+    // A multi-megabyte inline image data-URL, exactly as buildAttachmentContent
+    // emits for a vision turn.
+    const bigPayload = "QkJCQkND".repeat(700_000); // > 4 KB, comfortably large
+    const dataUrl = `data:image/png;base64,${bigPayload}`;
+    const messages = [
+      { role: "user", content: [{ type: "image_url", image_url: { url: dataUrl } }] }
+    ];
+
+    // Persist a toolCallState the way runLoop does, via the real store.
+    const taskId = "task_extern_test";
+    await mutateState(config.instance, (state) => {
+      state.tasks.unshift({
+        id: taskId,
+        instance: config.instance,
+        title: "extern",
+        input: "extern",
+        status: "waiting_approval",
+        createdAt: now(),
+        updatedAt: now(),
+        currentStep: "Waiting for approval",
+        auditIds: [],
+        approvalIds: [],
+        toolCallState: {
+          messages: dehydrateMessages(config.instance, messages),
+          toolsHash: "h",
+          pending: [],
+          iterations: 1
+        }
+      } as unknown as Task);
+    });
+
+    // The raw state.json on disk must NOT contain the base64 payload.
+    const raw = await Bun.file(join(root, "instances", config.instance, "state.json")).text();
+    expect(raw).not.toContain(bigPayload);
+    const persistedUrl = (readState(config.instance).tasks.find((t) => t.id === taskId)!
+      .toolCallState!.messages[0] as any).content[0].image_url.url;
+    expect(isPayloadRef(persistedUrl)).toBe(true);
+
+    // Rehydrate restores the exact original bytes.
+    const restored = rehydrateMessages(
+      config.instance,
+      readState(config.instance).tasks.find((t) => t.id === taskId)!.toolCallState!.messages
+    );
+    expect((restored[0] as any).content[0].image_url.url).toBe(dataUrl);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
   test("falls back to a final answer when the model emits no tool calls", async () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
     const config = buildConfig(workspaceRoot, "chat-task-direct");

@@ -5,6 +5,7 @@ import { buildAgentSystemContext, renderEphemeralContext } from "./system-prompt
 import { loadInstructions, loadSoul, loadUserProfile } from "./runtime/identity-files";
 import { readState } from "./state";
 import { appendTrace } from "./state/trace";
+import { assertNoPayloadRef } from "./state/toolcall-payloads";
 import { bedrockSupportsStreamingWithTools, bedrockSupportsToolUse, estimateUsd, resolveProviderModality } from "./provider-capabilities";
 import { resolveAwsCredentials, signAwsRequest } from "./aws-sigv4";
 import type { CostRecord, ProviderAuthFailureRecord, ProviderAuthStatus, ProviderCatalogItem, ProviderConfig, ProviderName, ProviderReauthInfo, ProviderResult, RuntimeConfig, SystemNoteAuthError } from "./types";
@@ -1146,6 +1147,7 @@ function serializeChatContentParts(parts: MessageContentPart[]): Array<Record<st
   const out: Array<Record<string, unknown>> = [];
   for (const part of parts) {
     if (part.type === "document") {
+      assertNoPayloadRef(part.document.data);
       out.push({
         type: "file",
         file: {
@@ -1155,6 +1157,7 @@ function serializeChatContentParts(parts: MessageContentPart[]): Array<Record<st
       });
       continue;
     }
+    if (part.type === "image_url") assertNoPayloadRef(part.image_url.url);
     // text / image_url already match the chat-completions wire shape.
     out.push(part as unknown as Record<string, unknown>);
   }
@@ -1966,11 +1969,13 @@ function translateUserContent(
     if (part.type === "text") {
       blocks.push({ type: "text", text: part.text });
     } else if (part.type === "image_url") {
+      assertNoPayloadRef(part.image_url.url);
       const parsed = parseDataUrl(part.image_url.url);
       if (parsed) {
         blocks.push({ type: "image", source: { type: "base64", media_type: parsed.mediaType, data: parsed.data } });
       }
     } else if (part.type === "document") {
+      assertNoPayloadRef(part.document.data);
       blocks.push({
         type: "document",
         source: { type: "base64", media_type: part.document.mimeType, data: part.document.data }
@@ -2332,6 +2337,7 @@ function converseUserContent(content: string | MessageContentPart[] | null): Arr
     if (part.type === "text") {
       blocks.push({ text: part.text });
     } else if (part.type === "image_url") {
+      assertNoPayloadRef(part.image_url.url);
       const parsed = parseDataUrl(part.image_url.url);
       const format = parsed ? converseImageFormat(parsed.mediaType) : undefined;
       if (parsed && format) blocks.push({ image: { format, source: { bytes: parsed.data } } });

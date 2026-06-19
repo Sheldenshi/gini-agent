@@ -47,6 +47,7 @@ import {
   type ToolCall
 } from "../provider";
 import { uploadStat, sanitizeFilename, readUpload } from "../state/uploads";
+import { dehydrateMessages, rehydrateMessages } from "../state/toolcall-payloads";
 import { visionImageDataUrl } from "../media/image-compress";
 import {
   resolveDefaultPriorContextTokenBudget,
@@ -3372,9 +3373,14 @@ async function runLoop(
     workingMessages.push(...toolResultMessages);
 
     if (pendingApprovals.length > 0) {
-      // Snapshot the conversation onto the task and pause.
+      // Snapshot the conversation onto the task and pause. Lift large inline
+      // base64 image/document payloads out to content-addressed side files
+      // first — they'd otherwise live in state.json and tax every read (ADR
+      // toolcall-payload-externalization.md). dehydrateMessages deep-copies,
+      // so `workingMessages` (still held by the live loop) is never mutated;
+      // the side-file bytes are fsync'd before this snapshot is persisted.
       const snapshot: TaskToolCallState = {
-        messages: workingMessages,
+        messages: dehydrateMessages(config.instance, workingMessages),
         toolsHash,
         pending: pendingApprovals,
         iterations
@@ -3830,7 +3836,11 @@ export async function resumeChatTask(
   // Stage 2: pull the snapshot, append tool result messages, and continue
   // the loop.
   const snapshot = stage.task.toolCallState!;
-  const messages = (snapshot.messages as ToolCallingMessage[]).slice();
+  // Restore any externalized image/document payloads to their exact original
+  // bytes before they reach the provider. A reference whose side file is
+  // missing/corrupt is left as a marker; the provider serializers throw on it
+  // rather than silently dropping the part (ADR toolcall-payload-externalization.md).
+  const messages = (rehydrateMessages(config.instance, snapshot.messages) as ToolCallingMessage[]).slice();
   // Resolve the emit context once for the chat-block flips below. Tasks
   // without a chat session (subagent children) skip emission, matching
   // the loop-entry behavior in runLoop.
