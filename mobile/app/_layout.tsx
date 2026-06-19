@@ -28,6 +28,7 @@ import { LinkContextMenuHost } from "@/src/components/chat/linkContextMenu";
 import { FilePreviewProvider } from "@/src/components/FilePreview";
 import { ImagePreviewProvider } from "@/src/components/ImagePreview";
 import {
+  installNotificationResponseListener,
   primeDeviceTokenFromStorage,
   refreshBadge,
   registerApprovalCategoryAsync
@@ -83,6 +84,12 @@ export default function RootLayout() {
       // otherwise leave the NSE with no creds to enrich previews.
       mirrorCachedCredentialsToSharedContainer();
       await registerApprovalCategoryAsync();
+      // Install the live tap / action listener at root so a tap that arrives
+      // while the app is suspended routes even when the user never opened a
+      // chat detail this process (chat detail is the only other caller, via
+      // registerForPushAsync). Idempotent + permission-free, so it's safe to
+      // call on every launch alongside the category registration.
+      installNotificationResponseListener();
       if (active) setPrimed(true);
     })();
     return () => {

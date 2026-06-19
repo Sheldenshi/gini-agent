@@ -231,11 +231,16 @@ would hide the very reply the banner previewed). The `sessionId` /
 `threadId` parse and the route construction are shared by both delivery
 paths below, so a tap routes identically regardless of app state:
 
-- **App alive (foreground or suspended)**: iOS replays the tap through
+- **App alive (foreground or suspended)**: iOS delivers the tap through
   `addNotificationResponseReceivedListener`. The listener
   (`mobile/src/push.ts`) hands the response to
   `dispatchNotificationResponse` (`mobile/src/push-dispatch.ts`), whose
-  default-tap branch calls `navigateToChat`.
+  default-tap branch calls `navigateToChat`. The listener is installed at
+  root (`app/_layout.tsx` via `installNotificationResponseListener`) on every
+  launch — it needs no notification permission — so a tap that arrives while
+  the app is suspended routes even if the user never opened a chat detail
+  this process. (`registerForPushAsync` also calls the same idempotent
+  installer, so the listener exists whichever path runs first.)
 - **App killed (cold start)**: iOS does **not** replay the launch tap
   through the response listener — there is no live JS runtime at tap time,
   and the listener installed during the subsequent launch only sees taps
@@ -246,10 +251,16 @@ paths below, so a tap routes identically regardless of app state:
   `resolveLaunchTapRoute` (same id-parse as the live path), pushes the
   named chat on top of the channels list (a natural channels → chat back
   stack), then calls `Notifications.clearLastNotificationResponse()` so a
-  later remount can't navigate a second time off the same tap. Running it
-  on the authed screen — after the `index` auth gate has already bounced an
-  unauthed/expired credential to `/setup` — keeps a cold-start tap from
-  deep-linking into a 401.
+  later remount can't navigate a second time off the same tap. The `index`
+  auth gate is presence-only (it routes a MISSING credential to `/setup` but
+  lets a stale/expired one through), so a dead token here pushes the chat
+  optimistically — exactly like tapping an agent/channel row — and the chat
+  screen's own 401 handler (`clearCredentials` → `/setup`, mirrored on the
+  thread screen) clears the token; the next cold start then skips straight to
+  `/setup`. Sign-out / credential-swap also clears the stored launch response
+  (`__resetRegistrationForSignOut`) so an un-consumed tap can't replay across
+  a credential boundary, and the live listener clears it after handling a tap
+  so an already-handled tap isn't replayed by a later consume.
 
 `resolveLaunchTapRoute` returns null (no navigation) for an `APPROVE` /
 `DENY` action launch and for any payload without a `sessionId` (a silent

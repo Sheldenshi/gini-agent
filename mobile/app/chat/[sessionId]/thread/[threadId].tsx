@@ -20,6 +20,7 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { ApiError, uploadImage, type UploadRef } from "@/src/api";
+import { clearCredentials } from "@/src/auth";
 import { AttachmentSheet } from "@/src/components/AttachmentSheet";
 import { AgentAvatar, agentSwatch } from "@/src/components/chat/AgentAvatar";
 import { BlockRenderer } from "@/src/components/chat/BlockRenderer";
@@ -106,7 +107,15 @@ export default function ThreadViewScreen() {
   const unauthorized =
     stream.error instanceof ApiError && stream.error.status === 401;
   useEffect(() => {
-    if (unauthorized) router.replace("/setup");
+    // Clear the dead token before redirecting (mirrors the main chat screen).
+    // A cold-start notification tap on a threaded completion can deep-link
+    // straight here; without clearing, an expired token would redirect to
+    // /setup but leave the token in storage, so the next cold-start tap
+    // re-routes here and 401s again — the cold-start flash loop.
+    if (unauthorized) {
+      void clearCredentials();
+      router.replace("/setup");
+    }
   }, [unauthorized]);
 
   const summary = useMemo(

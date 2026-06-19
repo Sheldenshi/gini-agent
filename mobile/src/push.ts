@@ -215,6 +215,49 @@ function navigateToChat(sessionId: string, threadId: string | null): void {
   );
 }
 
+// Installs the live notification-response listener that routes taps and
+// Approve/Deny actions while the JS runtime is alive (foreground or
+// suspended). Idempotent via the module-scoped `responseSub` guard, and
+// requires NO notification permission — listening for a response the OS
+// hands us is always safe — so it's installed unconditionally at root
+// (app/_layout.tsx) on every launch, not gated behind the permission-prompt
+// flow in registerForPushAsync. Without the root install, a tap that arrived
+// while the app was suspended on a screen that never opened a chat detail
+// (so registerForPushAsync had never run) would be dropped.
+//
+// Handles three cases via dispatchNotificationResponse:
+//   - Default tap (no actionIdentifier, or the OS default action) → deep-link
+//     to the chat / thread the payload names.
+//   - APPROVE action → POST /api/authorizations/:id/approve.
+//   - DENY action → POST /api/authorizations/:id/deny.
+// Both action endpoints pre-date the push surface and enforce auth +
+// ownership. The action handler runs in the background while the app is
+// suspended; iOS gives up to 30s of JS time, plenty for one POST.
+export function installNotificationResponseListener(): void {
+  if (Platform.OS !== "ios") return;
+  if (responseSub) return;
+  responseSub = Notifications.addNotificationResponseReceivedListener((response) => {
+    void dispatchNotificationResponse(response, {
+      apiCall: (path, init) => api(path, init),
+      navigate: navigateToChat,
+      notifyFailure: notifyActionFailure
+    }).finally(() => {
+      // A tap handled live is ALSO retained by the OS as the "last
+      // notification response". Clear it so a later channels mount's
+      // consumeLaunchNotificationRoute() can't replay this already-handled
+      // tap (which, after a sign-out → sign-in remount, could navigate into
+      // a chat from the prior credential). The cold-start path is the only
+      // consumer that should ever act on the stored response.
+      try {
+        Notifications.clearLastNotificationResponse();
+      } catch {
+        // Native module not ready — the stored response is harmless until
+        // the next consume attempt, which clears it itself.
+      }
+    });
+  });
+}
+
 // Cold-start launch-tap recovery. When the app is launched from a fully
 // killed state by a notification tap, iOS does NOT replay that tap through
 // the response listener (the listener only fires for taps received while
@@ -222,10 +265,13 @@ function navigateToChat(sessionId: string, threadId: string | null): void {
 // the tap that launched the process; we route it to the right chat, then
 // clear it so a later remount can't navigate a second time off the same tap.
 //
-// Called from the authed landing screen (channels) on mount — running it
-// post-auth-gate means a missing/dead credential still lands on /setup
-// rather than deep-linking into a 401. Best-effort and iOS-gated: any
-// failure leaves the user on the screen they're already on.
+// Called from the authed landing screen (channels) on mount. The index auth
+// gate is presence-only — it routes a MISSING credential to /setup but lets a
+// stale/expired one through — so a dead token here pushes the chat
+// optimistically (same as tapping any agent/channel row), then the chat
+// screen's own 401 handler clears the token and redirects to /setup; the next
+// cold start skips straight to /setup. Best-effort and iOS-gated: any failure
+// leaves the user on the screen they're already on.
 //
 // Approve/Deny action launches resolve to null in resolveLaunchTapRoute, so
 // they never navigate here. Returns the route it navigated to (or null) so
@@ -444,38 +490,9 @@ export async function registerForPushAsync(opts: RegisterPushOptions = {}): Prom
       // honoured.
       if (!isStillCurrent(entryGeneration)) return;
 
-      // Response listener: handles three cases via dispatchNotificationResponse.
-      //   - Default tap (no actionIdentifier set, or
-      //     UNNotificationDefaultActionIdentifier) → deep-link to chat.
-      //   - APPROVE action → POST /api/authorizations/:id/approve.
-      //   - DENY action → POST /api/authorizations/:id/deny.
-      // Both action endpoints are existing routes — they pre-date the push
-      // surface and already enforce auth + ownership. The action handler
-      // runs in the background while the app is suspended; iOS gives up to
-      // 30s of JS time, plenty for a single POST round-trip.
-      if (!responseSub) {
-        responseSub = Notifications.addNotificationResponseReceivedListener((response) => {
-          void dispatchNotificationResponse(response, {
-            apiCall: (path, init) => api(path, init),
-            navigate: navigateToChat,
-            notifyFailure: notifyActionFailure
-          }).finally(() => {
-            // A tap handled live is ALSO retained by the OS as the "last
-            // notification response". Clear it so a later channels mount's
-            // consumeLaunchNotificationRoute() can't replay this already-
-            // handled tap (which, after a sign-out → sign-in remount, could
-            // navigate into a chat from the prior credential). The cold-start
-            // path is the only consumer that should ever act on the stored
-            // response.
-            try {
-              Notifications.clearLastNotificationResponse();
-            } catch {
-              // Native module not ready — the stored response is harmless
-              // until the next consume attempt, which clears it itself.
-            }
-          });
-        });
-      }
+      // Install the live tap / action listener (idempotent — the function
+      // no-ops if it's already subscribed, e.g. from the root-layout call).
+      installNotificationResponseListener();
 
       // Foreground delivery listener — fires for every received push,
       // including silent ones (where `setNotificationHandler` returned
@@ -587,6 +604,16 @@ export function __resetRegistrationForSignOut(): void {
   if (Platform.OS === "ios") {
     void Notifications.setBadgeCountAsync(0).catch(() => {});
     void Notifications.dismissAllNotificationsAsync().catch(() => {});
+    // Drop any stored launch tap too. The cold-start consume
+    // (consumeLaunchNotificationRoute) only runs on the authed landing
+    // screen, so an un-consumed tap that predates this sign-out would
+    // otherwise survive the signed-out /setup detour and replay after the
+    // next sign-in — navigating into a chat from the prior credential.
+    try {
+      Notifications.clearLastNotificationResponse();
+    } catch {
+      // Native module not ready — harmless; the next consume clears it.
+    }
   }
   // Bump generation LAST so anything that resolves during a
   // sign-out's pre-bump drain (via awaitRegistrationInFlight) still
