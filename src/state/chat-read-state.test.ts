@@ -243,6 +243,57 @@ describe("chat-read-state", () => {
     expect(unreadCountsByDevice(instance, "tok_iphone_b").get("chat_a")).toBe(2);
   });
 
+  test("unreadCountForDevice excludes blocks from excluded session ids", () => {
+    // The regression this pins: a session the user can't reach (an
+    // archived job channel) must not contribute to the badge, since
+    // there's no way to open it and clear the read-state. The aggregate
+    // counts everything by default; passing the session id in
+    // excludeSessionIds zeroes its contribution.
+    const instance = "crs-exclude-aggregate" as Instance;
+    insertChatBlock(instance, { kind: "user_text", sessionId: "chat_reachable", text: "1" });
+    insertChatBlock(instance, { kind: "user_text", sessionId: "chat_archived", text: "2" });
+    insertChatBlock(instance, {
+      kind: "tool_call",
+      sessionId: "chat_archived",
+      callId: "call_1",
+      toolName: "echo",
+      displayLabel: "Echo",
+      argsPreview: "{}",
+      argsFull: {},
+      status: "running"
+    });
+    // No read cursor anywhere — without exclusion every visible block counts.
+    expect(unreadCountForDevice(instance, "tok_x")).toBe(3);
+    // Excluding the archived session drops its two blocks.
+    expect(unreadCountForDevice(instance, "tok_x", ["chat_archived"])).toBe(1);
+    // An empty exclusion list is identical to omitting the argument.
+    expect(unreadCountForDevice(instance, "tok_x", [])).toBe(3);
+  });
+
+  test("unreadCountForDevice excludes multiple session ids at once", () => {
+    const instance = "crs-exclude-many" as Instance;
+    insertChatBlock(instance, { kind: "user_text", sessionId: "chat_a", text: "1" });
+    insertChatBlock(instance, { kind: "user_text", sessionId: "chat_b", text: "2" });
+    insertChatBlock(instance, { kind: "user_text", sessionId: "chat_c", text: "3" });
+    expect(unreadCountForDevice(instance, "tok_x", ["chat_a", "chat_b"])).toBe(1);
+    // An exclusion id that matches no session is a harmless no-op.
+    expect(unreadCountForDevice(instance, "tok_x", ["chat_missing"])).toBe(3);
+  });
+
+  test("unreadCountsByDevice omits excluded sessions from the per-row map", () => {
+    const instance = "crs-exclude-by-session" as Instance;
+    insertChatBlock(instance, { kind: "user_text", sessionId: "chat_a", text: "1" });
+    insertChatBlock(instance, { kind: "user_text", sessionId: "chat_archived", text: "2" });
+    insertChatBlock(instance, { kind: "user_text", sessionId: "chat_archived", text: "3" });
+    const counts = unreadCountsByDevice(instance, "tok_x", ["chat_archived"]);
+    expect(counts.get("chat_a")).toBe(1);
+    expect(counts.has("chat_archived")).toBe(false);
+    // The per-row map and the aggregate agree on the reachable total.
+    let sum = 0;
+    for (const n of counts.values()) sum += n;
+    expect(sum).toBe(unreadCountForDevice(instance, "tok_x", ["chat_archived"]));
+  });
+
   test("getLastReadByDevice returns per-session map", () => {
     const instance = "crs-map" as Instance;
     const a = insertChatBlock(instance, { kind: "user_text", sessionId: "chat_a", text: "1" });

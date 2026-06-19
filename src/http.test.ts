@@ -7,6 +7,7 @@ import { clearWebTargetCache } from "./web-target";
 import { dirname, join } from "node:path";
 import { addAudit, appendEvent, approvePairingRequest, claimPairingRequest, createPairingRequest, insertChatBlock, isPlausibleMime, mutateState, readState, readTrace, recordProviderAuthFailure, revokeDevice, sanitizeFilename, storeUpload, uploadStat } from "./state";
 import { getOrCreateAgentChat } from "./execution/chat";
+import { createScheduledJob } from "./jobs";
 import { listAllDevices } from "./state/devices";
 import { removeMemoryDb } from "./state/memory-db";
 import { listProviders } from "./integrations/connectors/registry";
@@ -5259,6 +5260,183 @@ describe("runtime api", () => {
 
       const after = await call(handler, config, "/api/badge", { headers: deviceHeader });
       expect(after.unread).toBe(1);
+    });
+
+    test("GET /api/badge and /api/unread exclude archived sessions", async () => {
+      // Regression: an archived session (e.g. a deleted recurring-job
+      // channel) is hidden from every client by the `!archivedAt` filter,
+      // so the user can never open it to clear its read-state. The badge
+      // must not count its blocks — otherwise it pins at a number that
+      // can never be drained.
+      const config = testConfig("chat-badge-archived");
+      const handler = createHandler(config);
+
+      await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_owner_device", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      const deviceHeader = { "x-device-token": "tok_owner_device" };
+
+      const live = await call(handler, config, "/api/chat", {
+        method: "POST",
+        body: JSON.stringify({ title: "live chat" })
+      });
+      const stale = await call(handler, config, "/api/chat", {
+        method: "POST",
+        body: JSON.stringify({ title: "old job channel" })
+      });
+
+      const { insertChatBlock } = await import("./state");
+      insertChatBlock(config.instance, { kind: "assistant_text", sessionId: live.id, text: "reachable", streaming: false });
+      insertChatBlock(config.instance, { kind: "assistant_text", sessionId: stale.id, text: "stuck 1", streaming: false });
+      insertChatBlock(config.instance, { kind: "assistant_text", sessionId: stale.id, text: "stuck 2", streaming: false });
+
+      // Both sessions visible → all three blocks count.
+      const before = await call(handler, config, "/api/badge", { headers: deviceHeader });
+      expect(before.unread).toBe(3);
+
+      // Archive the stale session — it now drops out of the badge.
+      await mutateState(config.instance, (state) => {
+        const session = state.chatSessions.find((s) => s.id === stale.id);
+        if (session) session.archivedAt = new Date().toISOString();
+      });
+
+      const afterBadge = await call(handler, config, "/api/badge", { headers: deviceHeader });
+      expect(afterBadge.unread).toBe(1);
+
+      const afterUnread = await call(handler, config, "/api/unread", { headers: deviceHeader });
+      expect(afterUnread.counts[live.id]).toBe(1);
+      expect(afterUnread.counts[stale.id]).toBeUndefined();
+    });
+
+    test("GET /api/badge and /api/unread exclude sessions of archived agents", async () => {
+      // Second unreachable vector: archiving an agent stamps `archivedAt`
+      // on the AGENT, not its chat session. Both clients show archived
+      // agents in a Restore-only group with no way to open the chat, so
+      // the session's blocks can never be marked read. The badge must
+      // exclude them just like a self-archived session.
+      const config = testConfig("chat-badge-archived-agent");
+      const handler = createHandler(config);
+
+      await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_owner_device", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      const deviceHeader = { "x-device-token": "tok_owner_device" };
+
+      const agent = await call(handler, config, "/api/agents", {
+        method: "POST",
+        body: JSON.stringify({ name: "scratch agent" })
+      });
+      const agentChat = await getOrCreateAgentChat(config.instance, agent.id);
+
+      const { insertChatBlock } = await import("./state");
+      insertChatBlock(config.instance, {
+        kind: "assistant_text",
+        sessionId: agentChat.id,
+        text: "agent reply 1",
+        streaming: false,
+        agentId: agent.id
+      });
+      insertChatBlock(config.instance, {
+        kind: "assistant_text",
+        sessionId: agentChat.id,
+        text: "agent reply 2",
+        streaming: false,
+        agentId: agent.id
+      });
+
+      // Agent active → its chat is reachable, both blocks count.
+      const before = await call(handler, config, "/api/badge", { headers: deviceHeader });
+      expect(before.unread).toBe(2);
+
+      // Archive the agent (the session keeps no archivedAt of its own).
+      await call(handler, config, `/api/agents/${agent.id}/archive`, { method: "POST" });
+      const sessionStillUnarchived = readState(config.instance).chatSessions.find((s) => s.id === agentChat.id);
+      expect(sessionStillUnarchived?.archivedAt).toBeUndefined();
+
+      // Badge drops to zero — the only session belongs to an archived agent.
+      const afterBadge = await call(handler, config, "/api/badge", { headers: deviceHeader });
+      expect(afterBadge.unread).toBe(0);
+      const afterUnread = await call(handler, config, "/api/unread", { headers: deviceHeader });
+      expect(afterUnread.counts[agentChat.id]).toBeUndefined();
+
+      // Restoring the agent makes the chat reachable again → blocks recount.
+      await call(handler, config, `/api/agents/${agent.id}/unarchive`, { method: "POST" });
+      const afterRestore = await call(handler, config, "/api/badge", { headers: deviceHeader });
+      expect(afterRestore.unread).toBe(2);
+    });
+
+    test("GET /api/badge still counts a job channel owned by an archived agent", async () => {
+      // Over-exclusion guard: a job CHANNEL (kind:"channel" / origin:"job")
+      // stays on the channel rail even when its owning agent is archived —
+      // the client filters key on kind/origin + !archivedAt, never on agent
+      // state. So unless the channel is archived in its own right it is still
+      // reachable and openable, and its blocks must keep counting. Only the
+      // agent's CANONICAL chat vanishes with the agent.
+      const config = testConfig("chat-badge-archived-agent-channel");
+      const handler = createHandler(config);
+
+      await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_owner_device", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      const deviceHeader = { "x-device-token": "tok_owner_device" };
+
+      const agent = await call(handler, config, "/api/agents", {
+        method: "POST",
+        body: JSON.stringify({ name: "channel owner" })
+      });
+      // A real recurring job with its own dedicated channel (kind:"channel",
+      // origin:"job"), owned by the agent. Going through createScheduledJob
+      // means the job references the channel, so the orphan-channel sweep in
+      // normalizeState leaves it live (a bare hand-built channel would be
+      // archived as orphaned on the next state load).
+      const job = await createScheduledJob(
+        config,
+        {
+          name: "news-watch",
+          prompt: "summarize headlines",
+          intervalSeconds: 600,
+          createDedicatedSession: { title: "news-watch" }
+        },
+        { originatingAgentId: agent.id }
+      );
+      const channelId = job.chatSessionId!;
+      const channelSession = readState(config.instance).chatSessions.find((s) => s.id === channelId);
+      expect(channelSession?.kind).toBe("channel");
+      expect(channelSession?.agentId).toBe(agent.id);
+
+      const { insertChatBlock } = await import("./state");
+      insertChatBlock(config.instance, {
+        kind: "assistant_text",
+        sessionId: channelId,
+        text: "digest 1",
+        streaming: false,
+        agentId: agent.id
+      });
+
+      const before = await call(handler, config, "/api/badge", { headers: deviceHeader });
+      expect(before.unread).toBe(1);
+
+      // Archive the agent. The channel is still rendered on the rail, so it
+      // must keep counting (unlike the agent's canonical chat).
+      await call(handler, config, `/api/agents/${agent.id}/archive`, { method: "POST" });
+      const sessionStillLive = readState(config.instance).chatSessions.find((s) => s.id === channelId);
+      expect(sessionStillLive?.archivedAt).toBeUndefined();
+
+      const afterBadge = await call(handler, config, "/api/badge", { headers: deviceHeader });
+      expect(afterBadge.unread).toBe(1);
+      const afterUnread = await call(handler, config, "/api/unread", { headers: deviceHeader });
+      expect(afterUnread.counts[channelId]).toBe(1);
+
+      // But if the channel itself is archived, it drops out (vector 1).
+      await mutateState(config.instance, (state) => {
+        const s = state.chatSessions.find((x) => x.id === channelId);
+        if (s) s.archivedAt = new Date().toISOString();
+      });
+      const afterChannelArchive = await call(handler, config, "/api/badge", { headers: deviceHeader });
+      expect(afterChannelArchive.unread).toBe(0);
     });
 
     test("POST /api/chat/:id/read rejects bad input and cross-session ids", async () => {

@@ -278,7 +278,30 @@ current session is a dedicated channel, stamps the channel's
 `archivedAt` (audited as `chat.session.archived`). An archived session
 keeps its full history and stays directly addressable by id/URL; it is
 only excluded from session/channel lists (web sidebar rail, mobile
-channels). Rebinding when already bound the requested way is a no-op.
+channels) **and from the unread/badge accounting**. The badge must not
+count blocks from any session the user has no surface to open and mark
+read, or the iOS app-icon badge pins at a number with no UI to drain it.
+Two session states are unreachable this way: (1) the session is archived
+(`archivedAt`), and (2) a non-channel session whose owning agent is
+archived — the agent's own chat: its canonical `kind:"agent"` session and
+any hidden legacy `kind: undefined` session it still owns (Decision A
+keeps demoted legacy sessions kind-less and hidden, never deleted). Both
+clients render archived agents in a Restore-only group with no affordance
+to open their chats, and `archiveAgent` stamps only the agent, never the
+session. A job CHANNEL (`kind:"channel"` / `origin:"job"`) is the
+exception to (2): the rails key channel visibility on kind/origin +
+`!archivedAt`, never on agent state, so a channel stays openable when its
+owning agent is archived and must keep counting until it is archived in
+its own right. The predicate is therefore `!isJobChannel && archived-agent`,
+not `kind === "agent"` — narrowing it to `=== "agent"` would re-pin the
+badge on an archived agent's hidden legacy sessions. `GET /api/badge` and `GET /api/unread`
+resolve the unreachable set via `unreachableSessionIds` (`src/http.ts`)
+and pass it to
+`unreadCountForDevice` / `unreadCountsByDevice`
+(`src/state/chat-read-state.ts`) so their blocks don't count. Without
+this a deleted recurring job's channel (which can hold hundreds of
+blocks) or an archived agent's chat pins the badge at a number the user
+can't clear. Rebinding when already bound the requested way is a no-op.
 Watcher jobs (a `preRunHook` or fan-out `routes`) reject `deliverTo` —
 their sessions carry routing state a rebind would orphan. The raw
 `PATCH /api/jobs` path stays permissive and has no `deliverTo`

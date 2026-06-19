@@ -2113,7 +2113,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       // Badge totals are per-device (see /read endpoint comment).
       const dev = requireDeviceToken(config, request, credential);
       if (!dev.ok) return json({ error: dev.reason }, dev.status);
-      const unread = unreadCountForDevice(config.instance, dev.token);
+      const unread = unreadCountForDevice(config.instance, dev.token, unreachableSessionIds(config));
       return json({ unread });
     }],
     // Per-session unread counts for the calling device. Powers the
@@ -2126,7 +2126,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       if (!credential) return json({ error: "Unauthorized" }, 401);
       const dev = requireDeviceToken(config, request, credential);
       if (!dev.ok) return json({ error: dev.reason }, dev.status);
-      const counts = unreadCountsByDevice(config.instance, dev.token);
+      const counts = unreadCountsByDevice(config.instance, dev.token, unreachableSessionIds(config));
       return json({ counts: Object.fromEntries(counts) });
     }],
     ["GET", /^\/api\/promotions$/, () => json(readState(config.instance).promotions)],
@@ -3442,6 +3442,55 @@ function requireDeviceToken(
     return { ok: false, reason: "Device token is not registered to this credential", status: 403 };
   }
   return { ok: true, token };
+}
+
+// Session ids the user has no surface to open, and therefore no way to
+// mark read. The badge / unread endpoints exclude these so they don't
+// count blocks that can never be cleared — otherwise the iOS app-icon
+// badge pins at a number with no UI to drain it. Two ways a session
+// becomes unreachable, both hidden by every client's list filters:
+//   1. The session itself is archived (`archivedAt`) — e.g. a deleted
+//      recurring-job channel. Hidden by the `!archivedAt` filter on the
+//      web rail and mobile channel list, regardless of `kind`.
+//   2. A non-channel session whose owning agent is archived — the agent's
+//      own chat: its canonical `kind: "agent"` session AND any hidden
+//      legacy `kind: undefined` session it still owns (Resolved Decision A
+//      keeps demoted legacy sessions kind-less and hidden, never deleted).
+//      The session keeps no `archivedAt` of its own (archiveAgent stamps
+//      only the agent), but both clients render archived agents in a
+//      Restore-only group with no affordance to open their chats, so the
+//      chat is unreachable until the agent is restored. This deliberately
+//      EXCLUDES a job CHANNEL (`kind: "channel"` / `origin: "job"`): the
+//      rails list channels by kind/origin + `!archivedAt`, never by agent
+//      state, so a channel stays visible and openable even when its owning
+//      agent is archived and must keep counting until archived in its own
+//      right. Hence the predicate is `!isJobChannel`, not `kind === "agent"`
+//      — narrowing it to `=== "agent"` would re-pin the badge on hidden
+//      legacy sessions of archived agents.
+// Reachability state lives in the JSON store (chatSessions + agents),
+// not memory.db, so it's resolved here and passed to the SQLite
+// accounting as an exclusion set.
+function unreachableSessionIds(config: RuntimeConfig): string[] {
+  const state = readState(config.instance);
+  const archivedAgentIds = new Set(
+    state.agents.filter((agent) => agent.archivedAt).map((agent) => agent.id)
+  );
+  const ids = new Set<string>();
+  for (const session of state.chatSessions) {
+    if (session.archivedAt) {
+      ids.add(session.id);
+      continue;
+    }
+    // A job channel stays on the rail (clients key on kind/origin +
+    // !archivedAt, never on agent state), so it's still reachable even
+    // when its owning agent is archived — leave it counting. Only the
+    // agent's own chat disappears with the agent.
+    const isJobChannel = session.kind === "channel" || session.origin === "job";
+    if (!isJobChannel && session.agentId && archivedAgentIds.has(session.agentId)) {
+      ids.add(session.id);
+    }
+  }
+  return [...ids];
 }
 
 function json(value: unknown, statusCode = 200): Response {

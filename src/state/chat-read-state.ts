@@ -242,11 +242,36 @@ export function getReadState(
   return row ? rowToState(row) : null;
 }
 
+// Builds the SQL fragment + bound params that exclude a set of session
+// ids from the block scan. Returns an empty fragment when the caller
+// passes no ids, so the un-filtered query path is byte-identical to the
+// original. Callers pass UNREACHABLE session ids here: a session the user
+// has no surface to open (archived itself, or owned by an archived agent —
+// see unreachableSessionIds in src/http.ts) can never have its read-state
+// cleared, so counting its blocks would inflate a badge with no UI to
+// drain it. The ids are bound as parameters (never interpolated) because
+// session ids, unlike COUNTABLE_KINDS, are not a fixed literal set.
+function excludeClause(excludeSessionIds: readonly string[]): {
+  sql: string;
+  params: string[];
+} {
+  if (excludeSessionIds.length === 0) return { sql: "", params: [] };
+  const placeholders = excludeSessionIds.map(() => "?").join(",");
+  return {
+    sql: ` AND b.session_id NOT IN (${placeholders})`,
+    params: [...excludeSessionIds]
+  };
+}
+
 // Total unread COUNTABLE_KINDS blocks across every session for the
 // device. A session with no chat_read_state row counts the entire
 // session as unread (this device has never seen any blocks in it).
 // For sessions WITH a row, unread = blocks with ordinal > cursor
 // block's ordinal.
+//
+// `excludeSessionIds` drops sessions the user can't reach (archived
+// sessions, or sessions of archived agents) from the count — see
+// excludeClause. Omit it (or pass an empty array) to count every session.
 //
 // Single SQL trip via two CTEs:
 //   - `cursors` joins the device's last-read rows to the cursor
@@ -257,15 +282,17 @@ export function getReadState(
 //     fresh sessions count every visible block.
 export function unreadCountForDevice(
   instance: Instance,
-  deviceToken: string
+  deviceToken: string,
+  excludeSessionIds: readonly string[] = []
 ): number {
   const db = getMemoryDb(instance);
   // SQLite parameter binding doesn't accept arrays for IN clauses, so
   // we expand the kind list inline. Using a constant list of literals
   // is safe — no user input flows in.
   const kindList = COUNTABLE_KINDS.map((k) => `'${k}'`).join(",");
+  const exclude = excludeClause(excludeSessionIds);
   const row = db
-    .query<{ unread: number }, [string]>(
+    .query<{ unread: number }, [string, ...string[]]>(
       `WITH cursor_ordinals AS (
          SELECT crs.session_id, cb.ordinal AS cutoff_ordinal
          FROM chat_read_state crs
@@ -276,9 +303,9 @@ export function unreadCountForDevice(
        FROM chat_blocks b
        LEFT JOIN cursor_ordinals co ON co.session_id = b.session_id
        WHERE b.kind IN (${kindList})
-         AND b.ordinal > COALESCE(co.cutoff_ordinal, -1)`
+         AND b.ordinal > COALESCE(co.cutoff_ordinal, -1)${exclude.sql}`
     )
-    .get(deviceToken);
+    .get(deviceToken, ...exclude.params);
   return row?.unread ?? 0;
 }
 
@@ -288,14 +315,19 @@ export function unreadCountForDevice(
 // zero unread blocks are omitted from the map (callers can default to
 // 0). A single SQL trip mirrors the aggregate query so the list
 // endpoint's render cost stays flat regardless of session count.
+//
+// `excludeSessionIds` mirrors unreadCountForDevice so the per-row map
+// and the aggregate total agree on which sessions are reachable.
 export function unreadCountsByDevice(
   instance: Instance,
-  deviceToken: string
+  deviceToken: string,
+  excludeSessionIds: readonly string[] = []
 ): Map<string, number> {
   const db = getMemoryDb(instance);
   const kindList = COUNTABLE_KINDS.map((k) => `'${k}'`).join(",");
+  const exclude = excludeClause(excludeSessionIds);
   const rows = db
-    .query<{ session_id: string; unread: number }, [string]>(
+    .query<{ session_id: string; unread: number }, [string, ...string[]]>(
       `WITH cursor_ordinals AS (
          SELECT crs.session_id, cb.ordinal AS cutoff_ordinal
          FROM chat_read_state crs
@@ -306,10 +338,10 @@ export function unreadCountsByDevice(
        FROM chat_blocks b
        LEFT JOIN cursor_ordinals co ON co.session_id = b.session_id
        WHERE b.kind IN (${kindList})
-         AND b.ordinal > COALESCE(co.cutoff_ordinal, -1)
+         AND b.ordinal > COALESCE(co.cutoff_ordinal, -1)${exclude.sql}
        GROUP BY b.session_id`
     )
-    .all(deviceToken);
+    .all(deviceToken, ...exclude.params);
   const counts = new Map<string, number>();
   for (const row of rows) {
     if (row.unread > 0) counts.set(row.session_id, row.unread);
