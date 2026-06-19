@@ -325,7 +325,10 @@ describe("chat-task loop", () => {
 
     // A multi-megabyte inline image data-URL, exactly as buildAttachmentContent
     // emits for a vision turn.
-    const bigPayload = "QkJCQkND".repeat(700_000); // > 4 KB, comfortably large
+    // Just over the 4096-byte externalization floor — magnitude is irrelevant
+    // to the behavior (any string past the threshold externalizes identically),
+    // so keep the fixture small to stay fast and low-memory.
+    const bigPayload = "QkJCQkND".repeat(1024); // 8 KB, > 4 KB floor
     const dataUrl = `data:image/png;base64,${bigPayload}`;
     const messages = [
       { role: "user", content: [{ type: "image_url", image_url: { url: dataUrl } }] }
@@ -389,7 +392,9 @@ describe("chat-task loop", () => {
     const provider = normalizeProvider(config.provider);
     await mutateState(config.instance, () => {});
 
-    const bigPayload = "Q29udGVudA".repeat(600_000); // > 4 KB
+    // Just over the 4096-byte externalization floor (see note in the
+    // persistence-layer test above); small keeps the resume loop fast.
+    const bigPayload = "Q29udGVudA".repeat(820); // 8.2 KB, > 4 KB floor
     const dataUrl = `data:image/png;base64,${bigPayload}`;
     const payloadHash = __testing.sha256Hex(dataUrl);
 
