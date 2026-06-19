@@ -1919,7 +1919,37 @@ function translateMessagesToAnthropic(messages: ToolCallingMessage[]): Anthropic
     out.push({ role: "assistant", content: blocks });
     i++;
   }
-  return { system: systemParts.join("\n\n"), messages: out };
+  return { system: systemParts.join("\n\n"), messages: mergeConsecutiveSameRole(out) };
+}
+
+// The Messages API requires strict user/assistant alternation and rejects two
+// consecutive same-role turns. Replay can legitimately produce adjacent user
+// turns — a prior turn the user cancelled persists its prompt with no assistant
+// answer, and the interrupt-context marker (see cancelTask) is a separate
+// user-role row — so before sending we merge any run of same-role messages into
+// one, concatenating their content blocks in order. (Adjacent tool-result runs
+// are already collapsed above; this is the general guard for the remaining
+// user/assistant cases.) Each merged message keeps the block shape the API
+// expects: a string content is wrapped as a text block so heterogeneous
+// (string + blocks) runs combine cleanly.
+function mergeConsecutiveSameRole(
+  messages: Array<Record<string, unknown>>
+): Array<Record<string, unknown>> {
+  const merged: Array<Record<string, unknown>> = [];
+  const toBlocks = (content: unknown): Array<Record<string, unknown>> => {
+    if (typeof content === "string") return [{ type: "text", text: content }];
+    if (Array.isArray(content)) return content as Array<Record<string, unknown>>;
+    return [];
+  };
+  for (const message of messages) {
+    const prev = merged[merged.length - 1];
+    if (prev && prev.role === message.role) {
+      prev.content = [...toBlocks(prev.content), ...toBlocks(message.content)];
+      continue;
+    }
+    merged.push({ ...message, content: message.content });
+  }
+  return merged;
 }
 
 // Map a user message's content to the Messages content shape. A plain string
@@ -2367,7 +2397,21 @@ function translateMessagesToConverse(messages: ToolCallingMessage[]): ConverseTr
     out.push({ role: "assistant", content: blocks });
     i++;
   }
-  return { system, messages: out };
+  // Converse, like the Anthropic Messages API, requires strict user/assistant
+  // alternation. Merge any run of same-role messages (the cancelled-prompt +
+  // interrupt-marker replay case produces adjacent user turns). Converse text
+  // blocks use the `{ text }` shape, and content here is always a block array.
+  const mergedConverse: Array<Record<string, unknown>> = [];
+  for (const message of out) {
+    const prev = mergedConverse[mergedConverse.length - 1];
+    const blocks = (message.content as Array<Record<string, unknown>>) ?? [];
+    if (prev && prev.role === message.role) {
+      prev.content = [...(prev.content as Array<Record<string, unknown>>), ...blocks];
+      continue;
+    }
+    mergedConverse.push(message);
+  }
+  return { system, messages: mergedConverse };
 }
 
 // Map tools to Converse's toolConfig. Returns undefined when there are no tools

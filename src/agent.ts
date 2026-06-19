@@ -30,6 +30,7 @@ import {
   appendTrace,
   assertInsideWorkspace,
   assertInsideWorkspaceNoSymlinkEscape,
+  createChatMessage,
   createTask,
   findInFlightAssistantTextForTask,
   isTerminalTaskStatus,
@@ -302,6 +303,12 @@ export async function cancelTask(
   // descendant cascade, queue drain) must NOT re-run, or a second Stop would
   // append a duplicate "Cancelled" system_note + phase.
   let didCancel = false;
+  // Whether a tool was involved when the cancel landed — drives the
+  // interrupt-context marker variant ("…for tool use" vs. plain), mirroring
+  // Claude Code's two interrupt strings. True when the task was parked on an
+  // approval gate, carried a pending tool-call snapshot, had a live pending
+  // gate row, or had a non-gated tool mid-execution at cancel time.
+  let cancelledDuringToolUse = false;
   const task = await mutateState(config.instance, (state) => {
     const task = findTask(state, taskId);
     if (parentTaskId !== undefined && parentTaskId === taskId) {
@@ -311,6 +318,23 @@ export async function cancelTask(
     }
     if (isTerminalTaskStatus(task.status)) return task;
     didCancel = true;
+    // Tool-use signal for the marker variant, from three in-state sources:
+    //  - parked on an approval gate (`waiting_approval`), or the paused loop's
+    //    persisted tool-call snapshot still has pending entries;
+    //  - a non-gated tool is mid-execution: `dispatchToolCall` runs OUTSIDE any
+    //    mutateState, between the loop committing a `running` recentToolCalls
+    //    entry and flipping it to done/error, so a `running` entry here means a
+    //    sync tool (file_read, web_fetch, browser_*, …) is in flight — these
+    //    create no gate row and never populate toolCallState.pending. The loop's
+    //    own terminal re-check (chat-task.ts, before the running push) means a
+    //    `running` entry can't appear after this cancel lands, so it's reliable.
+    // The mid-dispatch window (a durable pending gate row exists but the
+    // waiting_approval flip + toolCallState snapshot haven't persisted yet) is
+    // covered below by folding in the pending-gate set once it's computed.
+    cancelledDuringToolUse =
+      task.status === "waiting_approval" ||
+      (task.toolCallState?.pending?.length ?? 0) > 0 ||
+      (task.recentToolCalls?.some((c) => c.status === "running") ?? false);
     task.status = "cancelled";
     task.currentStep = "Cancelled";
     task.updatedAt = now();
@@ -388,6 +412,11 @@ export async function cancelTask(
       (id) => !resolvedCallIds.has(id) && !pendingCallIds.has(id)
     );
     cancelledPendingToolCallIds = [...new Set([...pendingCallIds, ...fromSnapshot])];
+    // Fold the durable pending-gate signal into the tool-use flag: in the
+    // mid-dispatch window the gate row exists here even though the snapshot /
+    // waiting_approval status the first approximation checked do not yet, so
+    // without this a tool-gated cancel would get the plain marker variant.
+    if (pendingCallIds.size > 0) cancelledDuringToolUse = true;
     // Halt-siblings fix: cancelling a task that's waiting on multiple
     // pending approvals must also tear down those approvals so a later
     // approve doesn't run a tool against a cancelled task. Clear the
@@ -407,6 +436,54 @@ export async function cancelTask(
     // when it gets the lock and return early without spawning the
     // side effect.
     recordInFlightAborted(state, config.instance, task, "task.cancelled");
+    // Persist an interrupt-context marker so the NEXT turn's model sees that
+    // the user stopped the previous response — matching Claude Code's
+    // `[Request interrupted by user]` / `[Request interrupted by user for tool
+    // use]`. Without it the cancelled turn is silent to the model: the prior
+    // user prompt sits unanswered as the last user turn (a cancelled turn
+    // persists no assistant answer and no transcript rows), so the model may
+    // re-attempt the abandoned work with no awareness it was stopped.
+    //
+    // Written INSIDE this same mutateState — atomic with the status flip and
+    // the abort fan-out — so the marker is durably committed before any
+    // queue-drain triggered by the abort (the in-flight turn's
+    // submitTask.finally → dispatchNextPendingChatMessage) can start the next
+    // turn and read priorChatMessages. The row is role:"user" (it represents
+    // the user's interrupt action and replays as a user message) and tagged
+    // kind:"tool_transcript" so it is model-facing only — excluded from the
+    // human chat views (chat.ts) and never the session summary; the UI already
+    // shows the "Cancelled" block. Top-level chat tasks only — subagents and
+    // jobs have their own lifecycle and no user-facing conversation to annotate.
+    //
+    // The session-existence check is decisive, not advisory: deleteChatSession
+    // removes a session and its chatMessages but does NOT cancel the session's
+    // in-flight tasks, so a task can be cancelled after its session is gone.
+    // Without the guard, createChatMessage still pushes the row (it only links
+    // it `if (session)`), recreating the orphan deleteChatSession just cleared.
+    // Running inside this mutateState serializes the read with deleteChatSession
+    // through the per-instance lock, so the check has no TOCTOU window — the
+    // same discipline persistAssistantTranscript and the identity-snapshot write
+    // use for their deferred session-scoped writes.
+    if (
+      task.mode === "chat" &&
+      task.chatSessionId &&
+      !task.parentTaskId &&
+      !task.jobId &&
+      state.chatSessions.some((session) => session.id === task.chatSessionId)
+    ) {
+      createChatMessage(state, {
+        sessionId: task.chatSessionId,
+        role: "user",
+        content: cancelledDuringToolUse
+          ? "[Request interrupted by user for tool use]"
+          : "[Request interrupted by user]",
+        taskId,
+        runId: task.runId,
+        kind: "tool_transcript",
+        ...(task.threadId ? { threadId: task.threadId } : {}),
+        ...(task.parentBlockId ? { parentBlockId: task.parentBlockId } : {})
+      });
+    }
     return task;
   });
   await updateRunFromTask(config, task);

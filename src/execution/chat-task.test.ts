@@ -4163,6 +4163,57 @@ describe("chat-task loop", () => {
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
 
+  // The interrupt-context marker persisted on cancel must reach the model: the
+  // turn AFTER a cancelled one replays "[Request interrupted by user]" via
+  // priorChatMessages, so the model knows the prior response was stopped and
+  // doesn't blindly re-attempt it. Mirrors Claude Code's interrupt injection.
+  test("a turn cancelled mid-stream replays the interrupt marker to the model on the next turn", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    // Per-instance runtime state persists across reruns in the same worker, so
+    // derive the instance from the unique mkdtemp basename — otherwise a rerun
+    // replays chatMessages accumulated by the prior run and the assertion races.
+    const config = buildConfig(workspaceRoot, `chat-task-interrupt-marker-replay-${basename(workspaceRoot)}`);
+    const provider = normalizeProvider(config.provider);
+    const { cancelTask } = await import("../agent");
+
+    const sessionId = await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "General chat");
+      return session.id;
+    });
+
+    // Turn 1: a held, tool-less model call so the cancel lands mid-stream.
+    setEchoToolCallingResponse(
+      { provider, text: "drafting a long answer...", toolCalls: [], finishReason: "stop" },
+      undefined,
+      { delayMs: 3000 }
+    );
+    const task = await submitTask(config, "write me a long essay", { mode: "chat", chatSessionId: sessionId });
+    // Wait until it's genuinely running (model call in flight), then cancel.
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      if (readState(config.instance).tasks.find((t) => t.id === task.id)?.status === "running") break;
+      await Bun.sleep(10);
+    }
+    await cancelTask(config, task.id);
+    const cancelled = await waitForTerminal(config, task.id);
+    expect(cancelled.status).toBe("cancelled");
+
+    // Turn 2 in the same session: the replayed provider messages must include
+    // the interrupt marker (a user-role row priorChatMessages replays).
+    clearEchoToolCallingResponses();
+    setEchoToolCallingResponse({ provider, text: "Sure.", toolCalls: [], finishReason: "stop" });
+    const followUp = await submitTask(config, "actually, just summarize", { mode: "chat", chatSessionId: sessionId });
+    const finishedFollowUp = await waitForTerminal(config, followUp.id);
+    expect(finishedFollowUp.status).toBe("completed");
+
+    const calls = getEchoToolCallingCalls();
+    const lastTurn = calls[calls.length - 1]!;
+    const replayed = lastTurn.map((m) => (typeof m.content === "string" ? m.content : "")).join("\n");
+    expect(replayed).toContain("[Request interrupted by user]");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
   // The iteration-cap/loop-stall summary exit completes the task with a real
   // user-facing summary, so it must land the same durable assistant answer
   // row as the no-tool-calls path — otherwise a turn that ends on the cap

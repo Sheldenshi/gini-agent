@@ -114,6 +114,97 @@ by `healOrphanedStreamingBlocks`. See
 [chat-block-protocol.md](chat-block-protocol.md) for the block-level wire
 shape.
 
+## Interrupt-context marker
+
+Stopping the in-flight call is silent to the model on its own: the
+cancelled turn persists no assistant answer (`persistFinalAnswerRow`
+fires only on `completed`) and no transcript rows (`persistTranscriptRow`
+short-circuits once the task is terminal), so the cancelled user prompt
+sits in history as the last user turn with no reply. The model on the
+NEXT turn would have no signal it was interrupted and could blindly
+re-attempt the abandoned work.
+
+To match Claude Code's behavior, `cancelTask` persists an
+interrupt-context marker as a durable `chatMessage` (top-level chat tasks
+only — not subagents or jobs):
+
+- `role: "user"` — it represents the user's interrupt action and replays
+  through `priorChatMessages` as a user message the next turn sees.
+- content is `[Request interrupted by user]`, or `[Request interrupted by
+  user for tool use]` when the cancel landed while a tool was in flight
+  (the task was `waiting_approval`, carried a pending tool-call snapshot,
+  or had a live pending authorization/setup-request gate row — see the
+  mid-dispatch note below).
+- `kind: "tool_transcript"` — model-facing only. The human chat views
+  (`chat.ts`) exclude `tool_transcript` rows, and `createChatMessage`
+  only lets a non-transcript assistant row drive the session summary, so
+  the marker never clutters the UI (which already shows the "Cancelled"
+  block) and never becomes the session preview.
+
+The marker is written INSIDE the same `mutateState` callback that flips
+the task to `cancelled` and fires the abort fan-out (`createChatMessage`
+is a pure state mutation with no I/O, so it runs safely under the lock).
+This is deliberate: committing the marker atomically with the status flip
+guarantees it is durable before any queue-drain triggered by the abort
+(the in-flight turn's `submitTask.finally` →
+`dispatchNextPendingChatMessage`) can start the next turn and read
+`priorChatMessages`. It also inherits the early `isTerminalTaskStatus`
+return as its gate — a duplicate/racing Stop on an already-terminal task
+returns before reaching the marker, so no second marker is ever appended
+(the same condition that guards `didCancel`).
+
+The write is additionally guarded on the session still existing
+(`state.chatSessions.some((s) => s.id === task.chatSessionId)`).
+`deleteChatSession` removes a session and its `chatMessages` but does NOT
+cancel the session's in-flight tasks, so a task can be cancelled after its
+session is gone; `createChatMessage` would still push the row (it only
+links it to a session `if (session)`), recreating the orphan the delete
+just cleared — and there is no orphan-`chatMessages` sweep to reclaim it.
+Running the existence check inside this `mutateState` serializes it with
+`deleteChatSession` through the per-instance lock, so the guard is
+decisive with no TOCTOU window — the same discipline
+`persistAssistantTranscript` and the identity-snapshot write use for
+their deferred session-scoped writes.
+
+The `…for tool use` variant is chosen from three in-state signals unioned
+together. The first is a snapshot read at status-flip time
+(`waiting_approval` status, or a non-empty `toolCallState.pending`). The
+second covers the mid-dispatch window (issue #395): between a gate being
+created and the loop persisting its `waiting_approval` status + tool-call
+snapshot, the only durable evidence a tool was in flight is the pending
+authorization/setup-request row. `cancelTask` already computes that
+pending-gate set (`pendingCallIds`) to settle orphaned tool-call rows to
+`denied`, so it folds the same set into the variant choice
+(`cancelledDuringToolUse ||= pendingCallIds.size > 0`) — a tool-gated
+cancel in that window gets the correct `…for tool use` marker instead of
+the plain one.
+
+The third covers a non-gated tool mid-execution. A sync tool (`file_read`,
+`web_fetch`, `web_search`, the `browser_*` actions, …) creates no gate row
+and never populates `toolCallState.pending`, and `dispatchToolCall` runs
+OUTSIDE any `mutateState` — between the loop committing a `running`
+`recentToolCalls` entry and flipping it to `done`/`error`. So at cancel
+time the only in-state evidence such a tool is in flight is a
+`recentToolCalls` entry still at `status: "running"`. The variant union
+includes `task.recentToolCalls?.some((c) => c.status === "running")`. This
+is reliable because the dispatch loop's own terminal re-check (under the
+same lock that pushes the `running` entry) means a `running` entry can
+never be born after the cancel lands — its presence at cancel time always
+means a tool was genuinely executing. A `done`/`error` entry from a tool
+that finished earlier in the turn does NOT count: a tool that ran and
+completed, after which the model's streamed text answer was cancelled, is
+a plain interrupt.
+
+Because replay can now legitimately place adjacent user turns (the
+cancelled prompt, then the marker, then the next prompt), the provider
+translators that require strict user/assistant alternation —
+`translateMessagesToAnthropic` and `translateMessagesToConverse` — merge
+any run of consecutive same-role messages into one, concatenating their
+content blocks in order. (This also hardens a pre-existing latent case:
+a cancelled prompt with no assistant answer followed by a new prompt
+already produced two adjacent user turns before this marker existed.)
+The codex `/responses` path is lenient on alternation and needs no merge.
+
 ## Context
 
 Issue #395: a chat turn cancelled while a model call was in flight kept
