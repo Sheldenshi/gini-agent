@@ -5,7 +5,7 @@ import { beforeEach, describe, expect, mock, test } from "bun:test";
 // chat component tests (BlockAssistantText.test, linkContextMenu.test) — a
 // divergent narrow mock here clobbers theirs and breaks them when the suite
 // runs in one process (bun's --parallel does not isolate files into processes).
-import { Image, Pressable, Text } from "./chatMockSetup";
+import { hostStateRef, Image, Pressable, Text, View } from "./chatMockSetup";
 
 // Modules BlockUserText needs that the shared setup doesn't cover. None of the
 // sibling chat components import these, so registering them here can't collide.
@@ -53,7 +53,63 @@ mock.module("@/src/components/ImagePreview", () => ({
   useImagePreview: () => ({ open: openPreview })
 }));
 
-const { VoiceBubble, BlockUserText } = await import("@/src/components/chat/BlockUserText");
+// react-native-gesture-handler needs native modules at import, so stub it. The
+// Pan and Tap builders record the last-registered callbacks of each kind so a
+// test can drive the scrub gesture directly; Race just returns its first arg so
+// the detector is non-null. No sibling mobile test imports RNGH, so this
+// process-global mock can't collide. GestureDetector renders its child so the
+// track/thumb stay reachable in the tree.
+let panHandlers: {
+  onBegin?: (e: { x: number }) => void;
+  onUpdate?: (e: { x: number }) => void;
+  onEnd?: (e: { x: number }) => void;
+  onFinalize?: (e: unknown, success: boolean) => void;
+} = {};
+let tapHandlers: { onEnd?: (e: { x: number }) => void } = {};
+function makePan() {
+  const builder = {
+    minDistance: () => builder,
+    runOnJS: () => builder,
+    onBegin(cb: (e: { x: number }) => void) {
+      panHandlers.onBegin = cb;
+      return builder;
+    },
+    onUpdate(cb: (e: { x: number }) => void) {
+      panHandlers.onUpdate = cb;
+      return builder;
+    },
+    onEnd(cb: (e: { x: number }) => void) {
+      panHandlers.onEnd = cb;
+      return builder;
+    },
+    onFinalize(cb: (e: unknown, success: boolean) => void) {
+      panHandlers.onFinalize = cb;
+      return builder;
+    }
+  };
+  return builder;
+}
+function makeTap() {
+  const builder = {
+    runOnJS: () => builder,
+    onEnd(cb: (e: { x: number }) => void) {
+      tapHandlers.onEnd = cb;
+      return builder;
+    }
+  };
+  return builder;
+}
+function GestureDetector({ children }: { children: unknown }) {
+  return children;
+}
+mock.module("react-native-gesture-handler", () => ({
+  Gesture: { Pan: makePan, Tap: makeTap, Race: (first: unknown) => first },
+  GestureDetector
+}));
+
+const { VoiceBubble, BlockUserText, seekFractionFromTouch } = await import(
+  "@/src/components/chat/BlockUserText"
+);
 
 type El =
   | { type: unknown; props: { children?: unknown; [k: string]: unknown } }
@@ -84,6 +140,21 @@ function getToggle() {
   return pressable.props.onPress as () => void;
 }
 
+// Render the bubble, prime the track width via its onLayout, and return the
+// captured Pan handlers so a test can drive a tap/drag. chatMockSetup stubs
+// useState to return hostStateRef.current, so set that BEFORE calling to
+// simulate the scrub-in-progress state in render assertions.
+function renderVoice(durationMs = 4000, trackWidth = 100) {
+  const tree = (VoiceBubble as unknown as (p: { audio: unknown }) => El)({
+    audio: { id: "abc", mimeType: "audio/wav", size: 1000, durationMs }
+  });
+  const track = flatten(tree).find((n) => n.type === View && typeof n.props.onLayout === "function");
+  (track!.props.onLayout as (e: { nativeEvent: { layout: { width: number } } }) => void)({
+    nativeEvent: { layout: { width: trackWidth } }
+  });
+  return { tree, handlers: panHandlers, tap: tapHandlers };
+}
+
 function renderBlock(block: Record<string, unknown>) {
   return (BlockUserText as unknown as (p: { block: unknown }) => El)({ block });
 }
@@ -101,6 +172,9 @@ beforeEach(() => {
   player.pause.mockClear();
   player.seekTo.mockClear();
   openPreview.mockClear();
+  panHandlers = {};
+  tapHandlers = {};
+  hostStateRef.current = null;
   playerStatus = { playing: false, currentTime: 0, duration: 0, didJustFinish: false };
 });
 
@@ -173,6 +247,107 @@ describe("VoiceBubble rendering", () => {
       audio: { id: "abc", mimeType: "audio/wav", size: 1000, durationMs: 4000 }
     });
     expect(textLabels(tree)).toContain("0:04");
+  });
+});
+
+describe("seekFractionFromTouch", () => {
+  test("maps a touch x to a clamped 0..1 fraction of the track width", () => {
+    expect(seekFractionFromTouch(0, 100)).toBe(0);
+    expect(seekFractionFromTouch(50, 100)).toBe(0.5);
+    expect(seekFractionFromTouch(100, 100)).toBe(1);
+  });
+
+  test("clamps out-of-range touches and guards a zero/unmeasured width", () => {
+    expect(seekFractionFromTouch(-20, 100)).toBe(0);
+    expect(seekFractionFromTouch(180, 100)).toBe(1);
+    expect(seekFractionFromTouch(40, 0)).toBe(0);
+  });
+});
+
+describe("VoiceBubble scrub-to-seek", () => {
+  test("dragging seeks the player to the released fraction of the duration", async () => {
+    // 8s clip, 100px track. Release at x=25 → 25% → 2.0s.
+    playerStatus = { playing: false, currentTime: 0, duration: 8, didJustFinish: false };
+    const { handlers } = renderVoice(8000, 100);
+    handlers.onBegin!({ x: 25 });
+    handlers.onUpdate!({ x: 25 });
+    handlers.onEnd!({ x: 25 });
+    expect(player.seekTo).toHaveBeenCalledWith(2);
+    // The seek does not start playback — a paused clip stays paused.
+    expect(player.play).not.toHaveBeenCalled();
+  });
+
+  test("a stationary tap on the track seeks to that point (Tap gesture, not Pan)", () => {
+    // A tap never moves far enough to activate Pan, so a separate Tap gesture
+    // handles it. Tap at mid-track on a 10s clip → 5s.
+    playerStatus = { playing: true, currentTime: 1, duration: 10, didJustFinish: false };
+    const { tap } = renderVoice(10000, 200);
+    tap.onEnd!({ x: 100 });
+    expect(player.seekTo).toHaveBeenCalledWith(5);
+    // Seeking a playing clip doesn't pause it.
+    expect(player.pause).not.toHaveBeenCalled();
+  });
+
+  test("after the seek resolves, the scrub override is dropped (fill follows playhead again)", async () => {
+    playerStatus = { playing: false, currentTime: 0, duration: 8, didJustFinish: false };
+    hostStateRef.current = 0.25; // a preview was showing during the drag
+    const { handlers } = renderVoice(8000, 100);
+    handlers.onEnd!({ x: 50 }); // release at 50% → seekTo(4)
+    expect(player.seekTo).toHaveBeenCalledWith(4);
+    // Settle the seek promise; the .then clears the scrub override.
+    seekResolves[0]();
+    await Promise.resolve();
+    expect(hostStateRef.current).toBeNull();
+  });
+
+  test("an out-of-bounds release clamps the seek to the clip end", () => {
+    playerStatus = { playing: false, currentTime: 0, duration: 6, didJustFinish: false };
+    const { handlers } = renderVoice(6000, 100);
+    handlers.onEnd!({ x: 999 });
+    expect(player.seekTo).toHaveBeenCalledWith(6);
+  });
+
+  test("a scrub before the clip loads (duration 0) does not seek", () => {
+    playerStatus = { playing: false, currentTime: 0, duration: 0, didJustFinish: false };
+    const { handlers } = renderVoice(0, 100);
+    handlers.onEnd!({ x: 50 });
+    expect(player.seekTo).not.toHaveBeenCalled();
+  });
+
+  test("a cancelled gesture drops the scrub preview without seeking", () => {
+    // setScrubFraction is the chatMockSetup setRequest stub, which writes
+    // hostStateRef.current — assert the finalize handler resets it to null on a
+    // failed gesture and leaves it alone on a successful one (the onEnd already
+    // committed + cleared in that case).
+    playerStatus = { playing: false, currentTime: 0, duration: 8, didJustFinish: false };
+    const { handlers } = renderVoice(8000, 100);
+    hostStateRef.current = 0.5; // pretend a preview is showing
+    handlers.onFinalize!({}, false);
+    expect(hostStateRef.current).toBeNull();
+    expect(player.seekTo).not.toHaveBeenCalled();
+
+    // A successful gesture: onFinalize must NOT clobber state (onEnd owns it).
+    hostStateRef.current = 0.5;
+    handlers.onFinalize!({}, true);
+    expect(hostStateRef.current).toBe(0.5);
+  });
+
+  test("while scrubbing, the fill + time readout follow the finger, not the playhead", () => {
+    // Simulate scrub-in-progress: chatMockSetup's useState returns
+    // hostStateRef.current, so a scrubFraction of 0.25 stands in for "finger at
+    // 25%". Playhead is at 0s, but the bubble should show the dragged position.
+    hostStateRef.current = 0.25;
+    playerStatus = { playing: false, currentTime: 0, duration: 8, didJustFinish: false };
+    const tree = (VoiceBubble as unknown as (p: { audio: unknown }) => El)({
+      audio: { id: "abc", mimeType: "audio/wav", size: 1000, durationMs: 8000 }
+    });
+    // The progress fill width reflects 25%, and the remaining time is 8s - 2s = 6s.
+    const fill = flatten(tree).find(
+      (n) => n.type === View && typeof (n.props.style as unknown[])?.find === "function" &&
+        (n.props.style as Array<{ width?: string }>).some((s) => s?.width === "25%")
+    );
+    expect(fill).toBeTruthy();
+    expect(textLabels(tree)).toContain("0:06");
   });
 });
 

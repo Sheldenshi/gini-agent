@@ -1,6 +1,8 @@
 import { Feather } from "@expo/vector-icons";
 import { useAudioPlayer, useAudioPlayerStatus } from "expo-audio";
-import { Image, Pressable, StyleSheet, Text, View } from "react-native";
+import { useRef, useState } from "react";
+import { Image, type LayoutChangeEvent, Pressable, StyleSheet, Text, View } from "react-native";
+import { Gesture, GestureDetector } from "react-native-gesture-handler";
 import { authHeader, uploadUrl } from "@/src/api";
 import { useImagePreview } from "@/src/components/ImagePreview";
 import { family, theme } from "@/src/theme";
@@ -87,17 +89,59 @@ export function BlockUserText({ block }: { block: UserTextBlock }) {
 // uses — expo-audio's remote AudioSource accepts a `headers` map. The
 // track fills as playback advances; tapping play after the clip finishes
 // restarts it from the beginning.
+// Map a horizontal touch x (px, relative to the track's left edge) and the
+// track's measured width to a clamped [0,1] fraction. Pulled out as a pure
+// function so the scrub math is unit-testable without a gesture/layout harness.
+// A zero/unmeasured width yields 0 so a touch before layout can't divide by 0.
+export function seekFractionFromTouch(x: number, trackWidth: number): number {
+  if (trackWidth <= 0) return 0;
+  return Math.min(1, Math.max(0, x / trackWidth));
+}
+
 export function VoiceBubble({ audio }: { audio: AudioAttachment }) {
   const player = useAudioPlayer({ uri: uploadUrl(audio.id), headers: authHeader() });
   const status = useAudioPlayerStatus(player);
+
+  // Measured pixel width of the track, captured on layout so a touch x can be
+  // turned into a 0..1 position. A ref (not state) because only the gesture
+  // callbacks read it, and the fill/thumb are percentage-positioned, so a
+  // width change needs no re-render.
+  const trackWidthRef = useRef(0);
+  // While the finger is down we show the dragged position instead of the
+  // playhead so the fill tracks the thumb smoothly; null means "not scrubbing,
+  // follow playback". The actual player.seekTo fires once on release.
+  const [scrubFraction, setScrubFraction] = useState<number | null>(null);
 
   // Prefer the decoded duration once it's known; fall back to the
   // client-measured length so the m:ss reads correctly before load.
   const durationMs =
     status.duration > 0 ? status.duration * 1000 : (audio.durationMs ?? 0);
   const positionMs = status.currentTime * 1000;
-  const progress = durationMs > 0 ? Math.min(1, positionMs / durationMs) : 0;
-  const remainingMs = status.playing ? Math.max(0, durationMs - positionMs) : durationMs;
+  const playbackProgress = durationMs > 0 ? Math.min(1, positionMs / durationMs) : 0;
+  // When scrubbing, the fill and the time readout follow the finger; otherwise
+  // they follow the playhead.
+  const progress = scrubFraction ?? playbackProgress;
+  const shownPositionMs = scrubFraction != null ? scrubFraction * durationMs : positionMs;
+  const remainingMs =
+    scrubFraction != null || status.playing
+      ? Math.max(0, durationMs - shownPositionMs)
+      : durationMs;
+
+  const onTrackLayout = (e: LayoutChangeEvent): void => {
+    trackWidthRef.current = e.nativeEvent.layout.width;
+  };
+
+  // Commit a scrub fraction to the player. seekTo is async; once it resolves we
+  // drop the scrub override so the fill resumes following the (now-moved)
+  // playhead. Seeking does not change play/pause state — a paused clip stays
+  // paused at the new spot, a playing clip keeps playing from it.
+  const seekToFraction = (fraction: number): void => {
+    if (durationMs <= 0) {
+      setScrubFraction(null);
+      return;
+    }
+    void player.seekTo((fraction * durationMs) / 1000).then(() => setScrubFraction(null));
+  };
 
   const toggle = (): void => {
     if (status.playing) {
@@ -121,6 +165,29 @@ export function VoiceBubble({ audio }: { audio: AudioAttachment }) {
     }
   };
 
+  // Pan tracks the drag and previews the position live; its onEnd commits the
+  // seek. runOnJS keeps the JS callbacks on the JS thread (no reanimated
+  // worklet needed for setState).
+  const pan = Gesture.Pan()
+    .minDistance(0)
+    .runOnJS(true)
+    .onBegin((e) => setScrubFraction(seekFractionFromTouch(e.x, trackWidthRef.current)))
+    .onUpdate((e) => setScrubFraction(seekFractionFromTouch(e.x, trackWidthRef.current)))
+    .onEnd((e) => seekToFraction(seekFractionFromTouch(e.x, trackWidthRef.current)))
+    // A cancelled/failed gesture (e.g. the row scrolls) must not leave the fill
+    // stuck at the preview — drop the override without seeking.
+    .onFinalize((_e, success) => {
+      if (!success) setScrubFraction(null);
+    });
+  // A stationary tap never moves far enough to activate Pan, so handle it
+  // explicitly: tapping anywhere on the track jumps the playhead to that point.
+  const tap = Gesture.Tap()
+    .runOnJS(true)
+    .onEnd((e) => seekToFraction(seekFractionFromTouch(e.x, trackWidthRef.current)));
+  // Race so whichever the user does — a quick tap or a drag — is handled; the
+  // first to activate wins.
+  const scrub = Gesture.Race(pan, tap);
+
   return (
     <View style={styles.voiceBubble}>
       <Pressable
@@ -136,9 +203,21 @@ export function VoiceBubble({ audio }: { audio: AudioAttachment }) {
           color={theme.userBubbleText}
         />
       </Pressable>
-      <View style={styles.voiceTrack}>
-        <View style={[styles.voiceProgress, { width: `${progress * 100}%` }]} />
-      </View>
+      <GestureDetector gesture={scrub}>
+        {/* Taller transparent hit area so the 3px track is easy to grab; the
+            visible bar sits centered inside it. */}
+        <View
+          style={styles.voiceTrackHit}
+          accessibilityRole="adjustable"
+          accessibilityLabel="Seek voice message"
+          accessibilityValue={{ now: Math.round(progress * 100), min: 0, max: 100 }}
+        >
+          <View style={styles.voiceTrack} onLayout={onTrackLayout}>
+            <View style={[styles.voiceProgress, { width: `${progress * 100}%` }]} />
+          </View>
+          <View style={[styles.voiceThumb, { left: `${progress * 100}%` }]} />
+        </View>
+      </GestureDetector>
       <Text style={styles.voiceDuration}>{formatDuration(remainingMs)}</Text>
     </View>
   );
@@ -213,8 +292,14 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center"
   },
-  voiceTrack: {
+  // Transparent, taller-than-the-bar grab zone so the thin track is an easy
+  // drag/tap target; the visible 3px bar is centered within it.
+  voiceTrackHit: {
     flex: 1,
+    height: 24,
+    justifyContent: "center"
+  },
+  voiceTrack: {
     height: 3,
     borderRadius: 1.5,
     backgroundColor: "rgba(255,255,255,0.3)",
@@ -223,6 +308,18 @@ const styles = StyleSheet.create({
   voiceProgress: {
     height: 3,
     borderRadius: 1.5,
+    backgroundColor: theme.userBubbleText
+  },
+  // Draggable knob centered on the playhead. marginLeft pulls it half its width
+  // left so its center (not its left edge) sits at the progress fraction.
+  voiceThumb: {
+    position: "absolute",
+    top: "50%",
+    width: 12,
+    height: 12,
+    marginTop: -6,
+    marginLeft: -6,
+    borderRadius: 6,
     backgroundColor: theme.userBubbleText
   },
   voiceDuration: {
