@@ -311,12 +311,12 @@ describe("chat-task loop", () => {
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
 
-  test("toolCallState image payload is externalized out of state.json and rehydrated byte-exact", async () => {
-    // Integration check for ADR toolcall-payload-externalization.md against the
-    // REAL persistence path (mutateState → writeState → disk). A vision turn
-    // produces an inline base64 image part in the working messages; when the
-    // task pauses, that payload must not land in state.json, and on resume the
-    // exact bytes must come back.
+  test("dehydrate/rehydrate persistence layer: image payload stays out of state.json on disk", async () => {
+    // Persistence-layer check for ADR toolcall-payload-externalization.md: a
+    // dehydrated snapshot persisted through the REAL store (mutateState →
+    // writeState → disk) keeps the base64 out of state.json, and rehydrate
+    // restores the exact bytes. (The chat-task pause/resume WIRING that calls
+    // these is pinned by the separate resumeChatTask test below.)
     const { dehydrateMessages, rehydrateMessages, isPayloadRef } = await import("../state/toolcall-payloads");
     const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
     const config = buildConfig(workspaceRoot, "chat-task-img-extern");
@@ -367,6 +367,91 @@ describe("chat-task loop", () => {
       readState(config.instance).tasks.find((t) => t.id === taskId)!.toolCallState!.messages
     );
     expect((restored[0] as any).content[0].image_url.url).toBe(dataUrl);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("resumeChatTask rehydrates the snapshot and runLoop re-dehydrates on a second pause (pins the wiring)", async () => {
+    // Pins the production WIRING, not just the helpers: a paused task carries a
+    // dehydrated inline-image snapshot. The REAL resumeChatTask must rehydrate
+    // it (chat-task.ts:3843) before feeding runLoop, and when runLoop pauses
+    // again at a fresh gate it must re-dehydrate the snapshot (chat-task.ts:3383).
+    // If either wiring call were removed, this test fails: a missing rehydrate
+    // would leave the marker, and the guarded Anthropic/echo serializers would
+    // throw (resume errors); a missing dehydrate would leave the raw base64 in
+    // the re-paused state.json on disk.
+    const { dehydrateMessages, isPayloadRef, __testing } = await import("../state/toolcall-payloads");
+    const { resumeChatTask } = await import("../execution/chat-task");
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-resume-wiring");
+    const provider = normalizeProvider(config.provider);
+    await mutateState(config.instance, () => {});
+
+    const bigPayload = "Q29udGVudA".repeat(600_000); // > 4 KB
+    const dataUrl = `data:image/png;base64,${bigPayload}`;
+    const payloadHash = __testing.sha256Hex(dataUrl);
+
+    // A chat session + a paused task whose snapshot holds the gated tool result
+    // pending and an inline image earlier in the conversation. The first gated
+    // call (call_g1) is what we're "resuming" by supplying its result.
+    const taskId = "task_resume_wiring";
+    let sessionId = "";
+    await mutateState(config.instance, (state) => {
+      sessionId = createChatSession(state, "resume-wiring").id;
+      const snapshotMessages = [
+        { role: "user", content: [{ type: "image_url", image_url: { url: dataUrl } }] },
+        { role: "assistant", content: null, tool_calls: [
+          { id: "call_g1", type: "function", function: { name: "file_write", arguments: JSON.stringify({ path: "first.txt", content: "one" }) } }
+        ] }
+      ];
+      state.tasks.unshift({
+        id: taskId, instance: config.instance, title: "resume", input: "resume",
+        status: "waiting_approval", createdAt: now(), updatedAt: now(),
+        currentStep: "Waiting for approval", auditIds: [], approvalIds: [], chatSessionId: sessionId,
+        toolCallState: {
+          messages: dehydrateMessages(config.instance, snapshotMessages),
+          toolsHash: "h",
+          pending: [{ toolCallId: "call_g1", toolName: "file_write", approvalId: "appr_g1" }],
+          iterations: 1
+        }
+      } as unknown as Task);
+    });
+
+    // The next model turn (after resume re-enters runLoop) requests a SECOND
+    // gated write, forcing a fresh pause so we can observe re-dehydration.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_g2", type: "function", function: { name: "file_write", arguments: JSON.stringify({ path: "second.txt", content: "two" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+
+    // Drive the REAL resume path with the first gate's result.
+    await resumeChatTask(config, taskId, "call_g1", "wrote first.txt");
+    const repaused = await waitForTerminal(config, taskId);
+
+    // Resume succeeded and re-paused at the second gate — proves rehydrate fed
+    // valid (non-marker) content through runLoop without the serializer throwing.
+    expect(repaused.status).toBe("waiting_approval");
+    expect(repaused.toolCallState).toBeDefined();
+
+    // The re-paused snapshot still has the image as a REFERENCE (runLoop
+    // re-dehydrated), pointing at the SAME content hash — proving the image
+    // survived rehydrate→loop→dehydrate byte-identical.
+    const reMessages = repaused.toolCallState!.messages;
+    const imageMsg = reMessages.find(
+      (m: any) => Array.isArray(m.content) && m.content.some((p: any) => p?.type === "image_url")
+    ) as any;
+    expect(imageMsg).toBeDefined();
+    const reUrl = imageMsg.content.find((p: any) => p.type === "image_url").image_url.url;
+    expect(isPayloadRef(reUrl)).toBe(true);
+    expect(reUrl).toBe(`${__testing.MARKER_PREFIX}${payloadHash}`);
+
+    // And the raw base64 is absent from the re-paused state.json on disk.
+    const raw = await Bun.file(join(root, "instances", config.instance, "state.json")).text();
+    expect(raw).not.toContain(bigPayload);
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });

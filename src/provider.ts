@@ -1404,8 +1404,11 @@ function translateMessagesToResponsesInput(messages: ToolCallingMessage[]): Resp
         const parts: Array<Record<string, unknown>> = [];
         for (const part of message.content) {
           if (part.type === "text") parts.push({ type: "input_text", text: part.text });
-          else if (part.type === "image_url") parts.push({ type: "input_image", image_url: part.image_url.url });
-          else if (part.type === "document") {
+          else if (part.type === "image_url") {
+            assertNoPayloadRef(part.image_url.url);
+            parts.push({ type: "input_image", image_url: part.image_url.url });
+          } else if (part.type === "document") {
+            assertNoPayloadRef(part.document.data);
             parts.push({
               type: "input_file",
               filename: part.document.filename,
