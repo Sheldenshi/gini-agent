@@ -86,6 +86,34 @@ describe("dispatchNotificationResponse", () => {
     expect(deps.calls.api).toEqual([{ path: "/authorizations/authz_2/deny", method: "POST" }]);
   });
 
+  test("a well-formed approvalId passes through the path unchanged", () => {
+    // encodeURIComponent must be a no-op for the server's opaque id shape
+    // (`authz_<hex>`) — every character is URL-unreserved.
+    const deps = buildSpyDeps();
+    void dispatchNotificationResponse(
+      buildResponse(APPROVE_ACTION, { approvalId: "authz_a1b2c3d4" }),
+      deps
+    );
+    expect(deps.calls.api).toEqual([
+      { path: "/authorizations/authz_a1b2c3d4/approve", method: "POST" }
+    ]);
+  });
+
+  test("a malformed approvalId is percent-encoded so it can't reshape the request path", async () => {
+    // Boundary guard: a payload id containing path/query metacharacters must
+    // not traverse out of /authorizations/:id/approve. The id is server-
+    // generated so this can't happen in practice, but the encode keeps a
+    // future regression / corrupt payload from retargeting the request.
+    const deps = buildSpyDeps();
+    await dispatchNotificationResponse(
+      buildResponse(APPROVE_ACTION, { approvalId: "../authz_x/deny?x=" }),
+      deps
+    );
+    expect(deps.calls.api).toEqual([
+      { path: "/authorizations/..%2Fauthz_x%2Fdeny%3Fx%3D/approve", method: "POST" }
+    ]);
+  });
+
   test("APPROVE failure schedules a follow-up local notification", async () => {
     const deps = buildSpyDeps({ apiShouldThrow: true });
     const outcome = await dispatchNotificationResponse(

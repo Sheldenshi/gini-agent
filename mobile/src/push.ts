@@ -216,10 +216,14 @@ export async function refreshBadge(): Promise<void> {
 // the live-tap response listener and the cold-start launch-tap consume so
 // both navigate to exactly the same route.
 function navigateToChat(sessionId: string, threadId: string | null): void {
+  // Percent-encode the dynamic segments. Both ids are server-generated opaque
+  // tokens (`chat_…` / `thread_…`), so this is a no-op for well-formed input;
+  // it's a boundary guard so a malformed id from the push payload can't
+  // reshape the route path.
   router.push(
     threadId
-      ? `/chat/${sessionId}/thread/${threadId}`
-      : `/chat/${sessionId}`
+      ? `/chat/${encodeURIComponent(sessionId)}/thread/${encodeURIComponent(threadId)}`
+      : `/chat/${encodeURIComponent(sessionId)}`
   );
 }
 

@@ -212,7 +212,11 @@ export async function dispatchNotificationResponse(
   if (response.actionIdentifier === APPROVE_ACTION) {
     if (!approvalId) return { kind: "ignored" };
     try {
-      await deps.apiCall(`/authorizations/${approvalId}/approve`, { method: "POST" });
+      // Percent-encode the id segment. The id is a server-generated opaque
+      // token (`authz_…`), so this is a no-op for well-formed input; it's a
+      // boundary guard so a malformed id from the push payload can't reshape
+      // the request target (path traversal / query injection).
+      await deps.apiCall(`/authorizations/${encodeURIComponent(approvalId)}/approve`, { method: "POST" });
       return { kind: "approve", approvalId };
     } catch {
       await deps.notifyFailure("approve");
@@ -223,7 +227,7 @@ export async function dispatchNotificationResponse(
   if (response.actionIdentifier === DENY_ACTION) {
     if (!approvalId) return { kind: "ignored" };
     try {
-      await deps.apiCall(`/authorizations/${approvalId}/deny`, { method: "POST" });
+      await deps.apiCall(`/authorizations/${encodeURIComponent(approvalId)}/deny`, { method: "POST" });
       return { kind: "deny", approvalId };
     } catch {
       await deps.notifyFailure("deny");

@@ -247,11 +247,13 @@ paths below, so a tap routes identically regardless of app state:
   that arrive *after* it subscribes. The launch tap is recoverable only via
   `Notifications.getLastNotificationResponse()`. The authed landing screen
   (`channels`) calls `consumeLaunchNotificationRoute()` on mount: it reads
-  that stored response, routes it through the shared
-  `resolveLaunchTapRoute` (same id-parse as the live path), pushes the
-  named chat on top of the channels list (a natural channels → chat back
-  stack), then calls `Notifications.clearLastNotificationResponse()` so a
-  later remount can't navigate a second time off the same tap. The `index`
+  that stored response, routes it through the shared `resolveLaunchTapRoute`
+  (same id-parse as the live path), clears the stored response
+  (`Notifications.clearLastNotificationResponse()`) so a later remount can't
+  navigate a second time off the same tap, then pushes the named chat on top
+  of the channels list (a natural channels → chat back stack). The clear runs
+  before the navigate (and before the no-route gate) so even a non-navigable
+  stored response is dropped rather than re-evaluated on the next mount. The `index`
   auth gate is presence-only (it routes a MISSING credential to `/setup` but
   lets a stale/expired one through), so a dead token here pushes the chat
   optimistically — exactly like tapping an agent/channel row — and the chat
