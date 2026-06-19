@@ -28,6 +28,7 @@ import { toast } from "sonner";
 import { api } from "@/lib/api";
 import { useAllChatSessions, useInvalidate, useStatus, useThreadsInbox } from "@/lib/queries";
 import { useChatReadState, useThreadReadState } from "@/lib/use-chat-read-state";
+import { isOpenableJobChannel } from "@/lib/job-channel";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -93,8 +94,7 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
       .filter((j) => !j.oneShot && (j.cronExpression != null || (j.intervalSeconds ?? 0) > 0))
       .filter((j) => {
         if (j.chatSessionId == null) return false;
-        const session = sessionsById.get(j.chatSessionId);
-        return session?.kind === "channel" && !session.archivedAt;
+        return isOpenableJobChannel(sessionsById.get(j.chatSessionId));
       })
       .sort(
         (a, b) =>
