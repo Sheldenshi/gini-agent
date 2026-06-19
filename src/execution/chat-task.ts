@@ -3376,9 +3376,10 @@ async function runLoop(
       // Snapshot the conversation onto the task and pause. Lift large inline
       // base64 image/document payloads out to content-addressed side files
       // first — they'd otherwise live in state.json and tax every read (ADR
-      // toolcall-payload-externalization.md). dehydrateMessages deep-copies,
-      // so `workingMessages` (still held by the live loop) is never mutated;
-      // the side-file bytes are fsync'd before this snapshot is persisted.
+      // toolcall-payload-externalization.md). dehydrateMessages copies the
+      // spine + touched parts without mutating `workingMessages` (still held by
+      // the live loop); the side-file bytes are fsync'd before this snapshot is
+      // persisted.
       const snapshot: TaskToolCallState = {
         messages: dehydrateMessages(config.instance, workingMessages),
         toolsHash,

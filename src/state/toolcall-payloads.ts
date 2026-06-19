@@ -175,9 +175,12 @@ function mapPart(part: ContentPartLike, transform: (value: string) => string): C
   return part;
 }
 
-// Deep-copy + transform the messages array. Returns a brand-new array of new
-// message objects with new content arrays; the input graph is never mutated
-// (so a snapshot that shares its array with the live loop is safe to pass in).
+// Structurally copy the message spine (new array, new message objects, new
+// content arrays) and the two large-string carrier parts, applying `transform`
+// to their payload strings. Non-carrier parts (text, unknown kinds) pass
+// through by reference — they are never written to, so the input graph is never
+// mutated (a snapshot that shares its array with the live loop is safe to pass
+// in). This is a targeted copy, not a full deep clone.
 function mapMessages(messages: unknown[], transform: (value: string) => string): unknown[] {
   return messages.map((message) => {
     if (!message || typeof message !== "object") return message;
@@ -194,16 +197,18 @@ function mapMessages(messages: unknown[], transform: (value: string) => string):
 
 // Dehydrate: lift large inline image/document payloads out of the messages
 // array into content-addressed side files, returning a new array with reference
-// strings in their place. Pure w.r.t. the input (deep-copies before replacing),
-// so the caller's live array is never mutated. Side-file bytes are durably
-// fsync'd before this returns.
+// strings in their place. Does not mutate the input — the message spine and the
+// touched carrier parts are freshly allocated before substitution, so the
+// caller's live array is never mutated. Side-file bytes are durably fsync'd
+// before this returns.
 export function dehydrateMessages(instance: Instance, messages: unknown[]): unknown[] {
   return mapMessages(messages, (value) => externalizeString(instance, value));
 }
 
 // Rehydrate: restore reference strings to their exact original bytes. A
 // reference whose side file is missing or corrupt is LEFT as a marker (provider
-// serializers throw on it), never silently blanked. Pure w.r.t. the input.
+// serializers throw on it), never silently blanked. Does not mutate the input
+// (same targeted-copy semantics as dehydrate).
 export function rehydrateMessages(instance: Instance, messages: unknown[]): unknown[] {
   return mapMessages(messages, (value) => {
     if (!isPayloadRef(value)) return value;

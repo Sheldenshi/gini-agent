@@ -791,6 +791,11 @@ export interface TaskToolCallState {
   // OpenAI-shaped messages array (system, user, assistant w/ tool_calls,
   // tool result messages). We keep `unknown[]` to avoid pulling provider
   // shape into the central type module.
+  //
+  // NOTE: persisted entries may carry externalized payload references in
+  // `image_url.url` / `document.data` (a 0x1e-prefixed marker) instead of raw
+  // base64; rehydrate via rehydrateMessages before sending to any provider.
+  // See ADR docs/adr/toolcall-payload-externalization.md.
   messages: unknown[];
   // Stable identifier for the tool catalog used during this loop. If it
   // changes between iterations (toolset toggled, skill loaded), we don't
