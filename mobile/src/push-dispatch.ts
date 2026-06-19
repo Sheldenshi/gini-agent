@@ -67,6 +67,119 @@ export type NotificationDispatchOutcome =
   | { kind: "deny-failed"; approvalId: string }
   | { kind: "ignored" };
 
+// The deep-link route a notification tap resolves to. `threadId` is set
+// only for a threaded completion (the tap opens the thread view); a plain
+// main-chat tap carries null.
+export interface LaunchTapRoute {
+  sessionId: string;
+  threadId: string | null;
+}
+
+// Builds the deep-link route string a notification tap opens. A threaded
+// completion opens the thread view (the main chat filters threaded blocks
+// out, so opening it would hide the reply the banner previewed); a main-chat
+// tap omits the thread segment. Both dynamic segments are percent-encoded as
+// a boundary guard so a malformed id from the push payload can't reshape the
+// route path — the ids are server-generated opaque tokens, so the encode is a
+// no-op for well-formed input. Pure (no expo-router) so the encode + the
+// thread-vs-main branch are unit-testable; the push.ts navigateToChat wrapper
+// just feeds the result to router.push.
+export function buildChatRoute(sessionId: string, threadId: string | null): string {
+  return threadId
+    ? `/chat/${encodeURIComponent(sessionId)}/thread/${encodeURIComponent(threadId)}`
+    : `/chat/${encodeURIComponent(sessionId)}`;
+}
+
+// Reads the routing fields the server-side dispatcher writes into a push
+// payload's `body` object (surfaced by expo-notifications as
+// `content.data`). Shared by the live-tap dispatcher and the cold-start
+// launch-tap resolver so both parse the wire shape identically.
+function readRouting(data: unknown): {
+  sessionId: string | null;
+  approvalId: string | null;
+  threadId: string | null;
+} {
+  const raw = data as
+    | { sessionId?: unknown; approvalId?: unknown; threadId?: unknown }
+    | null
+    | undefined;
+  return {
+    sessionId: typeof raw?.sessionId === "string" ? raw.sessionId : null,
+    approvalId: typeof raw?.approvalId === "string" ? raw.approvalId : null,
+    threadId: typeof raw?.threadId === "string" ? raw.threadId : null
+  };
+}
+
+/**
+ * Resolves the chat route a notification tap should open, or null when the
+ * response is not a navigable tap.
+ *
+ * This is the cold-start counterpart to `dispatchNotificationResponse`'s
+ * deep-link branch. When the app is launched from a fully-killed state by a
+ * notification tap, iOS does NOT replay the tap through
+ * `addNotificationResponseReceivedListener` — the only way to recover it is
+ * `Notifications.getLastNotificationResponse()`. The launch screen feeds that
+ * stored response here to decide where to navigate.
+ *
+ * Returns null (no navigation) for:
+ *   - an APPROVE / DENY action launch — those resolve the authorization via
+ *     the background action handler, not by opening a chat. (In practice the
+ *     non-foregrounding actions don't cold-launch the app, but guarding here
+ *     keeps the resolver correct for any action that ever opens to foreground.)
+ *   - a payload with no sessionId (silent wake, malformed, or a non-routing
+ *     notification).
+ *
+ * A genuine default tap returns `{ sessionId, threadId }`; threadId is
+ * non-null only for a threaded completion, matching the live-tap branch.
+ */
+export function resolveLaunchTapRoute(response: ResponseLike): LaunchTapRoute | null {
+  if (
+    response.actionIdentifier === APPROVE_ACTION ||
+    response.actionIdentifier === DENY_ACTION
+  ) {
+    return null;
+  }
+  const { sessionId, threadId } = readRouting(response.notification.request.content.data);
+  if (!sessionId) return null;
+  return { sessionId, threadId };
+}
+
+// Native seams the launch-tap consume orchestration depends on, injected so
+// the get → clear → navigate sequence is unit-testable without loading
+// react-native / expo-notifications / expo-router.
+export interface LaunchConsumeDeps {
+  // Expo's stored launch tap (Notifications.getLastNotificationResponse).
+  getLast: () => ResponseLike | null;
+  // Notifications.clearLastNotificationResponse — drops the stored response
+  // so it isn't re-evaluated on a later mount.
+  clear: () => void;
+  // Deep-link into the resolved chat / thread.
+  navigate: (sessionId: string, threadId: string | null) => void;
+}
+
+/**
+ * Pure orchestration for cold-start launch-tap recovery: read the stored
+ * launch response, clear it exactly once, and navigate when it resolves to a
+ * chat route.
+ *
+ * The clear is intentionally placed BEFORE the null-route gate: any observed
+ * launch response — even a non-navigable one (an action launch, a silent
+ * wake, a malformed payload) — must be cleared so it can't be re-evaluated on
+ * the next mount. Only a genuine deep-link tap then navigates.
+ *
+ * The `push.ts` wrapper injects the real Notifications APIs + router; tests
+ * inject spies to pin the clear-once and navigate-on-route semantics.
+ */
+export function consumeLaunchTap(deps: LaunchConsumeDeps): LaunchTapRoute | null {
+  const last = deps.getLast();
+  if (!last) return null;
+  const route = resolveLaunchTapRoute(last);
+  deps.clear();
+  if (!route) return null;
+  deps.navigate(route.sessionId, route.threadId);
+  return route;
+}
+
 export interface DispatchDeps {
   apiCall: <T = unknown>(path: string, init?: { method?: string }) => Promise<T>;
   navigate: (sessionId: string, threadId: string | null) => void;
@@ -107,18 +220,18 @@ export async function dispatchNotificationResponse(
   response: ResponseLike,
   deps: DispatchDeps
 ): Promise<NotificationDispatchOutcome> {
-  const rawData = response.notification.request.content.data as
-    | { sessionId?: unknown; approvalId?: unknown; threadId?: unknown }
-    | null
-    | undefined;
-  const sessionId = typeof rawData?.sessionId === "string" ? rawData.sessionId : null;
-  const approvalId = typeof rawData?.approvalId === "string" ? rawData.approvalId : null;
-  const threadId = typeof rawData?.threadId === "string" ? rawData.threadId : null;
+  const { sessionId, approvalId, threadId } = readRouting(
+    response.notification.request.content.data
+  );
 
   if (response.actionIdentifier === APPROVE_ACTION) {
     if (!approvalId) return { kind: "ignored" };
     try {
-      await deps.apiCall(`/authorizations/${approvalId}/approve`, { method: "POST" });
+      // Percent-encode the id segment. The id is a server-generated opaque
+      // token (`authz_…`), so this is a no-op for well-formed input; it's a
+      // boundary guard so a malformed id from the push payload can't reshape
+      // the request target (path traversal / query injection).
+      await deps.apiCall(`/authorizations/${encodeURIComponent(approvalId)}/approve`, { method: "POST" });
       return { kind: "approve", approvalId };
     } catch {
       await deps.notifyFailure("approve");
@@ -129,7 +242,7 @@ export async function dispatchNotificationResponse(
   if (response.actionIdentifier === DENY_ACTION) {
     if (!approvalId) return { kind: "ignored" };
     try {
-      await deps.apiCall(`/authorizations/${approvalId}/deny`, { method: "POST" });
+      await deps.apiCall(`/authorizations/${encodeURIComponent(approvalId)}/deny`, { method: "POST" });
       return { kind: "deny", approvalId };
     } catch {
       await deps.notifyFailure("deny");
