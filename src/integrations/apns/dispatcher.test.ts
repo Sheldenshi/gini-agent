@@ -555,16 +555,19 @@ describe("apns dispatcher", () => {
     dispatcher.stop();
   });
 
-  test("web-watching does not change an already-silent push (no banner to suppress)", async () => {
-    // A Completed-with-no-assistant_text turn is already silent; the web
-    // downgrade is a no-op here. isWebWatched must not even be consulted
-    // in a way that changes the outcome.
+  test("web-watching does not change an already-silent push, and isWebWatched is not consulted", async () => {
+    // A Completed-with-no-assistant_text turn is already silent, so there's
+    // no banner to downgrade — the dispatcher short-circuits before the web
+    // check (the downgrade only guards the alert branch). Even with
+    // isWebWatched returning true, the push stays silent, and the predicate
+    // is never called.
     const { client, calls } = buildFakeClient();
+    let webWatchedCalls = 0;
     const dispatcher = createApnsDispatcher("test-inst" as Instance, {
       client,
       listDevices: () => [buildDevice({ token: "tok_phone" })],
       isWatching: () => false,
-      isWebWatched: () => true,
+      isWebWatched: () => { webWatchedCalls += 1; return true; },
       hasAssistantText: () => false,
       subscribe: () => () => { /* noop */ }
     });
@@ -577,6 +580,8 @@ describe("apns dispatcher", () => {
     const body = call.payload.body as Record<string, unknown>;
     expect(body.event).toBe("phase_completed");
     expect(body.silent).toBe(true);
+    // The web check is skipped entirely when the push wouldn't alert.
+    expect(webWatchedCalls).toBe(0);
     dispatcher.stop();
   });
 

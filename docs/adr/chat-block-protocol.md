@@ -20,6 +20,16 @@ schema bumped 2 → 3) and exposed through two endpoints:
 - `GET /api/chat/:id/stream` — SSE companion for live updates, honoring
   `Last-Event-ID` for clean reconnects
 
+Opening the stream also registers the caller as present on the session,
+for push-suppression purposes: a request carrying a valid `X-Device-Token`
+lands in the per-device watch registry (so the dispatcher skips a
+redundant completion push to that device), and a tokenless web/CLI stream
+lands in the per-session pushless registry (so the dispatcher downgrades
+the user's phone completion alert to a silent badge tick while they read
+on the web). The entry lives only for the stream's lifetime — it clears on
+`cancel()`. See [Mobile Push Notifications](./mobile-push-notifications.md)
+for the suppression and downgrade rules.
+
 The protocol is additive. Legacy `GET /api/chat/:id`, the synthesized
 streaming placeholder in `getChatSession`, and `syncChatTaskResult`
 remain untouched during the migration window so existing web and mobile
