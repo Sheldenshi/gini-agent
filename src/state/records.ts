@@ -797,10 +797,12 @@ export function claimPairingCode(
 //
 // Rows minted before gini_client existed have no clientId; they fall back to
 // keying on the derived name, in a SEPARATE namespace ("name:" vs "client:") so
-// a legacy row and a clientId-bearing row can never match each other (the legacy
-// rows simply age out via SESSION_TTL_MS). This is what fixes the shared-
-// subdomain bug: two genuinely distinct browsers with the same User-Agent each
-// carry their own clientId, so re-pairing one no longer evicts the other.
+// a legacy row and a clientId-bearing row can never match each other. A legacy
+// row is retired by its own browser re-pairing (which now carries a clientId and
+// supersedes by name only against other name-keyed rows) or by manual revoke —
+// sessions no longer expire on their own. This is what fixes the shared-subdomain
+// bug: two genuinely distinct browsers with the same User-Agent each carry their
+// own clientId, so re-pairing one no longer evicts the other.
 export function pairedDeviceIdentityKey(device: PairedDevice): string | null {
   if (!device.origin) return null;
   if (device.clientId) return `${device.origin}\nclient:${device.clientId}`;
@@ -878,22 +880,27 @@ export function findActiveDeviceByToken(state: RuntimeState, token: string): Pai
   const tokenHash = hashSecret(token);
   const device = state.devices.find((item) => item.tokenHash === tokenHash && item.status === "active");
   if (!device) return undefined;
-  // Honor session expiry on the bearer path too, exactly as findActiveSessionByToken
-  // does for the cookie path — otherwise a relay-minted session token (which carries
-  // a finite expiresAt) would outlive its expiry when presented as a Bearer. Mobile/
-  // code-claimed devices have no expiresAt, so this is a no-op for them.
+  // Defensive expiry guard, mirroring findActiveSessionByToken's cookie path.
+  // Sessions no longer carry an expiresAt (they live until revoke), but a legacy
+  // row minted with a finite expiresAt must still expire correctly when presented
+  // as a Bearer; a row with no expiresAt sails through this check.
   if (device.expiresAt && new Date(device.expiresAt).getTime() <= Date.now()) return undefined;
   device.lastSeenAt = now();
   device.updatedAt = device.lastSeenAt;
   return device;
 }
 
-// Default relay-browser session lifetime. Bearer/mobile devices (claimed via
-// createPairingCode/claimPairingCode) have no expiry; relay browser sessions
-// get a finite one so an abandoned cookie eventually dies even if the operator
-// never explicitly revokes it. Revocation still takes effect immediately,
-// independent of this TTL.
-export const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+// `gini_session` cookie Max-Age, pinned to the browser maximum. A paired session
+// never expires on the server (no `expiresAt` is stamped — it lives until
+// `revokeDevice`), so the cookie is given the longest lifetime a browser will
+// honor: RFC 6265bis / Chrome cap any persistent cookie at 400 days and silently
+// clamp anything larger, so 400 days is the ceiling. The gate re-issues this
+// cookie on every document navigation (see the relay gate in src/http.ts), so an
+// actively-used session slides its 400-day window forward and never lapses; only
+// a session untouched for 400 continuous days drops its cookie and re-pairs. This
+// is the cookie TTL only — NOT a server-side session expiry. Revocation still
+// takes effect immediately, independent of it.
+export const SESSION_COOKIE_MAX_AGE_MS = 400 * 24 * 60 * 60 * 1000;
 
 // Cap on concurrent PENDING pairing requests so a public flood can't bury the
 // operator panel. Enforced INSIDE createPairingRequest (one mutateState txn) so
@@ -1123,8 +1130,11 @@ export function claimPairingRequest(
     ...(request.clientId ? { clientId: request.clientId } : {}),
     createdAt: at,
     updatedAt: at,
-    lastSeenAt: at,
-    expiresAt: new Date(Date.now() + SESSION_TTL_MS).toISOString()
+    lastSeenAt: at
+    // No expiresAt: a paired session lives until the operator revokes it
+    // (revokeDevice), the same no-expiry contract as code-claimed bearer devices.
+    // The token validators still honor an expiresAt if one is present, so a
+    // legacy row minted with a finite expiry continues to expire correctly.
   };
   request.status = "claimed";
   request.resolvedAt = at;

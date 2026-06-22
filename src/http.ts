@@ -26,7 +26,7 @@ import {
   now,
   PairingCapExceededError,
   readState,
-  SESSION_TTL_MS,
+  SESSION_COOKIE_MAX_AGE_MS,
   unreadCountsByDevice,
   readTrace,
   readUpload,
@@ -2410,6 +2410,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     // device-pairing-auth.md ("Relay sessions mirror loopback").
     const webHost = request.headers.get("host") ?? url.host;
     let gatedSessionToken: string | undefined;
+    let reissueSessionDocumentNav = false;
     if (relaySessionGateRequired(webHost, url.pathname)) {
       const sessionToken = sessionCookieValue(request);
       if (!sessionToken || !resolveSessionFromCookie(config, sessionToken)) {
@@ -2424,6 +2425,15 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       // global unhandledRejection handler, which exits the gateway process.
       if (request.headers.get("sec-fetch-dest") === "document") {
         void touchPairedSession(config, sessionToken).catch(() => {});
+        // Re-issue the session cookie on each document navigation so an active
+        // session slides its Max-Age window forward. The server session never
+        // expires (no expiresAt), but browsers cap a persistent cookie at 400
+        // days (RFC 6265bis), so without this slide a daily user would still be
+        // bounced to /pair exactly 400 days after first pairing — expiry in all
+        // but name. Sliding on the same cadence as touchPairedSession keeps an
+        // in-use session's cookie effectively permanent; only a session left
+        // untouched for 400 continuous days drops its cookie.
+        reissueSessionDocumentNav = true;
       }
       // Carry the validated token into proxyWeb so a long-lived SSE stream can be
       // re-validated and torn down if this session is revoked mid-stream — the
@@ -2431,7 +2441,21 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       // would outlive a revocation. Loopback (un-gated) needs no such check.
       gatedSessionToken = sessionToken;
     }
-    return proxyWeb(request, url, config, gatedSessionToken);
+    const proxied = await proxyWeb(request, url, config, gatedSessionToken);
+    if (reissueSessionDocumentNav && gatedSessionToken) {
+      const secure = pairingCookieSecure(request, webHost);
+      const refreshed = new Headers(proxied.headers);
+      refreshed.append(
+        "set-cookie",
+        serializeCookie(sessionCookieName(secure), gatedSessionToken, {
+          ...sessionCookieAttributes,
+          secure,
+          maxAge: SESSION_COOKIE_TTL_SECONDS
+        })
+      );
+      return new Response(proxied.body, { status: proxied.status, statusText: proxied.statusText, headers: refreshed });
+    }
+    return proxied;
   };
 }
 
@@ -3091,10 +3115,18 @@ function clientCookieName(secure: boolean): string {
   return secure ? CLIENT_COOKIE_SECURE : CLIENT_COOKIE;
 }
 
-// Read the per-browser client id from whichever name was issued: prefer the
-// secure `__Host-` cookie, fall back to the plain name. Mirrors sessionCookieValue.
-export function clientCookieValue(request: Request): string | undefined {
-  return cookieValue(request, CLIENT_COOKIE_SECURE) ?? cookieValue(request, CLIENT_COOKIE);
+// Read the per-browser client id. On a secure front read ONLY the un-tossable
+// `__Host-gini_client` — NOT the plain name. Unlike gini_session (whose value is
+// hash-validated and fails closed on a tossed value), the client id is used
+// verbatim as an identity key with no server-side check, so honoring a plain
+// `gini_client` that a sibling subdomain tossed onto the shared registrable domain
+// would let two browsers collapse to one identity (the very eviction this guards
+// against). On a secure front the gateway only ever issues the `__Host-` name, so
+// dropping the plain fallback loses nothing legitimate. The plain name is read
+// only on a plain-http front, which can't use `__Host-` at all.
+export function clientCookieValue(request: Request, secure: boolean): string | undefined {
+  if (secure) return cookieValue(request, CLIENT_COOKIE_SECURE);
+  return cookieValue(request, CLIENT_COOKIE);
 }
 
 // Gateway-owned cookies that must never reach the inner web child: it is
@@ -3108,9 +3140,10 @@ const GATEWAY_ONLY_COOKIES = new Set([
   CLIENT_COOKIE,
   CLIENT_COOKIE_SECURE
 ]);
-// Derived from the single source of truth so the cookie Max-Age and the
-// server-side device.expiresAt can't drift apart.
-const SESSION_COOKIE_TTL_SECONDS = Math.floor(SESSION_TTL_MS / 1000);
+// `gini_session` cookie Max-Age, pinned to the browser-max 400 days (the server
+// session itself never expires; see SESSION_COOKIE_MAX_AGE_MS). Re-issued on each
+// document navigation so an active session's window slides forward.
+const SESSION_COOKIE_TTL_SECONDS = Math.floor(SESSION_COOKIE_MAX_AGE_MS / 1000);
 const PAIR_BIND_COOKIE_TTL_SECONDS = 3600;
 // The client id must outlive any single session so it stays stable across
 // re-pairs; a year keeps it effectively permanent without being literally
@@ -3371,7 +3404,8 @@ async function handlePairingRoutes(request: Request, url: URL, config: RuntimeCo
     // stack a second active session. A native client with no header therefore gets
     // clientId=undefined and keeps the legacy origin+name supersede. An empty
     // header/cookie is treated as absent.
-    const browserClientId = clientCookieValue(request) || randomBindSecret();
+    const cookieSecure = pairingCookieSecure(request, host);
+    const browserClientId = clientCookieValue(request, cookieSecure) || randomBindSecret();
     const clientId = native ? request.headers.get(CLIENT_ID_HEADER) || undefined : browserClientId;
     let created: Awaited<ReturnType<typeof requestPairing>>;
     try {
@@ -3397,7 +3431,7 @@ async function handlePairingRoutes(request: Request, url: URL, config: RuntimeCo
       201
     );
     if (!native) {
-      const secure = pairingCookieSecure(request, host);
+      const secure = cookieSecure;
       response.headers.append(
         "set-cookie",
         serializeCookie(PAIR_BIND_COOKIE, bindSecret, {

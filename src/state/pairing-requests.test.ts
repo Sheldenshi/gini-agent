@@ -216,7 +216,10 @@ describe("claimPairingRequest", () => {
     expect(result.device.status).toBe("active");
     expect(result.device.origin).toBe(request.relayHost);
     expect(result.device.userAgent).toBe(SAFARI_IPHONE);
-    expect(result.device.expiresAt).toBeDefined();
+    // A paired session never expires on its own — it lives until the operator
+    // revokes it (the same no-expiry contract as code-claimed bearer devices), so
+    // no expiresAt is stamped.
+    expect(result.device.expiresAt).toBeUndefined();
     expect(state.devices[0]?.id).toBe(result.device.id);
     const stored = state.pairingRequests.find((r) => r.id === request.id)!;
     expect(stored.status).toBe("claimed");
@@ -260,6 +263,15 @@ describe("findActiveSessionByToken / touchSessionLastSeen", () => {
     expect(found?.id).toBe(device.id);
     // read-only: lastSeenAt is untouched
     expect(state.devices[0]?.lastSeenAt).toBe(before);
+  });
+
+  test("a freshly-claimed session has no expiry and never times out on its own", () => {
+    const { state, token, device } = mintSession();
+    // No expiresAt was stamped — the session lives until manual revoke.
+    expect(device.expiresAt).toBeUndefined();
+    // The defensive expiry guard is a no-op for an expiry-less row, so the
+    // session resolves no matter how much wall-clock time has passed.
+    expect(findActiveSessionByToken(state, token)?.id).toBe(device.id);
   });
 
   test("returns undefined for an unknown token", () => {

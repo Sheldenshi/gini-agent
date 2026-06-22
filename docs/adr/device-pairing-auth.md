@@ -55,9 +55,16 @@ token. The relay cookie gate validates it via `findActiveSessionByToken`
 hashed `tokenHash` in `state.devices` and require `status: "active"`. Consequence:
 **one revocation switch** — `revokeDevice` (POST `/api/devices/:id/revoke`) flips
 that row to `revoked`, so both the cookie session and any bearer use of that token
-fail on the next request, with no separate session blocklist. Browser sessions carry an `origin` (the relay host),
-`userAgent`, and a finite `expiresAt`; the read-only validator treats a past
-`expiresAt` as inactive even while `status` is still `active`.
+fail on the next request, with no separate session blocklist. Browser sessions carry an `origin` (the relay host)
+and `userAgent`. A paired session does **not** expire on its own — it lives until
+`revokeDevice`, the same no-expiry contract as code-claimed bearer devices. The
+`gini_session` cookie is issued at the browser-maximum 400-day `Max-Age`
+(RFC 6265bis caps persistent cookies there) and **re-issued on every document
+navigation**, so an actively-used session slides its window forward and never
+lapses; only a session left untouched for 400 continuous days drops its cookie and
+must re-pair. The `expiresAt` field is retained on the type and still honored by
+the validators (a past `expiresAt` reads as inactive) purely so a legacy row minted
+with a finite expiry continues to expire correctly.
 
 Pending requests live in a new `state.pairingRequests` array (lazily expired,
 mirroring `pairingCodes`). The display `code` is stored in plaintext on purpose:
@@ -68,11 +75,11 @@ claim, which is hashed.
 ### Re-pairing supersedes the device's prior session
 
 A claim mints a **new** `PairedDevice` row each time; the device only ever holds
-the freshly-minted token. Without intervention, re-pairing the same browser or
-app (after a sign-out, reinstall, cookie clear, or a relay reconnect) would
-leave the prior row `active` until its `expiresAt`, so the operator's Active
-Sessions list would accumulate one dead entry per re-pair — all sharing a relay
-origin and an identical derived label. `claimPairingRequest` therefore calls
+the freshly-minted token. Sessions never expire on their own, so without
+intervention, re-pairing the same browser or app (after a sign-out, reinstall,
+cookie clear, or a relay reconnect) would leave the prior row `active` forever, so
+the operator's Active Sessions list would accumulate one dead entry per re-pair —
+all sharing a relay origin and an identical derived label. `claimPairingRequest` therefore calls
 `supersedePriorDeviceSessions`: any OTHER `active` session that is the **same
 device** is revoked (`status: "revoked"`, stamped `revokedAt`) as the new one is
 minted. "Same device" is `isSamePairedDevice` — equal `pairedDeviceIdentityKey`.
@@ -197,7 +204,9 @@ admin to anything but the operator's own loopback dev port.
 
 - `gini_session`: value is a `gini_device_<uuid>` token; only `hashSecret(token)`
   persists. `HttpOnly; SameSite=Lax; Path=/`, `Domain` unset (host-only to the
-  exact relay subdomain), finite `Max-Age`. HttpOnly because the web app
+  exact relay subdomain), `Max-Age` of 400 days (the RFC 6265bis browser cap) and
+  re-issued on every document navigation so an active session never lapses (the
+  server session itself has no expiry). HttpOnly because the web app
   authenticates `/api/runtime/*` via the BFF's server-side bearer — the cookie is
   purely the gateway's relay gate, never read by JS. On a **secure** front it is
   issued under the **`__Host-` prefix** (`__Host-gini_session`); the gate reads
