@@ -797,12 +797,17 @@ export function claimPairingCode(
 //
 // Rows minted before gini_client existed have no clientId; they fall back to
 // keying on the derived name, in a SEPARATE namespace ("name:" vs "client:") so
-// a legacy row and a clientId-bearing row can never match each other. A legacy
-// row is retired by its own browser re-pairing (which now carries a clientId and
-// supersedes by name only against other name-keyed rows) or by manual revoke —
-// sessions no longer expire on their own. This is what fixes the shared-subdomain
-// bug: two genuinely distinct browsers with the same User-Agent each carry their
-// own clientId, so re-pairing one no longer evicts the other.
+// a legacy row and a clientId-bearing row can never match each other. Because the
+// namespaces never match, a device's FIRST re-pair after upgrading (the one that
+// finally carries a clientId) mints a new client:-keyed row that does NOT retire
+// the old name:-keyed row — leaving one stale duplicate the operator revokes (see
+// the "Known one-time migration artifact" note in
+// docs/adr/device-pairing-auth.md). A legacy name: row is only retired by a
+// re-pair that STILL sends no clientId (staying name-keyed, so the keys match) or
+// by manual revoke — sessions no longer expire on their own. This is what fixes
+// the shared-subdomain bug: two genuinely distinct browsers with the same
+// User-Agent each carry their own clientId, so re-pairing one no longer evicts
+// the other.
 export function pairedDeviceIdentityKey(device: PairedDevice): string | null {
   if (!device.origin) return null;
   if (device.clientId) return `${device.origin}\nclient:${device.clientId}`;
