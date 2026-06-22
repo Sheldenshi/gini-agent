@@ -1188,3 +1188,70 @@ describe("dedupeStaleDeviceSessions (stale-duplicate session backfill)", () => {
     ).toBe(1);
   });
 });
+
+describe("normalizeState task.chatSessionId backfill", () => {
+  // Build a state with one legacy task (no chatSessionId) joined to a user
+  // chat message, plus a task that has no matching message (a job task) to
+  // prove unmatched tasks are left alone and don't force re-scans.
+  function seedLegacyTasks(instance: string): RuntimeState {
+    const state = createEmptyState(instance);
+    const at = "2026-01-01T00:00:00.000Z";
+    state.tasks = [
+      {
+        id: "task_chat", title: "t", input: "hi", status: "completed", instance,
+        createdAt: at, updatedAt: at, tracePath: "", auditIds: [], approvalIds: [], skillIds: []
+      },
+      {
+        id: "task_job", title: "j", input: "run", status: "completed", instance,
+        createdAt: at, updatedAt: at, tracePath: "", auditIds: [], approvalIds: [], skillIds: []
+      }
+    ] as RuntimeState["tasks"];
+    state.chatMessages = [
+      { id: "m1", instance, sessionId: "chat_A", role: "user", content: "hi", createdAt: at, taskId: "task_chat" },
+      // A second user message for the same task; the FIRST in array order wins.
+      { id: "m2", instance, sessionId: "chat_B", role: "user", content: "again", createdAt: at, taskId: "task_chat" }
+    ] as RuntimeState["chatMessages"];
+    return state;
+  }
+
+  test("stamps a legacy task's chatSessionId from its first user message and sets the marker", () => {
+    const state = seedLegacyTasks("backfill-happy");
+    const dyn = state as unknown as { migrations?: { taskChatSessionIdBackfilled?: string } };
+    expect(dyn.migrations?.taskChatSessionIdBackfilled).toBeUndefined();
+
+    normalizeState("backfill-happy", state);
+
+    expect(state.tasks.find((t) => t.id === "task_chat")!.chatSessionId).toBe("chat_A");
+    // A task with no matching user message is left undefined.
+    expect(state.tasks.find((t) => t.id === "task_job")!.chatSessionId).toBeUndefined();
+    // Marker is set so the join never re-runs.
+    expect(dyn.migrations?.taskChatSessionIdBackfilled).toBeString();
+  });
+
+  test("is gated by the marker: a task added after the backfill is NOT re-derived", () => {
+    const state = seedLegacyTasks("backfill-gated");
+    normalizeState("backfill-gated", state);
+    // Simulate a later un-stamped legacy task appearing with a matching message
+    // AFTER the marker is set (e.g. a hand-edited state file). The gate means
+    // the one-time backfill won't touch it — the field stays as created.
+    (state.tasks as RuntimeState["tasks"]).push({
+      id: "task_late", title: "l", input: "x", status: "completed", instance: "backfill-gated",
+      createdAt: "2026-01-02T00:00:00.000Z", updatedAt: "2026-01-02T00:00:00.000Z",
+      tracePath: "", auditIds: [], approvalIds: [], skillIds: []
+    } as RuntimeState["tasks"][number]);
+    (state.chatMessages as RuntimeState["chatMessages"]).push({
+      id: "m3", instance: "backfill-gated", sessionId: "chat_C", role: "user",
+      content: "late", createdAt: "2026-01-02T00:00:00.000Z", taskId: "task_late"
+    } as RuntimeState["chatMessages"][number]);
+
+    normalizeState("backfill-gated", state);
+    expect(state.tasks.find((t) => t.id === "task_late")!.chatSessionId).toBeUndefined();
+  });
+
+  test("never overwrites a chatSessionId already set on a task", () => {
+    const state = seedLegacyTasks("backfill-preserve");
+    state.tasks.find((t) => t.id === "task_chat")!.chatSessionId = "chat_explicit";
+    normalizeState("backfill-preserve", state);
+    expect(state.tasks.find((t) => t.id === "task_chat")!.chatSessionId).toBe("chat_explicit");
+  });
+});

@@ -920,19 +920,47 @@ function dedupeStaleDeviceSessions(state: RuntimeState): void {
 // Backfill Task.chatSessionId from the chatMessages join for records that
 // pre-date the field. The Tasks page reads task.chatSessionId directly so it
 // no longer has to pull /state for the chatMessages list — but state files
-// older than this field must still resolve correctly. Idempotent: only
-// stamps tasks where the field is missing AND a matching user-role message
-// exists. No audit row — this is purely derived data, not a new fact.
+// older than this field must still resolve correctly.
+//
+// Marker-gated on `state.migrations.taskChatSessionIdBackfilled` so the join
+// runs at most ONCE per instance. New tasks set chatSessionId at creation
+// (execution/chat.ts) and non-chat tasks (jobs/messaging) legitimately have
+// none, so after the one-time backfill there is nothing left to derive —
+// re-running every readState only re-scanned the same unmatched tasks forever.
+// The original ungated version was an O(tasks × chatMessages) nested .find on
+// EVERY read (measured at 28,764ms across one short window on a 4,353-task /
+// 971-message instance) and dominated the runtime's CPU. This pass is now both
+// gated AND O(tasks + chatMessages): a single index of taskId -> user-message
+// sessionId replaces the per-task linear scan. No audit row — this is purely
+// derived data, not a new fact.
 function migrateTaskChatSessionId(state: RuntimeState): void {
+  const dyn = state as unknown as {
+    migrations?: { taskChatSessionIdBackfilled?: string };
+  };
+  if (dyn.migrations?.taskChatSessionIdBackfilled) return;
   if (!Array.isArray(state.tasks) || state.tasks.length === 0) return;
-  if (!Array.isArray(state.chatMessages) || state.chatMessages.length === 0) return;
+  if (!Array.isArray(state.chatMessages) || state.chatMessages.length === 0) {
+    // Nothing to join against, but the backfill has "run" for this state shape
+    // — mark it so a task-only instance doesn't re-enter every read.
+    dyn.migrations = { ...(dyn.migrations ?? {}), taskChatSessionIdBackfilled: now() };
+    return;
+  }
+  // Index taskId -> sessionId from the first user-role message per task, in one
+  // pass over chatMessages, so the task loop below is O(tasks) not O(tasks ×
+  // messages). First match wins (mirrors the prior .find, which returned the
+  // first matching message in array order).
+  const sessionByTask = new Map<string, string>();
+  for (const message of state.chatMessages) {
+    if (message.role !== "user") continue;
+    if (!message.taskId) continue;
+    if (!sessionByTask.has(message.taskId)) sessionByTask.set(message.taskId, message.sessionId);
+  }
   for (const task of state.tasks) {
     if (task.chatSessionId) continue;
-    const message = state.chatMessages.find(
-      (candidate) => candidate.taskId === task.id && candidate.role === "user"
-    );
-    if (message) task.chatSessionId = message.sessionId;
+    const sessionId = sessionByTask.get(task.id);
+    if (sessionId) task.chatSessionId = sessionId;
   }
+  dyn.migrations = { ...(dyn.migrations ?? {}), taskChatSessionIdBackfilled: now() };
 }
 
 // Stamp the active-at-migration-time agent onto records that pre-date the
