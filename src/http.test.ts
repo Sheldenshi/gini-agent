@@ -7248,6 +7248,182 @@ describe("email watcher routes", () => {
   });
 });
 
+describe("response compression", () => {
+  // Seed enough audit rows that /api/state's JSON body clears the 1 KB
+  // threshold, so the compressible-path assertions exercise real compression
+  // rather than the too-small skip.
+  function seedBulkyState(config: RuntimeConfig): void {
+    mutateState(config.instance, (state) => {
+      for (let i = 0; i < 200; i += 1) {
+        addAudit(state, {
+          actor: "runtime",
+          action: "test.bulk",
+          target: `row-${i}`,
+          risk: "low",
+          evidence: { note: "padding to push the state payload past the gzip threshold" }
+        }, { system: true });
+      }
+    });
+  }
+
+  test("gzips a large JSON response when the client accepts only gzip", async () => {
+    const config = testConfig("gzip-json");
+    const handler = createHandler(config);
+    seedBulkyState(config);
+    const response = await rawCall(
+      handler,
+      config,
+      "/api/state",
+      { headers: { "accept-encoding": "gzip" } },
+      config.token
+    );
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-encoding")).toBe("gzip");
+    expect(response.headers.get("vary") ?? "").toContain("Accept-Encoding");
+    // The body is real gzip and decodes back to valid JSON state.
+    const compressed = new Uint8Array(await response.arrayBuffer());
+    const decoded = JSON.parse(new TextDecoder().decode(Bun.gunzipSync(compressed)));
+    expect(decoded.instance).toBe(config.instance);
+    // The compressed transfer is materially smaller than the raw JSON.
+    const rawLen = new TextEncoder().encode(JSON.stringify(decoded)).length;
+    expect(compressed.byteLength).toBeLessThan(rawLen);
+  });
+
+  test("prefers brotli when the client accepts both br and gzip", async () => {
+    const config = testConfig("br-json");
+    const handler = createHandler(config);
+    seedBulkyState(config);
+    const response = await rawCall(
+      handler,
+      config,
+      "/api/state",
+      { headers: { "accept-encoding": "gzip, br" } },
+      config.token
+    );
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-encoding")).toBe("br");
+    expect(response.headers.get("vary") ?? "").toContain("Accept-Encoding");
+    // The body is real brotli and decodes back to valid JSON state.
+    const { brotliDecompressSync } = await import("node:zlib");
+    const compressed = new Uint8Array(await response.arrayBuffer());
+    const decoded = JSON.parse(new TextDecoder().decode(brotliDecompressSync(compressed)));
+    expect(decoded.instance).toBe(config.instance);
+    const rawLen = new TextEncoder().encode(JSON.stringify(decoded)).length;
+    expect(compressed.byteLength).toBeLessThan(rawLen);
+  });
+
+  test("falls back to gzip when br is explicitly opted out (br;q=0)", async () => {
+    const config = testConfig("br-optout");
+    const handler = createHandler(config);
+    seedBulkyState(config);
+    const response = await rawCall(
+      handler,
+      config,
+      "/api/state",
+      { headers: { "accept-encoding": "br;q=0, gzip" } },
+      config.token
+    );
+    expect(response.headers.get("content-encoding")).toBe("gzip");
+  });
+
+  test("does not compress when the client omits Accept-Encoding", async () => {
+    const config = testConfig("gzip-absent");
+    const handler = createHandler(config);
+    seedBulkyState(config);
+    const response = await rawCall(handler, config, "/api/state", {}, config.token);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-encoding")).toBeNull();
+    const body = await response.json();
+    expect(body.instance).toBe(config.instance);
+  });
+
+  test("honors gzip;q=0 as an explicit opt-out", async () => {
+    const config = testConfig("gzip-q0");
+    const handler = createHandler(config);
+    seedBulkyState(config);
+    const response = await rawCall(
+      handler,
+      config,
+      "/api/state",
+      { headers: { "accept-encoding": "gzip;q=0" } },
+      config.token
+    );
+    expect(response.headers.get("content-encoding")).toBeNull();
+  });
+
+  test("leaves a small JSON response uncompressed (below threshold)", async () => {
+    const config = testConfig("gzip-small");
+    const handler = createHandler(config);
+    const response = await rawCall(
+      handler,
+      config,
+      "/api/tasks?agentId=does_not_exist",
+      { headers: { "accept-encoding": "gzip" } },
+      config.token
+    );
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-encoding")).toBeNull();
+    // Body is still the intact (empty) JSON array.
+    expect(await response.json()).toEqual([]);
+  });
+
+  test("never compresses an SSE event stream", async () => {
+    const config = testConfig("gzip-sse");
+    const handler = createHandler(config);
+    const response = await rawCall(
+      handler,
+      config,
+      "/api/events/stream",
+      { headers: { "accept-encoding": "gzip" } },
+      config.token
+    );
+    try {
+      expect(response.headers.get("content-type") ?? "").toContain("text/event-stream");
+      expect(response.headers.get("content-encoding")).toBeNull();
+    } finally {
+      await response.body?.cancel();
+    }
+  });
+
+  test("never compresses a web-proxy path (only the native /api surface is compressed)", async () => {
+    // /api/runtime/* is a web-proxy path (isWebProxyPath). Those responses are
+    // reachable unauthenticated via the pairing bootstrap and are gzip'd by the
+    // web child itself, so the gateway must NOT brotli/gzip them — that would
+    // let an unauthenticated client burn CPU on compression before any session
+    // check. Unauthenticated relay-less loopback returns 401 here, but the
+    // point is the absence of a gateway-applied Content-Encoding regardless.
+    const config = testConfig("gzip-webproxy");
+    const handler = createHandler(config);
+    const response = await rawCall(
+      handler,
+      config,
+      "/api/runtime/status",
+      { headers: { "accept-encoding": "gzip, br" } }
+    );
+    expect(response.headers.get("content-encoding")).toBeNull();
+  });
+
+  test("never compresses a 206 byte-range response (preserves Content-Range semantics)", async () => {
+    // A compressible upload (text/csv) over the 1 KB threshold, fetched with a
+    // Range. The 206 carries Content-Range computed on the UNENCODED bytes, so
+    // adding Content-Encoding would corrupt the range contract (RFC 7233).
+    const config = testConfig("gzip-range");
+    const handler = createHandler(config);
+    const bytes = new TextEncoder().encode("col_a,col_b,col_c\n" + "1,2,3\n".repeat(500));
+    const ref = storeUpload(config.instance, bytes, "text/csv");
+    const res = await rawCall(
+      handler,
+      config,
+      `/api/uploads/${ref.id}`,
+      { headers: { range: "bytes=0-1999", "accept-encoding": "br, gzip" } },
+      config.token
+    );
+    expect(res.status).toBe(206);
+    expect(res.headers.get("content-range")).toContain("bytes 0-1999/");
+    expect(res.headers.get("content-encoding")).toBeNull();
+  });
+});
+
 async function call(handler: ReturnType<typeof createHandler>, config: RuntimeConfig, path: string, init: RequestInit = {}) {
   return callWithToken(handler, config, config.token, path, init);
 }

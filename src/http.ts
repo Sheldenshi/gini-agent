@@ -2439,10 +2439,17 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
   return async (request: Request) => {
     const url = new URL(request.url);
     const response = await handle(request, url);
-    // Compress compressible API/text bodies before they hit the
-    // bandwidth-capped relay. SSE streams and already-encoded/proxied bodies
-    // pass through untouched (see maybeCompress). Last step so it covers every
-    // return path — route handlers, proxyWeb, and the auth/404 short-circuits.
+    // Compress the gateway's OWN native /api responses before they hit the
+    // bandwidth-capped relay — the large JSON bodies (/api/state, /api/tasks)
+    // are the whole point. Deliberately scoped to the native surface:
+    // web-proxy paths (the Next BFF + /_next/* + static assets, anything
+    // isWebProxyPath matches) are excluded because (a) those responses are
+    // reachable UNAUTHENTICATED via the pairing-bootstrap allowlist, so
+    // compressing them would let a remote client burn gateway CPU on
+    // brotli before any session check, and (b) the web child already gzips
+    // its own assets, so re-compressing here is redundant. maybeCompress
+    // still no-ops on already-encoded/SSE/small/incompressible bodies.
+    if (isWebProxyPath(url.pathname)) return response;
     return maybeCompress(request, response);
   };
 }
@@ -2843,6 +2850,14 @@ async function maybeCompress(request: Request, response: Response): Promise<Resp
   if (response.headers.has("content-encoding")) return response;
   // No body to compress (204/304, HEAD, or an empty body).
   if (!response.body || response.status === 204 || response.status === 304) return response;
+  // Never compress a byte-range / partial response. A Content-Range is
+  // computed against the UNENCODED representation (RFC 7233 §4.2), so adding
+  // Content-Encoding to a 206 slice — or to any response answering a Range
+  // request — corrupts the range contract for a client reassembling ranges.
+  // The native /api/uploads/:id media endpoint serves such 206s.
+  if (response.status === 206 || response.headers.has("content-range") || request.headers.has("range")) {
+    return response;
+  }
   const contentType = response.headers.get("content-type") ?? "";
   if (!isCompressibleContentType(contentType)) return response;
   // Buffer the body. Safe: SSE (the only never-ending body) was excluded by
