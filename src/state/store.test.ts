@@ -1188,11 +1188,10 @@ describe("dedupeStaleDeviceSessions (stale-duplicate session backfill)", () => {
     ).toBe(1);
   });
 
-  // The shared-subdomain eviction bug at the migration layer: two DISTINCT
-  // browsers on one relay subdomain share the same User-Agent-derived name, so
-  // the legacy origin+name key collapsed them and the migration revoked one
-  // person's live session. Each browser carries its own gini_client id
-  // (clientId), so they must stay independent.
+  // At the migration layer: two DISTINCT browsers on one relay subdomain share
+  // the same User-Agent-derived name but each carries its own gini_client id
+  // (clientId). The migration must key on clientId and leave both live sessions
+  // active rather than collapsing one person's session into the other's.
   test("keeps two distinct browsers (same origin+name, different clientId) both active", () => {
     const state = createEmptyState("dedupe-distinct-clients");
     pushDevice(state, { id: "device_alice", clientId: "client-alice", lastSeenAt: "2026-06-10T00:00:00.000Z" });
@@ -1216,8 +1215,8 @@ describe("dedupeStaleDeviceSessions (stale-duplicate session backfill)", () => {
 
   test("legacy rows without clientId still collapse by name (back-compat)", () => {
     const state = createEmptyState("dedupe-legacy-noclient");
-    // Pre-fix rows: no clientId, same origin + name. The migration must still
-    // collapse these so the original stale-duplicate heal keeps working.
+    // Rows with no clientId, same origin + name, must still collapse so the
+    // stale-duplicate heal keeps working for sessions minted without a clientId.
     pushDevice(state, { id: "device_pre_1", clientId: undefined, lastSeenAt: "2026-06-01T00:00:00.000Z" });
     pushDevice(state, { id: "device_pre_2", clientId: undefined, lastSeenAt: "2026-06-18T00:00:00.000Z" });
 

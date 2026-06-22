@@ -863,8 +863,9 @@ function archiveOrphanJobChannels(state: RuntimeState): void {
 // re-pair existed, every re-pair of the same device minted a fresh session and
 // left the prior one "active" forever, so an operator's Active Sessions list
 // grew an entry per re-pair (same label, same relay origin). Collapse each
-// identity group (origin + derived name; see pairedDeviceIdentityKey) down to
-// the single most-recently-seen ACTIVE session, revoking the older siblings.
+// identity group (origin + clientId, or origin + derived name for rows with no
+// clientId; see pairedDeviceIdentityKey) down to the single most-recently-seen
+// ACTIVE session, revoking the older siblings.
 // Originless rows (legacy code-claimed mobile bearer devices) key to null and
 // are skipped — they are long-lived credentials, never supersession targets.
 // Revocation (not deletion) preserves the audit trail; the isListedSession UI

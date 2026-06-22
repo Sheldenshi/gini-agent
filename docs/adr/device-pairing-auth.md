@@ -75,18 +75,27 @@ Sessions list would accumulate one dead entry per re-pair — all sharing a rela
 origin and an identical derived label. `claimPairingRequest` therefore calls
 `supersedePriorDeviceSessions`: any OTHER `active` session that is the **same
 device** is revoked (`status: "revoked"`, stamped `revokedAt`) as the new one is
-minted. "Same device" is `isSamePairedDevice` — equal relay `origin` AND equal
-`name` (the `pairedDeviceIdentityKey`, `origin\nname`). A session with **no
-origin** (a legacy code-claimed mobile bearer device, which is long-lived and
-originless) keys to `null` and is never a supersession target — re-pairing must
-not retire a standing bearer credential. Revocation (not deletion) preserves the
-audit trail (`device.superseded`); the new device's existing `kind: "pairing"`
-tick already refreshes every admin client's `["devices"]` query. The only false
-match is two genuinely distinct same-model devices on one relay, which is fully
-recoverable by re-pairing (and those rows are visually identical to the operator
-anyway). A one-time `normalizeState` sweep (`dedupeStaleDeviceSessions`) heals
-instances that pre-date this rule, collapsing each identity group to its
-most-recently-seen active session.
+minted. "Same device" is `isSamePairedDevice` — equal `pairedDeviceIdentityKey`.
+That key is the relay `origin` plus a stable per-browser/per-install id
+(`clientId`): `origin\nclient:<clientId>`. The `clientId` is carried by the
+**`gini_client`** cookie for browsers (host-only, long-lived, re-sent across
+re-pairs so it survives the new session token a re-pair mints) and the
+**`X-Gini-Client-ID`** header for the cookieless native client (a per-install id
+the app persists locally). Keying on `clientId` is what lets two genuinely
+distinct browsers with the **same** User-Agent share one relay subdomain without
+evicting each other on re-pair. A row with **no `clientId`** (a session minted
+before `gini_client` existed, or a native client that sent no header) falls back
+to `origin\nname:<name>` — a **separate namespace** so a legacy row and a
+`clientId`-bearing row never match; these legacy rows age out via `SESSION_TTL_MS`.
+A session with **no origin** (a legacy code-claimed mobile bearer device, which is
+long-lived and originless) keys to `null` and is never a supersession target —
+re-pairing must not retire a standing bearer credential. Revocation (not deletion)
+preserves the audit trail (`device.superseded`); the new device's existing
+`kind: "pairing"` tick already refreshes every admin client's `["devices"]` query.
+A one-time `normalizeState` sweep (`dedupeStaleDeviceSessions`) heals instances
+that pre-date the supersede rule, collapsing each identity group to its
+most-recently-seen active session; it keys through `pairedDeviceIdentityKey`, so
+it inherits the `clientId` model unchanged.
 
 ## Trust tiers of the pairing routes
 
@@ -206,6 +215,17 @@ admin to anything but the operator's own loopback dev port.
   Path=/api/pairing`. Only the browser that created a request holds it, so a
   third party that learns a request id can neither claim its session nor cancel
   it. Cleared on claim/cancel.
+- `gini_client`: the stable per-browser id (`clientId`) that device identity keys
+  on (see "Superseding a re-paired session" above). Minted at
+  `POST /api/pairing/request` when absent, re-sent on every later request so it
+  survives re-pairs (unlike `gini_session`, which a re-pair re-mints). It carries
+  **no secret** — only an opaque dedup id — so it is not a credential; the
+  `gini_session` token remains the entire access decision. Attributes mirror
+  `gini_session`, **not** `gini_pair`: `HttpOnly; SameSite=Lax; Path=/`, host-only
+  (no `Domain`), `__Host-` prefix on a secure front (the gate reads `__Host-` first
+  then the plain name), long `Max-Age` (one year). It is in `GATEWAY_ONLY_COOKIES`,
+  so it is stripped before the inner web child ever sees it. A native client is
+  cookieless and instead sends the same id as the `X-Gini-Client-ID` header.
 - `Secure` is conditional (`pairingCookieSecure`): set on relay and
   runtime-managed tunnel fronts (both always HTTPS), loopback fronts, and any
   HTTPS request, and omitted only on a deliberately plain-HTTP
@@ -269,6 +289,15 @@ all three native deviations:
   cookie jar would otherwise persist a `__Host-gini_session` the client never
   reads and that the app's sign-out can't clear. The browser claim body stays
   `{ ok: true }` with the token delivered cookie-only, so an XSS can't exfiltrate it.
+- **Per-install id in a header.** The cookieless client can't hold the
+  `gini_client` cookie, so it persists its own per-install id locally (a random id
+  minted once and kept in AsyncStorage) and sends it as `X-Gini-Client-ID` on every
+  pairing call. The gateway threads it into `clientId` exactly as it would the
+  cookie, so device identity keys on it (two phones on one relay subdomain don't
+  evict each other). The gateway **never mints** a `clientId` for native: a
+  server-minted id is write-only to a cookieless client (it can't be echoed back),
+  so a native request that sends no header gets `clientId` unset and keeps the
+  legacy `origin\nname` supersede — never two stacked active sessions.
 
 Post-pairing needs no new gate: `isWebProxyPath` routes `/api/chat`,
 `/api/agents`, etc. to the native bearer surface, so the stored device token
@@ -366,12 +395,15 @@ pairing screen.
 - `revokeDevice` on a session immediately 302s its pages and 401s its API on the
   next request (unified revocation). A revoked session drops out of the Active
   Sessions list while remaining in durable state.
-- Claiming a second session for the same `(origin, name)` revokes the first
+- Claiming a second session for the same `(origin, clientId)` revokes the first
   (`supersedePriorDeviceSessions`): the device's prior row reads `revoked`, the
-  new one `active`, leaving exactly one active session per device. A distinct
-  label, a distinct origin, or an originless legacy bearer row is left active.
-  `normalizeState`'s `dedupeStaleDeviceSessions` collapses a pre-existing
-  duplicate pileup to one active session per identity group and is idempotent.
+  new one `active`, leaving exactly one active session per browser/install. A
+  distinct `clientId` (a different browser/install), a distinct origin, or an
+  originless legacy bearer row is left active — so two distinct browsers with the
+  same User-Agent on one relay subdomain coexist. A row with no `clientId` falls
+  back to `(origin, name)` in its own namespace. `normalizeState`'s
+  `dedupeStaleDeviceSessions` collapses a pre-existing duplicate pileup to one
+  active session per identity group and is idempotent.
 - `/pair` renders with provider setup incomplete and emits no authenticated
   `/api/runtime/*` calls.
 - A native client (opt-in header, no `Sec-Fetch-*`) creates with no `Origin`
@@ -379,7 +411,9 @@ pairing screen.
   the claim returns the token in the body; that token authenticates a subsequent
   `Authorization: Bearer` call over the relay. A browser that also sends the
   opt-in header (but carries `Sec-Fetch-*`) still gets the cookie-only claim with
-  no body token.
+  no body token. A native client's `X-Gini-Client-ID` threads into the device's
+  `clientId`; a native request with no such header gets no minted `clientId` and
+  still supersedes its own prior session by `(origin, name)`.
 - `GET /.well-known/apple-app-site-association` returns the AASA JSON (with the
   configured app id) unpaired on both relay and loopback fronts, with no redirect.
 - State mutators are pinned by `src/state/pairing-requests.test.ts` (including

@@ -580,11 +580,10 @@ describe("pairedDeviceIdentityKey / isSamePairedDevice", () => {
     expect(isSamePairedDevice(device({ origin: undefined }), device({ origin: undefined }))).toBe(false);
   });
 
-  // The shared-subdomain eviction bug: two DISTINCT browsers on the same relay
-  // subdomain produce the same User-Agent-derived name ("Chrome · Mac"). Each
-  // holds its own per-browser gini_client id (clientId), so they must NOT be
-  // treated as the same device. Before the clientId fix the key was origin+name,
-  // so these collided and a re-pair by one evicted the other.
+  // Two DISTINCT browsers on the same relay subdomain produce the same
+  // User-Agent-derived name ("Chrome · Mac") but each holds its own per-browser
+  // gini_client id (clientId). They must NOT be treated as the same device, so a
+  // re-pair by one never evicts the other on a shared subdomain.
   test("same origin + same name but DIFFERENT clientId are NOT the same device", () => {
     const browserA = device({ id: "device_a", clientId: "client-aaaa" });
     const browserB = device({ id: "device_b", clientId: "client-bbbb" });

@@ -3363,11 +3363,16 @@ async function handlePairingRoutes(request: Request, url: URL, config: RuntimeCo
     const deviceName = sanitizeDeviceName((await body(request)).deviceName);
     // The stable per-browser/per-install id. A browser already paired here re-sends
     // its gini_client cookie (reused as-is so identity is stable across re-pairs);
-    // a native client sends the X-Gini-Client-ID header. A first-time browser sends
-    // neither, so the gateway mints one and sets it as the cookie below. An empty
-    // header/cookie is treated as absent so a blank never becomes an identity.
-    const reusedClientId = (native ? request.headers.get(CLIENT_ID_HEADER) : clientCookieValue(request)) || undefined;
-    const clientId = reusedClientId ?? randomBindSecret();
+    // a first-time browser sends none, so the gateway mints one and persists it as
+    // the cookie below (always a string for the browser path). A native client owns
+    // its id locally and sends it in the X-Gini-Client-ID header — the gateway must
+    // NEVER mint one for native: a server-minted id is write-only to a cookieless
+    // client (it can't be echoed back), so each re-pair would get a fresh id and
+    // stack a second active session. A native client with no header therefore gets
+    // clientId=undefined and keeps the legacy origin+name supersede. An empty
+    // header/cookie is treated as absent.
+    const browserClientId = clientCookieValue(request) || randomBindSecret();
+    const clientId = native ? request.headers.get(CLIENT_ID_HEADER) || undefined : browserClientId;
     let created: Awaited<ReturnType<typeof requestPairing>>;
     try {
       created = await requestPairing(config, {
@@ -3405,7 +3410,7 @@ async function handlePairingRoutes(request: Request, url: URL, config: RuntimeCo
       // Max-Age). Native clients own their id locally and stay cookieless.
       response.headers.append(
         "set-cookie",
-        serializeCookie(clientCookieName(secure), clientId, {
+        serializeCookie(clientCookieName(secure), browserClientId, {
           ...sessionCookieAttributes,
           secure,
           maxAge: CLIENT_COOKIE_TTL_SECONDS

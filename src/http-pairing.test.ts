@@ -1077,6 +1077,41 @@ describe("pairing routes — per-browser client identity (gini_client)", () => {
     const devices = readState(config.instance).devices;
     expect(devices.filter((d) => d.status === "active").length).toBe(2);
   });
+
+  // A native client that sends NO X-Gini-Client-ID (an older mobile build, or one
+  // whose id hasn't primed yet) must keep the legacy origin+name supersede: the
+  // gateway must NOT mint a throwaway server-side clientId the cookieless client
+  // can never echo back, or a re-pair would stack a second active session forever.
+  test("a header-less native re-pair still supersedes its prior session (legacy origin+name)", async () => {
+    const { config, handler } = makeHandler("client-native-noheader");
+    const relay = RELAY("client-native-noheader");
+
+    async function nativePairNoHeader(): Promise<string> {
+      const created = await pair(handler, "/api/pairing/request", {
+        method: "POST", host: relay, pairClient: "native", userAgent: "GiniMobile/1.0 (iOS)", body: {}
+      });
+      const { id, bindSecret } = await created.json();
+      await pair(handler, `/api/pairing/requests/${id}/approve`, {
+        method: "POST", host: "127.0.0.1:7337", origin: "http://127.0.0.1:7337", secFetchSite: "same-origin", body: {}
+      });
+      const claimed = await pair(handler, `/api/pairing/request/${id}/claim`, {
+        method: "POST", host: relay, pairClient: "native", pairSecret: bindSecret, body: {}
+      });
+      expect(claimed.status).toBe(200);
+      const { devices } = readState(config.instance);
+      return devices.find((d) => d.status === "active")!.id;
+    }
+
+    const first = await nativePairNoHeader();
+    const second = await nativePairNoHeader();
+    expect(first).not.toBe(second);
+    const devices = readState(config.instance).devices;
+    // No clientId was minted onto either device — identity falls back to origin+name.
+    expect(devices.find((d) => d.id === second)!.clientId).toBeUndefined();
+    expect(devices.find((d) => d.id === first)!.status).toBe("revoked");
+    expect(devices.find((d) => d.id === second)!.status).toBe("active");
+    expect(devices.filter((d) => d.status === "active").length).toBe(1);
+  });
 });
 
 describe("pairing routes — device name", () => {
