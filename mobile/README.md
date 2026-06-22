@@ -64,12 +64,14 @@ link hasn't resolved yet. See ADR
 [device-pairing-auth.md](../docs/adr/device-pairing-auth.md) ("Native
 pairing client").
 
-A relay-paired session is a finite-lifetime credential (it inherits the
-relay session TTL, 30 days), so the app re-prompts for pairing once it
-expires — re-open the link to re-pair. The manual token from `gini
-status` does not expire. Opening a link — whether for the same gateway or
-a different one — goes straight to the pairing screen; cancelling there
-drops you back into the app you were already connected to.
+A relay-paired session lives until you revoke it from the web app's
+Active Sessions panel — it does not expire on its own. (The native app
+holds a bearer token the server keeps valid until revoke; the browser's
+session cookie is capped at the 400-day browser maximum and slides
+forward on each use.) The manual token from `gini status` likewise does
+not expire. Opening a link — whether for the same gateway or a different
+one — goes straight to the pairing screen; cancelling there drops you
+back into the app you were already connected to.
 
 ## Behavior
 

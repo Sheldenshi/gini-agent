@@ -329,10 +329,12 @@ export default function PairScreen() {
         // Do NOT persist a superseded attempt's token. If the generation moved on
         // (a new attempt started, the user cancelled, or the screen unmounted),
         // bail BEFORE saving so a stale/late claim can't silently repoint the app
-        // to that attempt's gateway. The cost is a rare orphaned
-        // active device row when an unmount races a successful claim — bounded and
-        // self-healing (the row carries a TTL and its one-time token was discarded,
-        // so it's an unused session the server expires).
+        // to that attempt's gateway. The cost is a rare orphaned active device row
+        // when an unmount races a successful claim. Its one-time token was
+        // discarded, so it's an unusable session (no live credential); it no longer
+        // self-expires, but it's harmless and is cleared when the operator revokes
+        // it or the same device re-pairs (supersedePriorDeviceSessions retires the
+        // prior row).
         if (genRef.current !== myGen) return;
         await saveCredentials({ baseUrl: client.origin, token });
         if (genRef.current !== myGen) return;

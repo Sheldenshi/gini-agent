@@ -1228,7 +1228,7 @@ describe("runtime api", () => {
 
   // Gateway-owned pairing cookies must not cross into the inner web child, which
   // is relay-agnostic and authenticates via the BFF bearer. Other cookies pass.
-  test("proxyWeb strips gini_session/gini_pair from the forwarded Cookie header", async () => {
+  test("proxyWeb strips gini_session/gini_pair/gini_client from the forwarded Cookie header", async () => {
     const config = testConfig("web-proxy-cookie-strip");
     const handler = createHandler(config);
     const captured: { cookie: string | null } = { cookie: null };
@@ -1253,7 +1253,7 @@ describe("runtime api", () => {
       await handler(new Request(`http://127.0.0.1:${config.port}/some/app/route`, {
         headers: {
           origin: `http://127.0.0.1:${config.port}`,
-          cookie: "gini_session=sekret; theme=dark; gini_pair=bindy"
+          cookie: "gini_session=sekret; theme=dark; gini_pair=bindy; gini_client=cid; __Host-gini_client=cid2"
         }
       }));
       expect(captured.cookie).toBe("theme=dark");

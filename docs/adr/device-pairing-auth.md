@@ -93,7 +93,21 @@ distinct browsers with the **same** User-Agent share one relay subdomain without
 evicting each other on re-pair. A row with **no `clientId`** (a session minted
 before `gini_client` existed, or a native client that sent no header) falls back
 to `origin\nname:<name>` — a **separate namespace** so a legacy row and a
-`clientId`-bearing row never match; these legacy rows age out via `SESSION_TTL_MS`.
+`clientId`-bearing row never match. Like all paired sessions, these legacy rows no
+longer age out automatically; they persist until superseded by the same device
+re-pairing or revoked by the operator.
+
+**Known one-time migration artifact.** Because the two namespaces never match, a
+device that paired *before* it sent a `clientId` (a pre-`gini_client` browser, or
+a native build before `X-Gini-Client-ID`) leaves its old `name:`-keyed row
+un-superseded on its *first* re-pair after upgrading — that re-pair mints a
+`clientId` and the new `client:`-keyed row can't match the old `name:` one. The
+result is one stale duplicate (same label/origin) the operator can revoke; every
+subsequent re-pair supersedes normally. This is deliberately NOT auto-healed: a
+one-way "a new `client:` row also revokes a matching `name:` row" bridge would
+re-revoke a *different* person's still-legacy same-User-Agent session on the shared
+subdomain — exactly the cross-eviction this whole design removes. The visible,
+operator-revocable duplicate is the safe trade.
 A session with **no origin** (a legacy code-claimed mobile bearer device, which is
 long-lived and originless) keys to `null` and is never a supersession target —
 re-pairing must not retire a standing bearer credential. Revocation (not deletion)

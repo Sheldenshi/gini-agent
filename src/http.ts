@@ -3145,10 +3145,12 @@ const GATEWAY_ONLY_COOKIES = new Set([
 // document navigation so an active session's window slides forward.
 const SESSION_COOKIE_TTL_SECONDS = Math.floor(SESSION_COOKIE_MAX_AGE_MS / 1000);
 const PAIR_BIND_COOKIE_TTL_SECONDS = 3600;
-// The client id must outlive any single session so it stays stable across
-// re-pairs; a year keeps it effectively permanent without being literally
-// non-expiring.
-const CLIENT_COOKIE_TTL_SECONDS = 60 * 60 * 24 * 365;
+// The client id must live at least as long as the session it identifies, so it
+// shares the session cookie's 400-day browser-max lifetime. A shorter lifetime
+// would let gini_client lapse while a still-alive session slides past it (the
+// session cookie is re-issued on navigation), after which a re-pair would mint a
+// fresh clientId and fail to supersede the prior session — a stale duplicate.
+const CLIENT_COOKIE_TTL_SECONDS = SESSION_COOKIE_TTL_SECONDS;
 // Flood control on the public create endpoint. Keyed on the inbound Host (the
 // relay subdomain is un-forgeable — the relay owns its DNS), NOT on
 // X-Forwarded-For, which a client can spoof to mint fresh buckets. A separate
