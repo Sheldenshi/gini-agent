@@ -14,6 +14,7 @@ import { MarkdownContent } from "@/components/chat/MarkdownContent";
 import { api } from "@/lib/api";
 import { useConnectors, useGoogleAccounts, useInvalidate, useProviders, useSkills, type ProviderDescriptor } from "@/lib/queries";
 import { AddConnectorDialog, type CreateConnectorBody } from "@/components/AddConnectorDialog";
+import { ManualCredentialDialog } from "@/components/ManualCredentialDialog";
 import { GoogleAccountsCard } from "./_components/GoogleAccountsCard";
 import { deriveActivation, type Activation } from "./_activation";
 import type { ChatSession } from "@/lib/view-types";
@@ -58,6 +59,7 @@ export default function SkillsPage() {
   const googleAccounts = useGoogleAccounts();
   const invalidate = useInvalidate();
   const [dialog, setDialog] = useState<InlineDialogState>({ open: false, provider: "", suggestedName: "", mode: "create" });
+  const [manualProvider, setManualProvider] = useState<ProviderDescriptor | null>(null);
 
   useEffect(() => {
     const timer = setTimeout(() => setDebounced(search), 200);
@@ -118,6 +120,7 @@ export default function SkillsPage() {
       await api(`/connectors/${created.id}/health`, { method: "POST" }).catch(() => undefined);
       invalidate(["connectors", "skills"]);
       setDialog({ open: false, provider: "", suggestedName: "", mode: "create" });
+      setManualProvider(null);
     },
     onError: (error: Error) => toast.error(error.message)
   });
@@ -223,6 +226,16 @@ export default function SkillsPage() {
   const setupSkillProviders = useMemo(
     () => setupSkillProvidersMap(providers.data ?? []),
     [providers.data]
+  );
+  // For the currently displayed setup skill (e.g. google-workspace-setup),
+  // resolve its provider's credential template and whether that credential is
+  // already configured — gates the manual "Enter ID & secret" affordance so we
+  // don't offer to create a connector that already exists.
+  const setupProvider = detail ? setupSkillProviders.get(detail.name) : undefined;
+  const setupCredentialName = setupProvider?.credentialTemplate?.name;
+  const setupConfigured = Boolean(
+    setupCredentialName &&
+    (connectors.data ?? []).some((c) => c.name === setupCredentialName && c.status === "configured")
   );
 
   return (
@@ -346,6 +359,22 @@ export default function SkillsPage() {
                     Rollback
                   </Button>
                 </div>
+                {setupProvider?.credentialTemplate && !setupConfigured ? (
+                  <Section title="Already have an OAuth client?">
+                    <div className="space-y-2">
+                      <p className="text-xs text-muted-foreground">
+                        Enter your Google OAuth Client ID and secret to skip the Cloud Console setup and go straight to sign-in.
+                      </p>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => setManualProvider(setupProvider)}
+                      >
+                        Enter ID &amp; secret
+                      </Button>
+                    </div>
+                  </Section>
+                ) : null}
                 {detail.allowedTools ? (
                   <Section title="Allowed tools (from SKILL.md frontmatter)">
                     <p className="font-mono text-[11px] text-muted-foreground">{detail.allowedTools}</p>
@@ -475,16 +504,31 @@ export default function SkillsPage() {
                               // setup — Google Cloud Console clicks, CLI
                               // installs, OAuth consent. Defer to the
                               // agent in chat instead of popping a form
-                              // the user can't fill in.
-                              <Button
-                                size="sm"
-                                variant="outline"
-                                className="h-6 px-2 text-[10px]"
-                                disabled={setupViaChat.isPending}
-                                onClick={() => setupViaChat.mutate(detail)}
-                              >
-                                {setupViaChat.isPending ? "Opening chat…" : "Set up via chat"}
-                              </Button>
+                              // the user can't fill in. When the provider
+                              // carries a credential template, also offer
+                              // manual entry for users who already minted
+                              // an OAuth client.
+                              <div className="flex items-center gap-1.5">
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  className="h-6 px-2 text-[10px]"
+                                  disabled={setupViaChat.isPending}
+                                  onClick={() => setupViaChat.mutate(detail)}
+                                >
+                                  {setupViaChat.isPending ? "Opening chat…" : "Set up via chat"}
+                                </Button>
+                                {provider.credentialTemplate ? (
+                                  <Button
+                                    size="sm"
+                                    variant="outline"
+                                    className="h-6 px-2 text-[10px]"
+                                    onClick={() => setManualProvider(provider)}
+                                  >
+                                    Enter ID &amp; secret
+                                  </Button>
+                                ) : null}
+                              </div>
                             ) : (
                               // Simple secret-only providers (e.g. linear
                               // PAT). Original credential dialog works
@@ -661,6 +705,14 @@ export default function SkillsPage() {
         defaultName={dialog.suggestedName}
         lockProvider
         mode={dialog.mode}
+      />
+
+      <ManualCredentialDialog
+        open={manualProvider !== null}
+        onOpenChange={(open) => { if (!open) setManualProvider(null); }}
+        provider={manualProvider}
+        onSubmit={(body) => create.mutate(body)}
+        pending={create.isPending}
       />
     </>
   );
