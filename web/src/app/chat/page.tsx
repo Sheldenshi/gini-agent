@@ -3,6 +3,7 @@
 import { useSearchParams } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
 import { useMutation } from "@tanstack/react-query";
+import { ChevronDown } from "lucide-react";
 import { toast } from "sonner";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { BlockRenderer } from "@/components/chat/BlockRenderer";
@@ -335,7 +336,11 @@ function ChatSurface({
   // opens or the user returns to the Messages tab (the viewport mounts at the
   // top, so an animated scroll there would be visible); follow smoothly as new
   // blocks arrive mid-turn. Keyed by sessionId so switching agents re-arms the snap.
-  const messagesEndRef = useStickToBottom(mainBlocks.length, {
+  const {
+    ref: messagesEndRef,
+    atBottom: messagesAtBottom,
+    scrollToBottom: scrollMessagesToBottom
+  } = useStickToBottom(mainBlocks.length, {
     key: sessionId,
     enabled: tab === "messages" && hasBlocks
   });
@@ -485,7 +490,8 @@ function ChatSurface({
 
         {tab === "messages" ? (
           <>
-            <ScrollArea className="min-h-0 flex-1">
+            <div className="relative flex min-h-0 flex-1 flex-col">
+              <ScrollArea className="min-h-0 flex-1">
               <div className="mx-auto w-full max-w-3xl px-6 py-6">
                 {blocksLoading && !hasBlocks ? (
                   <div className="flex min-h-[40vh] items-center justify-center text-sm text-muted-foreground">
@@ -516,7 +522,18 @@ function ChatSurface({
                 )}
                 <div ref={messagesEndRef} />
               </div>
-            </ScrollArea>
+              </ScrollArea>
+              {hasBlocks && !messagesAtBottom ? (
+                <button
+                  type="button"
+                  onClick={scrollMessagesToBottom}
+                  aria-label="Scroll to latest messages"
+                  className="absolute bottom-3 left-1/2 z-10 inline-flex size-9 -translate-x-1/2 items-center justify-center rounded-full border border-border bg-background text-muted-foreground shadow-md transition-colors hover:bg-accent hover:text-foreground"
+                >
+                  <ChevronDown className="size-5" />
+                </button>
+              ) : null}
+            </div>
 
             <div className="px-6 pb-5 pt-2">
               <div className="mx-auto w-full max-w-3xl">

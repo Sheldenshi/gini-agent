@@ -10,7 +10,7 @@
 // container's metrics are stubbed to drive the guard.
 
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { render } from "@testing-library/react";
+import { act, render } from "@testing-library/react";
 import { useStickToBottom } from "./use-stick-to-bottom";
 
 let behaviors: (ScrollBehavior | undefined)[] = [];
@@ -28,17 +28,30 @@ afterEach(() => {
 });
 
 function Harness({ count, k, enabled }: { count: number; k?: unknown; enabled?: boolean }) {
-  const ref = useStickToBottom(count, { key: k, enabled });
+  const { ref } = useStickToBottom(count, { key: k, enabled });
   return <div ref={ref} data-testid="end" />;
 }
 
 // Harness whose sentinel lives inside a real scroll-area viewport, so the hook
 // finds a scroller and the near-bottom guard engages.
 function ScrollerHarness({ count, k }: { count: number; k?: unknown }) {
-  const ref = useStickToBottom(count, { key: k });
+  const { ref } = useStickToBottom(count, { key: k });
   return (
     <div data-slot="scroll-area-viewport">
       <div ref={ref} data-testid="end" />
+    </div>
+  );
+}
+
+// Surfaces the button-driving outputs: `atBottom` (drives visibility) and
+// `scrollToBottom` (the click handler).
+function ButtonHarness({ count, k }: { count: number; k?: unknown }) {
+  const { ref, atBottom, scrollToBottom } = useStickToBottom(count, { key: k });
+  return (
+    <div data-slot="scroll-area-viewport">
+      <div ref={ref} data-testid="end" />
+      <span data-testid="at-bottom">{String(atBottom)}</span>
+      <button type="button" data-testid="jump" onClick={scrollToBottom} />
     </div>
   );
 }
@@ -49,7 +62,11 @@ function setScroll(vp: HTMLElement, scrollHeight: number, clientHeight: number, 
   Object.defineProperty(vp, "scrollHeight", { configurable: true, value: scrollHeight });
   Object.defineProperty(vp, "clientHeight", { configurable: true, value: clientHeight });
   Object.defineProperty(vp, "scrollTop", { configurable: true, writable: true, value: scrollTop });
-  vp.dispatchEvent(new Event("scroll"));
+  // Wrap in act so the sample's setState (which drives `atBottom`) flushes
+  // before the test reads it.
+  act(() => {
+    vp.dispatchEvent(new Event("scroll"));
+  });
 }
 
 describe("useStickToBottom", () => {
@@ -125,5 +142,23 @@ describe("useStickToBottom", () => {
 
     // Unmount detaches the scroll listener.
     unmount();
+  });
+
+  test("atBottom tracks scroll position; scrollToBottom snaps and re-pins", () => {
+    const { container, getByTestId } = render(<ButtonHarness count={1} k="s1" />);
+    // Mounts pinned to the bottom.
+    expect(getByTestId("at-bottom").textContent).toBe("true");
+
+    const vp = container.querySelector<HTMLElement>('[data-slot="scroll-area-viewport"]')!;
+    // gap = 1000 - 100 - 400 = 500 > 64 → scrolled up, button should show.
+    setScroll(vp, 1000, 400, 100);
+    expect(getByTestId("at-bottom").textContent).toBe("false");
+
+    // Clicking jumps to the bottom instantly and re-pins (button hides).
+    act(() => {
+      getByTestId("jump").click();
+    });
+    expect(behaviors[behaviors.length - 1]).toBe("auto");
+    expect(getByTestId("at-bottom").textContent).toBe("true");
   });
 });

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useLayoutEffect, useRef } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 
 // Sentinel for "no snap has happened for this mounted view yet". A plain
 // boolean can't distinguish "first content" from "switched to a different
@@ -66,6 +66,10 @@ export function useStickToBottom(
   // Whether the user is currently parked at the bottom. Sampled on scroll
   // (before any content growth) and assumed true until the user scrolls away.
   const pinnedRef = useRef(true);
+  // Same value mirrored into render state so a "jump to bottom" affordance can
+  // appear only while the user has scrolled up. The ref drives the auto-follow
+  // (so sampling stays render-free); this state drives the button.
+  const [atBottom, setAtBottom] = useState(true);
 
   // Track the pinned state from the scroll container. Re-binds when the view
   // (key/enabled) changes, since that can swap which element scrolls.
@@ -73,8 +77,10 @@ export function useStickToBottom(
     const scroller = findScroller(endRef.current);
     if (!scroller) return;
     const sample = () => {
-      pinnedRef.current =
+      const pinned =
         scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight <= PIN_THRESHOLD_PX;
+      pinnedRef.current = pinned;
+      setAtBottom((prev) => (prev === pinned ? prev : pinned));
     };
     sample();
     scroller.addEventListener("scroll", sample, { passive: true });
@@ -95,9 +101,20 @@ export function useStickToBottom(
     if (firstForKey || pinnedRef.current) {
       endRef.current?.scrollIntoView({ behavior: "auto", block: "end" });
       pinnedRef.current = true;
+      setAtBottom(true);
     }
     snappedKeyRef.current = key;
   }, [itemCount, key, enabled]);
 
-  return endRef;
+  // Explicit "jump to bottom" for the button. Instant, like every other scroll
+  // in this hook — a smooth animation's intermediate scroll samples would flip
+  // `atBottom` back to false mid-flight and flash the button. Re-pins so the
+  // next block keeps following.
+  const scrollToBottom = useCallback(() => {
+    endRef.current?.scrollIntoView({ behavior: "auto", block: "end" });
+    pinnedRef.current = true;
+    setAtBottom(true);
+  }, []);
+
+  return { ref: endRef, atBottom, scrollToBottom };
 }

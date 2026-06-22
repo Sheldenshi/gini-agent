@@ -1,7 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { X } from "lucide-react";
+import { ChevronDown, X } from "lucide-react";
 import { toast } from "sonner";
 import type { ChatBlock } from "@runtime/types";
 import type { UploadRef } from "@/lib/api";
@@ -60,7 +60,11 @@ export function ThreadPanel({
   // panel mounts empty while the thread loads, and snapping then would burn the
   // instant-snap latch before the replies are laid out, leaving the real
   // content to animate in.
-  const endRef = useStickToBottom(blocks.length, {
+  const {
+    ref: endRef,
+    atBottom,
+    scrollToBottom
+  } = useStickToBottom(blocks.length, {
     key: thread.threadId,
     enabled: blocks.length > 0
   });
@@ -146,6 +150,7 @@ export function ThreadPanel({
         </button>
       </div>
 
+      <div className="relative flex min-h-0 flex-1 flex-col">
       <ScrollArea className="min-h-0 flex-1">
         <div className="flex flex-col gap-4 p-[18px]">
           {/* Parent message — the thread's root, always shown at the top.
@@ -224,6 +229,17 @@ export function ThreadPanel({
           <div ref={endRef} />
         </div>
       </ScrollArea>
+        {blocks.length > 0 && !atBottom ? (
+          <button
+            type="button"
+            onClick={scrollToBottom}
+            aria-label="Scroll to latest replies"
+            className="absolute bottom-3 left-1/2 z-10 inline-flex size-9 -translate-x-1/2 items-center justify-center rounded-full border border-border bg-background text-muted-foreground shadow-md transition-colors hover:bg-accent hover:text-foreground"
+          >
+            <ChevronDown className="size-5" />
+          </button>
+        ) : null}
+      </div>
 
       <div className="shrink-0 border-t border-border px-4 py-3.5">
         <Composer
