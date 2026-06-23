@@ -37,9 +37,10 @@ import { browserTracesDir, downloadsDir, instanceRoot } from "../paths";
 import { launchSpawnedChrome } from "./chrome-launch";
 import { generateAuxText, generateVisionAnalysis } from "../provider";
 import { resolveImageByteLimit, resolveProviderModality } from "../provider-capabilities";
-import { addAudit, assertInsideWorkspace, mutateState, readState, recordUsage } from "../state";
+import { addAudit, assertInsideWorkspace, mutateState, readState, recordUsage, storeUpload } from "../state";
+import { imageTagFor } from "../lib/upload-ref";
 import { sanitizeUrlForAuditTarget } from "../execution/browser-fill-secrets-types";
-import type { BrowserConnectionRecord, BrowserDomainPolicy, Instance, RuntimeConfig } from "../types";
+import type { BrowserConnectionRecord, BrowserDomainPolicy, ImageAttachment, Instance, RuntimeConfig } from "../types";
 
 // Per-instance Chrome profile directory. The agent persists ALL sign-ins
 // and cookies here; the directory survives runtime restarts and spawned
@@ -4657,15 +4658,12 @@ export async function browserVision(
         ? `${question}\n\nThe numbered badges overlaid on the screenshot are element refs (badge "e12" = @e12 in the page snapshot); cite them when referring to specific elements.`
         : question;
       // Route selection (see resolveVisionRoute). "native-image" means
-      // the screenshot is ALLOWED to enter the conversation directly —
-      // but every provider tool-result serializer is string-only today
-      // (translateMessagesToAnthropic JSON-stringifies tool_result
-      // parts; the chat-completions `tool` role and codex
-      // function_call_output accept no image parts), so there is no
-      // transport for an image tool result yet. Until that plumbing
-      // exists the native route degrades to the same aux side-call;
-      // the gate is evaluated and pinned by tests HERE so the
-      // transport swap is local to this branch when it lands.
+      // the screenshot is ALLOWED to enter the conversation directly. The
+      // model loop still only sees the text answer below — but the captured
+      // pixels are now ALSO stored as an upload and surfaced to the USER via
+      // the tool_result block's render-only `images` channel, so a request
+      // like "screenshot lego.com and send it to me" actually delivers the
+      // image. See ADR outbound-chat-attachments.md.
       const route = resolveVisionRoute(config);
       void route;
       const result = await generateVisionAnalysis(config, {
@@ -4687,11 +4685,30 @@ export async function browserVision(
       // partial blur (very small screenshot, tiny font, etc.).
       // secretValues was snapshotted pre-screenshot above.
       const redactedAnswer = redactSecretValuesFromString(result.text, secretValues);
+      // Store the captured PNG as an upload so the user can see it. `buf` is
+      // the SAME bytes sent to the vision model — already DOM-blurred for
+      // any [data-gini-secret] element before capture (see the screenshot
+      // block above), so redaction parity holds: a user-visible screenshot
+      // never leaks a secret the vision answer would have redacted. Storage
+      // is best-effort — a failure here must not fail the tool, since the
+      // text answer is the model-facing result and already succeeded.
+      let image: ImageAttachment | undefined;
+      try {
+        image = storeUpload(config.instance, buf, "image/png", "screenshot.png");
+      } catch {
+        image = undefined;
+      }
       return ok({
         url: session.page.url(),
         answer: redactedAnswer,
         bytes: buf.length,
         full,
+        // Ready-to-paste markdown tag the model drops into its reply WHERE it
+        // wants the screenshot shown (inline, mid-prose). The clients rewrite
+        // the `gini-image://<id>` ref to their own authed image source; a
+        // missing tag just means no inline image. See ADR
+        // outbound-chat-attachments.md.
+        ...(image ? { imageMarkdown: imageTagFor(image.id, "screenshot") } : {}),
         cost: result.cost ?? null,
         usage: result.usage ?? null
       }, taskId);

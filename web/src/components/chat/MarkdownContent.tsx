@@ -4,11 +4,26 @@ import { memo } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
+import { Paperclip } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { uploadUrl } from "@/lib/api";
+import { defaultUrlTransform } from "react-markdown";
+import { uploadIdFromRef, UPLOAD_REF_SCHEME } from "@/lib/upload-ref";
 import { EmailDraftCard } from "./EmailDraftCard";
 
 const remarkPlugins = [remarkGfm];
 const rehypePlugins = [rehypeHighlight];
+
+// react-markdown's default urlTransform sanitizes any non-safe-protocol URL
+// (anything with a colon outside the http/https/mailto/… allowlist) to empty
+// BEFORE the img/a component sees it — which would strip our gini-upload://
+// scheme. Let upload refs pass through untouched so the img/a overrides can
+// rewrite them to the BFF URL; defer to the default sanitizer for all other
+// URLs (so a foreign javascript:/data: src is still neutralized).
+function uploadAwareUrlTransform(url: string): string {
+  if (url.startsWith(UPLOAD_REF_SCHEME)) return url;
+  return defaultUrlTransform(url);
+}
 
 // Reconstruct the original fenced-block source from a hast node. rehype-highlight
 // wraps code text in <span> tokens, so we collect text descendants rather than
@@ -54,9 +69,49 @@ export function resolveDocHref(href: string | undefined, base?: string): string 
 
 function makeComponents(linkBaseUrl?: string) {
   return {
-    a: ({ href, ...props }: React.AnchorHTMLAttributes<HTMLAnchorElement>) => (
-      <a {...props} href={resolveDocHref(href, linkBaseUrl)} target="_blank" rel="noopener noreferrer" />
-    ),
+    // An agent-produced attachment is authored as a `gini-upload://<id>` ref.
+    // An image ref → an inline <img> served from the BFF (which injects the
+    // bearer). A non-upload `src` is DROPPED rather than fetched — that
+    // allowlist closes the SSRF / tracking-pixel surface that arbitrary
+    // model-authored image URLs would open. See ADR outbound-chat-attachments.md.
+    img: ({ src, alt, ...props }: React.ImgHTMLAttributes<HTMLImageElement>) => {
+      const id = uploadIdFromRef(typeof src === "string" ? src : undefined);
+      if (!id) return null;
+      return (
+        <a href={uploadUrl(id)} target="_blank" rel="noopener noreferrer" className="block">
+          <img
+            {...props}
+            src={uploadUrl(id)}
+            alt={alt ?? "attachment"}
+            className="my-1 block max-h-80 max-w-full rounded-lg border object-contain"
+          />
+        </a>
+      );
+    },
+    a: ({ href, children, ...props }: React.AnchorHTMLAttributes<HTMLAnchorElement>) => {
+      // A `gini-upload://<id>` link is a non-image attachment — render a
+      // download chip pointing at the BFF upload URL. Foreign links keep the
+      // standard doc-href resolution below.
+      const uploadId = uploadIdFromRef(href);
+      if (uploadId) {
+        return (
+          <a
+            href={uploadUrl(uploadId)}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="my-1 inline-flex items-center gap-1.5 rounded-lg border bg-background px-3 py-1.5 text-sm hover:bg-accent"
+          >
+            <Paperclip className="size-3.5 shrink-0 text-muted-foreground" />
+            <span className="font-medium text-foreground">{children ?? "attachment"}</span>
+          </a>
+        );
+      }
+      return (
+        <a {...props} href={resolveDocHref(href, linkBaseUrl)} target="_blank" rel="noopener noreferrer">
+          {children}
+        </a>
+      );
+    },
     // A ```email-draft fenced block renders as an inline draft card instead of a
     // code block. `node` is destructured out so it isn't spread onto the DOM <pre>.
     pre: ({ node, className, ...props }: React.HTMLAttributes<HTMLPreElement> & { node?: unknown }) => {
@@ -85,6 +140,7 @@ export const MarkdownContent = memo(function MarkdownContent({
       <ReactMarkdown
         remarkPlugins={remarkPlugins}
         rehypePlugins={rehypePlugins}
+        urlTransform={uploadAwareUrlTransform}
         components={makeComponents(linkBaseUrl)}
       >
         {text}

@@ -311,8 +311,12 @@ export default function ChatDetailScreen() {
     let lastJobName: string | undefined;
     for (const item of renderItems) {
       const ownJobName = itemJobName(item, runIdToJobName);
-      const jobName = ownJobName ?? (item.kind === "file_artifact" ? lastJobName : undefined);
-      lastJobName = item.kind === "file_artifact" ? lastJobName : ownJobName;
+      // A file_artifact card trails its run's tool group with no runId of its
+      // own, so it inherits the preceding run's job name rather than breaking
+      // the segment.
+      const isArtifact = item.kind === "file_artifact";
+      const jobName = ownJobName ?? (isArtifact ? lastJobName : undefined);
+      lastJobName = isArtifact ? lastJobName : ownJobName;
       const tail = segments[segments.length - 1];
       if (tail && tail.jobName === jobName) tail.items.push(item);
       else segments.push({ jobName, items: [item] });

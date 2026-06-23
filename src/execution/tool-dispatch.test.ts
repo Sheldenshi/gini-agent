@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { mutateState, createChatSession, createMcpServerRecord, createTask, readState, upsertTask } from "../state";
 import type { RuntimeConfig } from "../types";
-import { capToolResultText, dispatchToolCall, ToolDisplayError } from "./tool-dispatch";
+import { capToolResultText, dispatchToolCall, withPromoteFileAttachmentTag, ToolDisplayError } from "./tool-dispatch";
 
 const ROOT = mkdtempSync(join(tmpdir(), "gini-mcp-dispatch-"));
 process.env.GINI_STATE_ROOT = ROOT;
@@ -1661,6 +1661,51 @@ describe("capToolResultText", () => {
     expect(out.endsWith(tail)).toBe(true);
     // The middle was dropped: the full middle run can't fit under the cap.
     expect(out).not.toContain(middle);
+  });
+});
+
+describe("withPromoteFileAttachmentTag", () => {
+  const okPng = JSON.stringify({ ok: true, uploadId: "up_shot", mimeType: "image/png", size: 35106, filename: "shot.png" });
+
+  function tagOf(raw: string): string | undefined {
+    return (JSON.parse(withPromoteFileAttachmentTag("attachments", "promote-file", raw)) as { attachmentMarkdown?: string })
+      .attachmentMarkdown;
+  }
+
+  test("adds an IMAGE markdown tag for an image upload", () => {
+    expect(tagOf(okPng)).toBe("![image](gini-upload://up_shot)");
+  });
+
+  test("adds a LINK markdown tag (filename label) for a non-image upload", () => {
+    const pdf = JSON.stringify({ ok: true, uploadId: "up_pdf", mimeType: "application/pdf", size: 99, filename: "report.pdf" });
+    expect(tagOf(pdf)).toBe("[report.pdf](gini-upload://up_pdf)");
+  });
+
+  test("falls back to a generic file label when no filename is present", () => {
+    const csv = JSON.stringify({ ok: true, uploadId: "up_csv", mimeType: "text/csv", size: 9 });
+    expect(tagOf(csv)).toBe("[file](gini-upload://up_csv)");
+  });
+
+  test("leaves the result unchanged for any other skill", () => {
+    expect(withPromoteFileAttachmentTag("google", "promote-file", okPng)).toBe(okPng);
+  });
+
+  test("leaves the result unchanged for any other script", () => {
+    expect(withPromoteFileAttachmentTag("attachments", "signed-upload", okPng)).toBe(okPng);
+  });
+
+  test("leaves the result unchanged when the promote failed (ok:false)", () => {
+    const failed = JSON.stringify({ ok: false, error: "File not found" });
+    expect(withPromoteFileAttachmentTag("attachments", "promote-file", failed)).toBe(failed);
+  });
+
+  test("leaves the result unchanged when uploadId is missing", () => {
+    const noId = JSON.stringify({ ok: true, mimeType: "image/png" });
+    expect(withPromoteFileAttachmentTag("attachments", "promote-file", noId)).toBe(noId);
+  });
+
+  test("leaves the result unchanged on non-JSON input", () => {
+    expect(withPromoteFileAttachmentTag("attachments", "promote-file", "boom")).toBe("boom");
   });
 });
 

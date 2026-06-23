@@ -95,6 +95,7 @@ export {
   readUpload,
   uploadExists,
   uploadStat,
+  uploadPathFor,
   isPlausibleMime,
   sanitizeFilename
 } from "./uploads";

@@ -152,3 +152,19 @@ export function uploadStat(instance: Instance, id: string): { size: number; mime
     return null;
   }
 }
+
+// Resolve the on-disk blob path for a stored upload, or null when the upload
+// doesn't exist. Used by outbound dispatch paths (e.g. mirroring a screenshot
+// to a messaging bridge) that need the actual file path rather than the bytes.
+export function uploadPathFor(instance: Instance, id: string): string | null {
+  const dir = uploadsDir(instance);
+  const manifestPath = join(dir, `${id}.json`);
+  if (!existsSync(manifestPath)) return null;
+  try {
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as UploadManifest;
+    const blobPath = join(dir, `${id}.${extensionFor(manifest.mimeType)}`);
+    return existsSync(blobPath) ? blobPath : null;
+  } catch {
+    return null;
+  }
+}

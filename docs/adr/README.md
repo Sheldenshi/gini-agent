@@ -65,6 +65,7 @@ Each file in this directory captures one architecture decision: the context, the
 - [Provider Re-Authentication Guidance](provider-reauth-guidance.md)
 - [Voice Messages With Gateway-Side Local Speech-To-Text](voice-messages-and-local-stt.md)
 - [Chat File Attachments — Capability-Driven Delivery](chat-file-attachments.md)
+- [Outbound Chat Attachments — Agent → User Images](outbound-chat-attachments.md)
 - [Server-Side Chat Message Queue](chat-message-queue.md)
 - [One Chat Per Agent, Threads, And Job Channels](agent-chat-threads-and-channels.md)
 - [Connector-Backed Web Search](web-search-connectors.md)

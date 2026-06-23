@@ -2,6 +2,49 @@ export function print(value: unknown): void {
   console.log(JSON.stringify(value, null, 2));
 }
 
+// A chat block as the CLI cares about it for image rendering: the kinds that
+// can carry outbound image attachments. Loosely typed because the CLI consumes
+// the wire JSON, not the runtime ChatBlock type.
+interface RenderableBlock {
+  kind?: string;
+  images?: { id: string; mimeType: string; size: number }[];
+}
+
+// Block kinds that carry OUTBOUND (agent-produced) images. user_text images
+// are inbound — the user's own uploads, which they already have locally — so
+// they're excluded; this function is outbound-only by name and behavior.
+const OUTBOUND_IMAGE_KINDS = new Set(["assistant_text", "tool_result"]);
+
+// Render outbound image attachments for the CLI. A terminal can't display
+// pixels, so the honest behavior is: fetch each upload's bytes via
+// GET /api/uploads/:id and write them to a temp file, then print the saved
+// path so the user can open it. Returns the number of images saved. The
+// fetcher is injected so this stays unit-testable without a live gateway.
+export async function renderOutboundImages(
+  blocks: unknown,
+  deps: {
+    fetchUpload: (id: string) => Promise<Uint8Array>;
+    savePath: (id: string, mimeType: string) => string;
+    writeFile: (path: string, bytes: Uint8Array) => void;
+  }
+): Promise<number> {
+  if (!Array.isArray(blocks)) return 0;
+  let saved = 0;
+  for (const block of blocks as RenderableBlock[]) {
+    if (!block?.kind || !OUTBOUND_IMAGE_KINDS.has(block.kind)) continue;
+    const images = Array.isArray(block?.images) ? block.images : [];
+    for (const image of images) {
+      if (!image?.id || !image.mimeType?.startsWith("image/")) continue;
+      const bytes = await deps.fetchUpload(image.id);
+      const path = deps.savePath(image.id, image.mimeType);
+      deps.writeFile(path, bytes);
+      console.log(paint("dim", "🖼  image attachment saved:") + ` ${path}`);
+      saved += 1;
+    }
+  }
+  return saved;
+}
+
 const ANSI = {
   green: "\x1b[32m",
   yellow: "\x1b[33m",

@@ -1,7 +1,8 @@
 # ADR: Chat File Attachments — Capability-Driven Delivery
 
 - **Status:** Accepted
-- **See also:** [ChatBlock Protocol](./chat-block-protocol.md), [Attachments skill](../../skills/attachments/SKILL.md), [BFF Trust Boundary](./bff-trust-boundary.md)
+- **See also:** [ChatBlock Protocol](./chat-block-protocol.md), [Attachments skill](../../skills/attachments/SKILL.md), [BFF Trust Boundary](./bff-trust-boundary.md), [Outbound Chat Attachments](./outbound-chat-attachments.md)
+- **Scope:** This ADR covers the **inbound** direction only — files a *user* attaches and the agent consumes. The reverse (images the *agent* produces and sends to the user — browser screenshots, promoted files) is [Outbound Chat Attachments](./outbound-chat-attachments.md).
 
 ## Decision
 

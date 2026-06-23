@@ -89,6 +89,8 @@ skill_run({
 
 Path is workspace-relative and escape-protected (same guard as `file_read`).
 
+**When the user asked you to send / show them a file** (a screenshot, a chart, a generated picture, a PDF, a CSV), `promote-file` is all you need. Its result includes an `attachmentMarkdown` field — a ready-to-paste markdown tag like `![image](gini-upload://<id>)` (for images) or `[name](gini-upload://<id>)` (for other files). **Paste that tag verbatim into your reply at the spot where the attachment should appear** — it renders inline there (an image shows as a picture, any other file as a download chip), so you can place a screenshot mid-sentence, right where you're describing it. Do **not** paste the raw `uploadId` on its own — use the provided `attachmentMarkdown` tag. The bare `uploadId` is only an argument to a *follow-up* tool (`signed-upload`, `vision_query`, `materialize`), never user-facing text.
+
 ### `materialize` — Gini upload → workspace file
 
 The inverse of `promote-file`: write a Gini upload's bytes to a workspace file. Used when you need a chat-attached (or downloaded / promoted) upload on disk so `terminal_exec`, `code_exec`, or a git flow can read the actual file — e.g. committing an image to an asset branch.

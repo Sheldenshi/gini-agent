@@ -10,7 +10,8 @@
 import { mkdirSync } from "node:fs";
 import { extname, join } from "node:path";
 import type { MessagingBridgeRecord, MessagingMessageMedia, RuntimeConfig, TaskStatus } from "../types";
-import { appendLog, isTerminalTaskStatus, mutateState, now, readState } from "../state";
+import { appendLog, isTerminalTaskStatus, mutateState, now, readState, uploadPathFor, uploadStat } from "../state";
+import { UPLOAD_REF_SCHEME, uploadIdsFromText } from "../lib/upload-ref";
 import {
   authorizeTelegramChat,
   deliverVerificationCode,
@@ -438,9 +439,15 @@ async function maintainTypingAndMirrorReply(
     if (!session || !session.source || session.source.kind !== "telegram") return;
 
     let replyText: string | undefined;
+    let suppressed = false;
     try {
       const message = await syncChatTaskResult(config, session.id, taskId);
-      if (message && message.role === "assistant") replyText = message.content;
+      // A null result means the reply was suppressed — a [SILENT] sentinel
+      // (see src/jobs/silent.ts) or otherwise nothing to deliver. That silence
+      // is intentional and must extend to the image: a [SILENT] turn that also
+      // took a screenshot must NOT leak the photo to Telegram.
+      if (message === null) suppressed = true;
+      else if (message.role === "assistant") replyText = message.content;
     } catch (error) {
       appendLog(config.instance, "messaging.telegram.sync_error", {
         bridgeId,
@@ -450,20 +457,60 @@ async function maintainTypingAndMirrorReply(
       return;
     }
 
-    // Empty replies or [SILENT]-suppressed messages produce nothing to
-    // dispatch — leave the inbound record in place but stay quiet.
-    if (!replyText || replyText.trim().length === 0) return;
+    // Respect suppression for the image too — a [SILENT] turn stays fully
+    // silent on the bridge (its reply text, which would carry any attachment
+    // ref, was suppressed).
+    if (suppressed) return;
+
+    // The agent embeds any attachment it produced as a `gini-upload://<id>`
+    // markdown ref INSIDE its reply text (so it can land inline, mid-prose, in
+    // the web/app chat). Telegram can't render those refs, so: pull the upload
+    // ids out of the reply, send each image upload as its own photo, and strip
+    // the now-redundant markdown tags from the text Telegram shows. Non-image
+    // uploads are left as-is in the text for now (a future change can send them
+    // as documents). Resolve each id to its on-disk path + mime.
+    const refIds = replyText ? uploadIdsFromText(replyText) : [];
+    const photoSends: Record<string, unknown>[] = [];
+    for (const id of refIds) {
+      const meta = uploadStat(config.instance, id);
+      const path = uploadPathFor(config.instance, id);
+      if (!meta || !path || !meta.mimeType.startsWith("image/")) continue;
+      photoSends.push({ photo: { path, contentType: meta.mimeType } });
+    }
+
+    // Strip the upload-ref markdown tags from the text Telegram displays —
+    // `![alt](gini-upload://id)` / `[label](gini-upload://id)` would otherwise
+    // render as raw noise. Remove the whole tag; collapse leftover blank lines.
+    const cleanedText = (replyText ?? "")
+      .replace(new RegExp(`!?\\[[^\\]]*\\]\\(${UPLOAD_REF_SCHEME}[A-Za-z0-9_-]+\\)`, "g"), "")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+
+    // Nothing to send when the reply is empty AND there is no image to deliver.
+    const hasText = cleanedText.length > 0;
+    if (!hasText && photoSends.length === 0) return;
+
+    // Send each photo on its own, then the cleaned text as its own message —
+    // never a photo+caption (Telegram caps a caption at 1024 MarkdownV2-escaped
+    // chars and a failed photo upload would take the caption text down with it).
+    // Separate messages guarantee the text always reaches the user.
+    const sends: Record<string, unknown>[] = [...photoSends];
+    if (hasText) sends.push({ text: cleanedText });
 
     try {
       // Thread the originating taskId so the outbound row and its
       // messaging.sent audit attribute back to the owning agent rather
-      // than landing unattributed at the bridge level.
-      await sendMessagingOutput(config, bridgeId, {
-        text: replyText,
-        target: session.source.target,
-        taskId,
-        ...(replyToMessageId !== undefined ? { replyToMessageId } : {})
-      });
+      // than landing unattributed at the bridge level. replyToMessageId is
+      // only threaded onto the FIRST send so a photo+text split doesn't
+      // double-quote the user's original message.
+      for (let i = 0; i < sends.length; i++) {
+        await sendMessagingOutput(config, bridgeId, {
+          ...sends[i],
+          target: session.source.target,
+          taskId,
+          ...(i === 0 && replyToMessageId !== undefined ? { replyToMessageId } : {})
+        });
+      }
     } catch (error) {
       appendLog(config.instance, "messaging.telegram.reply_error", {
         bridgeId,

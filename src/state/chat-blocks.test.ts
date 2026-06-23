@@ -900,6 +900,42 @@ describe("chat-blocks persistence", () => {
       reauthUrl: "/settings"
     });
   });
+
+  test("user_text inbound images round-trip and rowToBlock drops malformed entries", () => {
+    const instance = "chat-blocks-usertext-images";
+    const inserted = insertChatBlock(instance, {
+      kind: "user_text",
+      sessionId: "chat_ui",
+      text: "look at these",
+      images: [{ id: "up_ok", mimeType: "image/png", size: 10 }]
+    });
+    const block = listChatBlocks(instance, "chat_ui")[0];
+    if (block?.kind !== "user_text") throw new Error("expected a user_text block");
+    expect(block.images).toEqual([{ id: "up_ok", mimeType: "image/png", size: 10 }]);
+
+    // A hand-edited payload with one valid entry, one empty-id, one non-object:
+    // only the valid entry survives.
+    getMemoryDb(instance).run("UPDATE chat_blocks SET payload_json = ? WHERE id = ?", [
+      JSON.stringify({
+        text: "look at these",
+        images: [{ id: "", mimeType: "image/png", size: 1 }, "nope", { id: "up_keep", mimeType: "image/jpeg", size: 5 }]
+      }),
+      inserted.id
+    ]);
+    const edited = listChatBlocks(instance, "chat_ui")[0];
+    if (edited?.kind !== "user_text") throw new Error("expected a user_text block");
+    expect(edited.images).toEqual([{ id: "up_keep", mimeType: "image/jpeg", size: 5 }]);
+
+    // An all-bad array yields no images field at all.
+    getMemoryDb(instance).run("UPDATE chat_blocks SET payload_json = ? WHERE id = ?", [
+      JSON.stringify({ text: "x", images: [{ id: "" }, 7] }),
+      inserted.id
+    ]);
+    const edited2 = listChatBlocks(instance, "chat_ui")[0];
+    if (edited2?.kind !== "user_text") throw new Error("expected a user_text block");
+    expect(edited2.images).toBeUndefined();
+  });
+
 });
 
 describe("chat-blocks threading", () => {

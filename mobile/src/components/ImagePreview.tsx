@@ -2,12 +2,14 @@ import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useMemo,
   useState,
   type ReactNode
 } from "react";
 import {
   Image,
+  Platform,
   Pressable,
   StyleSheet,
   Text,
@@ -94,6 +96,36 @@ function FullScreenImagePreview({
   const translateX = useSharedValue(0);
   const translateY = useSharedValue(0);
 
+  // On web, RN Web renders <Image> as an <img> that can't send the bearer
+  // header, so the source's `headers` are ignored and the upload 401s. Fetch
+  // the bytes with the header and swap to a blob: URL (no secret in any URL).
+  // Native honors source headers directly, so this is web-only. Mirrors
+  // AuthedImage; see ADR outbound-chat-attachments.md.
+  const [webBlobUri, setWebBlobUri] = useState<string | null>(null);
+  useEffect(() => {
+    if (Platform.OS !== "web" || !source.headers) return;
+    let cancelled = false;
+    let objectUrl: string | null = null;
+    (async () => {
+      try {
+        const res = await fetch(source.uri, { headers: source.headers });
+        if (!res.ok) return;
+        const blob = await res.blob();
+        if (cancelled) return;
+        objectUrl = URL.createObjectURL(blob);
+        setWebBlobUri(objectUrl);
+      } catch {
+        // Best-effort — leave the native/header source in place on failure.
+      }
+    })();
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [source.uri, source.headers]);
+
+  const imageSource = Platform.OS === "web" && webBlobUri ? { uri: webBlobUri } : source;
+
   const close = useCallback(() => onClose(), [onClose]);
 
   // Pan drives the dismiss: the photo tracks the finger, and onEnd either
@@ -173,7 +205,7 @@ function FullScreenImagePreview({
       <GestureDetector gesture={gesture}>
         <Animated.View style={[StyleSheet.absoluteFill, styles.center, imageStyle]}>
           <Image
-            source={source}
+            source={imageSource}
             style={{ width, height }}
             resizeMode="contain"
             accessibilityLabel="Full screen image"

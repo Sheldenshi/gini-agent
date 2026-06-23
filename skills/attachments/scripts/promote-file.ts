@@ -4,7 +4,7 @@
 // Contract:
 //   stdin:  JSON { path, mimeType? }
 //   env:    GINI_WORKSPACE, GINI_UPLOADS_DIR
-//   stdout: JSON { ok, uploadId?, mimeType?, size?, error? }
+//   stdout: JSON { ok, uploadId?, mimeType?, size?, filename?, error? }
 //   exit:   0 on success, 1 on hard failure
 //
 // Register a workspace-relative file as a Gini upload. Closes the
@@ -26,6 +26,7 @@ interface Result {
   uploadId?: string;
   mimeType?: string;
   size?: number;
+  filename?: string;
   error?: string;
 }
 
@@ -159,7 +160,7 @@ async function main(): Promise<void> {
   };
   writeFileSync(join(uploadsDir, `${id}.json`), JSON.stringify(manifest));
 
-  emit({ ok: true, uploadId: id, mimeType, size: bytes.length });
+  emit({ ok: true, uploadId: id, mimeType, size: bytes.length, filename });
 }
 
 main().catch((error) => {

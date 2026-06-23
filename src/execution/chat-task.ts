@@ -2762,6 +2762,10 @@ async function runLoop(
           if (inFlightAssistantBlockId) {
             deleteAssistantTextBlock(emitCtx, inFlightAssistantBlockId);
           }
+          // Any attachment the turn produced is referenced by a markdown tag
+          // INSIDE this assistant_text — deleting the block above drops the
+          // ref with it, so a [SILENT] turn leaves nothing for the clients to
+          // render. No separate image retraction needed.
         } else if (inFlightAssistantBlockId) {
           finalizeAssistantText(emitCtx, inFlightAssistantBlockId, finalText || "(no content)");
         } else if (finalText) {
@@ -3261,7 +3265,10 @@ async function runLoop(
         if (dispatch.kind === "sync") {
           recordToolResult(call.id, dispatch.result);
           // Flip the tool_call row to `ok` and append a tool_result
-          // block carrying a truncated preview of the dispatch result.
+          // block carrying a truncated preview of the dispatch result. An
+          // agent-produced attachment reaches the user via a markdown ref the
+          // model pastes into its reply (see ADR outbound-chat-attachments.md),
+          // so the tool_result block itself stays text-only.
           emitToolCallStatus(emitCtx, { callId: call.id, status: "ok" });
           emitToolResult(emitCtx, { callId: call.id, result: dispatch.result });
           // Mirror onto the legacy Task.recentToolCalls display payload so

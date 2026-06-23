@@ -23,6 +23,7 @@ import type {
   AuthorizationAction,
   ChatBlock,
   ChatBlockKind,
+  ImageAttachment,
   Instance,
   ProviderName,
   RiskLevel,
@@ -91,6 +92,24 @@ interface ChatBlockRow {
   updated_at: string;
 }
 
+// Parse an array of image attachments off a block payload, dropping any
+// entry without a usable id. A hand-edited or truncated row must never
+// yield a half-formed attachment that a client would try to fetch. Shared
+// by user_text (inbound), assistant_text, and tool_result (outbound) so
+// the validation rules stay identical in every direction.
+function parseImagesPayload(raw: unknown): ImageAttachment[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const images = raw
+    .filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null)
+    .map((item) => ({
+      id: String(item.id ?? ""),
+      mimeType: String(item.mimeType ?? ""),
+      size: Number(item.size ?? 0)
+    }))
+    .filter((image) => image.id.length > 0);
+  return images.length > 0 ? images : undefined;
+}
+
 // Parse the optional voice attachment off a user_text payload, guarding
 // types the same way the inline-image parse does (a hand-edited or
 // truncated row must not yield a half-formed attachment).
@@ -133,22 +152,13 @@ function rowToBlock(row: ChatBlockRow): ChatBlock {
   };
   switch (row.kind) {
     case "user_text": {
-      const images = Array.isArray(payload.images)
-        ? payload.images
-            .filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null)
-            .map((item) => ({
-              id: String(item.id ?? ""),
-              mimeType: String(item.mimeType ?? ""),
-              size: Number(item.size ?? 0)
-            }))
-            .filter((image) => image.id.length > 0)
-        : undefined;
+      const images = parseImagesPayload(payload.images);
       const audio = parseAudioPayload(payload.audio);
       return {
         ...base,
         kind: "user_text",
         text: String(payload.text ?? ""),
-        ...(images && images.length > 0 ? { images } : {}),
+        ...(images ? { images } : {}),
         ...(audio ? { audio } : {})
       };
     }

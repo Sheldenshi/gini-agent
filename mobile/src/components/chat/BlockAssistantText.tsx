@@ -7,10 +7,14 @@ import {
   type ReactElement,
   type ReactNode
 } from "react";
-import { Animated, Easing, StyleSheet, Text, View } from "react-native";
+import { Animated, Easing, Pressable, StyleSheet, Text, View } from "react-native";
 import Markdown, { MarkdownIt } from "react-native-markdown-display";
 import { family, theme } from "@/src/theme";
 import type { AssistantTextBlock } from "@/src/types";
+import { authHeader, uploadUrl } from "@/src/api";
+import { uploadIdFromRef } from "@/src/upload-ref";
+import { AuthedImage } from "./AuthedImage";
+import { useImagePreview } from "@/src/components/ImagePreview";
 import {
   handleMarkdownLinkPress,
   isWebUrl,
@@ -23,7 +27,7 @@ type MarkdownNode = {
   key: string;
   type?: string;
   content: string;
-  attributes?: { href?: string };
+  attributes?: { href?: string; src?: string; alt?: string };
   children?: MarkdownNode[];
 };
 type MarkdownStylesMap = Record<string, object>;
@@ -192,6 +196,41 @@ function nonSelectable(children: ReactNode): ReactNode {
   });
 }
 
+// An inline agent image rendered from a `gini-upload://<id>` markdown ref.
+// Tapping opens the full-screen preview. Split into its own component so it can
+// use the useImagePreview hook (the markdown rules are a module-level constant,
+// not a component, so the hook can't live there directly).
+function MarkdownUploadImage({ uploadId }: { uploadId: string }) {
+  const { open } = useImagePreview();
+  const uri = uploadUrl(uploadId);
+  const headers = authHeader();
+  return (
+    <Pressable
+      style={uploadImageStyles.wrapper}
+      onPress={() => open({ uri, headers })}
+      accessibilityRole="button"
+      accessibilityLabel="Open image"
+    >
+      <AuthedImage uploadId={uploadId} style={uploadImageStyles.image} resizeMode="cover" />
+    </Pressable>
+  );
+}
+
+const uploadImageStyles = StyleSheet.create({
+  wrapper: {
+    marginVertical: 6,
+    borderRadius: 10,
+    overflow: "hidden",
+    borderWidth: 1,
+    borderColor: theme.border,
+    alignSelf: "flex-start"
+  },
+  image: {
+    width: 240,
+    height: 170
+  }
+});
+
 // Inline rules (text/textgroup/link/strong/em/s/inline) need their own
 // `selectable` because react-native-markdown-display emits <Text>
 // wrappers per rule and the defaults omit the prop — without these
@@ -237,6 +276,21 @@ export const markdownRules: Record<string, RenderRule> = {
   ),
   link: (node, children, _parent, styles) => {
     const href = node.attributes?.href;
+    // A `gini-upload://<id>` link is a non-image attachment — tapping it opens
+    // the upload (image preview) rather than a web browser. Render it as an
+    // interactive chip-style link.
+    const uploadId = uploadIdFromRef(href);
+    if (uploadId) {
+      return (
+        <Text
+          key={node.key}
+          style={styles.link}
+          onPress={() => openLink(uploadUrl(uploadId))}
+        >
+          {nonSelectable(children)}
+        </Text>
+      );
+    }
     // Only http(s) links are interactive. Tap opens the in-app browser;
     // long-press raises the link context menu at the touch point. The link
     // is intentionally not `selectable` so a long-press shows the menu
@@ -257,6 +311,18 @@ export const markdownRules: Record<string, RenderRule> = {
       </Text>
     );
   },
+  // An agent-produced image is authored as a `gini-upload://<id>` markdown
+  // image ref. Override the default image rule (which renders a header-less
+  // FitImage that 401s against the gateway) to render AuthedImage instead —
+  // it carries the bearer on native and fetches a blob on web. A non-upload
+  // src is DROPPED (returns null) rather than fetched: that allowlist closes
+  // the SSRF / tracking-pixel surface. The image rule has a special signature
+  // (extra allowedImageHandlers / defaultImageHandler args), so it's cast.
+  image: ((node: MarkdownNode) => {
+    const id = uploadIdFromRef(node.attributes?.src);
+    if (!id) return null;
+    return <MarkdownUploadImage key={node.key} uploadId={id} />;
+  }) as RenderRule,
   // Code blocks render as `SelectableBlockText` so iOS gets the loupe
   // and drag handles on multi-line snippets. The library's defaults
   // emit a single `<Text>` here, which on iOS would otherwise collapse

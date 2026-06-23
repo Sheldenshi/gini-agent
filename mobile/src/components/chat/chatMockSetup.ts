@@ -102,6 +102,27 @@ mock.module("expo-web-browser", () => ({ openBrowserAsync }));
 mock.module("expo-clipboard", () => ({ setStringAsync }));
 mock.module("@expo/vector-icons", () => ({ Feather: Stub }));
 
+// AuthedImage and ImagePreview pull in native modules (reanimated / gesture-
+// handler) at import time; BlockAssistantText/BlockUserText now import them for
+// inline upload images. Stub both so the component tests don't drag the native
+// graph in. (The markdown lib is mocked to render null above, so the image
+// rule that uses these never actually executes here.)
+mock.module("@/src/components/chat/AuthedImage", () => ({ AuthedImage: Stub }));
+mock.module("@/src/components/ImagePreview", () => ({
+  useImagePreview: () => ({ open: () => {} })
+}));
+mock.module("@/src/upload-ref", () => ({
+  UPLOAD_REF_SCHEME: "gini-upload://",
+  uploadIdFromRef: (ref?: string | null) =>
+    ref && ref.startsWith("gini-upload://") ? ref.slice("gini-upload://".length) : null
+}));
+// @/src/api pulls in expo-file-system at import; the chat components only need
+// uploadUrl/authHeader for inline upload images.
+mock.module("@/src/api", () => ({
+  uploadUrl: (id: string) => `http://gw.local/api/uploads/${id}`,
+  authHeader: () => ({ Authorization: "Bearer t" })
+}));
+
 mock.module("@/src/theme", () => ({
   theme: {
     bg: "#FFFFFF",

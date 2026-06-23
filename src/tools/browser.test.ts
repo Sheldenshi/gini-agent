@@ -3650,6 +3650,7 @@ describe("browserVision", () => {
       bytes?: number;
       url?: string;
       full?: boolean;
+      imageMarkdown?: string;
     };
     expect(parsed.success).toBe(true);
     expect(parsed.answer).toContain("login form");
@@ -3657,6 +3658,38 @@ describe("browserVision", () => {
     expect(parsed.url).toBe("https://example.com/dashboard");
     expect(parsed.full).toBe(false);
     expect(screenshotCalls).toBe(1);
+    // The captured PNG is stored as an upload and surfaced as a ready-to-paste
+    // markdown tag the model drops inline into its reply. The bytes are the
+    // same ones sent to the vision model (already secret-blurred).
+    expect(parsed.imageMarkdown).toBeDefined();
+    expect(parsed.imageMarkdown).toMatch(/^!\[screenshot\]\(gini-upload:\/\/[A-Za-z0-9._-]+\)$/);
+  });
+
+  test("still succeeds (text answer, no image) when storing the screenshot upload throws", async () => {
+    // An empty buffer slips past the byte-cap check (0 is not over the cap)
+    // and makes storeUpload throw "Upload is empty." The tool must still
+    // succeed on the text answer — image storage is best-effort — and the
+    // envelope must simply omit the `image` field. Exercises the catch path.
+    const fakePage = {
+      screenshot: async () => Buffer.alloc(0),
+      url: () => "https://example.com/empty"
+    };
+    browserTest.installFakeSessionWithPageForTest("vision-emptybuf", fakePage);
+    setEchoVisionResponse({ text: "Blank page." });
+    const config: RuntimeConfig = {
+      instance: "test",
+      port: 7337,
+      token: "test",
+      provider: { name: "echo", model: "gini-echo-v0" },
+      workspaceRoot: "/tmp",
+      stateRoot: "/tmp/gini-vision-test",
+      logRoot: "/tmp/gini-vision-test-logs"
+    };
+    const raw = await browserVision("vision-emptybuf", { question: "what?" }, config);
+    const parsed = JSON.parse(raw) as { success: boolean; answer?: string; imageMarkdown?: unknown };
+    expect(parsed.success).toBe(true);
+    expect(parsed.answer).toContain("Blank page.");
+    expect(parsed.imageMarkdown).toBeUndefined();
   });
 
   test("fails fast when the screenshot exceeds the base64-aware byte cap", async () => {

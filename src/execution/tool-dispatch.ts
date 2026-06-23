@@ -58,6 +58,7 @@ import {
 import { resolveEffectiveContext } from "./effective-context";
 import { importTableFromFile } from "../data/import-table";
 import { dbExecute, dbListTables, dbQuery } from "../state";
+import { uploadTagFor } from "../lib/upload-ref";
 import { resolveEmitContext, setToolCallRunningHint } from "./chat-task-emit";
 import { searchSessions } from "./search";
 import { installSkillFromBody, setSkillStatus } from "../capabilities/skills";
@@ -98,6 +99,11 @@ import {
 import { parseFillSecretSlots, sanitizeUrlForAuditTarget } from "./browser-fill-secrets-types";
 
 export type DispatchResult =
+  // `result` is the text the model sees. An agent-produced image (e.g. a
+  // browser screenshot) reaches the user by a ready-to-paste markdown tag
+  // embedded IN `result` (`gini-image://<id>`) that the model drops into its
+  // reply where the picture belongs — there is no separate image channel. See
+  // ADR outbound-chat-attachments.md.
   | { kind: "sync"; result: string }
   | { kind: "pending"; approvalId: string };
 
@@ -345,6 +351,9 @@ async function dispatchToolCallInner(
       // addCostToTask. Failures here are best-effort; the tool result
       // already flows back to the model.
       await accumulateBrowserVisionCost(config, taskId, result);
+      // browserVision's result already carries `imageMarkdown` (the ready-to-
+      // paste tag) in its envelope, so the model can drop the screenshot into
+      // its reply inline. Nothing to lift here.
       return { kind: "sync", result };
     }
     case "browser_upload_file":
@@ -1238,7 +1247,46 @@ async function skillRunDispatch(
     }
     return { kind: "pending", approvalId };
   }
-  return { kind: "sync", result: await skillRunTool(config, taskId, args) };
+  const result = await skillRunTool(config, taskId, args);
+  // attachments/promote-file lifts a workspace file into the upload space and
+  // returns { ok, uploadId, mimeType, size, filename }. For ANY successful
+  // promote, augment the model-facing result with a ready-to-paste markdown
+  // tag (`attachmentMarkdown`) the model drops into its reply WHERE the
+  // attachment belongs (inline, mid-prose). An image yields an image tag
+  // (renders as a picture); any other file yields a link tag (renders a
+  // download chip). This is the path the agent reaches for to "send" a file —
+  // a screenshot from terminal_exec, a generated PDF/CSV, a log. See ADR
+  // outbound-chat-attachments.md.
+  return { kind: "sync", result: withPromoteFileAttachmentTag(skillName, scriptName, result) };
+}
+
+// Given an attachments/promote-file result, return it augmented with an
+// `attachmentMarkdown` field (the ready-to-paste tag) for any successful
+// promote, choosing image-vs-link syntax by mime. Returns the result unchanged
+// for any other skill/script, a failed promote, or a malformed envelope. The
+// tag embeds the canonical `gini-upload://<id>` ref the clients rewrite to
+// their authed source.
+export function withPromoteFileAttachmentTag(
+  skillName: string,
+  scriptName: string,
+  rawResult: string
+): string {
+  if (skillName !== "attachments" || scriptName !== "promote-file") return rawResult;
+  let parsed: { ok?: unknown; uploadId?: unknown; mimeType?: unknown; filename?: unknown };
+  try {
+    parsed = JSON.parse(rawResult) as typeof parsed;
+  } catch {
+    return rawResult;
+  }
+  if (parsed.ok !== true) return rawResult;
+  const id = String(parsed.uploadId ?? "");
+  if (id.length === 0) return rawResult;
+  const tag = uploadTagFor(id, {
+    mimeType: String(parsed.mimeType ?? ""),
+    filename: typeof parsed.filename === "string" ? parsed.filename : undefined
+  });
+  // Re-serialize with the tag added so the model sees a single JSON object.
+  return JSON.stringify({ ...(parsed as Record<string, unknown>), attachmentMarkdown: tag });
 }
 
 // Mint the skill.run approval row. Mirrors requestTerminalExec: the

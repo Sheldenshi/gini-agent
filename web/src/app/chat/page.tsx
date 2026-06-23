@@ -313,18 +313,20 @@ function ChatSurface({
     return map;
   }, [chatRuns.data, allJobs.data]);
 
-  // Segment the render items into consecutive runs sharing one job name (a
-  // file_artifact card inherits the preceding item's name since it trails its
-  // run's tool group). Each segment with a jobName renders inside one bordered
-  // container with a single "from <job name>" header; segments without one
-  // render exactly as before. Grouping happens here, not in groupExchanges.
+  // Segment the render items into consecutive runs sharing one job name. A
+  // file_artifact card trails its run's tool group with no runId of its own,
+  // so it inherits the preceding run's name rather than breaking the segment.
+  // Each segment with a jobName renders inside one bordered container with a
+  // single "from <job name>" header; segments without one render exactly as
+  // before. Grouping happens here, not in groupExchanges.
   const itemSegments = useMemo(() => {
     const segments: { jobName?: string; items: ChatRenderItem[] }[] = [];
     let lastJobName: string | undefined;
     for (const item of renderItems) {
       const ownJobName = itemJobName(item, runIdToJobName);
-      const jobName = ownJobName ?? (item.kind === "file_artifact" ? lastJobName : undefined);
-      lastJobName = item.kind === "file_artifact" ? lastJobName : ownJobName;
+      const isArtifact = item.kind === "file_artifact";
+      const jobName = ownJobName ?? (isArtifact ? lastJobName : undefined);
+      lastJobName = isArtifact ? lastJobName : ownJobName;
       const tail = segments[segments.length - 1];
       if (tail && tail.jobName === jobName) tail.items.push(item);
       else segments.push({ jobName, items: [item] });

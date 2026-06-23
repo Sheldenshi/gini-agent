@@ -95,4 +95,32 @@ describe("MarkdownContent", () => {
     rerender(<MarkdownContent text="hi" />);
     expect(container.querySelector(".streaming-cursor")).toBeNull();
   });
+
+  test("an inline gini-upload image ref renders an <img> served from the BFF upload URL", () => {
+    const { container } = render(
+      <MarkdownContent text="Here's the shot: ![screenshot](gini-upload://up_abc123)" />
+    );
+    const img = container.querySelector("img");
+    expect(img).not.toBeNull();
+    expect(img?.getAttribute("src")).toBe("/api/runtime/uploads/up_abc123");
+  });
+
+  test("a foreign image URL is DROPPED, not rendered (SSRF / tracking-pixel guard)", () => {
+    const { container } = render(
+      <MarkdownContent text="![x](https://evil.example/pixel.gif)" />
+    );
+    expect(container.querySelector("img")).toBeNull();
+  });
+
+  test("a gini-upload link ref renders a download chip pointing at the BFF upload URL", () => {
+    render(<MarkdownContent text="[report.pdf](gini-upload://up_pdf99)" />);
+    const link = screen.getByText("report.pdf").closest("a");
+    expect(link?.getAttribute("href")).toBe("/api/runtime/uploads/up_pdf99");
+  });
+
+  test("a normal external link still renders untouched", () => {
+    render(<MarkdownContent text="see [the docs](https://example.com/docs)" />);
+    const link = screen.getByText("the docs").closest("a");
+    expect(link?.getAttribute("href")).toBe("https://example.com/docs");
+  });
 });

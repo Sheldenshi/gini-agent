@@ -108,6 +108,14 @@ remote previews, screen readers) would need the same translation code.
   that block on an external event the agent cannot drive (today only
   `wait_for_messaging_pair`, waiting on an inbound Telegram DM up to
   600s) and is cleared automatically when status leaves `running`.
+  Both `AssistantTextBlock` and `ToolResultBlock` also carry an optional
+  `images?: ImageAttachment[]` — the OUTBOUND (agent → user) media
+  channel, symmetric with `UserTextBlock.images` on the inbound side.
+  Bytes live under `uploads/<id>.<ext>` and clients fetch them via
+  `GET /api/uploads/:id`; the block carries only `{ id, mimeType, size }`.
+  This is render-only — image bytes do NOT re-enter the model loop (the
+  tool's text result already does). A browser screenshot or a
+  promoted-file upload lands here. See ADR outbound-chat-attachments.md.
 
 - Persistence in `src/state/chat-blocks.ts`. SQLite is the source of
   truth, not the JSON `RuntimeState` blob. `ordinal` is allocated as
