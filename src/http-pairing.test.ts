@@ -654,7 +654,9 @@ describe("relay session gate (web-bound branch)", () => {
     const cookie = res.headers.getSetCookie().find((c) => c.startsWith("__Host-gini_session="));
     expect(cookie).toBeDefined();
     expect(setCookieValue(res, "__Host-gini_session")).toBe(session);
-    expect(cookie).toContain("Max-Age=");
+    // Exactly the 400-day cap (34560000s) — a shorter slide would still expire an
+    // active session, and a longer one is clamped by the browser anyway.
+    expect(cookie).toContain("Max-Age=34560000");
     expect(cookie).toContain("HttpOnly");
     expect(cookie).toContain("Secure");
     expect(cookie).toContain("Path=/");
@@ -680,9 +682,12 @@ describe("relay session gate (web-bound branch)", () => {
     // slides past it, and a later re-pair mints a fresh id that fails to supersede.
     expect(setCookieValue(res, "__Host-gini_client")).toBe(clientId);
     const cookie = res.headers.getSetCookie().find((c) => c.startsWith("__Host-gini_client="));
-    expect(cookie).toContain("Max-Age=");
+    // Same 400-day cap as the session, so the two slide in lockstep and the
+    // client id never lapses behind a slid session.
+    expect(cookie).toContain("Max-Age=34560000");
     expect(cookie).toContain("HttpOnly");
     expect(cookie).toContain("Secure");
+    expect(cookie).not.toContain("Domain=");
   });
 
   test("a document navigation without a gini_client cookie does NOT mint one (no write-only garbage)", async () => {
@@ -942,6 +947,11 @@ describe("pairing routes — per-browser client identity (gini_client)", () => {
     expect(cookie).toContain("Secure");
     expect(cookie).toContain("Path=/");
     expect(cookie).toContain("SameSite=Lax");
+    // Host-only is the anti-tossing property: a Domain attribute would let a
+    // sibling relay subdomain set/override this cookie on the shared parent.
+    expect(cookie).not.toContain("Domain=");
+    // 400-day cap (RFC 6265bis): 400 * 24 * 60 * 60 = 34560000 seconds.
+    expect(cookie).toContain("Max-Age=34560000");
     // A fresh request with no inbound gini_client mints a non-empty id.
     expect(setCookieValue(res, "__Host-gini_client")).toBeTruthy();
   });
