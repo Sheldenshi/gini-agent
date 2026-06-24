@@ -6605,6 +6605,26 @@ describe("GET /api/files", () => {
     expect(res.status).toBe(401);
   });
 
+  test("a caller-supplied ?ttl= is honored and clamped to the [30,600]s ceiling", async () => {
+    const config = testConfig("uploads-sign-ttl");
+    const handler = createHandler(config);
+    const ref = storeUpload(config.instance, new Uint8Array([0x25, 0x50, 0x44, 0x46]), "application/pdf", "x.pdf");
+
+    // An in-range ttl rides through unchanged; an over-max one clamps to 600.
+    // The exp the mint returns is now + clampedTtl, so assert exp lands within a
+    // small window of that target (a couple seconds for clock drift across the call).
+    const now = Math.floor(Date.now() / 1000);
+    const inRange = await rawCall(handler, config, `/api/uploads/${ref.id}/sign?ttl=120`, { method: "POST" }, config.token);
+    expect(inRange.status).toBe(200);
+    expect((await inRange.json()).exp - now).toBeLessThanOrEqual(122);
+
+    const clamped = await rawCall(handler, config, `/api/uploads/${ref.id}/sign?ttl=99999`, { method: "POST" }, config.token);
+    expect(clamped.status).toBe(200);
+    const clampedExp = (await clamped.json()).exp - Math.floor(Date.now() / 1000);
+    expect(clampedExp).toBeGreaterThan(595);
+    expect(clampedExp).toBeLessThanOrEqual(600);
+  });
+
   test("a signed HEAD is also authorized (in-app browser preflight)", async () => {
     const config = testConfig("uploads-sign-head");
     const handler = createHandler(config);
