@@ -589,7 +589,7 @@ export function AddConnectorDialog({
                   data-form-type="other"
                   className={field.secret ? "font-mono" : undefined}
                 />
-                {field.description && !selectedProvider?.docsUrl ? (
+                {field.description ? (
                   <p className="text-[11px] text-muted-foreground">{field.description}</p>
                 ) : null}
               </div>
