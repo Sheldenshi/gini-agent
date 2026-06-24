@@ -44,6 +44,7 @@ export async function provider(ctx: CliContext): Promise<void> {
       name !== "openai" &&
       name !== "codex" &&
       name !== "openrouter" &&
+      name !== "requesty" &&
       name !== "local" &&
       name !== "deepseek" &&
       name !== "anthropic" &&
@@ -169,7 +170,7 @@ export async function provider(ctx: CliContext): Promise<void> {
 
     config.provider = normalizeProvider({
       name,
-      model: model ?? (name === "echo" ? "gini-echo-v0" : name === "codex" ? "gpt-5.5" : name === "openrouter" ? "openrouter/auto" : name === "local" ? "local/default" : name === "deepseek" ? "deepseek-v4-flash" : name === "anthropic" ? "claude-opus-4-8" : name === "bedrock" ? "us.anthropic.claude-opus-4-8" : name === "azure" ? "gpt-5.5" : "gpt-5.4-mini"),
+      model: model ?? (name === "echo" ? "gini-echo-v0" : name === "codex" ? "gpt-5.5" : name === "openrouter" ? "openrouter/auto" : name === "requesty" ? "openai/gpt-4o-mini" : name === "local" ? "local/default" : name === "deepseek" ? "deepseek-v4-flash" : name === "anthropic" ? "claude-opus-4-8" : name === "bedrock" ? "us.anthropic.claude-opus-4-8" : name === "azure" ? "gpt-5.5" : "gpt-5.4-mini"),
       ...(baseUrl ? { baseUrl } : {}),
       ...(apiKeyEnv ? { apiKeyEnv } : {}),
       ...(extraBody ? { extraBody } : {}),

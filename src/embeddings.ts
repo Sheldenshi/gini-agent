@@ -378,7 +378,7 @@ async function embedOpenAIBatch(config: RuntimeConfig, texts: string[]): Promise
 // the request and leak the chat key to that host (e.g. the Anthropic key to
 // api.anthropic.com/embeddings). Those fall back to the canonical OpenAI
 // endpoint + OPENAI_API_KEY instead.
-const OPENAI_EMBEDDING_COMPATIBLE = new Set(["openai", "openrouter", "deepseek", "local"]);
+const OPENAI_EMBEDDING_COMPATIBLE = new Set(["openai", "openrouter", "requesty", "deepseek", "local"]);
 
 function openAIEmbeddingBaseUrl(config: RuntimeConfig): string {
   const reuse = OPENAI_EMBEDDING_COMPATIBLE.has(config.provider.name) && config.provider.baseUrl;

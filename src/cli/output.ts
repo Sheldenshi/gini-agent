@@ -112,16 +112,16 @@ Usage:
   bun run gini notifications list|queue|send|ack
   bun run gini promotions list|propose|approve|reject
   bun run gini snapshots list|create|restore
-  bun run gini provider show|catalog|set echo|openai|codex|openrouter|local|deepseek|azure [model]
+  bun run gini provider show|catalog|set echo|openai|codex|openrouter|requesty|local|deepseek|azure [model]
                   [--base-url <url>] [--api-key-env <NAME>] [--extra-body <JSON>]
                   [--api-version <V>] [--deployment <NAME>] [--auth-scheme bearer|api-key]
                   --base-url and --api-key-env work for every OpenAI-compatible
-                  provider (local / openai / openrouter / deepseek / azure —
+                  provider (local / openai / openrouter / requesty / deepseek / azure —
                   point at servers like oMLX, vLLM, LM Studio) AND for codex
                   (override the backend URL or auth-file env var). --extra-body
                   forwards server-specific request fields like
                   \`chat_template_kwargs\` and applies to the chat-completions
-                  calls of local / openai / openrouter / deepseek / azure;
+                  calls of local / openai / openrouter / requesty / deepseek / azure;
                   codex (/responses) and echo ignore it. --api-version,
                   --deployment, and --auth-scheme configure the azure provider
                   (Azure OpenAI): set --base-url to https://<resource>.openai.azure.com;

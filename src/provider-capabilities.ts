@@ -135,6 +135,10 @@ export function resolveProviderContextWindowTokens(provider: ProviderConfig): nu
       return Math.min(CODEX_BACKEND_CONTEXT_WINDOW_TOKENS, openaiContextWindowTokens(model));
     case "openrouter":
       return openrouterContextWindowTokens(model);
+    case "requesty":
+      // Requesty uses the same <vendor>/<model> slug scheme as OpenRouter,
+      // so the per-vendor context-window lookup applies unchanged.
+      return openrouterContextWindowTokens(model);
     case "deepseek":
       return deepseekContextWindowTokens(model);
     case "anthropic":
@@ -186,6 +190,9 @@ export function resolveProviderModality(provider: ProviderConfig): ProviderModal
         ? { vision: true, nativeDocs: false }
         : { vision: false, nativeDocs: false };
     case "openrouter":
+      return openrouterModality(model);
+    case "requesty":
+      // Same <vendor>/<model> slug scheme as OpenRouter; reuse its modality map.
       return openrouterModality(model);
     case "deepseek":
       // Confirmed text-only API — no image/file content part.

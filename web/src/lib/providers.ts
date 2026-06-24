@@ -63,6 +63,7 @@ export function providerBrandLabel(name: string): string {
     codex: "Codex",
     openai: "OpenAI",
     openrouter: "OpenRouter",
+    requesty: "Requesty",
     deepseek: "DeepSeek",
     anthropic: "Anthropic",
     bedrock: "Amazon Bedrock",

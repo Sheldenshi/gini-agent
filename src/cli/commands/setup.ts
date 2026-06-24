@@ -123,7 +123,7 @@ export interface ProviderExtraConfig {
 }
 
 export interface ProviderModule {
-  id: "openai" | "codex" | "anthropic" | "bedrock" | "azure" | "openrouter" | "deepseek" | "local";
+  id: "openai" | "codex" | "anthropic" | "bedrock" | "azure" | "openrouter" | "requesty" | "deepseek" | "local";
   kind: ProviderKind;
   label: string;
   description: string;
@@ -229,6 +229,16 @@ const openrouterProvider: ProviderModule = apiKeyProvider({
   defaultModel: "openrouter/auto",
   suggestedModels: ["openrouter/auto"],
   keyHint: "sk-or-"
+});
+
+const requestyProvider: ProviderModule = apiKeyProvider({
+  id: "requesty",
+  label: "Requesty",
+  description: "Multi-model router — rqsty-sk-...",
+  apiKeyEnv: "REQUESTY_API_KEY",
+  defaultModel: "openai/gpt-4o-mini",
+  suggestedModels: ["openai/gpt-4o-mini", "openai/gpt-4o", "anthropic/claude-opus-4-8"],
+  keyHint: "rqsty-sk-"
 });
 
 const deepseekProvider: ProviderModule = apiKeyProvider({
@@ -460,6 +470,7 @@ const PROVIDERS: ProviderModule[] = [
   bedrockProvider,
   azureProvider,
   openrouterProvider,
+  requestyProvider,
   deepseekProvider,
   localProvider
 ];
@@ -528,6 +539,7 @@ const AUTO_CONFIGURABLE: ProviderModule[] = [
   openaiProvider,
   anthropicProvider,
   openrouterProvider,
+  requestyProvider,
   deepseekProvider,
   bedrockProvider
 ];
@@ -722,6 +734,7 @@ export const __testing = {
   bedrockProvider,
   azureProvider,
   openrouterProvider,
+  requestyProvider,
   deepseekProvider,
   localProvider,
   PROVIDERS,

@@ -136,6 +136,7 @@ export function providerHealth(config: RuntimeConfig) {
 const PROVIDER_API_KEY_ENV: Record<string, string> = {
   openai: "OPENAI_API_KEY",
   openrouter: "OPENROUTER_API_KEY",
+  requesty: "REQUESTY_API_KEY",
   deepseek: "DEEPSEEK_API_KEY",
   local: "GINI_LOCAL_API_KEY",
   anthropic: "ANTHROPIC_API_KEY",
@@ -377,6 +378,16 @@ export function providerCatalog(): ProviderCatalogItem[] {
       costHint: "external"
     },
     {
+      id: "requesty",
+      name: "requesty",
+      displayName: "Requesty Compatible",
+      baseUrl: "https://router.requesty.ai/v1",
+      auth: "env",
+      models: ["openai/gpt-4o-mini"],
+      capabilities: ["chat-completions", "model-routing"],
+      costHint: "external"
+    },
+    {
       id: "deepseek",
       name: "deepseek",
       displayName: "DeepSeek",
@@ -429,6 +440,8 @@ export function providerDisplayLabel(name: ProviderName): string {
       return "OpenAI";
     case "openrouter":
       return "OpenRouter";
+    case "requesty":
+      return "Requesty";
     case "deepseek":
       return "DeepSeek";
     case "anthropic":
@@ -3082,6 +3095,7 @@ export async function generateTaskSummary(
     }
     if (
       provider.name === "openrouter" ||
+      provider.name === "requesty" ||
       provider.name === "local" ||
       provider.name === "deepseek" ||
       // Azure OpenAI exposes deployment-scoped chat/completions, not the flat
@@ -3225,6 +3239,7 @@ export async function generateStructured<T>(
   // many compat providers reject the field. Validator re-checks shape.
   if (
     provider.name === "openrouter" ||
+    provider.name === "requesty" ||
     provider.name === "local" ||
     provider.name === "openai" ||
     provider.name === "deepseek" ||
@@ -3433,6 +3448,15 @@ export function normalizeProvider(provider: ProviderConfig): ProviderConfig {
       model: provider.model || "openrouter/auto",
       baseUrl: pickBaseUrl(provider.baseUrl, "https://openrouter.ai/api/v1"),
       apiKeyEnv: provider.apiKeyEnv ?? "OPENROUTER_API_KEY",
+      ...(provider.extraBody ? { extraBody: provider.extraBody } : {})
+    };
+  }
+  if (provider.name === "requesty") {
+    return {
+      name: "requesty",
+      model: provider.model || "openai/gpt-4o-mini",
+      baseUrl: pickBaseUrl(provider.baseUrl, "https://router.requesty.ai/v1"),
+      apiKeyEnv: provider.apiKeyEnv ?? "REQUESTY_API_KEY",
       ...(provider.extraBody ? { extraBody: provider.extraBody } : {})
     };
   }
@@ -4329,6 +4353,7 @@ function resolveBaseUrl(baseUrl: string | undefined, fallback: string): string {
 function defaultBaseUrl(provider: ProviderConfig): string {
   if (provider.name === "codex") return DEFAULT_CODEX_BASE_URL;
   if (provider.name === "openrouter") return "https://openrouter.ai/api/v1";
+  if (provider.name === "requesty") return "https://router.requesty.ai/v1";
   if (provider.name === "local") return "http://127.0.0.1:11434/v1";
   if (provider.name === "deepseek") return DEFAULT_DEEPSEEK_BASE_URL;
   if (provider.name === "anthropic") return DEFAULT_ANTHROPIC_BASE_URL;

@@ -40,6 +40,7 @@ export const SELECTABLE_PROVIDERS = [
   "anthropic",
   "bedrock",
   "openrouter",
+  "requesty",
   "deepseek",
   "azure",
   "local"
@@ -53,6 +54,7 @@ export const PROVIDER_DESCRIPTION: Record<string, string> = {
   anthropic: "Claude (first-party API key)",
   bedrock: "Claude, Nova, Llama… on AWS",
   openrouter: "Multi-model router",
+  requesty: "Multi-model router",
   deepseek: "DeepSeek V4 family",
   azure: "Azure OpenAI deployments",
   local: "Ollama, LM Studio, vLLM"

@@ -13,7 +13,7 @@ import { ProviderPicker } from "@/components/ProviderPicker";
 // On mount we call /api/setup/status. If providerConfigured is true the user
 // got here by mistake (or backed into the URL) and we redirect home. Otherwise
 // we render the shared ProviderPicker, which offers the full provider catalog
-// (OpenAI, Codex, Anthropic, Bedrock, OpenRouter, DeepSeek, Azure, Local) and
+// (OpenAI, Codex, Anthropic, Bedrock, OpenRouter, Requesty, DeepSeek, Azure, Local) and
 // POSTs the choice to /api/setup/provider — the same surface Settings → Add
 // provider uses.
 
