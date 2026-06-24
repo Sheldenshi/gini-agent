@@ -26,7 +26,7 @@
 // store, browser opener, port resolver, drivers) is injectable so unit tests
 // never hit the network, OAuth, or the host browser. See `setTunnelDeps`.
 
-import { unlinkSync } from "node:fs";
+import { mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   buildTunnel as realBuildTunnel,
@@ -53,6 +53,9 @@ import { appendLog } from "../state/trace";
 import { relayHome } from "../paths";
 import { isSupervisedWebChild } from "../runtime/health-probe";
 import { clearRuntimeTunnelTrust, setRuntimeTunnelTrust } from "../lib/origin-trust";
+import { registerAccount } from "./connectors/google-accounts";
+import { configDirForAccount, newAccountId } from "../state/google-accounts";
+import { buildAuthorizedUserCredential } from "./connectors/relay-workspace-client";
 
 // ---------------------------------------------------------------------------
 // Injectable gini-relay seams.
@@ -585,6 +588,12 @@ export interface TunnelDeps {
   // server-side revoke — which keeps the same stable subdomain/URL on reconnect
   // while still rotating the token. Called by disconnect (= sever the connector).
   logout: (config: RuntimeConfig) => Promise<void>;
+  // Persist a relay-provisioned Workspace grant: given the refresh token a
+  // provisioned relay login returned, write a gws-readable authorized_user
+  // credential and register it as a tagged Google account, so gws can use
+  // Calendar/Gmail with no per-user OAuth setup. Best-effort — the caller never
+  // lets a failure here break the tunnel connect.
+  persistWorkspaceGrant: (refreshToken: string) => Promise<void>;
   // The manual tunnel drivers (tailscale / ngrok / cloudflared).
   drivers: Record<ManualProviderId, ManualDriver>;
 }
@@ -638,6 +647,40 @@ export async function defaultLogout(
   }
 }
 
+// Default tag for an auto-provisioned account. A relay-provisioned login doesn't
+// ask the user for a tag (it rides the tunnel connect), so seed a friendly one;
+// the user can retag later. Collisions fall back to a unique suffix.
+const PROVISIONED_TAG = "workspace";
+
+// Persist a relay-provisioned Workspace grant so gws can use it: mint a managed
+// gws config dir, write the standard authorized_user credentials.json gws reads
+// (tier 4 / GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE), then register it as a tagged
+// account (registerAccount runs `gws auth status`, which now succeeds because the
+// credential is in place, and captures the email). Seams injected for tests.
+//
+// Tag handling: try PROVISIONED_TAG, and on a uniqueness clash (re-provision /
+// a second account) retry once with an id-suffixed tag so a repeat never throws.
+type RegisterAccount = (input: { tag: string; configDir: string }) => Promise<unknown>;
+
+export async function defaultPersistWorkspaceGrant(
+  refreshToken: string,
+  register: RegisterAccount = registerAccount,
+  makeConfigDir: () => string = () => configDirForAccount(newAccountId()),
+  mkdir: (path: string) => void = (path) => void mkdirSync(path, { recursive: true, mode: 0o700 }),
+  writeFile: (path: string, body: string) => void = (path, body) => writeFileSync(path, body, { mode: 0o600 })
+): Promise<void> {
+  const configDir = makeConfigDir();
+  mkdir(configDir);
+  writeFile(join(configDir, "credentials.json"), buildAuthorizedUserCredential(refreshToken));
+  try {
+    await register({ tag: PROVISIONED_TAG, configDir });
+  } catch {
+    // Most likely a tag collision (re-provision or a second account); retry once
+    // with a guaranteed-unique tag so provisioning still lands.
+    await register({ tag: `${PROVISIONED_TAG}-${newAccountId()}`, configDir });
+  }
+}
+
 // How long a relay frpc child gets to register its proxy before start() is
 // declared failed. frp's config sets loginFailExit:false, so without this the
 // process logs in, retries a never-registering proxy forever, and start() never
@@ -680,6 +723,7 @@ export function makeDefaultDeps(): TunnelDeps {
     resolveLocalPort: defaultResolveLocalPort,
     probeLocalPort: (config: RuntimeConfig, port: number) => isSupervisedWebChild(config.instance, port),
     logout: (config: RuntimeConfig) => defaultLogout(config.instance),
+    persistWorkspaceGrant: defaultPersistWorkspaceGrant,
     drivers: makeDefaultDrivers()
   };
 }
@@ -1709,6 +1753,21 @@ async function runConnect(
       );
     });
     appendLog(config.instance, "tunnel.connected", { provider, url, port });
+    // A provisioned login carries a Workspace refresh token; persist it as a
+    // gws-usable account so Calendar/Gmail work with no per-user OAuth setup.
+    // Strictly best-effort and AFTER the tunnel is published — a failure here
+    // (disk, registry, gws status) must never downgrade a connected tunnel.
+    if (session.refreshToken) {
+      try {
+        await deps.persistWorkspaceGrant(session.refreshToken);
+        appendLog(config.instance, "tunnel.workspace_grant.persisted", { provider });
+      } catch (error) {
+        appendLog(config.instance, "tunnel.workspace_grant.failed", {
+          provider,
+          message: error instanceof Error ? error.message : String(error)
+        });
+      }
+    }
     // Watch the live child for an unexpected exit (crash, relay drop) so a dead
     // tunnel flips to "error" instead of reading "connected" forever.
     if (child) watchChildExit(config, provider, sup, child);

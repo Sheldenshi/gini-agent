@@ -21,6 +21,7 @@ import {
   connectTunnel,
   defaultLogout,
   defaultOpenBrowser,
+  defaultPersistWorkspaceGrant,
   defaultReadCloudflareConfig,
   defaultRunCommand,
   defaultTunnelProcSpawn,
@@ -228,6 +229,7 @@ function depsNoPort(over: Partial<TunnelDeps> = {}): Partial<TunnelDeps> {
     },
     probeLocalPort: () => Promise.resolve(true),
     logout: () => Promise.resolve(),
+    persistWorkspaceGrant: () => Promise.resolve(),
     drivers: fakeDrivers(),
     ...over
   };
@@ -434,6 +436,62 @@ describe("tunnel integration", () => {
     await awaitTunnelSettled(config.instance);
     expect(getTunnel(config).status).toBe("connected");
     expect(seen).toBeUndefined();
+  });
+
+  // A fresh login whose session carries a Workspace refresh token persists the
+  // grant after the tunnel connects (so gws can use it), passing the token through.
+  test("connectTunnel persists the Workspace grant when the login returns a refresh token", async () => {
+    let persisted: string | undefined;
+    const handle = fakeLoginHandle({
+      waitForSession: () => Promise.resolve({ ...SESSION, refreshToken: "rt-from-relay" })
+    });
+    setTunnelDeps(
+      depsLogin({
+        loginUrl: () => Promise.resolve(handle),
+        persistWorkspaceGrant: (rt) => {
+          persisted = rt;
+          return Promise.resolve();
+        }
+      })
+    );
+    await connectTunnel(config, "gini-relay");
+    await awaitTunnelSettled(config.instance);
+    expect(getTunnel(config).status).toBe("connected");
+    expect(persisted).toBe("rt-from-relay");
+  });
+
+  // An identity-only login (no refresh token) never calls the persist seam.
+  test("connectTunnel does not persist a grant when the session has no refresh token", async () => {
+    let called = false;
+    setTunnelDeps(
+      depsLogin({
+        persistWorkspaceGrant: () => {
+          called = true;
+          return Promise.resolve();
+        }
+      })
+    );
+    await connectTunnel(config, "gini-relay");
+    await awaitTunnelSettled(config.instance);
+    expect(getTunnel(config).status).toBe("connected");
+    expect(called).toBe(false);
+  });
+
+  // Persisting the grant is best-effort: a failure must NOT downgrade an
+  // already-connected tunnel.
+  test("connectTunnel stays connected when persisting the Workspace grant fails", async () => {
+    const handle = fakeLoginHandle({
+      waitForSession: () => Promise.resolve({ ...SESSION, refreshToken: "rt-boom" })
+    });
+    setTunnelDeps(
+      depsLogin({
+        loginUrl: () => Promise.resolve(handle),
+        persistWorkspaceGrant: () => Promise.reject(new Error("gws not installed"))
+      })
+    );
+    await connectTunnel(config, "gini-relay");
+    await awaitTunnelSettled(config.instance);
+    expect(getTunnel(config).status).toBe("connected");
   });
 
   // A stored session the relay rejects (revoked) -> connect self-heals by
@@ -891,6 +949,82 @@ describe("tunnel integration", () => {
     expect(typeof (await real.probeLocalPort(config, 1))).toBe("boolean");
     expect(typeof real.logout).toBe("function");
     await real.logout(config);
+    expect(typeof real.persistWorkspaceGrant).toBe("function");
+  });
+
+  // defaultPersistWorkspaceGrant writes the gws authorized_user credential into a
+  // minted config dir and registers it; the register seam is faked so no real gws
+  // or disk-registry is touched.
+  test("defaultPersistWorkspaceGrant writes the credential and registers the account", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gini-ws-grant-"));
+    const writes: Array<{ path: string; body: string }> = [];
+    const registered: Array<{ tag: string; configDir: string }> = [];
+    await defaultPersistWorkspaceGrant(
+      "rt-live",
+      async (input) => {
+        registered.push(input);
+        return { id: "gacct_x", tag: input.tag, email: "wilson@lilaclabs.ai", configDir: input.configDir, addedAt: "t" };
+      },
+      () => dir,
+      () => {}, // dir already exists (mkdtemp)
+      (path, body) => writes.push({ path, body })
+    );
+    expect(writes).toHaveLength(1);
+    expect(writes[0]!.path).toBe(join(dir, "credentials.json"));
+    const cred = JSON.parse(writes[0]!.body) as Record<string, string>;
+    expect(cred.type).toBe("authorized_user");
+    expect(cred.refresh_token).toBe("rt-live");
+    expect(cred.client_id).toMatch(/\.apps\.googleusercontent\.com$/);
+    expect(registered).toEqual([{ tag: "workspace", configDir: dir }]);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  // Exercise the REAL default mkdir/writeFile/makeConfigDir arrows (HOME pointed
+  // at a temp dir so configDirForAccount lands somewhere disposable); only the
+  // register seam is faked so no gws subprocess runs.
+  test("defaultPersistWorkspaceGrant uses real fs defaults to write the credential", async () => {
+    const home = mkdtempSync(join(tmpdir(), "gini-ws-home-"));
+    const prevHome = process.env.HOME;
+    process.env.HOME = home;
+    let writtenDir = "";
+    try {
+      await defaultPersistWorkspaceGrant("rt-realfs", async (input) => {
+        writtenDir = input.configDir;
+        return { id: "gacct_z", tag: input.tag, email: "", configDir: input.configDir, addedAt: "t" };
+      });
+      // The default makeConfigDir lands under ~/.gini/google-accounts/<id>, the
+      // default mkdir created it, and the default writeFile dropped credentials.json.
+      expect(writtenDir).toContain(join(home, ".gini", "google-accounts"));
+      const cred = JSON.parse(readFileSync(join(writtenDir, "credentials.json"), "utf8")) as Record<string, string>;
+      expect(cred.refresh_token).toBe("rt-realfs");
+      expect(cred.type).toBe("authorized_user");
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  // A tag collision (re-provision / second account) must not throw: the first
+  // register rejects, the retry uses a unique tag and succeeds.
+  test("defaultPersistWorkspaceGrant retries with a unique tag on collision", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gini-ws-grant-"));
+    const tags: string[] = [];
+    await defaultPersistWorkspaceGrant(
+      "rt-2",
+      async (input) => {
+        tags.push(input.tag);
+        if (tags.length === 1) throw new Error('tagged "workspace" already exists');
+        return { id: "gacct_y", tag: input.tag, email: "", configDir: input.configDir, addedAt: "t" };
+      },
+      () => dir,
+      () => {},
+      () => {}
+    );
+    expect(tags).toHaveLength(2);
+    expect(tags[0]).toBe("workspace");
+    expect(tags[1]).toMatch(/^workspace-gacct_/);
+    rmSync(dir, { recursive: true, force: true });
   });
 
   // awaitTunnelSettled resolves immediately when no connect is in flight.
