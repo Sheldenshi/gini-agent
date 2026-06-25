@@ -49,8 +49,16 @@ export function verifyUploadSignature(
   if (!Number.isSafeInteger(exp)) return false;
   if (exp * 1000 <= nowMs) return false;
   const expected = digest(secret, id, exp);
-  // timingSafeEqual throws on length mismatch, so guard the length first; a
-  // wrong-length sig is trivially invalid anyway.
+  // A valid sig is ALWAYS lowercase hex (digest() ends in .digest("hex")), so
+  // reject any non-hex sig up front. This also keeps the length guard below
+  // byte-accurate: timingSafeEqual compares Buffer BYTE lengths, but a JS
+  // string's `.length` counts UTF-16 units — a multibyte char could pass a
+  // `.length` check yet differ in UTF-8 bytes and make timingSafeEqual THROW.
+  // Constraining sig to ASCII hex makes .length === byte length, so the throw
+  // can't happen and a malformed sig fails closed as a clean false (not a 500).
+  if (!/^[0-9a-f]+$/.test(sigRaw)) return false;
+  // Wrong-length sig is trivially invalid (and timingSafeEqual throws on a
+  // length mismatch anyway), so guard the length before the timing-safe compare.
   if (sigRaw.length !== expected.length) return false;
   return timingSafeEqual(Buffer.from(sigRaw), Buffer.from(expected));
 }

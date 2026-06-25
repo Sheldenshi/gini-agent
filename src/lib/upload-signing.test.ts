@@ -84,4 +84,17 @@ describe("verifyUploadSignature", () => {
     const tampered = (sig[0] === "a" ? "b" : "a") + sig.slice(1);
     expect(verifyUploadSignature(SECRET, ID, exp, tampered, NOW)).toBe(false);
   });
+
+  test("rejects a non-hex sig WITHOUT throwing (multibyte char can't crash the compare)", () => {
+    const { exp, sig } = freshSig();
+    // A sig whose JS .length matches the 64-char hex digest but contains a
+    // multibyte char would, without the hex guard, pass the .length check and
+    // make timingSafeEqual throw on a UTF-8 byte-length mismatch. The hex guard
+    // rejects it as a clean false instead.
+    const multibyte = "é".repeat(sig.length); // .length === 64, but >64 UTF-8 bytes
+    expect(multibyte.length).toBe(sig.length);
+    expect(verifyUploadSignature(SECRET, ID, exp, multibyte, NOW)).toBe(false);
+    // Uppercase hex is also non-canonical (digest emits lowercase) → rejected.
+    expect(verifyUploadSignature(SECRET, ID, exp, sig.toUpperCase(), NOW)).toBe(false);
+  });
 });
