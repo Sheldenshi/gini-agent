@@ -65,7 +65,7 @@ Stable local clients use the gateway API:
 - `/api/tasks`, `/api/usage`, `/api/chat`, `/api/runs`, `/api/authorizations`, `/api/setup-requests`
 - `/api/memory/retain`, `/api/memory/recall`, `/api/memory/reflect`, `/api/memory/units`, `/api/memory/banks`, `/api/memory/migrate`
 - `/api/embedding/status`, `/api/embedding/reembed`, `/api/reranker/status`, `/api/stt/status`
-- `/api/uploads` (POST `image/*` or `audio/*`), `GET /api/uploads/:id` — serves both inbound (user-attached) and outbound (agent-produced) media; the same store backs agent screenshots / promoted images that ride on `AssistantTextBlock.images` / `ToolResultBlock.images`. See [outbound-chat-attachments.md](adr/outbound-chat-attachments.md)
+- `/api/uploads` (POST `image/*` or `audio/*`), `GET /api/uploads/:id` — serves both inbound (user-attached) and outbound (agent-produced) media; the same store backs agent screenshots / promoted files, which the agent references inline in its reply text as `gini-upload://<id>` markdown (the block schema is unchanged — only `UserTextBlock.images` carries inbound attachments). See [outbound-chat-attachments.md](adr/outbound-chat-attachments.md)
 - `/api/skills`, `/api/jobs`, `/api/connectors`, `/api/toolsets`
 - `/api/pairing`, `/api/pairing/claim`, `/api/pairing/request*`, `/api/devices`, `/api/mobile/bootstrap`
 - `/api/messaging`, `/api/mcp`, `/api/subagents`, `/api/agents`

@@ -94,9 +94,10 @@ interface ChatBlockRow {
 
 // Parse an array of image attachments off a block payload, dropping any
 // entry without a usable id. A hand-edited or truncated row must never
-// yield a half-formed attachment that a client would try to fetch. Shared
-// by user_text (inbound), assistant_text, and tool_result (outbound) so
-// the validation rules stay identical in every direction.
+// yield a half-formed attachment that a client would try to fetch. Used by
+// the user_text parse — the only kind that carries inbound image attachments.
+// Outbound agent images ride inline in the reply text as `gini-upload://`
+// refs, not a block field (see ADR outbound-chat-attachments.md).
 function parseImagesPayload(raw: unknown): ImageAttachment[] | undefined {
   if (!Array.isArray(raw)) return undefined;
   const images = raw
