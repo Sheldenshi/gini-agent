@@ -4,8 +4,10 @@ import {
   bedrockSupportsToolUse,
   estimateUsd,
   FALLBACK_CONTEXT_WINDOW_TOKENS,
+  FALLBACK_MAX_OUTPUT_TOKENS,
   resolveDefaultPriorContextTokenBudget,
   resolveImageByteLimit,
+  resolveMaxOutputTokens,
   resolveModelPricing,
   resolveProviderContextWindowTokens,
   resolveProviderModality
@@ -267,11 +269,71 @@ describe("resolveProviderContextWindowTokens", () => {
 
   test("unknown, local, echo, and openrouter auto fall back conservatively", () => {
     expect(resolveProviderContextWindowTokens(provider("openai", "llama-3-70b"))).toBe(FALLBACK_CONTEXT_WINDOW_TOKENS);
+    // An unrecognized deepseek model id hits the deepseek context-window fallback.
+    expect(resolveProviderContextWindowTokens(provider("deepseek", "deepseek-legacy-v0"))).toBe(FALLBACK_CONTEXT_WINDOW_TOKENS);
     expect(resolveProviderContextWindowTokens(provider("local", "local/default"))).toBe(FALLBACK_CONTEXT_WINDOW_TOKENS);
     expect(resolveProviderContextWindowTokens(provider("echo", "gini-echo-v0"))).toBe(FALLBACK_CONTEXT_WINDOW_TOKENS);
     expect(resolveProviderContextWindowTokens(provider("openrouter", "openrouter/auto"))).toBe(FALLBACK_CONTEXT_WINDOW_TOKENS);
     expect(resolveProviderContextWindowTokens({ name: "mystery" as ProviderConfig["name"], model: "x" }))
       .toBe(FALLBACK_CONTEXT_WINDOW_TOKENS);
+  });
+});
+
+describe("resolveMaxOutputTokens", () => {
+  test("Claude 4.6+ Opus/Sonnet and Fable resolve to the 128K ceiling (anthropic + bedrock)", () => {
+    expect(resolveMaxOutputTokens(provider("anthropic", "claude-opus-4-8"))).toBe(128_000);
+    expect(resolveMaxOutputTokens(provider("anthropic", "claude-sonnet-4-6"))).toBe(128_000);
+    expect(resolveMaxOutputTokens(provider("anthropic", "claude-fable-5"))).toBe(128_000);
+    expect(resolveMaxOutputTokens(provider("bedrock", "us.anthropic.claude-opus-4-8"))).toBe(128_000);
+    expect(resolveMaxOutputTokens(provider("bedrock", "us.anthropic.claude-sonnet-4-6"))).toBe(128_000);
+    // A future point release (4.9, 4.10) stays on the 128K tier.
+    expect(resolveMaxOutputTokens(provider("anthropic", "claude-opus-4-9"))).toBe(128_000);
+    expect(resolveMaxOutputTokens(provider("anthropic", "claude-sonnet-4-12"))).toBe(128_000);
+  });
+
+  test("Haiku 4.5 and the 4.5 Opus/Sonnet tier resolve to 64K", () => {
+    expect(resolveMaxOutputTokens(provider("anthropic", "claude-haiku-4-5"))).toBe(64_000);
+    expect(resolveMaxOutputTokens(provider("anthropic", "claude-opus-4-5"))).toBe(64_000);
+    expect(resolveMaxOutputTokens(provider("anthropic", "claude-sonnet-4-5"))).toBe(64_000);
+    expect(resolveMaxOutputTokens(provider("bedrock", "us.anthropic.claude-haiku-4-5-20251001-v1:0"))).toBe(64_000);
+    expect(resolveMaxOutputTokens(provider("bedrock", "us.anthropic.claude-sonnet-4-5-20250929-v1:0"))).toBe(64_000);
+  });
+
+  test("Opus 4.1 resolves to 32K", () => {
+    expect(resolveMaxOutputTokens(provider("anthropic", "claude-opus-4-1"))).toBe(32_000);
+    expect(resolveMaxOutputTokens(provider("bedrock", "us.anthropic.claude-opus-4-1-20250805-v1:0"))).toBe(32_000);
+  });
+
+  test("non-Claude Bedrock families carry their own probed ceilings", () => {
+    expect(resolveMaxOutputTokens(provider("bedrock", "us.amazon.nova-premier-v1:0"))).toBe(32_000);
+    expect(resolveMaxOutputTokens(provider("bedrock", "us.amazon.nova-pro-v1:0"))).toBe(10_000);
+    expect(resolveMaxOutputTokens(provider("bedrock", "eu.amazon.nova-lite-v1:0"))).toBe(10_000);
+    expect(resolveMaxOutputTokens(provider("bedrock", "us.amazon.nova-micro-v1:0"))).toBe(10_000);
+    expect(resolveMaxOutputTokens(provider("bedrock", "us.deepseek.r1-v1:0"))).toBe(32_768);
+    expect(resolveMaxOutputTokens(provider("bedrock", "us.meta.llama4-scout-17b-instruct-v1:0"))).toBe(8_192);
+    expect(resolveMaxOutputTokens(provider("bedrock", "us.meta.llama4-maverick-17b-instruct-v1:0"))).toBe(8_192);
+  });
+
+  test("unrecognized Claude, unrecognized Bedrock family, and non-Anthropic providers fall back to the floor", () => {
+    // Legacy/EOL/unrecognized Claude ids on both providers.
+    expect(resolveMaxOutputTokens(provider("anthropic", "claude-3-5-sonnet-20241022"))).toBe(FALLBACK_MAX_OUTPUT_TOKENS);
+    expect(resolveMaxOutputTokens(provider("anthropic", "mystery-model"))).toBe(FALLBACK_MAX_OUTPUT_TOKENS);
+    expect(resolveMaxOutputTokens(provider("bedrock", "us.meta.llama3-3-70b-instruct-v1:0"))).toBe(FALLBACK_MAX_OUTPUT_TOKENS);
+    // The chat-completions providers send no max_tokens default at all, so they
+    // get the floor here (their send-path never applies it).
+    expect(resolveMaxOutputTokens(provider("openai", "gpt-5.5"))).toBe(FALLBACK_MAX_OUTPUT_TOKENS);
+    expect(resolveMaxOutputTokens(provider("azure", "gpt-5.5"))).toBe(FALLBACK_MAX_OUTPUT_TOKENS);
+    expect(resolveMaxOutputTokens(provider("openrouter", "anthropic/claude-opus-4-8"))).toBe(FALLBACK_MAX_OUTPUT_TOKENS);
+    expect(resolveMaxOutputTokens(provider("deepseek", "deepseek-chat"))).toBe(FALLBACK_MAX_OUTPUT_TOKENS);
+    expect(resolveMaxOutputTokens(provider("local", "local/default"))).toBe(FALLBACK_MAX_OUTPUT_TOKENS);
+    expect(resolveMaxOutputTokens(provider("codex", "gpt-5.5"))).toBe(FALLBACK_MAX_OUTPUT_TOKENS);
+    expect(resolveMaxOutputTokens(provider("echo", "gini-echo-v0"))).toBe(FALLBACK_MAX_OUTPUT_TOKENS);
+    expect(resolveMaxOutputTokens({ name: "mystery" as ProviderConfig["name"], model: "x" })).toBe(FALLBACK_MAX_OUTPUT_TOKENS);
+  });
+
+  test("a missing model id falls back to the floor without throwing", () => {
+    expect(resolveMaxOutputTokens({ name: "anthropic" } as ProviderConfig)).toBe(FALLBACK_MAX_OUTPUT_TOKENS);
+    expect(resolveMaxOutputTokens({ name: "bedrock" } as ProviderConfig)).toBe(FALLBACK_MAX_OUTPUT_TOKENS);
   });
 });
 

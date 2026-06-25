@@ -153,6 +153,76 @@ export function resolveDefaultPriorContextTokenBudget(provider: ProviderConfig):
   return Math.floor(resolveProviderContextWindowTokens(provider) * PRIOR_CONTEXT_WINDOW_FRACTION);
 }
 
+// Conservative max-output-token floor for a model whose family we don't
+// recognize, and the historical Anthropic/Bedrock default. Every send-site
+// fell back to this flat 8192 before per-family resolution existed; keeping it
+// as the floor means an unrecognized id behaves exactly as it did before.
+export const FALLBACK_MAX_OUTPUT_TOKENS = 8_192;
+
+// Max output tokens (synchronous Messages/Converse) by Claude family. The model
+// REJECTS a max_tokens above its real ceiling with a 400 (Bedrock
+// ValidationException "exceeds the model limit of N"; first-party Anthropic the
+// equivalent) — it does NOT clamp — so this must never overshoot. Values are
+// each model's documented/probed ceiling: 4.6+ Opus/Sonnet and Fable at 128K;
+// Haiku 4.5 and the 4.5 Opus/Sonnet tier at 64K; Opus 4.1 at 32K. The minor
+// classes ([6-9]|\d\d) keep future point releases on the 128K tier while the
+// explicit 4.5/4.1 patterns pin the older tiers. `slug` may carry a Bedrock
+// inference-profile prefix ("us.anthropic.claude-opus-4-8") or be bare
+// ("claude-opus-4-8"); both match. Anything else (3.x, EOL, unrecognized)
+// stays on the conservative floor.
+function claudeMaxOutputTokens(slug: string): number {
+  if (/claude-opus-4-(?:[6-9]|\d\d)/.test(slug)) return 128_000;
+  if (/claude-sonnet-4-(?:[6-9]|\d\d)/.test(slug)) return 128_000;
+  if (/claude-fable-\d/.test(slug)) return 128_000;
+  if (/claude-haiku-4-5/.test(slug)) return 64_000;
+  if (/claude-opus-4-5/.test(slug)) return 64_000;
+  if (/claude-sonnet-4-5/.test(slug)) return 64_000;
+  if (/claude-opus-4-1/.test(slug)) return 32_000;
+  return FALLBACK_MAX_OUTPUT_TOKENS;
+}
+
+// Max output tokens for a Bedrock model id (cross-region inference profile,
+// e.g. "us.anthropic.claude-sonnet-4-6" or "us.amazon.nova-pro-v1:0"). Claude
+// families defer to claudeMaxOutputTokens; the non-Claude families carry their
+// own probed ceilings. Unknown families stay on the conservative floor.
+function bedrockMaxOutputTokens(model: string): number {
+  const slug = normalizeModel(model);
+  if (/anthropic\.claude/.test(slug)) return claudeMaxOutputTokens(slug);
+  if (/amazon\.nova-premier/.test(slug)) return 32_000;
+  if (/amazon\.nova-(pro|lite|micro)/.test(slug)) return 10_000;
+  if (/deepseek\.r1/.test(slug)) return 32_768;
+  if (/meta\.llama4/.test(slug)) return 8_192;
+  return FALLBACK_MAX_OUTPUT_TOKENS;
+}
+
+// Default max_tokens for the streaming tool-calling loop, where a tool call's
+// arguments must fit in one response: if the model truncates them mid-JSON
+// (stopReason "max_tokens"/"length"), the runtime can't parse the call and the
+// turn fails (see the file_write/code_exec "JSON Parse error: Expected '}'"
+// cascade this replaced). Returns the model's REAL output ceiling so a large
+// tool argument (a long file body, a big code block) fits.
+//
+// Scope: only the `anthropic` and `bedrock` providers historically applied a
+// flat 8192 default; the chat-completions providers (openai/azure/openrouter/
+// deepseek/local) send no max_tokens at all, so the model's own server-side max
+// applies and they are not affected. Callers on those providers get the floor.
+//
+// IMPORTANT — streaming only: this ceiling is for the streaming send-path. A
+// NON-streaming request with a large max_tokens trips the first-party Anthropic
+// API's "streaming is required for long requests" guard, so non-streaming
+// callers (structured-output) must keep a small explicit budget rather than
+// this value.
+export function resolveMaxOutputTokens(provider: ProviderConfig): number {
+  switch (provider.name) {
+    case "anthropic":
+      return claudeMaxOutputTokens(normalizeModel(provider.model ?? ""));
+    case "bedrock":
+      return bedrockMaxOutputTokens(provider.model ?? "");
+    default:
+      return FALLBACK_MAX_OUTPUT_TOKENS;
+  }
+}
+
 // OpenRouter routes to many upstream models under `<vendor>/<model>` slugs.
 // The families below are documented to accept image + file input via
 // OpenRouter's unified `file` content part. Anything outside these families

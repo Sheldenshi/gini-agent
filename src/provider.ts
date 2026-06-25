@@ -5,7 +5,7 @@ import { buildAgentSystemContext, renderEphemeralContext } from "./system-prompt
 import { loadInstructions, loadSoul, loadUserProfile } from "./runtime/identity-files";
 import { readState } from "./state";
 import { appendTrace } from "./state/trace";
-import { bedrockSupportsStreamingWithTools, bedrockSupportsToolUse, estimateUsd, resolveProviderModality } from "./provider-capabilities";
+import { bedrockSupportsStreamingWithTools, bedrockSupportsToolUse, estimateUsd, FALLBACK_MAX_OUTPUT_TOKENS, resolveMaxOutputTokens, resolveProviderModality } from "./provider-capabilities";
 import { resolveAwsCredentials, signAwsRequest } from "./aws-sigv4";
 import type { CostRecord, ProviderAuthFailureRecord, ProviderAuthStatus, ProviderCatalogItem, ProviderConfig, ProviderName, ProviderReauthInfo, ProviderResult, RuntimeConfig, SystemNoteAuthError } from "./types";
 
@@ -41,9 +41,16 @@ const DEFAULT_BEDROCK_BASE_URL = bedrockRuntimeBaseUrl(DEFAULT_BEDROCK_REGION);
 // live versioning docs (newest entry; the SSE-named-events format). Honored by
 // both the first-party API and Claude in Amazon Bedrock.
 const ANTHROPIC_VERSION = "2023-06-01";
-// The Messages API REQUIRES max_tokens. Applied when the caller didn't pin one
-// via extraBody.max_tokens; vision passes a smaller per-call budget.
-const DEFAULT_ANTHROPIC_MAX_TOKENS = 8192;
+// The Messages API REQUIRES max_tokens. The streaming send-path resolves the
+// model's real output ceiling via resolveMaxOutputTokens so a large tool-call
+// argument isn't truncated mid-JSON; this flat floor is the NON-streaming
+// budget (structured output) and the fallback when no model-specific ceiling
+// resolves. A non-streaming request with a large max_tokens trips the
+// first-party Anthropic "streaming is required for long requests" guard, so the
+// non-streaming path must stay small. Vision passes its own smaller per-call
+// budget via maxTokensOverride. Re-exported from provider-capabilities as
+// FALLBACK_MAX_OUTPUT_TOKENS so the two stay in lockstep.
+const DEFAULT_ANTHROPIC_MAX_TOKENS = FALLBACK_MAX_OUTPUT_TOKENS;
 // Azure OpenAI has no universal base URL — it is per-resource
 // (https://<resource>.openai.azure.com), so there is no default and a config
 // without one is rejected at the entry boundaries (CLI / setup API /
@@ -1780,8 +1787,14 @@ async function callAnthropicMessages(
   const safeMessages = pairToolCallingMessages(stripDocumentPartsIfUnsupported(messages, provider));
   const { system, messages: anthropicMessages } = translateMessagesToAnthropic(safeMessages);
   const extras = sanitizeExtraBody(provider.extraBody, ANTHROPIC_RESERVED_EXTRA_BODY_KEYS);
+  // Precedence: explicit per-call override (vision) > user-pinned
+  // extraBody.max_tokens > model default. The model default is the model's full
+  // output ceiling ONLY when streaming (a truncated tool call mid-JSON is the
+  // bug this fixes); a non-streaming request keeps the conservative floor so it
+  // can't trip the first-party "streaming is required for long requests" guard.
+  const modelDefaultMaxTokens = wantStream ? resolveMaxOutputTokens(provider) : DEFAULT_ANTHROPIC_MAX_TOKENS;
   const resolvedMaxTokens =
-    maxTokensOverride ?? (typeof extras.max_tokens === "number" ? extras.max_tokens : DEFAULT_ANTHROPIC_MAX_TOKENS);
+    maxTokensOverride ?? (typeof extras.max_tokens === "number" ? extras.max_tokens : modelDefaultMaxTokens);
   const body: Record<string, unknown> = {
     ...extras,
     model: provider.model,
@@ -2507,7 +2520,13 @@ async function callBedrockConverse(
   const { system, messages: converseMessages } = translateMessagesToConverse(safeMessages, !toolConfig);
   const extraMax =
     isRecord(provider.extraBody) && typeof provider.extraBody.max_tokens === "number" ? provider.extraBody.max_tokens : undefined;
-  const maxTokens = maxTokensOverride ?? extraMax ?? DEFAULT_ANTHROPIC_MAX_TOKENS;
+  // Same precedence + streaming rule as the Anthropic path: a streaming turn
+  // gets the model's full output ceiling so a large tool-call argument fits;
+  // non-streaming keeps the floor. (Bedrock Converse non-streaming actually
+  // tolerates a large max_tokens, but matching the Anthropic path keeps one
+  // rule for both.)
+  const modelDefaultMaxTokens = wantStream ? resolveMaxOutputTokens(provider) : DEFAULT_ANTHROPIC_MAX_TOKENS;
+  const maxTokens = maxTokensOverride ?? extraMax ?? modelDefaultMaxTokens;
   const body: Record<string, unknown> = {
     messages: converseMessages,
     inferenceConfig: { maxTokens }

@@ -4247,6 +4247,10 @@ describe("anthropic provider", () => {
       expect(headers["x-api-key"]).toBe("bedrock-api-key-xyz&Version=1");
       expect(headers["accept"]).toBe("text/event-stream");
       expect(JSON.parse(String(call.init.body)).stream).toBe(true);
+      // Streaming resolves the model's full output ceiling (opus-4-8 → 128000)
+      // so a large tool-call argument isn't truncated mid-JSON. The companion
+      // non-streaming test above keeps the conservative 8192 floor.
+      expect(JSON.parse(String(call.init.body)).max_tokens).toBe(128000);
     } finally {
       fetchStub.restore();
       restoreEnv();
