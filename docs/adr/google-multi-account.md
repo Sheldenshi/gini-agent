@@ -257,6 +257,49 @@ flows through `terminal_exec`'s clean env unchanged. Removing a gini-managed
 account deletes its config dir (its tokens) but never the user's
 `~/.config/gws`.
 
+Registration normally gates the registry write on a live `gws auth status`
+probe, so an empty or signed-out dir is never registered. The relay-provisioned
+grant path (`defaultPersistWorkspaceGrant` in `src/integrations/tunnel.ts`) is
+the one exception: it calls `registerAccount` with `trusted: true`, which skips
+the probe. This is sound because the credential is trustworthy *by
+construction* — the relay only issues a refresh token after a completed OAuth
+consent — and the probe is unusable at tunnel-connect time, when the `gws`
+binary may not yet be installed, so gating on it would strand a valid credential
+unregistered (invisible to every readiness surface). The trusted account is
+written with `email: ""`; `listAccountsWithStatus` back-fills the live email and
+sign-in liveness on the next read. `trusted` is reachable only from this
+internal path: the public `POST /api/google/accounts` route forwards only
+`{ tag, configDir, adopt }` and never sets it, so the probe stays mandatory for
+all caller-supplied dirs.
+
+A trusted account carries two extra fields on the registry row (`GoogleAccount`
+in `src/types.ts`), both set only on this path and never by a user/manual
+account:
+
+- `provisioned: true` — immutable provenance. The grant path re-finds *its own*
+  account by this flag, NOT by the mutable display `tag`, so re-persisting on a
+  reconnect upserts the same dir/row (no duplicate account per reconnect) while a
+  user retagging it — or independently tagging another account `workspace` —
+  never redirects or clobbers the provisioned credential. The flag is sticky: a
+  later non-trusted re-register of the same dir cannot strip it.
+- `principal` — the relay/Google subject id (relay `Session.account`) the grant
+  belongs to. Re-find matches on this, so two *different* identities provisioned
+  on the same machine (the registry is machine-global, but each instance has its
+  own relay session) each keep their own managed dir instead of one overwriting
+  the other's credential. Reuse also preserves the account's current `tag`, so a
+  reconnect never reverts a user's retag.
+
+Re-find matches *only* on `provisioned`/`principal`, never on the `tag`. A relay
+account registered before these fields existed therefore isn't recognized, and
+the first reconnect after upgrading mints a fresh provisioned row beside it — a
+one-time, non-destructive duplicate (the old row still works) for the narrow set
+of machines that provisioned successfully on the prior build. This is a
+deliberate trade: adopting a pre-flag row would have to key off the mutable
+`tag` (its credential's `client_id` is the public, baked relay id, not a secret),
+which could misclassify and overwrite a user account that merely shares the tag.
+The duplicate is cleaned up by removing the stale row; correctness is never at
+risk.
+
 ## Acceptance checks
 
 - `bun test src/state/google-accounts.test.ts` — registry round-trips
@@ -265,9 +308,11 @@ account deletes its config dir (its tokens) but never the user's
 - `bun test src/integrations/connectors/google-accounts.test.ts` —
   `registerAccount` derives the id from the dir basename for a gini-managed dir
   (so `removeAccount` cleans that dir) and reuses/mints for an adopted dir;
-  `registerAccount` throws for a not-signed-in dir; `removeAccount` deletes a
-  gini-managed dir but never `~/.config/gws`; `listAccountsWithStatus` degrades
-  a failing per-dir status fetch to `signedIn: false`.
+  `registerAccount` throws for a not-signed-in dir **on the default (probed)
+  path**, and registers without probing when called with `trusted: true` (the
+  relay-provisioned path below); `removeAccount` deletes a gini-managed dir but
+  never `~/.config/gws`; `listAccountsWithStatus` degrades a failing per-dir
+  status fetch to `signedIn: false`.
 - `bun test src/integrations/connectors/gws-session.test.ts` —
   `gwsSessionStatusForDir` passes `GOOGLE_WORKSPACE_CLI_CONFIG_DIR` and caches
   per dir (each dir spawns at most one `gws auth status` per TTL window);

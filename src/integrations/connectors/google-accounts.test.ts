@@ -116,6 +116,66 @@ describe("registerAccount", () => {
     expect(again.id).toBe(first.id);
     expect(readGoogleAccounts()).toHaveLength(1);
   });
+
+  test("trusted:true registers without probing gws (gws may not be installed yet)", async () => {
+    const configDir = configDirForAccount("gacct_trust01");
+    // statusForDir must NOT be called on the trusted path — fail loudly if it is.
+    const account = await registerAccount(
+      { tag: "workspace", configDir, trusted: true },
+      {
+        statusForDir: async () => {
+          throw new Error("statusForDir must not run on the trusted path");
+        }
+      }
+    );
+    expect(account.id).toBe("gacct_trust01");
+    expect(account.tag).toBe("workspace");
+    expect(account.email).toBe(""); // back-filled later by listAccountsWithStatus
+    expect(account.provisioned).toBe(true); // immutable relay provenance
+    expect(readGoogleAccounts()).toHaveLength(1);
+  });
+
+  test("trusted:true preserves an existing account's email on re-register", async () => {
+    const configDir = configDirForAccount("gacct_trust02");
+    await registerAccount(
+      { tag: "workspace", configDir },
+      { statusForDir: async () => signedIn("known@example.com") }
+    );
+    // A later trusted re-register (e.g. re-provision) must not blank the email
+    // that the earlier live probe captured.
+    const again = await registerAccount(
+      { tag: "workspace", configDir, trusted: true },
+      {
+        statusForDir: async () => {
+          throw new Error("statusForDir must not run on the trusted path");
+        }
+      }
+    );
+    expect(again.email).toBe("known@example.com");
+    expect(readGoogleAccounts()).toHaveLength(1);
+  });
+
+  test("a non-trusted register does NOT mark an account provisioned", async () => {
+    const account = await registerAccount(
+      { tag: "personal", configDir: "/tmp/gws-user" },
+      { statusForDir: async () => signedIn("me@example.com") }
+    );
+    expect(account.provisioned).toBeUndefined();
+  });
+
+  test("the provisioned flag is sticky: a later non-trusted re-register keeps it", async () => {
+    const configDir = configDirForAccount("gacct_trust03");
+    const first = await registerAccount({ tag: "workspace", configDir, trusted: true });
+    expect(first.provisioned).toBe(true);
+    // Re-register the SAME dir on the probed path (e.g. a manual retag flow):
+    // provenance must not be strippable.
+    const again = await registerAccount(
+      { tag: "renamed", configDir },
+      { statusForDir: async () => signedIn("me@example.com") }
+    );
+    expect(again.provisioned).toBe(true);
+    expect(again.tag).toBe("renamed");
+  });
 });
 
 describe("listAccountsWithStatus", () => {

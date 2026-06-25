@@ -73,22 +73,41 @@ export async function listAccountsWithStatus(deps: AccountDeps = {}): Promise<Go
 // the existing id when a registry entry already points at this configDir, else
 // mint a new one.
 export async function registerAccount(
-  input: { tag: string; configDir: string; adopt?: boolean },
+  input: { tag: string; configDir: string; adopt?: boolean; trusted?: boolean; principal?: string },
   deps: AccountDeps = {}
 ): Promise<GoogleAccount> {
   const statusForDir = deps.statusForDir ?? gwsSessionStatusForDir;
-  const status = await statusForDir(input.configDir);
-  if (!status.signedIn) {
-    throw new Error(`No signed-in Google session in ${input.configDir}`);
+  // A relay-provisioned credential is trustworthy by construction (the relay
+  // only issues a refresh token after a completed consent), and gws may not be
+  // installed yet at tunnel-connect time. trusted:true registers it without the
+  // live `gws auth status` probe; listAccountsWithStatus back-fills the live
+  // email/liveness on the next read. The probe stays mandatory for the
+  // adopt-an-arbitrary-dir callers, where liveness genuinely must be verified.
+  let email = "";
+  if (!input.trusted) {
+    const status = await statusForDir(input.configDir);
+    if (!status.signedIn) {
+      throw new Error(`No signed-in Google session in ${input.configDir}`);
+    }
+    email = status.email ?? "";
   }
   const existing = readGoogleAccounts().find((a) => a.configDir === input.configDir);
   const managed = input.configDir.startsWith(googleAccountsRoot());
+  const provisioned = input.trusted || existing?.provisioned === true;
   const account: GoogleAccount = {
     id: managed ? basename(input.configDir) : existing?.id ?? newAccountId(),
     tag: input.tag,
-    email: status.email ?? "",
+    email: input.trusted ? existing?.email ?? "" : email,
     configDir: input.configDir,
-    addedAt: existing?.addedAt ?? now()
+    addedAt: existing?.addedAt ?? now(),
+    // Relay-provisioned provenance is sticky: once set it stays set, so a later
+    // manual re-register of the same dir can't strip it. The grant path re-finds
+    // its account by these, not by the mutable tag. `principal` (the relay/Google
+    // subject id) keeps distinct identities in separate dirs.
+    ...(provisioned ? { provisioned: true } : {}),
+    ...(provisioned && (input.principal ?? existing?.principal)
+      ? { principal: input.principal ?? existing?.principal }
+      : {})
   };
   addGoogleAccount(account);
   // A fresh login just changed this dir's session; drop any cached status so the

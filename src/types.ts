@@ -2110,10 +2110,22 @@ export interface ConnectorRecord {
 // ~/.gini/google-accounts/accounts.json. See src/state/google-accounts.ts.
 export interface GoogleAccount {
   id: string;          // stable slug, e.g. "gacct_<rand>"
-  tag: string;         // user label: "personal" | "work" | "school" | ...
+  tag: string;         // user label: "personal" | "work" | "school" | ... (mutable; retaggable)
   email: string;       // signed-in email from `gws auth status` .user ("" until known)
   configDir: string;   // absolute path to this account's gws config dir
   addedAt: string;     // ISO
+  // Immutable provenance: true only for an account minted by the relay-provisioned
+  // grant path (registerAccount with trusted:true). Lets that path re-find ITS
+  // account idempotently without keying off the mutable display tag — so a user
+  // retagging it, or independently tagging another account "workspace", never
+  // redirects or clobbers the provisioned credential. Absent ⇒ user/manual account.
+  provisioned?: boolean;
+  // The relay/Google principal (the OAuth subject id, relay Session.account) the
+  // provisioned credential belongs to. Set only alongside `provisioned`. Re-find
+  // matches on this, so two different identities provisioned on one machine
+  // (e.g. distinct instances) each keep their OWN dir instead of one clobbering
+  // the other's credential. Absent ⇒ user/manual account.
+  principal?: string;
 }
 
 // A registry account enriched with its live `gws auth status` (per config dir).

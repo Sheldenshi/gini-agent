@@ -43,6 +43,7 @@ import {
   type TunnelDeps
 } from "./tunnel";
 import { mutateState, readState } from "../state";
+import { addGoogleAccount } from "../state/google-accounts";
 import { isRuntimeTunnelHost } from "../lib/origin-trust";
 import type { RuntimeConfig, TunnelProviderId } from "../types";
 import type { LoginHandle, RelayDefaults, Session, Store, TunnelOptions } from "gini-relay";
@@ -475,6 +476,35 @@ describe("tunnel integration", () => {
     await awaitTunnelSettled(config.instance);
     expect(getTunnel(config).status).toBe("connected");
     expect(called).toBe(false);
+  });
+
+  // A RESUMED session (read from the store, not a fresh consent) that carries a
+  // refresh token still calls the persist seam — persistence is idempotent, so
+  // running it on every connect heals a grant that a prior fresh login failed to
+  // land, without duplicating the account (the dedup lives in
+  // defaultPersistWorkspaceGrant, exercised in its own unit tests below).
+  test("connectTunnel persists the grant when reusing a stored session with a refresh token", async () => {
+    let persisted: string | undefined;
+    const storedWithToken: Store = {
+      home: "/tmp/gini-relay-fake",
+      deviceId: () => "device-1",
+      readSession: () => ({ ...SESSION, refreshToken: "rt-stored" }),
+      writeSession: () => {},
+      clearSession: () => {}
+    };
+    setTunnelDeps(
+      deps({
+        createStore: () => storedWithToken,
+        persistWorkspaceGrant: (rt) => {
+          persisted = rt;
+          return Promise.resolve();
+        }
+      })
+    );
+    await connectTunnel(config, "gini-relay");
+    await awaitTunnelSettled(config.instance);
+    expect(getTunnel(config).status).toBe("connected");
+    expect(persisted).toBe("rt-stored");
   });
 
   // Persisting the grant is best-effort: a failure must NOT downgrade an
@@ -954,20 +984,23 @@ describe("tunnel integration", () => {
 
   // defaultPersistWorkspaceGrant writes the gws authorized_user credential into a
   // minted config dir and registers it; the register seam is faked so no real gws
-  // or disk-registry is touched.
+  // or disk-registry is touched. Signature:
+  // (refreshToken, principal, register, makeConfigDir, mkdir, writeFile, findProvisioned).
   test("defaultPersistWorkspaceGrant writes the credential and registers the account", async () => {
     const dir = mkdtempSync(join(tmpdir(), "gini-ws-grant-"));
     const writes: Array<{ path: string; body: string }> = [];
-    const registered: Array<{ tag: string; configDir: string }> = [];
+    const registered: Array<{ tag: string; configDir: string; trusted?: boolean; principal?: string }> = [];
     await defaultPersistWorkspaceGrant(
       "rt-live",
+      "sub-123",
       async (input) => {
         registered.push(input);
         return { id: "gacct_x", tag: input.tag, email: "wilson@lilaclabs.ai", configDir: input.configDir, addedAt: "t" };
       },
       () => dir,
       () => {}, // dir already exists (mkdtemp)
-      (path, body) => writes.push({ path, body })
+      (path, body) => writes.push({ path, body }),
+      () => null // no existing provisioned account → mint the dir under test
     );
     expect(writes).toHaveLength(1);
     expect(writes[0]!.path).toBe(join(dir, "credentials.json"));
@@ -975,20 +1008,23 @@ describe("tunnel integration", () => {
     expect(cred.type).toBe("authorized_user");
     expect(cred.refresh_token).toBe("rt-live");
     expect(cred.client_id).toMatch(/\.apps\.googleusercontent\.com$/);
-    expect(registered).toEqual([{ tag: "workspace", configDir: dir }]);
+    // trusted:true so registration skips the live gws probe; the principal is
+    // threaded so distinct identities keep separate dirs.
+    expect(registered).toEqual([{ tag: "workspace", configDir: dir, trusted: true, principal: "sub-123" }]);
     rmSync(dir, { recursive: true, force: true });
   });
 
-  // Exercise the REAL default mkdir/writeFile/makeConfigDir arrows (HOME pointed
-  // at a temp dir so configDirForAccount lands somewhere disposable); only the
-  // register seam is faked so no gws subprocess runs.
+  // Exercise the REAL default mkdir/writeFile/makeConfigDir/findProvisioned arrows
+  // (HOME pointed at an empty temp dir so the registry read is empty and
+  // configDirForAccount lands somewhere disposable); only the register seam is
+  // faked so no gws subprocess runs.
   test("defaultPersistWorkspaceGrant uses real fs defaults to write the credential", async () => {
     const home = mkdtempSync(join(tmpdir(), "gini-ws-home-"));
     const prevHome = process.env.HOME;
     process.env.HOME = home;
     let writtenDir = "";
     try {
-      await defaultPersistWorkspaceGrant("rt-realfs", async (input) => {
+      await defaultPersistWorkspaceGrant("rt-realfs", undefined, async (input) => {
         writtenDir = input.configDir;
         return { id: "gacct_z", tag: input.tag, email: "", configDir: input.configDir, addedAt: "t" };
       });
@@ -1005,13 +1041,14 @@ describe("tunnel integration", () => {
     }
   });
 
-  // A tag collision (re-provision / second account) must not throw: the first
-  // register rejects, the retry uses a unique tag and succeeds.
+  // A tag collision (a DIFFERENT account already holds PROVISIONED_TAG) must not
+  // throw: the first register rejects, the retry uses a unique tag and succeeds.
   test("defaultPersistWorkspaceGrant retries with a unique tag on collision", async () => {
     const dir = mkdtempSync(join(tmpdir(), "gini-ws-grant-"));
     const tags: string[] = [];
     await defaultPersistWorkspaceGrant(
       "rt-2",
+      undefined,
       async (input) => {
         tags.push(input.tag);
         if (tags.length === 1) throw new Error('tagged "workspace" already exists');
@@ -1019,12 +1056,220 @@ describe("tunnel integration", () => {
       },
       () => dir,
       () => {},
-      () => {}
+      () => {},
+      () => null // no existing provisioned account → mint the dir under test
     );
     expect(tags).toHaveLength(2);
     expect(tags[0]).toBe("workspace");
     expect(tags[1]).toMatch(/^workspace-gacct_/);
     rmSync(dir, { recursive: true, force: true });
+  });
+
+  // The retry after a tag collision must ALSO be trusted — otherwise the second
+  // attempt would re-introduce the live gws probe the fix is removing.
+  test("defaultPersistWorkspaceGrant marks both the first attempt and the collision retry trusted", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gini-ws-grant-"));
+    const trustedFlags: Array<boolean | undefined> = [];
+    await defaultPersistWorkspaceGrant(
+      "rt-3",
+      undefined,
+      async (input) => {
+        trustedFlags.push(input.trusted);
+        if (trustedFlags.length === 1) throw new Error('tagged "workspace" already exists');
+        return { id: "gacct_w", tag: input.tag, email: "", configDir: input.configDir, addedAt: "t" };
+      },
+      () => dir,
+      () => {},
+      () => {},
+      () => null
+    );
+    expect(trustedFlags).toEqual([true, true]);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  // Idempotency: when a provisioned account already exists, re-persisting reuses
+  // its config dir (rewriting the refreshed credential in place) instead of
+  // minting a new one — so a reconnect never accumulates duplicate accounts — AND
+  // keeps the user's current tag instead of forcing it back to PROVISIONED_TAG.
+  test("defaultPersistWorkspaceGrant reuses the existing provisioned dir and tag on re-persist", async () => {
+    const existingDir = mkdtempSync(join(tmpdir(), "gini-ws-existing-"));
+    const registered: Array<{ tag: string; configDir: string; trusted?: boolean; principal?: string }> = [];
+    let minted = false;
+    const writes: Array<{ path: string; body: string }> = [];
+    await defaultPersistWorkspaceGrant(
+      "rt-refreshed",
+      "sub-abc",
+      async (input) => {
+        registered.push(input);
+        return { id: "gacct_x", tag: input.tag, email: "", configDir: input.configDir, addedAt: "t" };
+      },
+      () => {
+        minted = true; // makeConfigDir must NOT be consulted when one exists
+        return "/tmp/should-not-be-used";
+      },
+      () => {},
+      (path, body) => writes.push({ path, body }),
+      // The user retagged this provisioned account to "work"; reuse must keep it.
+      () => ({ configDir: existingDir, tag: "work" })
+    );
+    expect(minted).toBe(false);
+    expect(registered).toEqual([{ tag: "work", configDir: existingDir, trusted: true, principal: "sub-abc" }]);
+    // The refreshed credential is rewritten into the SAME dir.
+    expect(writes).toHaveLength(1);
+    expect(writes[0]!.path).toBe(join(existingDir, "credentials.json"));
+    const cred = JSON.parse(writes[0]!.body) as Record<string, string>;
+    expect(cred.refresh_token).toBe("rt-refreshed");
+    rmSync(existingDir, { recursive: true, force: true });
+  });
+
+  // The default findProvisioned seam, against a registry that ALREADY holds a
+  // provisioned account for THIS principal, returns its dir+tag so re-persist
+  // reuses it (exercises the real readGoogleAccounts filter+match). HOME is
+  // isolated so the registry is the one we seed, not the machine's.
+  test("defaultPersistWorkspaceGrant default seam reuses the provisioned account for the same principal", async () => {
+    const home = mkdtempSync(join(tmpdir(), "gini-ws-seeded-"));
+    const prevHome = process.env.HOME;
+    process.env.HOME = home;
+    const seededDir = join(home, ".gini", "google-accounts", "gacct_seeded1");
+    const registered: Array<{ tag: string; configDir: string; trusted?: boolean; principal?: string }> = [];
+    let minted = false;
+    try {
+      addGoogleAccount({ id: "gacct_seeded1", tag: "work", email: "x@y.com", configDir: seededDir, addedAt: "t", provisioned: true, principal: "sub-seed" });
+      await defaultPersistWorkspaceGrant(
+        "rt-reuse",
+        "sub-seed",
+        async (input) => {
+          registered.push(input);
+          return { id: "gacct_seeded1", tag: input.tag, email: "x@y.com", configDir: input.configDir, addedAt: "t" };
+        },
+        () => {
+          minted = true;
+          return "/tmp/should-not-be-used";
+        },
+        () => {},
+        () => {}
+        // findProvisioned left at its default → matches principal → seededDir + tag "work"
+      );
+      expect(minted).toBe(false);
+      expect(registered).toEqual([{ tag: "work", configDir: seededDir, trusted: true, principal: "sub-seed" }]);
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  // A DIFFERENT principal must NOT reuse another identity's provisioned dir — it
+  // mints its own, so one identity's credential never clobbers the other's.
+  test("defaultPersistWorkspaceGrant mints a separate dir for a different principal", async () => {
+    const home = mkdtempSync(join(tmpdir(), "gini-ws-principal-"));
+    const prevHome = process.env.HOME;
+    process.env.HOME = home;
+    const otherDir = join(home, ".gini", "google-accounts", "gacct_other");
+    const freshDir = mkdtempSync(join(tmpdir(), "gini-ws-mine-"));
+    const registeredDirs: string[] = [];
+    let minted = false;
+    try {
+      // Account already provisioned for principal A.
+      addGoogleAccount({ id: "gacct_other", tag: "workspace", email: "a@y.com", configDir: otherDir, addedAt: "t", provisioned: true, principal: "sub-A" });
+      // We connect as principal B.
+      await defaultPersistWorkspaceGrant(
+        "rt-B",
+        "sub-B",
+        async (input) => {
+          registeredDirs.push(input.configDir);
+          return { id: "gacct_n", tag: input.tag, email: "", configDir: input.configDir, addedAt: "t" };
+        },
+        () => {
+          minted = true;
+          return freshDir;
+        },
+        () => {},
+        () => {}
+        // default findProvisioned → no provisioned account for sub-B → null → mint freshDir
+      );
+      expect(minted).toBe(true);
+      expect(registeredDirs).toEqual([freshDir]); // principal A's dir is untouched
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+      rmSync(home, { recursive: true, force: true });
+      rmSync(freshDir, { recursive: true, force: true });
+    }
+  });
+
+  // Back-compat: a provisioned account recorded BEFORE principals were tracked
+  // has no `principal`. A connect that itself carries no principal must still
+  // reuse that unkeyed account (not mint a duplicate) — the default seam's
+  // no-principal arm.
+  test("defaultPersistWorkspaceGrant default seam reuses an unkeyed provisioned account when no principal is known", async () => {
+    const home = mkdtempSync(join(tmpdir(), "gini-ws-nokey-"));
+    const prevHome = process.env.HOME;
+    process.env.HOME = home;
+    const legacyDir = join(home, ".gini", "google-accounts", "gacct_legacy");
+    const registered: Array<{ tag: string; configDir: string; trusted?: boolean; principal?: string }> = [];
+    let minted = false;
+    try {
+      // Provisioned, but no principal recorded (pre-principal row).
+      addGoogleAccount({ id: "gacct_legacy", tag: "workspace", email: "l@y.com", configDir: legacyDir, addedAt: "t", provisioned: true });
+      await defaultPersistWorkspaceGrant(
+        "rt-legacy",
+        undefined, // connect carries no principal
+        async (input) => {
+          registered.push(input);
+          return { id: "gacct_legacy", tag: input.tag, email: "l@y.com", configDir: input.configDir, addedAt: "t" };
+        },
+        () => {
+          minted = true;
+          return "/tmp/should-not-be-used";
+        },
+        () => {},
+        () => {}
+        // default findProvisioned → no-principal arm → legacyDir + tag "workspace"
+      );
+      expect(minted).toBe(false);
+      expect(registered).toEqual([{ tag: "workspace", configDir: legacyDir, trusted: true, principal: undefined }]);
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  // The default findProvisioned seam reads the live registry: with no provisioned
+  // account present it returns null, so a fresh dir is minted. HOME points at an
+  // empty temp dir so the registry read is genuinely empty.
+  test("defaultPersistWorkspaceGrant mints a fresh dir when no provisioned account exists", async () => {
+    const home = mkdtempSync(join(tmpdir(), "gini-ws-emptyhome-"));
+    const prevHome = process.env.HOME;
+    process.env.HOME = home;
+    const dir = mkdtempSync(join(tmpdir(), "gini-ws-fresh-"));
+    let minted = false;
+    const registeredDirs: string[] = [];
+    try {
+      await defaultPersistWorkspaceGrant(
+        "rt-fresh",
+        undefined,
+        async (input) => {
+          registeredDirs.push(input.configDir);
+          return { id: "gacct_n", tag: input.tag, email: "", configDir: input.configDir, addedAt: "t" };
+        },
+        () => {
+          minted = true;
+          return dir;
+        },
+        () => {},
+        () => {}
+        // findProvisioned left at its default → reads the (empty) registry → null
+      );
+      expect(minted).toBe(true);
+      expect(registeredDirs).toEqual([dir]);
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+      rmSync(home, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   // awaitTunnelSettled resolves immediately when no connect is in flight.
