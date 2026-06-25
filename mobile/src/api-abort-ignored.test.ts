@@ -147,4 +147,38 @@ describe("api() settles even when the runtime's fetch ignores abort (device wint
     },
     10_000
   );
+
+  test(
+    "a caller abort settles api() even when the fetch ignores the abort signal",
+    async () => {
+      // The caller-signal cancellation path has the same exposure as the
+      // timeout path: api() races the request against a deadline, and on a
+      // runtime whose fetch ignores abort the request never settles. The
+      // caller-abort handler must therefore settle the race itself — not rely
+      // on the fetch rejecting — or a caller that cancels mid-flight on a
+      // wedged socket would hang exactly like the un-fixed spinner. With a
+      // large timeoutMs the internal timer can't be what rescues this; only
+      // the caller-abort settling the deadline can.
+      globalThis.fetch = ((_url: string, _init?: RequestInit) => {
+        return new Promise<Response>(() => {
+          // never resolves; ignores _init.signal
+        });
+      }) as typeof fetch;
+
+      const controller = new AbortController();
+      const pending = raceApiAgainstHang(
+        api("/agents", { signal: controller.signal, timeoutMs: 60_000 }),
+        3_000
+      );
+      controller.abort();
+      const result = await pending;
+
+      expect(result.outcome).toBe("rejected");
+      // A caller cancel is NOT a timeout: it must surface as a plain
+      // cancellation error, never relabeled ApiError(0) "timed out".
+      expect(result.error).not.toBeInstanceOf(ApiError);
+      expect((result.error as Error).message).toContain("aborted");
+    },
+    10_000
+  );
 });

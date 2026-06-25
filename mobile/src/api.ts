@@ -154,9 +154,12 @@ export async function api<T = unknown>(path: string, init: ApiOptions = {}): Pro
   // the tagged ApiError(0). The flag is set only by our timer, so a
   // caller-initiated cancel never trips it.
   let didTimeout = false;
-  // The deadline is a reject-only promise the request races against. The
-  // timer both rejects it (settles the race) and fires the abort (frees the
-  // request where supported).
+  // The deadline is a reject-only promise the request races against. It is
+  // rejected by EITHER the timer (a timeout) OR a caller abort — both must
+  // settle the race, because the race is the only thing that guarantees
+  // termination when the runtime's fetch ignores the abort signal. The timer
+  // rejects with the timeout ApiError; onCallerAbort rejects with a plain
+  // cancellation error (below).
   const deadline = Promise.withResolvers<never>();
   const timer = setTimeout(() => {
     didTimeout = true;
@@ -169,9 +172,19 @@ export async function api<T = unknown>(path: string, init: ApiOptions = {}): Pro
   // the catch a microtask later, leaving a window for the macrotask timer
   // to run first). Both the already-aborted and the later-abort paths go
   // through here so neither can race the flag.
+  //
+  // Rejecting the deadline here too is what makes the caller-abort path
+  // settle even when the runtime's fetch ignores the signal: controller.abort()
+  // alone only rejects the in-flight request on a cancellation-honoring
+  // runtime, so on the winter-fetch wedge the race would otherwise hang
+  // exactly as the timeout path would without its own deadline rejection. The
+  // rejection is a plain Error (not an ApiError) and didTimeout stays false,
+  // so the catch rethrows it unchanged — a caller cancel surfaces as a
+  // cancellation, never relabeled as a timeout.
   const onCallerAbort = () => {
     clearTimeout(timer);
     controller.abort();
+    deadline.reject(new Error("The operation was aborted."));
   };
   if (callerSignal) {
     if (callerSignal.aborted) onCallerAbort();
