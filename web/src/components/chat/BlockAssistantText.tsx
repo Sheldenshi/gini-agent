@@ -29,7 +29,7 @@ export function BlockAssistantText({
           {timestamp ? <span className="text-muted-foreground">{timestamp}</span> : null}
         </div>
         <div className="max-w-[90%] rounded-xl border bg-card px-3 py-2.5 text-card-foreground">
-          <MarkdownContent text={block.text} streaming={block.streaming} />
+          <MarkdownContent text={block.text} streaming={block.streaming} dropForeignImages />
         </div>
       </div>
     </div>

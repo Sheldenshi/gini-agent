@@ -32,7 +32,7 @@ export function BlockThinking({ block }: { block: AssistantTextBlock }) {
       </button>
       {expanded ? (
         <div className="ml-[23px] text-[13px] text-muted-foreground">
-          <MarkdownContent text={text} />
+          <MarkdownContent text={text} dropForeignImages />
         </div>
       ) : null}
     </div>

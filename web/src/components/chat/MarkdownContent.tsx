@@ -67,16 +67,31 @@ export function resolveDocHref(href: string | undefined, base?: string): string 
   }
 }
 
-function makeComponents(linkBaseUrl?: string) {
+function makeComponents(linkBaseUrl?: string, dropForeignImages = false) {
   return {
-    // An agent-produced attachment is authored as a `gini-upload://<id>` ref.
-    // An image ref → an inline <img> served from the BFF (which injects the
-    // bearer). A non-upload `src` is DROPPED rather than fetched — that
-    // allowlist closes the SSRF / tracking-pixel surface that arbitrary
-    // model-authored image URLs would open. See ADR outbound-chat-attachments.md.
+    // An agent-produced attachment is authored as a `gini-upload://<id>` ref →
+    // an inline <img> served from the BFF (which injects the bearer).
+    //
+    // For a NON-upload `src`: in `dropForeignImages` mode (model-authored chat /
+    // thinking) it's DROPPED rather than fetched — that allowlist closes the
+    // SSRF / tracking-pixel surface that arbitrary model-authored image URLs
+    // would open. For trusted doc/file/skill markdown (the default) an ordinary
+    // image renders normally; `uploadAwareUrlTransform` has already neutralized
+    // any `javascript:`/`data:` src via react-markdown's default sanitizer.
+    // See ADR outbound-chat-attachments.md.
     img: ({ src, alt, ...props }: React.ImgHTMLAttributes<HTMLImageElement>) => {
       const id = uploadIdFromRef(typeof src === "string" ? src : undefined);
-      if (!id) return null;
+      if (!id) {
+        if (dropForeignImages || typeof src !== "string" || src.length === 0) return null;
+        return (
+          <img
+            {...props}
+            src={src}
+            alt={alt ?? ""}
+            className="my-1 block max-h-80 max-w-full rounded-lg border object-contain"
+          />
+        );
+      }
       return (
         <a href={uploadUrl(id)} target="_blank" rel="noopener noreferrer" className="block">
           <img
@@ -129,13 +144,19 @@ function makeComponents(linkBaseUrl?: string) {
 export const MarkdownContent = memo(function MarkdownContent({
   text,
   streaming,
-  linkBaseUrl
+  linkBaseUrl,
+  dropForeignImages
 }: {
   text: string;
   streaming?: boolean;
   // When set, doc-relative links resolve absolute against this URL (the doc
   // viewer passes the doc's hosted URL); omit it for chat/skills rendering.
   linkBaseUrl?: string;
+  // When true, only `gini-upload://` image refs render and every other image
+  // `src` is dropped (the SSRF / tracking-pixel guard for UNTRUSTED
+  // model-authored chat/thinking text). Leave unset for trusted doc/file/skill
+  // markdown so ordinary images render. See ADR outbound-chat-attachments.md.
+  dropForeignImages?: boolean;
 }) {
   return (
     <div className="chat-markdown">
@@ -143,7 +164,7 @@ export const MarkdownContent = memo(function MarkdownContent({
         remarkPlugins={remarkPlugins}
         rehypePlugins={rehypePlugins}
         urlTransform={uploadAwareUrlTransform}
-        components={makeComponents(linkBaseUrl)}
+        components={makeComponents(linkBaseUrl, dropForeignImages)}
       >
         {text}
       </ReactMarkdown>
