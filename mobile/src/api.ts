@@ -122,7 +122,7 @@ export async function api<T = unknown>(path: string, init: ApiOptions = {}): Pro
   // native read. The timer would fire, the controller would abort, yet
   // `await fetch(...)` / `await response.text()` would never settle, leaving
   // the query pending and the list screen's spinner up until a force-quit.
-  // Racing the request against `deadline.promise` makes api() settle when the
+  // Racing the request against `deadlinePromise` makes api() settle when the
   // timer rejects the deadline, regardless of whether the fetch promise ever
   // does. controller.abort() is still fired so a cancellation-honoring
   // runtime frees the request promptly and a device runtime gets the signal
@@ -160,11 +160,22 @@ export async function api<T = unknown>(path: string, init: ApiOptions = {}): Pro
   // termination when the runtime's fetch ignores the abort signal. The timer
   // rejects with the timeout ApiError; onCallerAbort rejects with a plain
   // cancellation error (below).
-  const deadline = Promise.withResolvers<never>();
+  //
+  // Built with `new Promise`, NOT `Promise.withResolvers()`: the device JS
+  // engine is Hermes (react-native ships its own Promise polyfill, not a
+  // native one), which does not implement the ES2024 `Promise.withResolvers`.
+  // Calling it would throw `Promise.withResolvers is not a function` on every
+  // request on device — Bun (the test runtime) supports it, so a test-only
+  // build would mask the failure. Capturing the rejector from the executor is
+  // the portable equivalent.
+  let rejectDeadline!: (reason: Error) => void;
+  const deadlinePromise = new Promise<never>((_resolve, reject) => {
+    rejectDeadline = reject;
+  });
   const timer = setTimeout(() => {
     didTimeout = true;
     controller.abort();
-    deadline.reject(new ApiError(0, `Request to ${path} timed out`));
+    rejectDeadline(new ApiError(0, `Request to ${path} timed out`));
   }, timeout);
   // A caller-driven abort disarms the timer before aborting, so the timer
   // can't fire afterward and flip didTimeout — that would misclassify a
@@ -184,7 +195,7 @@ export async function api<T = unknown>(path: string, init: ApiOptions = {}): Pro
   const onCallerAbort = () => {
     clearTimeout(timer);
     controller.abort();
-    deadline.reject(new Error("The operation was aborted."));
+    rejectDeadline(new Error("The operation was aborted."));
   };
   if (callerSignal) {
     if (callerSignal.aborted) onCallerAbort();
@@ -196,8 +207,9 @@ export async function api<T = unknown>(path: string, init: ApiOptions = {}): Pro
     // Race the whole request (fetch + body read) against the deadline so a
     // runtime whose fetch ignores the abort can't keep this pending forever.
     // The fetch work is wrapped in its own async thunk; whichever settles
-    // first wins. `deadline.promise` only ever rejects (with the timeout
-    // ApiError), so the success branch can only come from the request.
+    // first wins. `deadlinePromise` is reject-only (the timeout ApiError, or
+    // the caller-abort Error), so the success branch can only come from the
+    // request.
     const requestWork = (async () => {
       const response = await fetch(url, { ...rest, headers, signal: controller.signal });
       // Read the body inside the raced work — a stalled body loses to the
@@ -212,7 +224,7 @@ export async function api<T = unknown>(path: string, init: ApiOptions = {}): Pro
     // promise rejection. Attach a no-op catch so the abandoned work can't
     // surface one; the deadline already produced the error we act on.
     requestWork.catch(() => {});
-    const { response, bodyText } = await Promise.race([requestWork, deadline.promise]);
+    const { response, bodyText } = await Promise.race([requestWork, deadlinePromise]);
     const value = bodyText ? safeParse(bodyText) : null;
     if (!response.ok) {
       // Two error-body shapes flow through the gateway: generic 4xx/5xx
