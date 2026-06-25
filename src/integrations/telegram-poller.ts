@@ -465,59 +465,67 @@ async function maintainTypingAndMirrorReply(
     // The agent embeds any attachment it produced as a `gini-upload://<id>`
     // markdown ref INSIDE its reply text (so it can land inline, mid-prose, in
     // the web/app chat). Telegram can't render those refs, so: pull the upload
-    // ids out of the reply, send each IMAGE upload as its own photo, and rewrite
-    // the markdown tags out of the displayed text. Non-image uploads (PDF, CSV,
-    // …) aren't sent yet — Telegram sendDocument is deferred (see ADR
-    // outbound-chat-attachments.md, alongside the stubbed Discord photo path).
-    // Resolve each id to its on-disk path + mime.
+    // ids out of the reply and send each IMAGE upload as its own photo. Non-image
+    // uploads (PDF, CSV, …) aren't sent yet — Telegram sendDocument is deferred
+    // (see ADR outbound-chat-attachments.md, alongside the stubbed Discord photo
+    // path). Resolve each id to its on-disk path + mime.
     const refIds = replyText ? uploadIdsFromText(replyText) : [];
-    const photoSends: Record<string, unknown>[] = [];
-    const sentImageIds = new Set<string>();
+    const imageRefs: { id: string; photo: Record<string, unknown> }[] = [];
     for (const id of refIds) {
       const meta = uploadStat(config.instance, id);
       const path = uploadPathFor(config.instance, id);
       if (!meta || !path || !meta.mimeType.startsWith("image/")) continue;
-      photoSends.push({ photo: { path, contentType: meta.mimeType } });
-      sentImageIds.add(id);
+      imageRefs.push({ id, photo: { path, contentType: meta.mimeType } });
     }
 
-    // Rewrite the upload-ref markdown tags out of the text Telegram displays.
-    // For a ref whose image WAS sent as a photo, drop the tag entirely (the
-    // photo carries it). For any other ref — a non-image file we don't send, or
-    // an image that failed to resolve — keep the visible LABEL (the filename) so
-    // the attachment never silently vanishes; only the unusable `gini-upload://`
-    // link target is removed. Collapse leftover blank lines.
-    const tagRe = new RegExp(`(!?)\\[([^\\]]*)\\]\\(${UPLOAD_REF_SCHEME}([A-Za-z0-9_-]+)\\)`, "g");
-    const cleanedText = (replyText ?? "")
-      .replace(tagRe, (_full, bang: string, label: string, id: string) =>
-        sentImageIds.has(id) ? "" : label
-      )
-      .replace(/\n{3,}/g, "\n\n")
-      .trim();
-
-    // Nothing to send when the reply is empty AND there is no image to deliver.
-    const hasText = cleanedText.length > 0;
-    if (!hasText && photoSends.length === 0) return;
-
-    // Send each photo on its own, then the cleaned text as its own message —
-    // never a photo+caption (Telegram caps a caption at 1024 MarkdownV2-escaped
-    // chars and a failed photo upload would take the caption text down with it).
-    // Separate messages guarantee the text always reaches the user.
-    const sends: Record<string, unknown>[] = [...photoSends];
-    if (hasText) sends.push({ text: cleanedText });
-
     try {
-      // Thread the originating taskId so the outbound row and its
-      // messaging.sent audit attribute back to the owning agent rather
-      // than landing unattributed at the bridge level. replyToMessageId is
-      // only threaded onto the FIRST send so a photo+text split doesn't
-      // double-quote the user's original message.
-      for (let i = 0; i < sends.length; i++) {
-        await sendMessagingOutput(config, bridgeId, {
-          ...sends[i],
+      // Send the photos FIRST, recording which ids actually delivered. Each
+      // photo is its own send — never a photo+caption (Telegram caps a caption
+      // at 1024 MarkdownV2-escaped chars and a failed photo upload would take
+      // the caption text down with it). replyToMessageId threads onto the first
+      // send only so a photo+text split doesn't double-quote the user.
+      // sendMessagingOutput SWALLOWS a failed send (records status:"failed",
+      // doesn't throw), so we key the tag-strip below on the RETURNED status —
+      // a photo that failed to deliver keeps its filename label in the text
+      // rather than vanishing from both the photo stream and the prose.
+      const deliveredImageIds = new Set<string>();
+      let firstSend = true;
+      for (const { id, photo } of imageRefs) {
+        const record = await sendMessagingOutput(config, bridgeId, {
+          photo,
           target: session.source.target,
           taskId,
-          ...(i === 0 && replyToMessageId !== undefined ? { replyToMessageId } : {})
+          ...(firstSend && replyToMessageId !== undefined ? { replyToMessageId } : {})
+        });
+        firstSend = false;
+        if ((record as { status?: string } | undefined)?.status === "sent") {
+          deliveredImageIds.add(id);
+        }
+      }
+
+      // Now rewrite the upload-ref markdown tags out of the text Telegram shows.
+      // For a ref whose photo actually DELIVERED, drop the tag entirely (the
+      // photo carries it). For any other ref — a non-image file we don't send,
+      // an image that failed to resolve, or a photo whose send FAILED — keep the
+      // visible LABEL (the filename) so the attachment never silently vanishes;
+      // only the unusable `gini-upload://` link target is removed. Collapse
+      // leftover blank lines.
+      const tagRe = new RegExp(`(!?)\\[([^\\]]*)\\]\\(${UPLOAD_REF_SCHEME}([A-Za-z0-9_-]+)\\)`, "g");
+      const cleanedText = (replyText ?? "")
+        .replace(tagRe, (_full, _bang: string, label: string, id: string) =>
+          deliveredImageIds.has(id) ? "" : label
+        )
+        .replace(/\n{3,}/g, "\n\n")
+        .trim();
+
+      // Send the cleaned text as its own message when non-empty. Thread
+      // replyToMessageId here only if no photo claimed it first.
+      if (cleanedText.length > 0) {
+        await sendMessagingOutput(config, bridgeId, {
+          text: cleanedText,
+          target: session.source.target,
+          taskId,
+          ...(firstSend && replyToMessageId !== undefined ? { replyToMessageId } : {})
         });
       }
     } catch (error) {
