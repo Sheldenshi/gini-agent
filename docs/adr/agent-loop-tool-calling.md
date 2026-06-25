@@ -65,10 +65,13 @@ through the same loop. So the loop comes first.
   `executeApprovedAction` runs the side effect, then calls
   `resumeChatTask(config, taskId, toolCallId, result)` for chat-task
   approvals. The loop continues from the next iteration.
-- The loop cap is `MAX_LOOP_ITERATIONS` (90 by default, overridable per
+- The loop cap is `MAX_LOOP_ITERATIONS` (200 by default, overridable per
   instance via `config.agent.maxIterations`, counted across pauses).
   Hitting it gives the model one final tool-less turn to summarize what it
   learned and what it could not finish, then marks the task `completed`.
+  The cap is deliberately generous: the loop-breakers below catch runaway
+  loops far earlier, so the cap only bounds tasks making genuine progress
+  every iteration (e.g. a bulk download of many items).
 - Tighter loop-breakers trip earlier when the model is stuck, routing into
   that same final-summary exit so a stuck loop ends with a useful answer
   instead of spinning to the cap. Three guards fire: repeating the identical

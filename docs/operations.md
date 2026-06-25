@@ -128,10 +128,13 @@ This is the same as the default install except it clones from your local repo in
 ## Agent Iteration Cap
 
 The chat-task agent loop is bounded by a per-iteration cap that prevents
-runaway tool-calling. The default is 90 iterations (one iteration = one
+runaway tool-calling. The default is 200 iterations (one iteration = one
 model call plus any tool dispatches that follow). Most tasks finish well
 under 10 iterations; the cap exists as a safety bound, not a meaningful
-budget for normal work.
+budget for normal work. It is deliberately generous because runaway loops
+are caught far earlier by the stuck-pattern detectors below — the cap only
+ever bounds tasks that are making genuine progress every iteration (such as
+a bulk download of many items, each needing several tool calls).
 
 Prior chat history replay is also bounded. The full chat remains stored,
 but each new chat-task prompt packs prior rows under `agent.priorContextTokens`
@@ -166,7 +169,7 @@ To override the cap for a single instance, edit
   "port": 7337,
   "...": "...",
   "agent": {
-    "maxIterations": 150,
+    "maxIterations": 400,
     "priorContextTokens": 50000
   }
 }
