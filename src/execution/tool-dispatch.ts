@@ -101,7 +101,7 @@ import { parseFillSecretSlots, sanitizeUrlForAuditTarget } from "./browser-fill-
 export type DispatchResult =
   // `result` is the text the model sees. An agent-produced image (e.g. a
   // browser screenshot) reaches the user by a ready-to-paste markdown tag
-  // embedded IN `result` (`gini-image://<id>`) that the model drops into its
+  // embedded IN `result` (`gini-upload://<id>`) that the model drops into its
   // reply where the picture belongs — there is no separate image channel. See
   // ADR outbound-chat-attachments.md.
   | { kind: "sync"; result: string }

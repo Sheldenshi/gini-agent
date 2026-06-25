@@ -4661,9 +4661,10 @@ export async function browserVision(
       // the screenshot is ALLOWED to enter the conversation directly. The
       // model loop still only sees the text answer below — but the captured
       // pixels are now ALSO stored as an upload and surfaced to the USER via
-      // the tool_result block's render-only `images` channel, so a request
-      // like "screenshot lego.com and send it to me" actually delivers the
-      // image. See ADR outbound-chat-attachments.md.
+      // a ready-to-paste `gini-upload://<id>` markdown tag (imageMarkdown
+      // below) the model drops into its reply, so a request like "screenshot
+      // lego.com and send it to me" actually delivers the image. See ADR
+      // outbound-chat-attachments.md.
       const route = resolveVisionRoute(config);
       void route;
       const result = await generateVisionAnalysis(config, {
@@ -4705,7 +4706,7 @@ export async function browserVision(
         full,
         // Ready-to-paste markdown tag the model drops into its reply WHERE it
         // wants the screenshot shown (inline, mid-prose). The clients rewrite
-        // the `gini-image://<id>` ref to their own authed image source; a
+        // the `gini-upload://<id>` ref to their own authed image source; a
         // missing tag just means no inline image. See ADR
         // outbound-chat-attachments.md.
         ...(image ? { imageMarkdown: imageTagFor(image.id, "screenshot") } : {}),

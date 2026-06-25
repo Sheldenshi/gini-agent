@@ -132,11 +132,15 @@ Specific choices:
 
 - **Messaging mirror.** The Telegram reply-mirror
   (`src/integrations/telegram-poller.ts`) parses upload refs out of the reply
-  text, sends each image as its own caption-less photo, and strips the markdown
-  tags from the text it shows (Telegram can't render them). Text and photo are
+  text and sends each IMAGE as its own caption-less photo. Text and photo are
   always separate sends — never a photo+caption — so the reply can't be lost to
-  Telegram's 1024-char caption limit or a photo-send failure. A `[SILENT]` turn
-  sends nothing. Discord photo sends remain stubbed.
+  Telegram's 1024-char caption limit or a photo-send failure. When it rewrites
+  the markdown tags out of the displayed text (Telegram can't render them) it
+  drops a tag only when that image was actually sent; for any other ref — a
+  non-image file, or an image that failed to resolve — it keeps the visible
+  filename LABEL so the attachment never silently vanishes. A `[SILENT]` turn
+  sends nothing. Telegram `sendDocument` for non-image attachments is deferred,
+  as are Discord photo sends (both stubbed).
 
 ## Consequences
 
