@@ -117,6 +117,23 @@ describe("bug: markdown links inside iOS block text are not clickable", () => {
     const inner = renderBlock("paragraph", nested, ["x"]);
     expect(inner.type).toBe(Text);
   });
+
+  test("iOS paragraph whose only link is a gini-upload chip renders as Text, not TextInput", () => {
+    // A `gini-upload://` chip has a live onPress (mint signed url + open the
+    // in-app browser), so it's interactive and must flip the block off the
+    // TextInput selection path — otherwise the wrapper swallows the chip's tap
+    // and the file chip is inert on iOS. Mirrors the http(s) case above.
+    const para: Node = {
+      key: "p",
+      type: "paragraph",
+      children: [linkNode("gini-upload://up_pdf01", "report.pdf")]
+    };
+    const inner = renderBlock("paragraph", para, [
+      rule("link")(linkNode("gini-upload://up_pdf01", "report.pdf"), "report.pdf", [], styles)
+    ]);
+    expect(inner.type).toBe(Text);
+    expect(inner.props.selectable).toBeFalsy();
+  });
 });
 
 describe("link tap and long-press wiring", () => {
@@ -205,12 +222,14 @@ describe("non-image attachment chip (gini-upload:// link)", () => {
     downloadAsync.mockClear();
     share.mockClear();
     await openUploadAttachment("up_pdf01", "report.pdf");
+    // The cache dest is namespaced by upload id so two same-named uploads
+    // can't collide / overwrite each other's bytes.
     expect(downloadAsync).toHaveBeenCalledWith(
       "http://gw.local/api/uploads/up_pdf01",
-      "/cache/report.pdf",
+      "/cache/up_pdf01-report.pdf",
       { headers: { authorization: "Bearer t" } }
     );
-    expect(share).toHaveBeenCalledWith({ url: "/cache/report.pdf" });
+    expect(share).toHaveBeenCalledWith({ url: "/cache/up_pdf01-report.pdf" });
   });
 
   test("a label-less upload chip still opens (filename falls back to 'attachment')", async () => {

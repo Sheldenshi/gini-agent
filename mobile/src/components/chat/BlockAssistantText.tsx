@@ -153,14 +153,21 @@ function nodeText(node: MarkdownNode): string {
 
 // Walk an AST node's subtree for an inline, *interactive* `link`. markdown-it
 // (with `linkify`) collapses `link_open`/`link_close` into a node of type
-// `link`, covering both `[label](url)` and bare autolinked URLs. Only http(s)
-// links get tap/long-press handlers, so only those should flip the block off
-// the selectable path — a non-web link is inert and should keep normal text
-// selection. A block-level `blocklink` (e.g. a linked image) keeps the
+// `link`, covering both `[label](url)` and bare autolinked URLs. A link is
+// interactive — and so must flip the block off the iOS TextInput selection path,
+// whose wrapper would otherwise swallow the link's taps — when it's either an
+// http(s) link OR a `gini-upload://` attachment chip (the link rule gives both
+// an onPress). A plain non-web, non-upload link is inert and should keep normal
+// text selection. A block-level `blocklink` (e.g. a linked image) keeps the
 // library's own touchable wrapper and is excluded here.
 function hasLinkDescendant(node: MarkdownNode): boolean {
   const href = node.attributes?.href;
-  if (node.type === "link" && href !== undefined && isWebUrl(href)) return true;
+  if (
+    node.type === "link" &&
+    href !== undefined &&
+    (isWebUrl(href) || uploadIdFromRef(href) !== null)
+  )
+    return true;
   return node.children?.some(hasLinkDescendant) ?? false;
 }
 
