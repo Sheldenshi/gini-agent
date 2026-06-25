@@ -939,6 +939,105 @@ describe("telegram poller supervisor", () => {
     expect(source.path?.endsWith(`${upload.id}.png`)).toBe(true);
   });
 
+  test("reply mirror keeps a NON-image attachment's filename in the text (not silently dropped)", async () => {
+    const config = testConfig("tg-outbound-doc");
+    const { storeUpload } = await import("../state");
+    const sendPhotoCalls: unknown[] = [];
+    const sendMessageCalls: string[] = [];
+    const client: TelegramClient = {
+      async getMe() {
+        return { id: 1, is_bot: true, username: "ginibot" };
+      },
+      async sendMessage(chatId, text) {
+        sendMessageCalls.push(text);
+        return { message_id: 1, date: 0, chat: { id: Number(chatId), type: "private" }, text };
+      },
+      async sendChatAction() {
+        return true as const;
+      },
+      async sendPhoto(chatId) {
+        sendPhotoCalls.push({ chatId });
+        return { message_id: 2, date: 0, chat: { id: Number(chatId), type: "private" } };
+      },
+      async getFile(fileId) {
+        return { file_id: fileId, file_unique_id: fileId, file_path: `f/${fileId}` };
+      },
+      async downloadFile() {
+        return new Uint8Array().buffer;
+      },
+      async getUpdates() {
+        return [];
+      }
+    };
+    setMessagingDeps({ telegramClientFactory: () => client });
+
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      deliveryTargets: ["55"],
+      botToken: "TOK"
+    });
+
+    // A non-image upload (PDF). Telegram sendDocument isn't wired yet, so the
+    // file isn't sent — but its filename label must survive in the text so the
+    // attachment doesn't vanish without a trace.
+    const upload = storeUpload(
+      config.instance,
+      new Uint8Array([0x25, 0x50, 0x44, 0x46]),
+      "application/pdf",
+      "release-notes.pdf"
+    );
+
+    await mutateState(config.instance, (state) => {
+      state.tasks.push({
+        id: "task_doc_tg",
+        instance: config.instance,
+        title: "send pdf",
+        input: "send me the pdf",
+        status: "completed",
+        summary: `Here are the files: [release-notes.pdf](gini-upload://${upload.id})`,
+        createdAt: "",
+        updatedAt: "",
+        tracePath: "",
+        auditIds: [],
+        approvalIds: [],
+        skillIds: [],
+        chatSessionId: "session_doc_tg"
+      });
+      const session: ChatSessionRecord = {
+        id: "session_doc_tg",
+        instance: config.instance,
+        title: "t",
+        createdAt: "",
+        updatedAt: "",
+        messageIds: [],
+        taskIds: ["task_doc_tg"],
+        runIds: [],
+        source: { kind: "telegram", bridgeId: bridge.id, chatId: 55, target: "55" }
+      };
+      state.chatSessions.push(session);
+    });
+
+    const controller = new AbortController();
+    await telegramInternals.maintainTypingAndMirrorReply(
+      config,
+      bridge.id,
+      "task_doc_tg",
+      55,
+      client,
+      controller.signal
+    );
+
+    // No photo (it's not an image), but the text is sent with the FILENAME
+    // visible and only the unusable gini-upload:// link target removed. The
+    // outbound text is MarkdownV2-escaped (`-` and `.` get backslash-escaped),
+    // so match the filename with the escaping the send layer applies.
+    expect(sendPhotoCalls.length).toBe(0);
+    expect(sendMessageCalls.length).toBe(1);
+    expect(sendMessageCalls[0]).toContain("release\\-notes\\.pdf");
+    expect(sendMessageCalls[0]).not.toContain("gini-upload://");
+  });
+
   test("a [SILENT]-suppressed turn does NOT leak its outbound image to Telegram", async () => {
     const config = testConfig("tg-silent-photo");
     const { storeUpload } = await import("../state");

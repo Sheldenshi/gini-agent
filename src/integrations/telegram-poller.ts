@@ -465,24 +465,33 @@ async function maintainTypingAndMirrorReply(
     // The agent embeds any attachment it produced as a `gini-upload://<id>`
     // markdown ref INSIDE its reply text (so it can land inline, mid-prose, in
     // the web/app chat). Telegram can't render those refs, so: pull the upload
-    // ids out of the reply, send each image upload as its own photo, and strip
-    // the now-redundant markdown tags from the text Telegram shows. Non-image
-    // uploads are left as-is in the text for now (a future change can send them
-    // as documents). Resolve each id to its on-disk path + mime.
+    // ids out of the reply, send each IMAGE upload as its own photo, and rewrite
+    // the markdown tags out of the displayed text. Non-image uploads (PDF, CSV,
+    // …) aren't sent yet — Telegram sendDocument is deferred (see ADR
+    // outbound-chat-attachments.md, alongside the stubbed Discord photo path).
+    // Resolve each id to its on-disk path + mime.
     const refIds = replyText ? uploadIdsFromText(replyText) : [];
     const photoSends: Record<string, unknown>[] = [];
+    const sentImageIds = new Set<string>();
     for (const id of refIds) {
       const meta = uploadStat(config.instance, id);
       const path = uploadPathFor(config.instance, id);
       if (!meta || !path || !meta.mimeType.startsWith("image/")) continue;
       photoSends.push({ photo: { path, contentType: meta.mimeType } });
+      sentImageIds.add(id);
     }
 
-    // Strip the upload-ref markdown tags from the text Telegram displays —
-    // `![alt](gini-upload://id)` / `[label](gini-upload://id)` would otherwise
-    // render as raw noise. Remove the whole tag; collapse leftover blank lines.
+    // Rewrite the upload-ref markdown tags out of the text Telegram displays.
+    // For a ref whose image WAS sent as a photo, drop the tag entirely (the
+    // photo carries it). For any other ref — a non-image file we don't send, or
+    // an image that failed to resolve — keep the visible LABEL (the filename) so
+    // the attachment never silently vanishes; only the unusable `gini-upload://`
+    // link target is removed. Collapse leftover blank lines.
+    const tagRe = new RegExp(`(!?)\\[([^\\]]*)\\]\\(${UPLOAD_REF_SCHEME}([A-Za-z0-9_-]+)\\)`, "g");
     const cleanedText = (replyText ?? "")
-      .replace(new RegExp(`!?\\[[^\\]]*\\]\\(${UPLOAD_REF_SCHEME}[A-Za-z0-9_-]+\\)`, "g"), "")
+      .replace(tagRe, (_full, bang: string, label: string, id: string) =>
+        sentImageIds.has(id) ? "" : label
+      )
       .replace(/\n{3,}/g, "\n\n")
       .trim();
 
