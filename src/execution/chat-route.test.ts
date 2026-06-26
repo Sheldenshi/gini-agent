@@ -24,9 +24,10 @@ import {
   setEchoStructuredResponse,
   setEchoToolCallingResponse
 } from "../provider";
-import { createChatSession, createTopic, listChatBlocks, mutateState, readState } from "../state";
-import type { RuntimeConfig, Task } from "../types";
+import { createChatSession, createTopic, insertChatBlock, listChatBlocks, mutateState, readState } from "../state";
+import type { ChatSessionRecord, RuntimeConfig, Task } from "../types";
 import { submitChatMessage } from "./chat";
+import { buildRecentConversation, buildUserPrompt, selectCandidates } from "./chat-route";
 
 let scratchHome: string;
 let prevHome: string | undefined;
@@ -177,6 +178,9 @@ describe("chat intake router", () => {
     expect(topic.title).toBe("World Cup trip");
     expect(topic.parentChatSessionId).toBe(chatId);
     expect(topic.agentId).toBe(agentId);
+    // The new topic's routing/retrieval descriptor is seeded with the
+    // originating user message so a later follow-up can match it by content.
+    expect(topic.topicSummary).toBe("my dad and I want to fly to SF for a world cup game");
 
     // The turn ran in the Topic (replay-authoritative records live there).
     const topicAnswers = state.chatMessages.filter(
@@ -362,5 +366,130 @@ describe("chat intake router", () => {
     expect(answers[0]!.content).toBe("Done in place.");
 
     rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("new_topic: a long originating message is truncated into topicSummary", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-route-ws-"));
+    const config = buildConfig(workspaceRoot, `chat-route-summary-${basename(workspaceRoot)}`);
+    const provider = normalizeProvider(config.provider);
+
+    const chatId = await mutateState(config.instance, (state) => {
+      const chat = createChatSession(state, "Messages", undefined, undefined, undefined, "agent");
+      return chat.id;
+    });
+
+    setEchoStructuredResponse("chat-route", { decision: "new_topic", title: "Long request" });
+    setEchoToolCallingResponse({ provider, text: "On it.", toolCalls: [], finishReason: "stop" });
+
+    const longContent = "x".repeat(300);
+    const result = await submitChatMessage(config, chatId, { content: longContent });
+    if ("queued" in result) throw new Error("expected run-now dispatch, got queued");
+    if (!("topicId" in result)) throw new Error("expected a topic dispatch result");
+    await waitForTerminal(config, result.taskId);
+
+    const topic = readState(config.instance).chatSessions.find((s) => s.id === result.topicId)!;
+    // Capped to 200 chars + the ellipsis, never the full 300-char message.
+    expect(topic.topicSummary!.length).toBe(201);
+    expect(topic.topicSummary!.endsWith("…")).toBe(true);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+});
+
+// Prompt-construction unit tests. The echo provider can't reason and doesn't
+// expose the prompt it receives, so routing QUALITY is verified by a live
+// dogfood; here we assert the pure builders carry the new context the router
+// relies on — the recent-conversation transcript, the populated topicSummary,
+// and recency order.
+describe("chat router prompt construction", () => {
+  let root: string;
+  let prevState: string | undefined;
+  let prevLog: string | undefined;
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "gini-chat-route-prompt-"));
+    prevState = process.env.GINI_STATE_ROOT;
+    prevLog = process.env.GINI_LOG_ROOT;
+    process.env.GINI_STATE_ROOT = root;
+    process.env.GINI_LOG_ROOT = `${root}-logs`;
+  });
+
+  afterEach(() => {
+    if (prevState === undefined) delete process.env.GINI_STATE_ROOT;
+    else process.env.GINI_STATE_ROOT = prevState;
+    if (prevLog === undefined) delete process.env.GINI_LOG_ROOT;
+    else process.env.GINI_LOG_ROOT = prevLog;
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("buildUserPrompt renders the recent-conversation section before message and topics, with populated summaries", () => {
+    const candidates = [
+      { topicId: "topic_a", title: "World Cup Final Trip", topicSummary: "my dad and I want to fly to SF for a world cup game" },
+      { topicId: "topic_b", title: "Birthday Party", topicSummary: "plan a birthday party for my sister" }
+    ];
+    const recent = [
+      "User: my dad and I want to fly to SF for a world cup game",
+      "Gini [in #World Cup Final Trip]: I found three nonstop flights to SFO."
+    ].join("\n");
+
+    const prompt = buildUserPrompt("What are my best options for flights from San Francisco?", candidates, recent);
+
+    // The recent-conversation section is present and comes BEFORE the message.
+    expect(prompt).toContain("Recent conversation:");
+    expect(prompt).toContain("Gini [in #World Cup Final Trip]:");
+    expect(prompt.indexOf("Recent conversation:")).toBeLessThan(prompt.indexOf("Message:"));
+    // Each candidate carries its populated summary (not just the bare title).
+    expect(prompt).toContain("#World Cup Final Trip (id=topic_a): my dad and I want to fly to SF for a world cup game");
+    expect(prompt).toContain("#Birthday Party (id=topic_b): plan a birthday party for my sister");
+  });
+
+  test("buildUserPrompt omits the recent-conversation section when there is no transcript", () => {
+    const prompt = buildUserPrompt("hello", [{ topicId: "t1", title: "Trip", topicSummary: "go to SF" }]);
+    expect(prompt).not.toContain("Recent conversation:");
+    expect(prompt.startsWith("Message:")).toBe(true);
+  });
+
+  test("buildRecentConversation labels a forwarded answer with its topic and keeps the last blocks", () => {
+    const instance = `chat-route-recent-${basename(root)}`;
+    const config = buildConfig(mkdtempSync(join(tmpdir(), "gini-chat-route-ws-")), instance);
+    const chatId = "chat_recent";
+    insertChatBlock(instance, { kind: "user_text", sessionId: chatId, text: "fly to SF for a world cup game" });
+    insertChatBlock(instance, {
+      kind: "assistant_text",
+      sessionId: chatId,
+      text: "I found three nonstop flights to SFO.",
+      streaming: false,
+      forwardedFromTopicId: "topic_wc",
+      forwardedFromTopicTitle: "World Cup Final Trip"
+    });
+
+    const transcript = buildRecentConversation(config, chatId);
+    expect(transcript).toContain("User: fly to SF for a world cup game");
+    expect(transcript).toContain("Gini [in #World Cup Final Trip]: I found three nonstop flights to SFO.");
+  });
+
+  test("buildRecentConversation truncates a long forwarded answer", () => {
+    const instance = `chat-route-recent-trunc-${basename(root)}`;
+    const config = buildConfig(mkdtempSync(join(tmpdir(), "gini-chat-route-ws-")), instance);
+    const chatId = "chat_recent_trunc";
+    insertChatBlock(instance, {
+      kind: "assistant_text",
+      sessionId: chatId,
+      text: "y".repeat(300),
+      streaming: false
+    });
+    const transcript = buildRecentConversation(config, chatId);
+    // 160-char cap + the ellipsis, prefixed with the chat-direct "Gini: " label.
+    expect(transcript).toBe(`Gini: ${"y".repeat(160)}…`);
+  });
+
+  test("selectCandidates orders the ≤cap path most-recently-updated first", async () => {
+    const config = buildConfig(mkdtempSync(join(tmpdir(), "gini-chat-route-ws-")), `chat-route-order-${basename(root)}`);
+    const topics: ChatSessionRecord[] = [
+      { id: "old", instance: config.instance, title: "Older topic", kind: "topic", updatedAt: "2026-06-20T00:00:00.000Z", createdAt: "2026-06-20T00:00:00.000Z", messageIds: [], taskIds: [], runIds: [], topicSummary: "older" },
+      { id: "new", instance: config.instance, title: "Newer topic", kind: "topic", updatedAt: "2026-06-24T00:00:00.000Z", createdAt: "2026-06-24T00:00:00.000Z", messageIds: [], taskIds: [], runIds: [], topicSummary: "newer" }
+    ];
+    const candidates = await selectCandidates(config, "any message", topics);
+    expect(candidates.map((c) => c.topicId)).toEqual(["new", "old"]);
   });
 });

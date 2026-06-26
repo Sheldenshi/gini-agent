@@ -246,10 +246,11 @@ export function createChatSession(
 // spawned it (for later forward-back).
 export function createTopic(
   state: RuntimeState,
-  opts: { agentId?: string; title: string; parentChatSessionId?: string; origin?: ChatSessionRecord["origin"] }
+  opts: { agentId?: string; title: string; parentChatSessionId?: string; origin?: ChatSessionRecord["origin"]; topicSummary?: string }
 ): ChatSessionRecord {
   const session = createChatSession(state, opts.title, undefined, opts.agentId, opts.origin, "topic");
   if (opts.parentChatSessionId) session.parentChatSessionId = opts.parentChatSessionId;
+  if (opts.topicSummary) session.topicSummary = opts.topicSummary;
   return session;
 }
 

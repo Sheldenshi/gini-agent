@@ -60,6 +60,19 @@ const AUTO_RENAME_ASSISTANT_TURNS = 2;
 // mobile list without ballooning the wire payload.
 const LAST_MESSAGE_PREVIEW_CHARS = 140;
 
+// Cap for the topicSummary seeded from a new topic's originating message. The
+// summary is a routing/retrieval descriptor surfaced to the intake router, so
+// it carries the gist of the request without bloating the router prompt.
+const TOPIC_SUMMARY_CHARS = 200;
+
+// Trim and bound the originating message used as a new topic's summary.
+function truncateTopicSummary(content: string): string {
+  const trimmed = content.trim();
+  return trimmed.length > TOPIC_SUMMARY_CHARS
+    ? `${trimmed.slice(0, TOPIC_SUMMARY_CHARS).trimEnd()}…`
+    : trimmed;
+}
+
 export function listChatSessions(config: RuntimeConfig) {
   const state = readState(config.instance);
   // Single SQL pass returns the most recent user_text / assistant_text
@@ -543,7 +556,12 @@ export async function submitChatMessage(
         createTopic(state, {
           agentId: prepared.liveSession.agentId,
           title: decision.title,
-          parentChatSessionId: sessionId
+          parentChatSessionId: sessionId,
+          // Seed the topic's routing/retrieval descriptor with the originating
+          // message so the router can recognize a later follow-up by content,
+          // not just the short title — no extra model call. See ADR
+          // chat-topics-tasks-subagents.md (Routing).
+          topicSummary: truncateTopicSummary(prepared.content)
         }).id
       );
       return dispatchChatMessageToTopic(config, sessionId, topicId, prepared);

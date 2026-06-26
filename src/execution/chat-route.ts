@@ -16,8 +16,8 @@
 
 import { generateStructured } from "../provider";
 import { cosineSimilarity, getEmbeddingProvider } from "../embeddings";
-import { readState, recordUsage } from "../state";
-import type { ChatSessionRecord, RuntimeConfig } from "../types";
+import { listChatBlocks, readState, recordUsage } from "../state";
+import type { AssistantTextBlock, ChatSessionRecord, RuntimeConfig, UserTextBlock } from "../types";
 import { providerOverrideForRuntime } from "./effective-context";
 
 export type RouteDecision =
@@ -37,6 +37,16 @@ interface RouteCandidate {
 // the structured call so the prompt stays bounded.
 const MAX_ROUTE_CANDIDATES = 12;
 
+// How many of the Chat's most recent message-bearing blocks feed the
+// recent-conversation context. Six covers the last few turns — enough to show
+// the model the thread a follow-up continues — without bloating the prompt.
+const RECENT_CONTEXT_BLOCKS = 6;
+
+// Truncation cap for each assistant line in the recent-conversation transcript.
+// User lines stay whole (they carry the routing signal); the agent's replies
+// only need their gist to establish what subject was last discussed.
+const RECENT_ASSISTANT_PREVIEW_CHARS = 160;
+
 export async function routeChatMessage(
   config: RuntimeConfig,
   chatSessionId: string,
@@ -54,6 +64,15 @@ export async function routeChatMessage(
       !session.archivedAt
   );
   const candidates = await selectCandidates(config, content, topics);
+  // The Chat's recent transcript is the key follow-up signal: a question about
+  // the same subject just discussed should continue that topic, not spawn a new
+  // one. Best-effort — a block-read failure leaves the section empty.
+  let recentConversation = "";
+  try {
+    recentConversation = buildRecentConversation(config, chatSessionId);
+  } catch {
+    recentConversation = "";
+  }
 
   const result = await generateStructured(
     config,
@@ -61,7 +80,7 @@ export async function routeChatMessage(
       schemaName: "ChatRoute",
       echoTag: "chat-route",
       system: buildSystemPrompt(candidates.length > 0),
-      user: buildUserPrompt(content, candidates),
+      user: buildUserPrompt(content, candidates, recentConversation),
       validator: {
         parse: (value: unknown) => coerceDecision(value, candidates, content)
       }
@@ -73,10 +92,12 @@ export async function routeChatMessage(
 }
 
 // Pick the candidate Topics to show the model. At or below the cap, pass them
-// all. Above it, embed the message + each candidate's title/summary and take
-// the top-MAX_ROUTE_CANDIDATES by cosine similarity. Any embedding failure
-// falls back to the most-recently-updated topics so routing never hard-fails.
-async function selectCandidates(
+// all, most-recently-updated first — recency is a strong continuation signal,
+// so the topic just discussed leads the list. Above the cap, embed the message
+// + each candidate's title/summary and take the top-MAX_ROUTE_CANDIDATES by
+// cosine similarity. Any embedding failure falls back to the most-recently-
+// updated topics so routing never hard-fails.
+export async function selectCandidates(
   config: RuntimeConfig,
   content: string,
   topics: ChatSessionRecord[]
@@ -87,7 +108,9 @@ async function selectCandidates(
     ...(session.topicSummary ? { topicSummary: session.topicSummary } : {})
   });
   if (topics.length <= MAX_ROUTE_CANDIDATES) {
-    return topics.map(toCandidate);
+    return [...topics]
+      .sort((a, b) => (b.updatedAt ?? "").localeCompare(a.updatedAt ?? ""))
+      .map(toCandidate);
   }
   try {
     const provider = getEmbeddingProvider(config);
@@ -122,6 +145,7 @@ function buildSystemPrompt(hasCandidates: boolean): string {
   if (hasCandidates) {
     routes.push(
       '- "existing_topic": the message clearly extends one of the listed topics. Set topicId to that topic\'s id.',
+      "A message that continues the recent conversation — a follow-up question about the same subject just discussed — should route to that topic via existing_topic; recency is a strong continuation signal.",
       "Choose existing_topic only when the message plainly continues a listed topic; otherwise prefer chat or new_topic."
     );
   } else {
@@ -132,15 +156,52 @@ function buildSystemPrompt(hasCandidates: boolean): string {
   return routes.join(" ");
 }
 
-function buildUserPrompt(content: string, candidates: RouteCandidate[]): string {
-  const lines = [`Message:\n${content}`];
+export function buildUserPrompt(
+  content: string,
+  candidates: RouteCandidate[],
+  recentConversation = ""
+): string {
+  const lines: string[] = [];
+  if (recentConversation) {
+    lines.push(`Recent conversation:\n${recentConversation}`);
+  }
+  lines.push(`Message:\n${content}`);
   if (candidates.length > 0) {
     const list = candidates
       .map((c) => `#${c.title} (id=${c.topicId}): ${c.topicSummary ?? ""}`)
       .join("\n");
-    lines.push(`\nExisting topics:\n${list}`);
+    lines.push(`Existing topics:\n${list}`);
   }
-  return lines.join("\n");
+  return lines.join("\n\n");
+}
+
+// Build a compact transcript of the Chat's recent message-bearing blocks so the
+// router sees the conversational thread a follow-up continues — and which topic
+// was most recently discussed. A forwarded answer (a Topic result mirrored into
+// Chat) is labeled with its topic so the model can tie the follow-up back to it.
+export function buildRecentConversation(config: RuntimeConfig, chatSessionId: string): string {
+  const blocks = listChatBlocks(config.instance, chatSessionId)
+    .filter((b): b is UserTextBlock | AssistantTextBlock =>
+      b.kind === "user_text" || b.kind === "assistant_text"
+    )
+    .slice(-RECENT_CONTEXT_BLOCKS);
+  return blocks.map(transcriptLine).join("\n");
+}
+
+function transcriptLine(block: UserTextBlock | AssistantTextBlock): string {
+  if (block.kind === "user_text") {
+    return `User: ${block.text}`;
+  }
+  const text = truncate(block.text, RECENT_ASSISTANT_PREVIEW_CHARS);
+  if (block.forwardedFromTopicId) {
+    return `Gini [in #${block.forwardedFromTopicTitle ?? ""}]: ${text}`;
+  }
+  return `Gini: ${text}`;
+}
+
+function truncate(text: string, max: number): string {
+  const trimmed = text.trim();
+  return trimmed.length > max ? `${trimmed.slice(0, max).trimEnd()}…` : trimmed;
 }
 
 // Coerce an arbitrary model result into a safe RouteDecision. Anything
