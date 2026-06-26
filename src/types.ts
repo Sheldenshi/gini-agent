@@ -1893,6 +1893,17 @@ export interface JobRecord {
   // as an assistant chat message. Backwards-compatible: legacy jobs without
   // this field keep their existing imperative delivery semantics.
   chatSessionId?: string;
+  // Forward-to-Chat flag (ADR chat-topics-tasks-subagents.md, "Jobs →
+  // Topics"). A job ALWAYS runs in its own dedicated Topic (the
+  // `kind:"channel"`, `origin:"job"` session pointed at by `chatSessionId`).
+  // When `forwardToChat` is true, each fire additionally FORWARDS its final
+  // answer into the owning agent's Chat (the `kind:"agent"` session) as a
+  // render-only block tagged with the job's Topic — instead of burying the
+  // job's reports inside the user's conversation. This is the new shape of
+  // "deliver to chat": the originating `deliverTo:"chat"` choice flips this
+  // flag rather than re-pointing `chatSessionId` at the user's conversation.
+  // Absent/false ⇒ channel-only delivery (the Topic is the only surface).
+  forwardToChat?: boolean;
   // One-shot reminder semantics: when true the job is auto-paused after its
   // first terminal run (success or fail). The user can resume manually
   // through /jobs. Defaults to undefined/false (recurring behavior).

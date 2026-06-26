@@ -4,7 +4,7 @@ import { ensureDir, instanceRoot, statePath } from "../paths";
 import { now } from "./ids";
 import { defaultAgent, defaultTools, defaultToolsets } from "./defaults";
 import { addAudit } from "./audit";
-import { pairedDeviceIdentityKey } from "./records";
+import { createChatSession, pairedDeviceIdentityKey } from "./records";
 import { getMemoryDb, memoryDbPath } from "./memory-db";
 import { canonicalCredentialName, getProvider } from "../integrations/connectors/registry";
 
@@ -994,6 +994,48 @@ function migrateThreadsToLinearHistory(state: RuntimeState): void {
   dyn.migrations = { ...(dyn.migrations ?? {}), threadsToLinearHistory: now() };
 }
 
+// Give every legacy chat-bound job a dedicated Topic + forwardToChat (ADR
+// chat-topics-tasks-subagents.md, "Jobs → Topics"). Before this phase a
+// `deliverTo:"chat"` job re-pointed its `chatSessionId` at the user's own
+// `kind:"agent"` conversation, so it has no dedicated Topic. Mint a fresh
+// channel/Topic for each such job, re-point `job.chatSessionId` at it, and set
+// `forwardToChat=true` so each fire forwards into Chat instead of burying
+// reports inline. Jobs already bound to a `kind:"channel"` Topic are left as
+// channel-only (forwardToChat defaults to false). Marker-gated so it runs ONCE
+// per instance; idempotent within a run. Runs after the channel-kind backfill
+// so a legacy `origin:"job"` session that just gained `kind:"channel"` is in
+// scope and never mistaken for an agent chat.
+function migrateJobsToTopics(state: RuntimeState): void {
+  const dyn = state as unknown as { migrations?: { jobsToTopics?: string } };
+  if (dyn.migrations?.jobsToTopics) return;
+  let migrated = 0;
+  for (const job of state.jobs) {
+    if (job.chatSessionId === undefined) continue;
+    const session = state.chatSessions.find((s) => s.id === job.chatSessionId);
+    // Only a job pointed at a real `kind:"agent"` Chat is a legacy
+    // deliverTo:"chat" rebind result with no dedicated Topic — give it one.
+    if (!session || session.kind !== "agent") continue;
+    const topic = createChatSession(state, job.name, undefined, job.agentId, "job", "channel");
+    job.chatSessionId = topic.id;
+    job.forwardToChat = true;
+    migrated += 1;
+  }
+  if (migrated > 0) {
+    addAudit(
+      state,
+      {
+        actor: "runtime",
+        action: "jobs.topics.migrated",
+        target: state.instance,
+        risk: "low",
+        evidence: { migrated }
+      },
+      { system: true }
+    );
+  }
+  dyn.migrations = { ...(dyn.migrations ?? {}), jobsToTopics: now() };
+}
+
 // Stamp the active-at-migration-time agent onto records that pre-date the
 // per-agent isolation field. Idempotent and audit-emitting. Covers Task,
 // ChatSessionRecord, JobRecord, JobRunRecord,
@@ -1478,6 +1520,11 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
   // Convert legacy threads into linear Chat history (ADR
   // chat-topics-tasks-subagents.md). Marker-gated so it runs ONCE per instance.
   migrateThreadsToLinearHistory(state);
+  // Give legacy chat-bound jobs a dedicated Topic + forwardToChat (ADR
+  // chat-topics-tasks-subagents.md, "Jobs → Topics"). Runs after the
+  // channel-kind backfill above so a job pointed at a real kind:"agent" Chat is
+  // unambiguously a legacy deliverTo:"chat" rebind result. Marker-gated.
+  migrateJobsToTopics(state);
   // Archive job channels orphaned by a pre-cleanup job deletion (issue #369).
   // Runs after the channel-kind backfill above so a legacy `origin:"job"`
   // session that just gained `kind:"channel"` is in scope, and after

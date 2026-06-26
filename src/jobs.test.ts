@@ -124,8 +124,8 @@ describe("cron lifecycle", () => {
     expect(audit).toBeDefined();
   });
 
-  test("deferral: a due chat-bound job is skipped while its session has a live turn, then fires once it ends", async () => {
-    const config = testConfig("jobs-defer-live-turn");
+  test("a due job fires even while its session has a live turn (deferral retired)", async () => {
+    const config = testConfig("jobs-no-defer-live-turn");
     const handler = createHandler(config);
 
     const sessionId = "chat_defer_test";
@@ -135,7 +135,10 @@ describe("cron lifecycle", () => {
     });
 
     // Make the job chat-bound and due now, and inject a live (user-initiated)
-    // turn for that session: a non-terminal task with no jobId.
+    // turn for that session: a non-terminal task with no jobId. The job now
+    // ALWAYS runs in its own Topic and forwards a single standalone block, so
+    // there is no ordinal interleave to defer against (ADR
+    // chat-topics-tasks-subagents.md, "Jobs → Topics").
     const dueAt = new Date(Date.now() - 5_000).toISOString();
     await mutateState(config.instance, (state) => {
       const item = state.jobs.find((candidate) => candidate.id === job.id);
@@ -149,23 +152,9 @@ describe("cron lifecycle", () => {
 
     await runDueJobs(config);
 
-    // Skipped: nextRunAt untouched and no run created.
-    const deferred = readState(config.instance);
-    expect(deferred.jobs.find((candidate) => candidate.id === job.id)!.nextRunAt).toBe(dueAt);
-    expect(deferred.jobRuns.filter((run) => run.jobId === job.id)).toHaveLength(0);
-
-    // Settle the live turn; the next tick claims and dispatches the job.
-    await mutateState(config.instance, (state) => {
-      const liveTurn = state.tasks.find((t) => t.chatSessionId === sessionId && t.jobId === undefined);
-      if (!liveTurn) throw new Error("setup: live turn missing");
-      liveTurn.status = "completed";
-    });
-
-    await runDueJobs(config);
-
+    // No longer deferred: the job claims and runs despite the live turn.
     const after = readState(config.instance);
     expect(after.jobRuns.filter((run) => run.jobId === job.id)).toHaveLength(1);
-    // nextRunAt advanced off the original due time now that it claimed.
     expect(after.jobs.find((candidate) => candidate.id === job.id)!.nextRunAt).not.toBe(dueAt);
   });
 
@@ -603,14 +592,22 @@ describe("cron lifecycle", () => {
 
     const stateAfter = readState(config.instance);
     expect(stateAfter.jobs).toHaveLength(1);
-    // The job delivers into the ORIGINATING conversation — no dedicated
-    // channel session is minted.
-    expect(stateAfter.jobs[0]?.chatSessionId).toBe(sessionId);
-    expect(stateAfter.chatSessions).toHaveLength(1);
+    // The job ALWAYS runs in its OWN dedicated Topic — deliverTo:"chat" only
+    // flips forwardToChat, never re-points at the originating conversation
+    // (ADR chat-topics-tasks-subagents.md, "Jobs → Topics").
+    const job = stateAfter.jobs[0]!;
+    expect(job.chatSessionId).toBeDefined();
+    expect(job.chatSessionId).not.toBe(sessionId);
+    expect(job.forwardToChat).toBe(true);
+    // A fresh dedicated channel/Topic was minted alongside the originating one.
+    const topic = stateAfter.chatSessions.find((s) => s.id === job.chatSessionId);
+    expect(topic?.kind).toBe("channel");
+    expect(topic?.origin).toBe("job");
+    expect(topic?.title).toBe("in-chat-reminder");
     // The originating session stays a normal chat: no kind/title mutation.
-    const session = stateAfter.chatSessions[0]!;
-    expect(session.kind).toBeUndefined();
-    expect(session.title).toBe("Test chat");
+    const originating = stateAfter.chatSessions.find((s) => s.id === sessionId)!;
+    expect(originating.kind).toBeUndefined();
+    expect(originating.title).toBe("Test chat");
   });
 
   test("create_job dispatch with explicit deliverTo \"channel\" still mints a dedicated chat session", async () => {
@@ -2452,6 +2449,112 @@ describe("cron lifecycle", () => {
     expect(audit).toBeDefined();
   });
 
+  test("a forwardToChat job materializes its answer in its Topic AND forwards a tagged block into the owning agent's Chat", async () => {
+    // End-to-end: a job that runs in its own Topic and forwards each fire's
+    // final answer into the owning agent's Chat (ADR
+    // chat-topics-tasks-subagents.md, "Jobs → Topics").
+    const { getOrCreateAgentChat } = await import("./execution/chat");
+    const { listChatBlocks, createChatSession } = await import("./state");
+    const config = testConfig("jobs-forward-to-chat");
+
+    // Resolve the owning agent + its Chat, then mint a dedicated Topic for the
+    // job and a forwardToChat job bound to it.
+    const agentId = readState(config.instance).agents[0]!.id;
+    const chat = await getOrCreateAgentChat(config.instance, agentId);
+    const topicId = await mutateState(config.instance, (state) => {
+      const topic = createChatSession(state, "ping-watch", undefined, agentId, "job", "channel");
+      return topic.id;
+    });
+    const job = await createScheduledJob(config, {
+      name: "ping-watch",
+      prompt: "echo ping",
+      intervalSeconds: 60,
+      chatSessionId: topicId,
+      forwardToChat: true,
+      oneShot: true
+    }, { originatingAgentId: agentId });
+    expect(job.forwardToChat).toBe(true);
+
+    await mutateState(config.instance, (state) => {
+      const item = state.jobs.find((candidate) => candidate.id === job.id);
+      if (!item) throw new Error("setup: job missing");
+      item.nextRunAt = new Date(Date.now() - 1_000).toISOString();
+    });
+
+    await runDueJobs(config);
+
+    await waitFor(() => {
+      const jobRun = readState(config.instance).jobRuns.find((run) => run.jobId === job.id);
+      return jobRun?.status === "completed" || jobRun?.status === "failed";
+    }, 5_000);
+
+    // The replay-authoritative answer landed in the Topic.
+    await waitFor(
+      () => readState(config.instance).chatMessages.some((m) => m.sessionId === topicId && m.role === "assistant"),
+      5_000
+    );
+
+    // …and a forwarded render-only block landed in the owning agent's Chat,
+    // tagged with the Topic for the deep-link chip.
+    await waitFor(() => {
+      return listChatBlocks(config.instance, chat.id).some(
+        (b) => b.kind === "assistant_text" && b.forwardedFromTopicId === topicId
+      );
+    }, 5_000);
+
+    const forwarded = listChatBlocks(config.instance, chat.id).find(
+      (b) => b.kind === "assistant_text" && b.forwardedFromTopicId === topicId
+    );
+    expect(forwarded).toBeDefined();
+    if (forwarded?.kind === "assistant_text") {
+      expect(forwarded.forwardedFromTopicTitle).toBe("ping-watch");
+      expect(forwarded.text.trim().length).toBeGreaterThan(0);
+    }
+  });
+
+  test("a channel-only job forwards NOTHING into the owning agent's Chat", async () => {
+    const { getOrCreateAgentChat } = await import("./execution/chat");
+    const { listChatBlocks, createChatSession } = await import("./state");
+    const config = testConfig("jobs-channel-only-no-forward");
+
+    const agentId = readState(config.instance).agents[0]!.id;
+    const chat = await getOrCreateAgentChat(config.instance, agentId);
+    const topicId = await mutateState(config.instance, (state) => {
+      const topic = createChatSession(state, "report", undefined, agentId, "job", "channel");
+      return topic.id;
+    });
+    // No forwardToChat: the answer stays in the Topic only.
+    const job = await createScheduledJob(config, {
+      name: "report",
+      prompt: "echo ping",
+      intervalSeconds: 60,
+      chatSessionId: topicId,
+      oneShot: true
+    }, { originatingAgentId: agentId });
+    expect(job.forwardToChat ?? false).toBe(false);
+
+    await mutateState(config.instance, (state) => {
+      const item = state.jobs.find((candidate) => candidate.id === job.id);
+      if (!item) throw new Error("setup: job missing");
+      item.nextRunAt = new Date(Date.now() - 1_000).toISOString();
+    });
+
+    await runDueJobs(config);
+
+    // The answer materializes in the Topic.
+    await waitFor(() => {
+      const jobRun = readState(config.instance).jobRuns.find((run) => run.jobId === job.id);
+      return jobRun?.status === "completed" || jobRun?.status === "failed";
+    }, 5_000);
+    await waitFor(
+      () => readState(config.instance).chatMessages.some((m) => m.sessionId === topicId && m.role === "assistant"),
+      5_000
+    );
+
+    // Nothing forwarded into the agent's Chat.
+    expect(listChatBlocks(config.instance, chat.id).filter((b) => b.kind === "assistant_text")).toHaveLength(0);
+  });
+
   test("syncChatTaskResult suppresses delivery when the task summary is [SILENT]", async () => {
     // The cron-execution hint instructs the LLM to emit "[SILENT]" when a
     // scheduled run has nothing new to report. syncChatTaskResult must
@@ -2797,10 +2900,10 @@ describe("update_job deliverTo rebinding", () => {
     });
   }
 
-  test("deliverTo \"channel\" mints a fresh channel, leaves the conversation unarchived, and no-ops on repeat", async () => {
+  test("deliverTo \"channel\" clears forwardToChat, keeps the job's Topic, and no-ops on repeat", async () => {
     const config = testConfig("jobs-rebind-chat-to-channel");
     const { taskId, sessionId } = await seedChatTask(config, "c2ch");
-    // Chat-bound job: fires deliver into the originating conversation.
+    // Forward-to-chat job: runs in its own Topic AND forwards into chat.
     await dispatchToolCall(
       config,
       taskId,
@@ -2808,8 +2911,13 @@ describe("update_job deliverTo rebinding", () => {
       "call_rebind_create",
       JSON.stringify({ name: "haiku-job", intervalSeconds: 60, prompt: "Haiku.", deliverTo: "chat" })
     );
-    const jobId = readState(config.instance).jobs[0]!.id;
-    expect(readState(config.instance).jobs[0]?.chatSessionId).toBe(sessionId);
+    const jobBefore = readState(config.instance).jobs[0]!;
+    const jobId = jobBefore.id;
+    const topicId = jobBefore.chatSessionId!;
+    // The job ALWAYS runs in its own dedicated Topic — never the originating
+    // conversation. deliverTo:"chat" only sets forwardToChat.
+    expect(topicId).not.toBe(sessionId);
+    expect(jobBefore.forwardToChat).toBe(true);
 
     const result = await dispatchToolCall(
       config,
@@ -2822,13 +2930,13 @@ describe("update_job deliverTo rebinding", () => {
 
     const state = readState(config.instance);
     const job = state.jobs.find((j) => j.id === jobId)!;
-    // Rebound to a FRESH dedicated channel with the job's name as title.
-    expect(job.chatSessionId).toBeDefined();
-    expect(job.chatSessionId).not.toBe(sessionId);
-    const channel = state.chatSessions.find((s) => s.id === job.chatSessionId);
-    expect(channel?.kind).toBe("channel");
-    expect(channel?.origin).toBe("job");
-    expect(channel?.title).toBe("haiku-job");
+    // The job KEEPS its Topic — only forwardToChat flips off. No fresh channel.
+    expect(job.chatSessionId).toBe(topicId);
+    expect(job.forwardToChat).toBe(false);
+    const topic = state.chatSessions.find((s) => s.id === topicId);
+    expect(topic?.kind).toBe("channel");
+    expect(topic?.origin).toBe("job");
+    expect(topic?.archivedAt).toBeUndefined();
     // The user's conversation is NOT archived — it was never job-owned.
     const conversation = state.chatSessions.find((s) => s.id === sessionId);
     expect(conversation?.archivedAt).toBeUndefined();
@@ -2837,7 +2945,7 @@ describe("update_job deliverTo rebinding", () => {
       expect(result.result).toContain(job.chatSessionId!);
     }
 
-    // Repeat call: already channel-bound — no second channel, no rebind.
+    // Repeat call: already channel-only — no change, no new session.
     const sessionCount = state.chatSessions.length;
     const repeat = await dispatchToolCall(
       config,
@@ -2854,10 +2962,10 @@ describe("update_job deliverTo rebinding", () => {
     }
   });
 
-  test("deliverTo \"chat\" rebinds to the originating conversation and archives the old channel, history intact", async () => {
+  test("deliverTo \"chat\" sets forwardToChat, keeps the job's Topic (no archive), and no-ops on repeat", async () => {
     const config = testConfig("jobs-rebind-channel-to-chat");
     const { taskId, sessionId } = await seedChatTask(config, "ch2c");
-    // Channel-bound job (the default): a dedicated channel is minted.
+    // Channel-only job (the default): a dedicated Topic is minted, no forward.
     await dispatchToolCall(
       config,
       taskId,
@@ -2865,12 +2973,14 @@ describe("update_job deliverTo rebinding", () => {
       "call_rebind_create_channel",
       JSON.stringify({ name: "briefing", intervalSeconds: 60, prompt: "Brief." })
     );
-    const jobId = readState(config.instance).jobs[0]!.id;
-    const channelId = readState(config.instance).jobs[0]!.chatSessionId!;
-    expect(channelId).not.toBe(sessionId);
-    // A delivered fire in the channel — must survive the archive.
+    const jobBefore = readState(config.instance).jobs[0]!;
+    const jobId = jobBefore.id;
+    const topicId = jobBefore.chatSessionId!;
+    expect(topicId).not.toBe(sessionId);
+    expect(jobBefore.forwardToChat ?? false).toBe(false);
+    // A delivered fire in the Topic — must survive the rebind untouched.
     await mutateState(config.instance, (state) => {
-      createChatMessage(state, { sessionId: channelId, role: "assistant", content: "fire output" });
+      createChatMessage(state, { sessionId: topicId, role: "assistant", content: "fire output" });
     });
 
     const result = await dispatchToolCall(
@@ -2883,20 +2993,21 @@ describe("update_job deliverTo rebinding", () => {
     expect(result.kind).toBe("sync");
 
     const state = readState(config.instance);
-    expect(state.jobs.find((j) => j.id === jobId)?.chatSessionId).toBe(sessionId);
-    // The orphaned channel is archived in place: still present, history
-    // intact, archivedAt stamped so it leaves the session lists.
-    const channel = state.chatSessions.find((s) => s.id === channelId);
-    expect(channel).toBeDefined();
-    expect(channel?.archivedAt).toBeDefined();
-    expect(channel?.messageIds).toHaveLength(1);
-    expect(state.audit.some((e) => e.action === "chat.session.archived" && e.target === channelId)).toBe(true);
+    const job = state.jobs.find((j) => j.id === jobId)!;
+    // The Topic is KEPT and never archived just because delivery moved to chat.
+    expect(job.chatSessionId).toBe(topicId);
+    expect(job.forwardToChat).toBe(true);
+    const topic = state.chatSessions.find((s) => s.id === topicId);
+    expect(topic).toBeDefined();
+    expect(topic?.archivedAt).toBeUndefined();
+    expect(topic?.messageIds).toHaveLength(1);
+    expect(state.audit.some((e) => e.action === "chat.session.archived" && e.target === topicId)).toBe(false);
     expect(state.audit.some((e) => e.action === "job.delivery.rebound" && e.target === jobId)).toBe(true);
     if (result.kind === "sync") {
-      expect(result.result).toContain("archived");
+      expect(result.result).toContain("forwards");
     }
 
-    // Repeat call: already bound to this conversation — no second archive.
+    // Repeat call: already forwarding — no change.
     const repeat = await dispatchToolCall(
       config,
       taskId,
@@ -2905,8 +3016,8 @@ describe("update_job deliverTo rebinding", () => {
       JSON.stringify({ jobId, deliverTo: "chat" })
     );
     const after = readState(config.instance);
-    expect(after.jobs.find((j) => j.id === jobId)?.chatSessionId).toBe(sessionId);
-    expect(after.audit.filter((e) => e.action === "chat.session.archived").length).toBe(1);
+    expect(after.jobs.find((j) => j.id === jobId)?.chatSessionId).toBe(topicId);
+    expect(after.jobs.find((j) => j.id === jobId)?.forwardToChat).toBe(true);
     if (repeat.kind === "sync") {
       expect(repeat.result).toContain("no change");
     }
@@ -2938,25 +3049,28 @@ describe("update_job deliverTo rebinding", () => {
     expect(state.audit.some((e) => e.action === "job.delivery.rebound")).toBe(false);
   });
 
-  test("rebindJobDelivery rejects a vanished originating session and mutates nothing", async () => {
-    const config = testConfig("jobs-rebind-vanished-session");
-    // Channel-bound job. The dispatcher resolves the originating session
-    // from a lock-free readState; the helper's mutateState re-check must
-    // refuse a session deleted between that read and the write.
+  test("rebindJobDelivery to \"chat\" sets forwardToChat and keeps the job's Topic (no archive)", async () => {
+    const config = testConfig("jobs-rebind-keeps-topic");
+    // Channel-only job with a dedicated Topic. Rebinding to "chat" must keep
+    // that same Topic and only flip forwardToChat — never archive it.
     const job = await createScheduledJob(config, {
       name: "race",
       intervalSeconds: 60,
       prompt: "x",
       createDedicatedSession: { title: "race" }
     });
-    await expect(
-      rebindJobDelivery(config, job.id, "chat", { originatingSessionId: "session_deleted_in_race" })
-    ).rejects.toThrow(/chat session session_deleted_in_race no longer exists/);
+    const topicId = job.chatSessionId!;
+    const result = await rebindJobDelivery(config, job.id, "chat");
+    expect(result.outcome).toBe("rebound");
     const state = readState(config.instance);
-    expect(state.jobs.find((j) => j.id === job.id)?.chatSessionId).toBe(job.chatSessionId);
-    const channel = state.chatSessions.find((s) => s.id === job.chatSessionId);
-    expect(channel?.archivedAt).toBeUndefined();
-    expect(state.audit.some((e) => e.action === "job.delivery.rebound")).toBe(false);
+    const after = state.jobs.find((j) => j.id === job.id)!;
+    // Same Topic, forwardToChat flipped on, Topic NOT archived.
+    expect(after.chatSessionId).toBe(topicId);
+    expect(after.forwardToChat).toBe(true);
+    const topic = state.chatSessions.find((s) => s.id === topicId);
+    expect(topic?.archivedAt).toBeUndefined();
+    expect(state.audit.some((e) => e.action === "chat.session.archived")).toBe(false);
+    expect(state.audit.some((e) => e.action === "job.delivery.rebound" && e.target === job.id)).toBe(true);
   });
 
   test("deliverTo is rejected for watcher jobs (preRunHook or fan-out routes)", async () => {
@@ -2991,111 +3105,20 @@ describe("update_job deliverTo rebinding", () => {
     expect(state.audit.some((e) => e.action === "job.delivery.rebound")).toBe(false);
   });
 
-  test("a raced session deletion after sibling patches reports partial success, not failure", async () => {
-    const config = testConfig("jobs-rebind-partial-apply");
-    const { taskId, sessionId } = await seedChatTask(config, "partial");
-    await dispatchToolCall(
-      config,
-      taskId,
-      "create_job",
-      "call_partial_create",
-      JSON.stringify({ name: "partial-job", intervalSeconds: 60, prompt: "x" })
-    );
-    const jobId = readState(config.instance).jobs[0]!.id;
-    const channelId = readState(config.instance).jobs[0]!.chatSessionId!;
-
-    // The handler runs synchronously through its lock-free pre-checks
-    // (which see the live session) and enqueues the name-patch mutation
-    // before its first await; the rebind's own mutateState is only
-    // enqueued after that patch resolves. Enqueueing the deletion here —
-    // after dispatch starts, before awaiting it — therefore lands it
-    // between the patch and the rebind on the FIFO per-instance queue:
-    // the name commits, then the rebind's serialized re-check sees the
-    // session gone.
-    const pending = dispatchToolCall(
-      config,
-      taskId,
-      "update_job",
-      "call_partial_update",
-      JSON.stringify({ jobId, name: "renamed-mid-race", deliverTo: "chat" })
-    );
-    const racingDeletion = mutateState(config.instance, (state) => {
-      const index = state.chatSessions.findIndex((s) => s.id === sessionId);
-      state.chatSessions.splice(index, 1);
-    });
-    const result = await pending;
-    await racingDeletion;
-
-    expect(result.kind).toBe("sync");
-    if (result.kind === "sync") {
-      // Partial success, not failure: the name persisted, only the rebind
-      // was skipped — the result text must say exactly that.
-      expect(result.result).toContain("Updated job");
-      expect(result.result).toContain("Delivery rebind skipped: the originating chat session was deleted mid-call.");
-      expect(result.result).not.toContain("Error:");
-    }
-    const state = readState(config.instance);
-    const job = state.jobs.find((j) => j.id === jobId)!;
-    expect(job.name).toBe("renamed-mid-race");
-    // Binding untouched: the rebind's mutateState threw before any write,
-    // so the channel was never archived.
-    expect(job.chatSessionId).toBe(channelId);
-    expect(state.chatSessions.find((s) => s.id === channelId)?.archivedAt).toBeUndefined();
-    // The tool-level audit row still lands, with deliverTo absent from
-    // appliedFields (it did not apply) while name is present.
-    const audit = state.audit.find((e) => e.action === "job.updated" && Array.isArray(e.evidence?.appliedFields));
-    expect(audit?.evidence?.appliedFields).toContain("name");
-    expect(audit?.evidence?.appliedFields).not.toContain("deliverTo");
-  });
-
-  test("a raced session deletion on a deliverTo-only call keeps the error surface", async () => {
-    const config = testConfig("jobs-rebind-deliverto-only-race");
-    const { taskId, sessionId } = await seedChatTask(config, "donly");
-    await dispatchToolCall(
-      config,
-      taskId,
-      "create_job",
-      "call_donly_create",
-      JSON.stringify({ name: "donly-job", intervalSeconds: 60, prompt: "x" })
-    );
-    const jobId = readState(config.instance).jobs[0]!.id;
-    const channelId = readState(config.instance).jobs[0]!.chatSessionId!;
-
-    // With no sibling fields the handler reaches the rebind synchronously
-    // and enqueues its mutateState before control returns, so the deletion
-    // must be enqueued FIRST: it executes on a microtask, after the
-    // handler's synchronous lock-free pre-check reads the still-live
-    // session from disk, and before the rebind's serialized re-check.
-    const racingDeletion = mutateState(config.instance, (state) => {
-      const index = state.chatSessions.findIndex((s) => s.id === sessionId);
-      state.chatSessions.splice(index, 1);
-    });
-    const result = await dispatchToolCall(
-      config,
-      taskId,
-      "update_job",
-      "call_donly_update",
-      JSON.stringify({ jobId, deliverTo: "chat" })
-    );
-    await racingDeletion;
-
-    expect(result.kind).toBe("sync");
-    if (result.kind === "sync") {
-      // Nothing was applied, so the whole call IS a failure here.
-      expect(result.result).toContain("Error: update_job skipped the delivery rebind");
-    }
-    const state = readState(config.instance);
-    expect(state.jobs.find((j) => j.id === jobId)?.chatSessionId).toBe(channelId);
-    expect(state.chatSessions.find((s) => s.id === channelId)?.archivedAt).toBeUndefined();
-  });
-
-  test("deliverTo \"channel\" clones the conversation's bridge source onto the new channel as outboundMirror", async () => {
+  test("deliverTo \"chat\" clones the conversation's bridge source onto the job's Topic as outboundMirror", async () => {
     const config = testConfig("jobs-rebind-mirror-clone");
     const { taskId, sessionId } = await seedChatTask(config, "mirror");
     const source = { kind: "telegram" as const, bridgeId: "bridge_tg", chatId: 42, target: "42" };
     await mutateState(config.instance, (state) => {
-      state.chatSessions.find((s) => s.id === sessionId)!.source = source;
+      const session = state.chatSessions.find((s) => s.id === sessionId)!;
+      session.source = source;
+      // The dedicated-Topic mirror clone resolves the parent session via its
+      // taskIds (as a real chat turn does), so seed the link.
+      if (!session.taskIds.includes(taskId)) session.taskIds.push(taskId);
     });
+    // The job ALWAYS mints its own Topic; create-time minting clones the
+    // originating conversation's `source` onto the Topic's outboundMirror so
+    // scheduled fires keep reaching the bridge.
     await dispatchToolCall(
       config,
       taskId,
@@ -3104,7 +3127,14 @@ describe("update_job deliverTo rebinding", () => {
       JSON.stringify({ name: "mirror-job", intervalSeconds: 60, prompt: "x", deliverTo: "chat" })
     );
     const jobId = readState(config.instance).jobs[0]!.id;
+    const topicId = readState(config.instance).jobs[0]!.chatSessionId!;
+    const topic = readState(config.instance).chatSessions.find((s) => s.id === topicId);
+    expect(topic?.kind).toBe("channel");
+    expect(topic?.outboundMirror).toEqual(source);
+    expect(topic?.source).toBeUndefined();
 
+    // Rebinding to "channel" keeps the same Topic (and its mirror) — only the
+    // forwardToChat flag flips off.
     await dispatchToolCall(
       config,
       taskId,
@@ -3112,88 +3142,11 @@ describe("update_job deliverTo rebinding", () => {
       "call_mirror_rebind",
       JSON.stringify({ jobId, deliverTo: "channel" })
     );
-
     const state = readState(config.instance);
     const job = state.jobs.find((j) => j.id === jobId)!;
-    const channel = state.chatSessions.find((s) => s.id === job.chatSessionId);
-    expect(channel?.kind).toBe("channel");
-    // Same semantics as create-time channel minting: the conversation's
-    // `source` is cloned as `outboundMirror` (outbound-only) so scheduled
-    // fires keep reaching the bridge after the rebind.
-    expect(channel?.outboundMirror).toEqual(source);
-    expect(channel?.source).toBeUndefined();
-  });
-
-  test("channel→chat archive is skipped when another job still delivers into the channel", async () => {
-    const config = testConfig("jobs-rebind-shared-channel");
-    const { taskId, sessionId } = await seedChatTask(config, "shared");
-    await dispatchToolCall(
-      config,
-      taskId,
-      "create_job",
-      "call_shared_create",
-      JSON.stringify({ name: "shared-a", intervalSeconds: 60, prompt: "x" })
-    );
-    const jobId = readState(config.instance).jobs[0]!.id;
-    const channelId = readState(config.instance).jobs.find((j) => j.id === jobId)!.chatSessionId!;
-    // Raw POST/PATCH /api/jobs can bind a second job to the same channel.
-    const other = await createScheduledJob(config, { name: "shared-b", intervalSeconds: 60, prompt: "x" });
-    await mutateState(config.instance, (state) => {
-      state.jobs.find((j) => j.id === other.id)!.chatSessionId = channelId;
-    });
-
-    const result = await dispatchToolCall(
-      config,
-      taskId,
-      "update_job",
-      "call_shared_rebind",
-      JSON.stringify({ jobId, deliverTo: "chat" })
-    );
-    expect(result.kind).toBe("sync");
-
-    const state = readState(config.instance);
-    // The rebind itself proceeded…
-    expect(state.jobs.find((j) => j.id === jobId)?.chatSessionId).toBe(sessionId);
-    // …but the shared channel stays live for the other job.
-    const channel = state.chatSessions.find((s) => s.id === channelId);
-    expect(channel?.archivedAt).toBeUndefined();
-    expect(state.audit.some((e) => e.action === "chat.session.archived")).toBe(false);
-    const rebound = state.audit.find((e) => e.action === "job.delivery.rebound" && e.target === jobId);
-    expect(rebound?.evidence?.archiveSkipped).toBe("channel shared");
-  });
-
-  test("channel→chat archive is skipped when a fan-out route references the channel", async () => {
-    const config = testConfig("jobs-rebind-shared-route");
-    const { taskId, sessionId } = await seedChatTask(config, "sharedroute");
-    await dispatchToolCall(
-      config,
-      taskId,
-      "create_job",
-      "call_route_create",
-      JSON.stringify({ name: "route-a", intervalSeconds: 60, prompt: "x" })
-    );
-    const jobId = readState(config.instance).jobs[0]!.id;
-    const channelId = readState(config.instance).jobs.find((j) => j.id === jobId)!.chatSessionId!;
-    const watcher = await createScheduledJob(config, { name: "route-b", intervalSeconds: 60, prompt: "x" });
-    await mutateState(config.instance, (state) => {
-      state.jobs.find((j) => j.id === watcher.id)!.routes = { bucket: { chatSessionId: channelId } };
-    });
-
-    await dispatchToolCall(
-      config,
-      taskId,
-      "update_job",
-      "call_route_rebind",
-      JSON.stringify({ jobId, deliverTo: "chat" })
-    );
-
-    const state = readState(config.instance);
-    expect(state.jobs.find((j) => j.id === jobId)?.chatSessionId).toBe(sessionId);
-    const channel = state.chatSessions.find((s) => s.id === channelId);
-    expect(channel?.archivedAt).toBeUndefined();
-    expect(state.audit.some((e) => e.action === "chat.session.archived")).toBe(false);
-    const rebound = state.audit.find((e) => e.action === "job.delivery.rebound" && e.target === jobId);
-    expect(rebound?.evidence?.archiveSkipped).toBe("channel shared");
+    expect(job.chatSessionId).toBe(topicId);
+    expect(job.forwardToChat).toBe(false);
+    expect(state.chatSessions.find((s) => s.id === topicId)?.outboundMirror).toEqual(source);
   });
 
   test("deliverTo \"channel\" on an archived-channel binding mints a fresh channel and keeps the bridge mirror", async () => {
@@ -3242,9 +3195,9 @@ describe("update_job deliverTo rebinding", () => {
     expect(fresh?.outboundMirror).toEqual(mirror);
   });
 
-  test("deliverTo \"chat\" on an archived-channel binding does not re-stamp archivedAt or re-audit", async () => {
+  test("deliverTo \"chat\" on an archived-channel binding mints a fresh Topic and sets forwardToChat", async () => {
     const config = testConfig("jobs-rebind-archived-chat");
-    const { taskId, sessionId } = await seedChatTask(config, "archchat");
+    const { taskId } = await seedChatTask(config, "archchat");
     await dispatchToolCall(
       config,
       taskId,
@@ -3268,74 +3221,55 @@ describe("update_job deliverTo rebinding", () => {
     );
 
     const state = readState(config.instance);
-    expect(state.jobs.find((j) => j.id === jobId)?.chatSessionId).toBe(sessionId);
-    // Original archive stamp preserved; no duplicate archive audit row.
+    const job = state.jobs.find((j) => j.id === jobId)!;
+    // The job had no LIVE Topic (its channel was archived), so it gets a fresh
+    // one; forwardToChat flips on. The old archived channel is untouched: its
+    // stamp is preserved and no new archive audit is emitted.
+    expect(job.chatSessionId).not.toBe(channelId);
+    expect(job.forwardToChat).toBe(true);
+    const fresh = state.chatSessions.find((s) => s.id === job.chatSessionId);
+    expect(fresh?.kind).toBe("channel");
+    expect(fresh?.archivedAt).toBeUndefined();
     expect(state.chatSessions.find((s) => s.id === channelId)?.archivedAt).toBe(stampedAt);
     expect(state.audit.some((e) => e.action === "chat.session.archived")).toBe(false);
-    // The rebound audit doesn't claim THIS call archived anything.
-    const rebound = state.audit.find((e) => e.action === "job.delivery.rebound" && e.target === jobId);
-    expect(rebound?.evidence?.archivedSessionId).toBeUndefined();
   });
 
-  test("a same-call name patch titles the freshly minted channel", async () => {
+  test("a same-call name patch titles a freshly minted channel when the job had no live Topic", async () => {
     const config = testConfig("jobs-rebind-rename-title");
     const { taskId } = await seedChatTask(config, "rename");
+    // Channel-only job, then force its Topic archived so the rebind must mint a
+    // fresh one — the name patch (applied first) titles that fresh channel.
     await dispatchToolCall(
       config,
       taskId,
       "create_job",
       "call_rename_create",
-      JSON.stringify({ name: "old-name", intervalSeconds: 60, prompt: "x", deliverTo: "chat" })
+      JSON.stringify({ name: "old-name", intervalSeconds: 60, prompt: "x" })
     );
     const jobId = readState(config.instance).jobs[0]!.id;
+    const channelId = readState(config.instance).jobs[0]!.chatSessionId!;
+    await mutateState(config.instance, (state) => {
+      state.chatSessions.find((s) => s.id === channelId)!.archivedAt = new Date().toISOString();
+    });
 
     await dispatchToolCall(
       config,
       taskId,
       "update_job",
       "call_rename_rebind",
-      JSON.stringify({ jobId, name: "new-name", deliverTo: "channel" })
+      JSON.stringify({ jobId, name: "new-name", deliverTo: "chat" })
     );
 
     const state = readState(config.instance);
     const job = state.jobs.find((j) => j.id === jobId)!;
     const channel = state.chatSessions.find((s) => s.id === job.chatSessionId);
     expect(channel?.kind).toBe("channel");
+    expect(channel?.id).not.toBe(channelId);
     // The name patch applies before the rebind, so the new channel takes
     // the PATCHED name as its title.
     expect(channel?.title).toBe("new-name");
     expect(job.name).toBe("new-name");
-  });
-
-  test("deliverTo \"chat\" from a different conversation rebinds to it without archiving the old conversation", async () => {
-    const config = testConfig("jobs-rebind-conversation-move");
-    const a = await seedChatTask(config, "convA");
-    const b = await seedChatTask(config, "convB");
-    await dispatchToolCall(
-      config,
-      a.taskId,
-      "create_job",
-      "call_move_create",
-      JSON.stringify({ name: "move-job", intervalSeconds: 60, prompt: "x", deliverTo: "chat" })
-    );
-    const jobId = readState(config.instance).jobs[0]!.id;
-    expect(readState(config.instance).jobs[0]!.chatSessionId).toBe(a.sessionId);
-
-    await dispatchToolCall(
-      config,
-      b.taskId,
-      "update_job",
-      "call_move_rebind",
-      JSON.stringify({ jobId, deliverTo: "chat" })
-    );
-
-    const state = readState(config.instance);
-    expect(state.jobs.find((j) => j.id === jobId)?.chatSessionId).toBe(b.sessionId);
-    // Conversation A is a user chat (kind undefined) — never archived.
-    const conversationA = state.chatSessions.find((s) => s.id === a.sessionId);
-    expect(conversationA).toBeDefined();
-    expect(conversationA?.archivedAt).toBeUndefined();
-    expect(state.audit.some((e) => e.action === "chat.session.archived")).toBe(false);
+    expect(job.forwardToChat).toBe(true);
   });
 });
 
