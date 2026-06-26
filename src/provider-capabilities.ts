@@ -94,12 +94,14 @@ function openrouterContextWindowTokens(model: string): number {
 // ("us.anthropic.claude-opus-4-8") or arrive bare ("claude-opus-4-8") — both
 // match the family patterns. The minor-version classes ([6-9]|\d\d) keep
 // future point releases (Opus 4.9+) on 1M while leaving 4.5/4.1/4.0 at 200K.
-// The `(?![0-9])` lookahead anchors the minor token so a model id's DATE STAMP
-// can't be misread as a minor version (e.g. "claude-sonnet-4-20250514" must not
-// match `4-\d\d` via the "20" of the date and jump to 1M; it falls to 200K).
+// The `(?=$|[-.])` boundary anchors the minor token to a whole segment so a
+// model id's DATE STAMP can't be misread as a minor version (e.g.
+// "claude-sonnet-4-20250514" must not match `4-\d\d` via the "20" of the date
+// and jump to 1M; it falls to 200K). Real ids delimit the minor with end-of-
+// string or a `-`/`.` separator, never a glued suffix.
 function claudeContextWindowTokens(slug: string): number {
-  if (/claude-opus-4-(?:[6-9]|\d\d)(?![0-9])/.test(slug)) return 1_000_000;
-  if (/claude-sonnet-4-(?:[6-9]|\d\d)(?![0-9])/.test(slug)) return 1_000_000;
+  if (/claude-opus-4-(?:[6-9]|\d\d)(?=$|[-.])/.test(slug)) return 1_000_000;
+  if (/claude-sonnet-4-(?:[6-9]|\d\d)(?=$|[-.])/.test(slug)) return 1_000_000;
   if (/claude-fable-\d/.test(slug)) return 1_000_000;
   if (/claude/.test(slug)) return 200_000;
   return FALLBACK_CONTEXT_WINDOW_TOKENS;
@@ -182,12 +184,15 @@ export const FALLBACK_MAX_OUTPUT_TOKENS = 8_192;
 // id's DATE STAMP can't be misread as a minor version: without it,
 // `claude-sonnet-4-20250514` (Sonnet 4.0, dated) matches `[…]4-(?:[6-9]|\d\d)`
 // because `\d\d` eats "20" → a wrong 128K ceiling → a 400 on a real Sonnet-4.0
-// streaming turn. The lookahead forces the minor token to be the WHOLE segment
-// (followed by `-`/end, not more digits), and the explicit 4.5/4.1/4.0 patterns
-// pin the older tiers; order matters (specific tiers before the 6-9 class).
+// streaming turn. The `(?=$|[-.])` boundary forces the minor token to be a WHOLE
+// segment (end of string, or followed by a `-`/`.` separator — the only ways a
+// minor version is delimited in real first-party and Bedrock ids), so a date
+// run or a glued suffix can't be misread as a minor version. The explicit
+// 4.5/4.1/4.0 patterns pin the older tiers; order matters (specific tiers before
+// the 6-9 class).
 function claudeMaxOutputTokens(slug: string): number {
-  if (/claude-opus-4-(?:[6-9]|\d\d)(?![0-9])/.test(slug)) return 128_000;
-  if (/claude-sonnet-4-(?:[6-9]|\d\d)(?![0-9])/.test(slug)) return 128_000;
+  if (/claude-opus-4-(?:[6-9]|\d\d)(?=$|[-.])/.test(slug)) return 128_000;
+  if (/claude-sonnet-4-(?:[6-9]|\d\d)(?=$|[-.])/.test(slug)) return 128_000;
   if (/claude-fable-\d/.test(slug)) return 128_000;
   if (/claude-haiku-4-5/.test(slug)) return 64_000;
   if (/claude-opus-4-5/.test(slug)) return 64_000;

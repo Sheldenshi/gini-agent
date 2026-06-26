@@ -372,6 +372,13 @@ describe("resolveMaxOutputTokens", () => {
     expect(resolveMaxOutputTokens(provider("bedrock", "us.anthropic.claude-sonnet-4-20250514-v1:0"))).toBe(64_000);
     expect(resolveMaxOutputTokens(provider("anthropic", "claude-opus-4-20250514"))).toBe(32_000);
     expect(resolveMaxOutputTokens(provider("bedrock", "us.anthropic.claude-opus-4-20250514-v1:0"))).toBe(32_000);
+    // The minor-version boundary is a whole segment (end / `-` / `.`), so a
+    // letter-glued suffix can't be misread as a 4.6+ minor either — it falls to
+    // the floor rather than the 128K tier. Real ids never glue letters onto the
+    // minor, but the boundary is segment-anchored so it can't.
+    expect(resolveMaxOutputTokens(provider("anthropic", "claude-sonnet-4-6preview"))).toBe(FALLBACK_MAX_OUTPUT_TOKENS);
+    // A dated 4.6 (minor delimited by `-`) still resolves to its 128K tier.
+    expect(resolveMaxOutputTokens(provider("bedrock", "us.anthropic.claude-sonnet-4-6-20260101-v1:0"))).toBe(128_000);
   });
 
   test("non-Claude Bedrock families carry their own probed ceilings", () => {
