@@ -42,9 +42,13 @@ const DEFAULT_BEDROCK_BASE_URL = bedrockRuntimeBaseUrl(DEFAULT_BEDROCK_REGION);
 // both the first-party API and Claude in Amazon Bedrock.
 const ANTHROPIC_VERSION = "2023-06-01";
 // Anthropic beta flag that enables fine-grained tool streaming (tool_use input
-// JSON streamed incrementally instead of buffered whole). GA on Bedrock via the
-// anthropic_beta request field; no HTTP beta header required. See AWS Bedrock
-// "Anthropic Claude tool use" docs.
+// JSON streamed incrementally instead of buffered whole). Carried two different
+// ways depending on the send path: the first-party Anthropic Messages path
+// sends it as the HTTP `anthropic-beta` request header (callAnthropicMessages),
+// while the Bedrock Converse path carries it as an `anthropic_beta` entry inside
+// the `additionalModelRequestFields` body object (callBedrockConverse) — Bedrock
+// takes no HTTP beta header. See the Anthropic "fine-grained tool streaming"
+// docs and the AWS Bedrock "Anthropic Claude tool use" docs.
 const FINE_GRAINED_TOOL_STREAMING_BETA = "fine-grained-tool-streaming-2025-05-14";
 // The Messages API REQUIRES max_tokens. The streaming send-path resolves the
 // model's real output ceiling via resolveMaxOutputTokens so a large tool-call

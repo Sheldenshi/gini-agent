@@ -32,7 +32,7 @@ Browser configuration goes through the same server-side path as every other env-
 
 ## Test Surface
 
-- `src/provider.test.ts` — fetch-mocked unit tests covering the non-stream and streaming paths, request shape and headers (`x-api-key`, `anthropic-version`), message/tool/multimodal translation, `stop_reason` mapping, error surfaces (HTTP + in-stream error events + missing body), `max_tokens` resolution, structured output (plain/fenced/invalid JSON), the vision path, the configured/catalog gates, verbatim model id, and the `/v1` trailing-path normalization.
+- `src/provider.test.ts` — fetch-mocked unit tests covering the non-stream and streaming paths, request shape and headers (`x-api-key`, `anthropic-version`), message/tool/multimodal translation, `stop_reason` mapping, error surfaces (HTTP + in-stream error events + missing body), `max_tokens` resolution, structured output (plain/fenced/invalid JSON), the vision path, the configured/catalog gates, verbatim model id, the `/v1` trailing-path normalization, and fine-grained tool streaming gating (the `anthropic-beta: fine-grained-tool-streaming-2025-05-14` header present on a streaming Claude-4 tool turn; absent on a tool-less turn, a non-streaming turn, and a non-Claude-4 model). The Claude-family allowlist itself is unit-tested via `claudeSupportsFineGrainedToolStreaming` in `src/provider-capabilities.test.ts`.
 - `src/runtime/setup-api.test.ts` — the anthropic env-keyed setup path and provider removal.
 - `src/cli/commands/provider.test.ts` — `gini provider set anthropic` with `--base-url` / `--api-key-env`, and default-model fallback.
 
