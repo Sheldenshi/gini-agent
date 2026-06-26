@@ -10,7 +10,7 @@
         "gini-relay": "git+ssh://git@github.com/Lilac-Labs/gini-relay.git#eb1f8f89e26c22b8e5e7af8ab7fcf840c4114cf6",
         "mammoth": "^1.12.0",
         "pdfjs-dist": "^6.0.227",
-        "playwright-core": "^1.61.0",
+        "playwright-core": "^1.61.1",
         "sharp": "^0.35.2",
         "xlsx": "file:vendor/xlsx-0.20.3.tgz",
       },
@@ -24,9 +24,6 @@
     "onnxruntime-node",
     "protobufjs",
   ],
-  "patchedDependencies": {
-    "playwright-core@1.61.0": "patches/playwright-core@1.61.0.patch",
-  },
   "packages": {
     "@emnapi/runtime": ["@emnapi/runtime@1.10.0", "", { "dependencies": { "tslib": "^2.4.0" } }, "sha512-ewvYlk86xUoGI0zQRNq/mC+16R1QeDlKQy21Ki3oSYXNgLb45GV1P6A0M+/s6nyCuNDqe5VpaY84BzXGwVbwFA=="],
 
@@ -228,7 +225,7 @@
 
     "platform": ["platform@1.3.6", "", {}, "sha512-fnWVljUchTro6RiCFvCXBbNhJc2NijN7oIQxbwsyL0buWJPG85v81ehlHI9fXrJsMNgTofEoWIQeClKpgxFLrg=="],
 
-    "playwright-core": ["playwright-core@1.61.0", "", { "bin": { "playwright-core": "cli.js" } }, "sha512-caX7TrY3Ml6egyDX0WUcTHDxodl/b51y5wJOdCEA36QviK/s2g081hvmGs8eaE3DWb6NYZQ6BjO/QkNRPenoPA=="],
+    "playwright-core": ["playwright-core@1.61.1", "", { "bin": { "playwright-core": "cli.js" } }, "sha512-h7Qlt6m4REp25qvIdvbDtVmD4LqVXfpRxhORv9L0jzETM05p4fuPJ3dKyuSXQxDSbXnmS79HAgi9589lGSpLkg=="],
 
     "process-nextick-args": ["process-nextick-args@2.0.1", "", {}, "sha512-3ouUOpQhtgrbOa17J7+uxOTpITYWaGP7/AhoR3+A+/1e9skrzelGi/dXzEYyvbxubEF6Wn2ypscTKiKJFFn1ag=="],
 
