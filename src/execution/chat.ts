@@ -583,9 +583,13 @@ export async function dispatchNextPendingChatMessage(config: RuntimeConfig, sess
     clientSurface: popped.clientSurface
   };
   try {
-    // A queued thread reply re-dispatches back into its thread; a main-chat
-    // message runs as a normal turn. popped.threadId distinguishes them.
-    if (popped.threadId) {
+    // A Topic session drains into its own context via runTopicSubmission; a
+    // queued thread reply re-dispatches back into its thread; a main-chat
+    // message runs as a normal turn. Topic membership (session.kind) and
+    // popped.threadId distinguish them.
+    if (afterShift.kind === "topic") {
+      await runTopicSubmission(config, sessionId, prepared);
+    } else if (popped.threadId) {
       await runThreadSubmission(config, sessionId, popped.threadId, popped.parentBlockId!, prepared, {
         alsoToMain: popped.alsoToMain
       });
@@ -784,6 +788,137 @@ async function runThreadSubmission(
     }
   }
   return { sessionId, threadId, runId: run.id, taskId: task.id, status: task.status };
+}
+
+// Run a prepared chat turn inside a Topic's isolated context (ADR
+// chat-topics-tasks-subagents.md). Modeled on runThreadSubmission but it swaps
+// the session id itself instead of tagging blocks: both run.conversationId AND
+// task.chatSessionId bind to `topicId`, so replay (priorChatMessages filters
+// m.sessionId === topicId), emit (resolveEmitContext keys on task.chatSessionId),
+// and the FIFO queue all follow the Topic automatically. There are no
+// threadId/parentBlockId tags — a Topic is a real separate session.
+//
+// `prepared.liveSession` is the CHAT session the message arrived on; the Topic's
+// own agentId is resolved from state here (topics carry agentId via createTopic)
+// so the task inherits the Topic owner, not whatever the Chat session pointed at.
+export async function runTopicSubmission(
+  config: RuntimeConfig,
+  topicId: string,
+  prepared: PreparedChatSubmission
+) {
+  const { content, images, audio, clientSurface } = prepared;
+  const topicSession = readState(config.instance).chatSessions.find((item) => item.id === topicId);
+  if (!topicSession) throw new Error(`Topic session not found: ${topicId}`);
+  const topicAgentId = topicSession.agentId;
+  const run = await createConversationRun(config, { conversationId: topicId, input: content });
+  const task = await submitTask(config, content, {
+    runId: run.id,
+    mode: "chat",
+    chatSessionId: topicId,
+    agentId: topicAgentId,
+    ...(clientSurface ? { clientSurface } : {}),
+    ...(images.length > 0 ? { images } : {})
+  });
+  await linkRunToTask(config, run.id, task);
+  await mutateState(config.instance, (current) => {
+    const message = createChatMessage(current, {
+      sessionId: topicId,
+      role: "user",
+      content,
+      taskId: task.id,
+      runId: run.id,
+      ...(images.length > 0 ? { images } : {}),
+      ...(audio ? { audio } : {})
+    });
+    const runRecord = current.runs.find((item) => item.id === run.id);
+    if (runRecord) {
+      runRecord.userMessageId = message.id;
+      runRecord.updatedAt = message.createdAt;
+    }
+  });
+  // Render the user's message inside the Topic. Best-effort like the other
+  // submit paths — a block-insert failure must not roll back the turn.
+  try {
+    insertChatBlock(config.instance, {
+      kind: "user_text",
+      sessionId: topicId,
+      text: content,
+      taskId: task.id,
+      runId: run.id,
+      agentId: topicAgentId ?? null,
+      ...(images.length > 0 ? { images } : {}),
+      ...(audio ? { audio } : {})
+    });
+  } catch (error) {
+    appendLog(config.instance, "chat.user_block.insert_failed", {
+      sessionId: topicId,
+      taskId: task.id,
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
+  return { topicId, runId: run.id, taskId: task.id, status: task.status };
+}
+
+// Dispatch a Chat-routed message into a Topic (ADR
+// chat-topics-tasks-subagents.md). The orchestrator the router calls once it has
+// chosen a Topic for a Chat message:
+//   1. Render the user's own message in the CHAT session so they see it in
+//      Chat (BLOCK ONLY — no ChatMessageRecord in Chat, which keeps Chat's
+//      replay transcript clean; the replay-authoritative user+answer rows live
+//      in the Topic).
+//   2. If the Topic already has a live turn (or a non-empty queue), enqueue the
+//      message onto the TOPIC's pendingMessages so it serializes behind the
+//      in-flight Topic turn. Otherwise run it now in the Topic's context.
+// The Topic's final answer is forwarded back into the Chat session from inside
+// persistFinalAnswerRow (one site, covering chat-routed, queued, and
+// direct-in-topic turns).
+export async function dispatchChatMessageToTopic(
+  config: RuntimeConfig,
+  chatSessionId: string,
+  topicId: string,
+  prepared: PreparedChatSubmission
+): Promise<
+  | { topicId: string; runId: string; taskId: string; status: TaskStatus }
+  | { topicId: string; queued: true; pendingId: string }
+> {
+  const { content, images, audio, liveSession, clientSurface } = prepared;
+  // Echo the user's message into Chat as a render-only block. Best-effort.
+  try {
+    insertChatBlock(config.instance, {
+      kind: "user_text",
+      sessionId: chatSessionId,
+      text: content,
+      agentId: liveSession.agentId ?? null,
+      ...(images.length > 0 ? { images } : {}),
+      ...(audio ? { audio } : {})
+    });
+  } catch (error) {
+    appendLog(config.instance, "chat.user_block.insert_failed", {
+      sessionId: chatSessionId,
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
+  // Serialize behind any live Topic turn, exactly like submitChatMessage but
+  // scoped to the TOPIC's queue: a message routed in mid-turn queues onto the
+  // Topic instead of spawning a second competing task. See ADR
+  // chat-message-queue.md.
+  const liveState = readState(config.instance);
+  const topicSession = liveState.chatSessions.find((item) => item.id === topicId);
+  const shouldQueue =
+    sessionHasInFlightChatTask(liveState, topicId) || (topicSession?.pendingMessages?.length ?? 0) > 0;
+  if (shouldQueue) {
+    const pending = await mutateState(config.instance, (current) =>
+      enqueuePendingChatMessage(current, topicId, {
+        content,
+        ...(images.length > 0 ? { images } : {}),
+        ...(clientSurface ? { clientSurface } : {})
+      })
+    );
+    const updated = readState(config.instance).chatSessions.find((item) => item.id === topicId);
+    if (updated) publishChatSession(config.instance, updated);
+    return { topicId, queued: true as const, pendingId: pending.id };
+  }
+  return runTopicSubmission(config, topicId, prepared);
 }
 
 export async function syncChatTaskResult(config: RuntimeConfig, sessionId: string, taskId: string) {

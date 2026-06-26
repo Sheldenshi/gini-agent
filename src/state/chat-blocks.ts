@@ -169,7 +169,15 @@ function rowToBlock(row: ChatBlockRow): ChatBlock {
         kind: "assistant_text",
         updatedAt: row.updated_at,
         text: String(payload.text ?? ""),
-        streaming: Boolean(payload.streaming)
+        streaming: Boolean(payload.streaming),
+        // Forward-marker fields ride in payload_json (render-only; no dedicated
+        // column). Present only on a Topic answer forwarded into the parent Chat.
+        ...(typeof payload.forwardedFromTopicId === "string"
+          ? { forwardedFromTopicId: payload.forwardedFromTopicId }
+          : {}),
+        ...(typeof payload.forwardedFromTopicTitle === "string"
+          ? { forwardedFromTopicTitle: payload.forwardedFromTopicTitle }
+          : {})
       };
     case "tool_call":
       return {
@@ -284,7 +292,12 @@ function payloadFor(block: ChatBlock): string {
         ...(block.audio ? { audio: block.audio } : {})
       });
     case "assistant_text":
-      return JSON.stringify({ text: block.text, streaming: block.streaming });
+      return JSON.stringify({
+        text: block.text,
+        streaming: block.streaming,
+        ...(block.forwardedFromTopicId ? { forwardedFromTopicId: block.forwardedFromTopicId } : {}),
+        ...(block.forwardedFromTopicTitle ? { forwardedFromTopicTitle: block.forwardedFromTopicTitle } : {})
+      });
     case "tool_call":
       return JSON.stringify({
         toolName: block.toolName,
@@ -385,7 +398,9 @@ export function insertChatBlock(
             kind: "assistant_text",
             updatedAt: at,
             text: input.text,
-            streaming: input.streaming
+            streaming: input.streaming,
+            ...(input.forwardedFromTopicId ? { forwardedFromTopicId: input.forwardedFromTopicId } : {}),
+            ...(input.forwardedFromTopicTitle ? { forwardedFromTopicTitle: input.forwardedFromTopicTitle } : {})
           };
         case "tool_call":
           return {

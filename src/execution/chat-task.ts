@@ -20,6 +20,7 @@ import {
   createChatMessage,
   findInFlightAssistantTextForTask,
   getMainChatUserTextBlockForTask,
+  insertChatBlock,
   isTerminalTaskStatus,
   mutateState,
   now,
@@ -1131,6 +1132,37 @@ async function persistFinalAnswerRow(
       }
     }
   });
+  // Topic → Chat forward (ADR chat-topics-tasks-subagents.md). When this turn
+  // ran inside a Topic (the replay-authoritative answer above landed in the
+  // Topic), surface a render-only copy of the final answer in the parent Chat
+  // session, tagged with the Topic for a deep-link chip. This single site
+  // covers chat-routed, queued, and direct-in-topic turns because all of them
+  // run with transcriptSessionId = the Topic. Best-effort: a forward failure
+  // must never fail the task.
+  const forwardState = readState(config.instance);
+  const session = forwardState.chatSessions.find((s) => s.id === transcriptSessionId);
+  if (session?.kind === "topic" && session.parentChatSessionId) {
+    try {
+      insertChatBlock(config.instance, {
+        kind: "assistant_text",
+        sessionId: session.parentChatSessionId,
+        text: finalText,
+        streaming: false,
+        taskId: finished.id,
+        runId: finished.runId,
+        agentId: session.agentId ?? null,
+        forwardedFromTopicId: session.id,
+        forwardedFromTopicTitle: session.title
+      });
+    } catch (error) {
+      appendLog(config.instance, "chat.topic_forward.insert_failed", {
+        topicId: session.id,
+        parentChatSessionId: session.parentChatSessionId,
+        taskId: finished.id,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }
 }
 
 // Pull prior chat messages for multi-turn context. We replay the full

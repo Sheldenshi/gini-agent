@@ -351,6 +351,11 @@ interface ChatBlockBase {
   // meaningful on the thread's first block, but stamped on every thread
   // block for simplicity.
   parentBlockId?: string;
+  // Set on a forwarded copy of a Topic's final answer that lands in the parent
+  // Chat (kind:"agent") session. The replay-authoritative answer row lives in the
+  // Topic session; this Chat-side copy is render-only and deep-links back to the Topic.
+  forwardedFromTopicId?: string;
+  forwardedFromTopicTitle?: string;
 }
 
 // Inline image attached to a user message. The runtime stores the bytes on
