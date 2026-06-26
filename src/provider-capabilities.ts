@@ -165,11 +165,16 @@ export const FALLBACK_MAX_OUTPUT_TOKENS = 8_192;
 // Max output tokens (synchronous Messages/Converse) by Claude family. The model
 // REJECTS a max_tokens above its real ceiling with a 400 (Bedrock
 // ValidationException "exceeds the model limit of N"; first-party Anthropic the
-// equivalent) — it does NOT clamp — so this must never overshoot. Documented/
-// probed ceilings (verified via the Anthropic Models API and provider docs):
+// equivalent) — it does NOT clamp — so this must never overshoot. Ceilings:
 // Opus/Sonnet 4.6+ and Fable at 128K; Haiku 4.5, Opus 4.5, and Sonnet 4.5 at
-// 64K; Sonnet 4.0 at 64K; Opus 4.1 and Opus 4.0 at 32K. `slug` may carry a
-// Bedrock inference-profile prefix ("us.anthropic.claude-opus-4-8") or be bare
+// 64K; Sonnet 4.0 at 64K; Opus 4.1 and Opus 4.0 at 32K. These are verified
+// against the Anthropic Models API AND the live Bedrock runtime (a Converse
+// call probes the exact boundary: us.anthropic.claude-sonnet-4-6 accepts
+// maxTokens=128000 and 400s at 128001 with "exceeds the model limit of
+// 128000"). NOTE: the AWS Bedrock model-card page is STALE for Sonnet 4.6 — it
+// lists "Max output tokens: 64K", but the runtime enforces 128000, so do NOT
+// "correct" this table down to match that doc. `slug` may carry a Bedrock
+// inference-profile prefix ("us.anthropic.claude-opus-4-8") or be bare
 // ("claude-opus-4-8"); both match. Anything else (3.x, EOL, unrecognized) stays
 // on the conservative floor.
 //
