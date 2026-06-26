@@ -579,6 +579,19 @@ async function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
 // exact value.
 export const IDLE_STREAM_TIMEOUT_MS = 120_000;
 
+// Resolve the idle window at use time (not module load) so it can be overridden
+// via GINI_IDLE_STREAM_TIMEOUT_MS — an operability knob (a slow self-hosted
+// model may legitimately pause longer than 2 min) and the seam that lets a live
+// test trigger the stall path in well under a second. Mirrors transientRetryBaseMs
+// in chat-task.ts. Production (env unset) uses IDLE_STREAM_TIMEOUT_MS; a 0 or
+// invalid override falls back to the default rather than disabling the guard.
+function resolveIdleStreamTimeoutMs(): number {
+  const raw = process.env.GINI_IDLE_STREAM_TIMEOUT_MS;
+  if (raw === undefined) return IDLE_STREAM_TIMEOUT_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : IDLE_STREAM_TIMEOUT_MS;
+}
+
 // Thrown when a streaming read stalls past IDLE_STREAM_TIMEOUT_MS. A DISTINCT
 // name (not "AbortError") on purpose: the chat-task loop must NOT mistake this
 // for a user cancel (isAbortError stays false) nor for a context overflow — it
@@ -614,7 +627,7 @@ export function isStreamIdleTimeoutError(error: unknown): boolean {
 // dangling handle.
 async function readWithIdleTimeout<T>(
   reader: ReadableStreamDefaultReader<T>,
-  idleMs: number = IDLE_STREAM_TIMEOUT_MS
+  idleMs: number = resolveIdleStreamTimeoutMs()
 ): Promise<Awaited<ReturnType<ReadableStreamDefaultReader<T>["read"]>>> {
   const { promise: timeout, reject } = Promise.withResolvers<never>();
   const timer = setTimeout(() => {

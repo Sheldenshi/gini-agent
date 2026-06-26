@@ -5938,4 +5938,36 @@ describe("streaming idle/stall timeout", () => {
       restoreEnv();
     }
   });
+
+  test("GINI_IDLE_STREAM_TIMEOUT_MS overrides the idle window at use time (real timing, no stub)", async () => {
+    const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    // Set a tiny window via the env seam — no accelerateIdleTimer stub here, so
+    // this exercises resolveIdleStreamTimeoutMs reading the override at use time.
+    const restoreIdle = setEnv("GINI_IDLE_STREAM_TIMEOUT_MS", "20");
+    const enc = new TextEncoder();
+    const firstEvent = enc.encode(
+      `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "m", usage: { input_tokens: 1 } } })}\n\n`
+    );
+    const fetchStub = installFetch(() =>
+      new Response(stallingStream([firstEvent]), { status: 200, headers: { "content-type": "text/event-stream" } })
+    );
+    try {
+      const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
+      const start = Date.now();
+      const err = await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "hi" }],
+        [],
+        () => {}
+      ).then(() => undefined, (e) => e);
+      // Fired off the 20ms override, far under the 120000ms default — proving the
+      // env value was read at use time, not the module-load default.
+      expect(err).toBeInstanceOf(StreamIdleTimeoutError);
+      expect(Date.now() - start).toBeLessThan(5000);
+    } finally {
+      fetchStub.restore();
+      restoreIdle();
+      restoreEnv();
+    }
+  });
 });
