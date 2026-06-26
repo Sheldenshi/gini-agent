@@ -180,14 +180,14 @@ export const FALLBACK_MAX_OUTPUT_TOKENS = 8_192;
 // ("claude-opus-4-8"); both match. Anything else (3.x, EOL, unrecognized) stays
 // on the conservative floor.
 //
-// The minor-version classes are anchored with a trailing `(?![0-9])` so a model
-// id's DATE STAMP can't be misread as a minor version: without it,
-// `claude-sonnet-4-20250514` (Sonnet 4.0, dated) matches `[…]4-(?:[6-9]|\d\d)`
-// because `\d\d` eats "20" → a wrong 128K ceiling → a 400 on a real Sonnet-4.0
-// streaming turn. The `(?=$|[-.])` boundary forces the minor token to be a WHOLE
-// segment (end of string, or followed by a `-`/`.` separator — the only ways a
-// minor version is delimited in real first-party and Bedrock ids), so a date
-// run or a glued suffix can't be misread as a minor version. The explicit
+// The minor-version classes are anchored with a trailing `(?=$|[-.])` so a
+// model id's DATE STAMP can't be misread as a minor version: without a
+// boundary, `claude-sonnet-4-20250514` (Sonnet 4.0, dated) matches
+// `[…]4-(?:[6-9]|\d\d)` because `\d\d` eats "20" → a wrong 128K ceiling → a 400
+// on a real Sonnet-4.0 streaming turn. The boundary forces the minor token to be
+// a WHOLE segment (end of string, or followed by a `-`/`.` separator — the only
+// ways a minor version is delimited in real first-party and Bedrock ids), so a
+// date run or a glued suffix can't be misread as a minor version. The explicit
 // 4.5/4.1/4.0 patterns pin the older tiers; order matters (specific tiers before
 // the 6-9 class).
 function claudeMaxOutputTokens(slug: string): number {
