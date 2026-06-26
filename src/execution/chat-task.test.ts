@@ -5429,13 +5429,18 @@ describe("chat-task loop", () => {
       // poll for it, then cancel inside the (60s) backoff window.
       const { readTrace } = await import("../state");
       const deadline = Date.now() + 5000;
+      let sawRetryWarning = false;
       while (Date.now() < deadline) {
-        const retried = readTrace(config.instance, task.id).some(
+        sawRetryWarning = readTrace(config.instance, task.id).some(
           (t) => t.type === "warning" && /Transient model-call fault; retrying/.test(t.message)
         );
-        if (retried) break;
+        if (sawRetryWarning) break;
         await Bun.sleep(5);
       }
+      // Assert the retry actually armed BEFORE we cancel — otherwise a regression
+      // that never enters the backoff would let the cancel land on a non-backoff
+      // task and still satisfy the assertions below, silently masking the break.
+      expect(sawRetryWarning).toBe(true);
       await cancelTask(config, task.id);
       const cancelled = await waitForTerminal(config, task.id, 10000);
 
