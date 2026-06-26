@@ -1392,6 +1392,8 @@ async function spawnSubagentTool(
 ): Promise<string> {
   const name = requireString(args, "name");
   const prompt = requireString(args, "prompt");
+  const goal = typeof args.goal === "string" ? args.goal : undefined;
+  const context = typeof args.context === "string" ? args.context : undefined;
   const systemPrompt = typeof args.system_prompt === "string" ? args.system_prompt : undefined;
   const toolsets = Array.isArray(args.toolsets) ? args.toolsets.map(String) : undefined;
   const skills = Array.isArray(args.skills) ? args.skills.map(String) : undefined;
@@ -1453,6 +1455,8 @@ async function spawnSubagentTool(
     const created = await spawnSubagent(config, {
       name,
       prompt,
+      goal,
+      context,
       systemPrompt,
       toolsets,
       skills,
@@ -1498,12 +1502,16 @@ async function spawnSubagentTool(
   });
 
   // Format the result. We return a compact JSON-shaped string so the model
-  // can parse if it wants, but the strings inside are human-readable.
+  // can parse if it wants, but the strings inside are human-readable. When the
+  // subagent bubbled up an "additional input needed" question, surface it as
+  // status:"needs_input" with the question so the parent (which has a topic/chat
+  // session) re-asks via its own ask_user. See ADR chat-topics-tasks-subagents.md.
   const payload = {
     subagentId,
     status: final.status,
     summary: final.summary ?? null,
-    error: final.error ?? null
+    error: final.error ?? null,
+    ...(final.needsInput ? { needsInput: final.needsInput } : {})
   };
   return JSON.stringify(payload);
 }
@@ -3417,7 +3425,7 @@ async function waitForSubagentTerminal(
   subagentId: string,
   timeoutMs: number,
   parentTaskId?: string
-): Promise<{ status: string; summary?: string; error?: string }> {
+): Promise<{ status: string; summary?: string; error?: string; needsInput?: { question: string } }> {
   const deadline = Date.now() + Math.max(1000, timeoutMs);
   const pollMs = 100;
   while (Date.now() < deadline) {
@@ -3425,6 +3433,19 @@ async function waitForSubagentTerminal(
     const sub = state.subagents.find((item) => item.id === subagentId);
     if (!sub) return { status: "missing", error: `Subagent ${subagentId} disappeared.` };
     if (sub.status === "completed" || sub.status === "failed" || sub.status === "cancelled") {
+      // "Additional input needed" return: the subagent reached a terminal
+      // status but carries a question its ask_user could not answer in-band.
+      // Surface it as status:"needs_input" so the parent re-asks instead of
+      // treating the run as a plain completion. NOT a persisted
+      // SubagentStatus — only the return-value status string. See ADR
+      // chat-topics-tasks-subagents.md.
+      if (sub.resultNeedsInput) {
+        return {
+          status: "needs_input",
+          summary: sub.resultSummary ?? sub.summary,
+          needsInput: sub.resultNeedsInput
+        };
+      }
       return {
         status: sub.status,
         summary: sub.resultSummary ?? sub.summary,
@@ -4245,6 +4266,25 @@ async function askUserTool(
     : undefined;
   const surfaceKind = surfaceSession?.source?.kind ?? surfaceSession?.outboundMirror?.kind;
   if (!surfaceSession || surfaceSession.origin === "job" || surfaceKind === "telegram" || surfaceKind === "discord") {
+    // A subagent child has no chat surface of its own (it runs with no
+    // chatSessionId), so the question can't be answered here. Bubble it up:
+    // return a STRUCTURED marker the subagent loop carries to its terminal
+    // result, and stamp it onto the task so syncSubagentFromTask mirrors it
+    // onto the SubagentRecord. The parent's spawn_subagent tool result then
+    // surfaces the question, and the parent — which DOES have a topic/chat
+    // session — re-asks via its own ask_user. See ADR
+    // chat-topics-tasks-subagents.md (the "additional input needed" return).
+    if (surfaceTask.subagentId) {
+      await mutateState(config.instance, (mutable: RuntimeState) => {
+        const item = findTask(mutable, taskId);
+        item.needsInput = { question };
+        item.updatedAt = now();
+      });
+      return {
+        kind: "sync",
+        result: JSON.stringify({ ok: false, needsInput: true, question })
+      };
+    }
     return {
       kind: "sync",
       result: JSON.stringify({

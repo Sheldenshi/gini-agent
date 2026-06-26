@@ -27,6 +27,7 @@
 // but the runtime never crashes mid-loop on a missing session.
 
 import {
+  appendLog,
   appendTrace,
   deleteChatBlock,
   insertChatBlock,
@@ -334,6 +335,44 @@ export function emitToolResult(
   });
 }
 
+// Topic → Chat gate forward (ADR chat-topics-tasks-subagents.md). When a
+// Topic turn pauses on a user gate (an ask_user choice card / a confirmation /
+// an authorization), the question would otherwise land only in the Topic, so a
+// user watching Chat never sees it. When the emitting session is a kind:"topic"
+// with a parentChatSessionId, mirror a render-only copy of the SAME gate block
+// (same id + payload) into the parent Chat. Because gates are global by id,
+// acting on the forwarded card from Chat resolves the same gate and resumes the
+// Topic turn. Best-effort: a forward failure must never break the gate.
+function forwardGateToChat(
+  ctx: ChatEmitContext,
+  buildInput: (forward: {
+    sessionId: string;
+    forwardedFromTopicId: string;
+    forwardedFromTopicTitle?: string;
+  }) => InsertChatBlockInput
+): void {
+  const state = readState(ctx.instance);
+  const session = state.chatSessions.find((s) => s.id === ctx.sessionId);
+  if (session?.kind !== "topic" || !session.parentChatSessionId) return;
+  try {
+    insertChatBlock(
+      ctx.instance,
+      buildInput({
+        sessionId: session.parentChatSessionId,
+        forwardedFromTopicId: session.id,
+        ...(session.title ? { forwardedFromTopicTitle: session.title } : {})
+      })
+    );
+  } catch (error) {
+    appendLog(ctx.instance, "chat.topic_gate_forward.insert_failed", {
+      topicId: session.id,
+      parentChatSessionId: session.parentChatSessionId,
+      taskId: ctx.taskId,
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
+}
+
 // Insert an authorization_requested block when a tool call is gated
 // pending user approval/denial (agent-actor flow).
 export function emitAuthorizationRequested(
@@ -346,7 +385,7 @@ export function emitAuthorizationRequested(
   }
 ): ChatBlock | undefined {
   if (!ctx) return undefined;
-  return insertChatBlock(ctx.instance, {
+  const block = insertChatBlock(ctx.instance, {
     kind: "authorization_requested",
     authorizationId: params.authorizationId,
     action: params.action,
@@ -354,6 +393,20 @@ export function emitAuthorizationRequested(
     summary: params.summary,
     ...bookkeepingFor(ctx)
   });
+  forwardGateToChat(ctx, (forward) => ({
+    kind: "authorization_requested",
+    sessionId: forward.sessionId,
+    authorizationId: params.authorizationId,
+    action: params.action,
+    risk: params.risk,
+    summary: params.summary,
+    taskId: ctx.taskId,
+    runId: ctx.runId,
+    agentId: ctx.agentId,
+    forwardedFromTopicId: forward.forwardedFromTopicId,
+    ...(forward.forwardedFromTopicTitle ? { forwardedFromTopicTitle: forward.forwardedFromTopicTitle } : {})
+  }));
+  return block;
 }
 
 // Insert a setup_requested block when a tool call needs the user to
@@ -369,13 +422,26 @@ export function emitSetupRequested(
   }
 ): ChatBlock | undefined {
   if (!ctx) return undefined;
-  return insertChatBlock(ctx.instance, {
+  const block = insertChatBlock(ctx.instance, {
     kind: "setup_requested",
     setupRequestId: params.setupRequestId,
     action: params.action,
     summary: params.summary,
     ...bookkeepingFor(ctx)
   });
+  forwardGateToChat(ctx, (forward) => ({
+    kind: "setup_requested",
+    sessionId: forward.sessionId,
+    setupRequestId: params.setupRequestId,
+    action: params.action,
+    summary: params.summary,
+    taskId: ctx.taskId,
+    runId: ctx.runId,
+    agentId: ctx.agentId,
+    forwardedFromTopicId: forward.forwardedFromTopicId,
+    ...(forward.forwardedFromTopicTitle ? { forwardedFromTopicTitle: forward.forwardedFromTopicTitle } : {})
+  }));
+  return block;
 }
 
 // Trace helper for the no-context branch. Useful when a higher-level

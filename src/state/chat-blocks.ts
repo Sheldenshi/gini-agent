@@ -236,7 +236,13 @@ function rowToBlock(row: ChatBlockRow): ChatBlock {
         authorizationId: String(payload.authorizationId ?? ""),
         action: String(payload.action ?? "") as AuthorizationAction,
         risk: (payload.risk as RiskLevel) ?? "low",
-        summary: String(payload.summary ?? "")
+        summary: String(payload.summary ?? ""),
+        ...(typeof payload.forwardedFromTopicId === "string"
+          ? { forwardedFromTopicId: payload.forwardedFromTopicId }
+          : {}),
+        ...(typeof payload.forwardedFromTopicTitle === "string"
+          ? { forwardedFromTopicTitle: payload.forwardedFromTopicTitle }
+          : {})
       };
     case "setup_requested":
       return {
@@ -244,7 +250,13 @@ function rowToBlock(row: ChatBlockRow): ChatBlock {
         kind: "setup_requested",
         setupRequestId: String(payload.setupRequestId ?? ""),
         action: String(payload.action ?? "") as SetupRequestAction,
-        summary: String(payload.summary ?? "")
+        summary: String(payload.summary ?? ""),
+        ...(typeof payload.forwardedFromTopicId === "string"
+          ? { forwardedFromTopicId: payload.forwardedFromTopicId }
+          : {}),
+        ...(typeof payload.forwardedFromTopicTitle === "string"
+          ? { forwardedFromTopicTitle: payload.forwardedFromTopicTitle }
+          : {})
       };
     case "system_note": {
       const raw =
@@ -323,13 +335,20 @@ function payloadFor(block: ChatBlock): string {
         authorizationId: block.authorizationId,
         action: block.action,
         risk: block.risk,
-        summary: block.summary
+        summary: block.summary,
+        // Forward markers ride in payload_json (render-only) on a gate block
+        // copied from a Topic into the parent Chat. Same treatment as the
+        // assistant_text forward above.
+        ...(block.forwardedFromTopicId ? { forwardedFromTopicId: block.forwardedFromTopicId } : {}),
+        ...(block.forwardedFromTopicTitle ? { forwardedFromTopicTitle: block.forwardedFromTopicTitle } : {})
       });
     case "setup_requested":
       return JSON.stringify({
         setupRequestId: block.setupRequestId,
         action: block.action,
-        summary: block.summary
+        summary: block.summary,
+        ...(block.forwardedFromTopicId ? { forwardedFromTopicId: block.forwardedFromTopicId } : {}),
+        ...(block.forwardedFromTopicTitle ? { forwardedFromTopicTitle: block.forwardedFromTopicTitle } : {})
       });
     case "system_note":
       return JSON.stringify({
@@ -434,7 +453,9 @@ export function insertChatBlock(
             authorizationId: input.authorizationId,
             action: input.action,
             risk: input.risk,
-            summary: input.summary
+            summary: input.summary,
+            ...(input.forwardedFromTopicId ? { forwardedFromTopicId: input.forwardedFromTopicId } : {}),
+            ...(input.forwardedFromTopicTitle ? { forwardedFromTopicTitle: input.forwardedFromTopicTitle } : {})
           };
         case "setup_requested":
           return {
@@ -442,7 +463,9 @@ export function insertChatBlock(
             kind: "setup_requested",
             setupRequestId: input.setupRequestId,
             action: input.action,
-            summary: input.summary
+            summary: input.summary,
+            ...(input.forwardedFromTopicId ? { forwardedFromTopicId: input.forwardedFromTopicId } : {}),
+            ...(input.forwardedFromTopicTitle ? { forwardedFromTopicTitle: input.forwardedFromTopicTitle } : {})
           };
         case "system_note":
           return {

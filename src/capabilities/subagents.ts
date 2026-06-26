@@ -38,6 +38,10 @@ export interface SpawnSubagentInput {
   systemPrompt?: string;
   toolsets?: string[];
   skills?: string[];
+  // Optional delegation framing rendered as `## Goal` / `## Context` sections
+  // ahead of the prompt in the subagent's system context.
+  goal?: string;
+  context?: string;
   // Internal: when an agent loop spawns a child via the spawn_subagent tool,
   // it passes the parent task id so the SubagentRecord and the child task
   // both link back. Not part of the public API surface.
@@ -88,6 +92,14 @@ export async function spawnSubagent(
   const skillNames = Array.isArray((input as SpawnSubagentInput).skills)
     ? (input as SpawnSubagentInput).skills!.map(String)
     : undefined;
+  const goal =
+    typeof (input as SpawnSubagentInput).goal === "string" && (input as SpawnSubagentInput).goal!.trim().length > 0
+      ? (input as SpawnSubagentInput).goal!.trim()
+      : undefined;
+  const context =
+    typeof (input as SpawnSubagentInput).context === "string" && (input as SpawnSubagentInput).context!.trim().length > 0
+      ? (input as SpawnSubagentInput).context!.trim()
+      : undefined;
   const parentTaskId =
     typeof (input as SpawnSubagentInput).parentTaskId === "string"
       ? (input as SpawnSubagentInput).parentTaskId
@@ -154,6 +166,8 @@ export async function spawnSubagent(
       systemPrompt,
       toolsetIds,
       skillNames,
+      ...(goal ? { goal } : {}),
+      ...(context ? { context } : {}),
       agentId: parentAgentId
     });
   });
@@ -256,7 +270,7 @@ export async function spawnSubagent(
     }
   });
 
-  return { ...subagent, taskId: task.id, status: "running", systemPrompt, toolsetIds, skillNames };
+  return { ...subagent, taskId: task.id, status: "running", systemPrompt, toolsetIds, skillNames, goal, context };
 }
 
 // Refresh subagent statuses by joining against their child tasks. Pulls
@@ -280,6 +294,7 @@ export async function refreshSubagents(config: RuntimeConfig): Promise<SubagentR
         subagent.completedAt = now();
         subagent.summary = task.summary;
         subagent.resultSummary = task.summary;
+        if (task.needsInput) subagent.resultNeedsInput = task.needsInput;
         subagent.updatedAt = subagent.completedAt;
       } else if (task.status === "failed") {
         subagent.status = "failed";
@@ -360,6 +375,7 @@ export async function syncSubagentFromTask(config: RuntimeConfig, task: Task): P
       sub.completedAt = now();
       sub.summary = task.summary;
       sub.resultSummary = task.summary;
+      if (task.needsInput) sub.resultNeedsInput = task.needsInput;
       sub.updatedAt = sub.completedAt;
     } else if (task.status === "failed") {
       sub.status = "failed";

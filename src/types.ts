@@ -890,6 +890,13 @@ export interface Task {
   // Times this task has been re-dispatched after a gateway restart; capped to
   // break crash loops — see ADR task-resume-on-restart.md.
   bootResumeCount?: number;
+  // "Additional input needed" marker (ADR chat-topics-tasks-subagents.md). Set
+  // when this task is a subagent child whose ask_user call could not be
+  // answered in-band (no chat surface), so the question must bubble up to the
+  // parent's spawn_subagent tool result. syncSubagentFromTask mirrors it onto
+  // the SubagentRecord's resultNeedsInput; the parent then re-asks via its own
+  // ask_user. Render-only/return-value grain — NOT a TaskStatus.
+  needsInput?: { question: string };
 }
 
 export interface RuntimeEvent {
@@ -1222,6 +1229,19 @@ export interface SubagentRecord {
   // joining against the task table.
   resultSummary?: string;
   resultError?: string;
+  // The "additional input needed" return variant (ADR
+  // chat-topics-tasks-subagents.md). A subagent has no chat surface of its
+  // own, so when its child task calls ask_user the question can't be answered
+  // in-band; instead the question bubbles up here and surfaces in the parent's
+  // spawn_subagent tool result so the PARENT (which does have a topic/chat
+  // session) can re-ask. This lives only on the return-value/marker types — it
+  // is NOT a persisted SubagentStatus.
+  resultNeedsInput?: { question: string };
+  // Optional framing the parent passes when delegating: a one-line objective and
+  // any background the subagent needs. Rendered as `## Goal` / `## Context`
+  // sections ahead of the subagent's prompt in its system context.
+  goal?: string;
+  context?: string;
 }
 
 // Cached `tools/list` entry from an HTTP MCP server. Populated on the

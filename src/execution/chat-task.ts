@@ -840,6 +840,13 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
     baseSystem,
     buildCurrentDateBlock(new Date(), resolveLocalTimeZone())
   ];
+  // Subagent delegation framing (ADR chat-topics-tasks-subagents.md): the
+  // parent's `goal`/`context` render as labeled sections ahead of the prompt
+  // so the child has its objective and background without the parent inlining
+  // them into the prompt. Only present on subagent runs that were spawned with
+  // these fields.
+  if (subagent?.goal) sections.push(`## Goal\n${subagent.goal}`);
+  if (subagent?.context) sections.push(`## Context\n${subagent.context}`);
   if (skillsBlock) sections.push(skillsBlock);
   if (inactiveSkillsBlock) sections.push(inactiveSkillsBlock);
   if (connectedAccountsBlock) sections.push(connectedAccountsBlock);

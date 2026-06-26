@@ -279,6 +279,8 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
         properties: {
           name: { type: "string", description: "Short label for the subagent (e.g. 'research', 'patch-author')." },
           prompt: { type: "string", description: "The user-facing instruction for the subagent." },
+          goal: { type: "string", description: "Optional one-line objective for the subagent, rendered as a '## Goal' section ahead of the prompt." },
+          context: { type: "string", description: "Optional background the subagent needs (constraints, prior findings), rendered as a '## Context' section ahead of the prompt." },
           system_prompt: { type: "string", description: "Optional override for the subagent's system instructions. Defaults to a generic 'focused subagent' preamble." },
           toolsets: { type: "array", items: { type: "string" }, description: "Optional list of toolset names to expose. Subset of the parent's enabled toolsets." },
           skills: { type: "array", items: { type: "string" }, description: "Optional list of enabled skill names to advertise. Subset of the parent's enabled skills." },

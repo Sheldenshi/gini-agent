@@ -2,11 +2,15 @@
 // truncated preview, and no-ops for a no-context (subagent / CLI) task. An
 // agent-produced attachment reaches the user via a markdown ref the model
 // pastes into its reply, not via this block. See ADR outbound-chat-attachments.md.
+//
+// Also covers the Topic→Chat gate forward (ADR chat-topics-tasks-subagents.md):
+// a gate emitted into a kind:"topic" session with a parentChatSessionId lands a
+// render-only copy of the SAME gate (same id + payload) in the parent Chat.
 
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
-import { closeAllMemoryDbs, listChatBlocks } from "../state";
-import { emitToolResult } from "./chat-task-emit";
+import { closeAllMemoryDbs, createChatSession, createTopic, listChatBlocks, mutateState } from "../state";
+import { emitSetupRequested, emitToolResult } from "./chat-task-emit";
 import type { ChatEmitContext } from "./chat-task-emit";
 
 const ROOT = "/tmp/gini-emit-toolresult-test";
@@ -53,5 +57,65 @@ describe("emitToolResult", () => {
     expect(block.truncated).toBe(true);
     expect(block.preview.length).toBeLessThanOrEqual(80);
     expect(block.preview.endsWith("…")).toBe(true);
+  });
+});
+
+describe("Topic→Chat gate forward", () => {
+  test("a setup_requested gate in a Topic forwards an actionable copy (same id) into the parent Chat", async () => {
+    const instance = "emit-gate-forward";
+    const { chatId, topicId, topicTitle } = await mutateState(instance, (state) => {
+      const chat = createChatSession(state, "Messages", undefined, undefined, undefined, "agent");
+      const topic = createTopic(state, {
+        agentId: chat.agentId,
+        title: "World Cup trip",
+        parentChatSessionId: chat.id
+      });
+      return { chatId: chat.id, topicId: topic.id, topicTitle: topic.title };
+    });
+
+    const topicCtx: ChatEmitContext = { instance, sessionId: topicId, taskId: "task_topic" };
+    emitSetupRequested(topicCtx, {
+      setupRequestId: "setup_42",
+      action: "chat.choice",
+      summary: "Which hotel?"
+    });
+
+    // The gate lands in the Topic.
+    const topicBlocks = listChatBlocks(instance, topicId);
+    const topicGate = topicBlocks.find((b) => b.kind === "setup_requested");
+    if (topicGate?.kind !== "setup_requested") throw new Error("expected a setup_requested block in the Topic");
+    expect(topicGate.setupRequestId).toBe("setup_42");
+    expect(topicGate.forwardedFromTopicId).toBeUndefined();
+
+    // A render-only copy with the SAME gate id + payload lands in the parent Chat,
+    // tagged with the Topic. Acting on it resolves the same global gate.
+    const chatBlocks = listChatBlocks(instance, chatId);
+    const forwarded = chatBlocks.find((b) => b.kind === "setup_requested");
+    if (forwarded?.kind !== "setup_requested") throw new Error("expected a forwarded setup_requested block in Chat");
+    expect(forwarded.setupRequestId).toBe("setup_42");
+    expect(forwarded.action).toBe("chat.choice");
+    expect(forwarded.summary).toBe("Which hotel?");
+    expect(forwarded.forwardedFromTopicId).toBe(topicId);
+    expect(forwarded.forwardedFromTopicTitle).toBe(topicTitle);
+  });
+
+  test("a setup_requested gate in plain Chat (no parent) is NOT forwarded", async () => {
+    const instance = "emit-gate-no-forward";
+    const chatId = await mutateState(instance, (state) => {
+      const chat = createChatSession(state, "Messages", undefined, undefined, undefined, "agent");
+      return chat.id;
+    });
+
+    const chatCtx: ChatEmitContext = { instance, sessionId: chatId, taskId: "task_chat" };
+    emitSetupRequested(chatCtx, {
+      setupRequestId: "setup_99",
+      action: "chat.choice",
+      summary: "Pick one"
+    });
+
+    const blocks = listChatBlocks(instance, chatId);
+    const gates = blocks.filter((b) => b.kind === "setup_requested");
+    expect(gates.length).toBe(1);
+    expect(gates[0]!.kind === "setup_requested" && gates[0]!.forwardedFromTopicId).toBeUndefined();
   });
 });
