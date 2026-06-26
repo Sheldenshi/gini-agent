@@ -40,13 +40,13 @@ function buildSpyDeps(opts?: {
 }): DispatchDeps & {
   calls: {
     api: Array<{ path: string; method: string | undefined }>;
-    navigate: Array<{ sessionId: string; threadId: string | null }>;
+    navigate: Array<{ sessionId: string }>;
     notifyFailure: Array<"approve" | "deny">;
   };
 } {
   const calls = {
     api: [] as Array<{ path: string; method: string | undefined }>,
-    navigate: [] as Array<{ sessionId: string; threadId: string | null }>,
+    navigate: [] as Array<{ sessionId: string }>,
     notifyFailure: [] as Array<"approve" | "deny">
   };
   return {
@@ -55,7 +55,7 @@ function buildSpyDeps(opts?: {
       if (opts?.apiShouldThrow) throw new Error("network");
       return {} as never;
     },
-    navigate: (sessionId, threadId) => { calls.navigate.push({ sessionId, threadId }); },
+    navigate: (sessionId) => { calls.navigate.push({ sessionId }); },
     notifyFailure: async (verb) => { calls.notifyFailure.push(verb); },
     calls
   };
@@ -161,29 +161,11 @@ describe("dispatchNotificationResponse", () => {
       }),
       deps
     );
-    // No threadId on this push → main-chat tap (threadId null).
-    expect(outcome).toEqual({ kind: "tap", sessionId: "chat_5", threadId: null });
-    expect(deps.calls.navigate).toEqual([{ sessionId: "chat_5", threadId: null }]);
+    expect(outcome).toEqual({ kind: "tap", sessionId: "chat_5" });
+    expect(deps.calls.navigate).toEqual([{ sessionId: "chat_5" }]);
     // Importantly: a plain tap on an approval notification does NOT
     // post to the approve / deny endpoints. The user has to use the
     // explicit action buttons or resolve the approval in-app.
-    expect(deps.calls.api).toEqual([]);
-  });
-
-  test("Default tap on a threaded completion carries threadId so it deep-links to the thread view", async () => {
-    const deps = buildSpyDeps();
-    const outcome = await dispatchNotificationResponse(
-      // A message_completed push fired by threaded work carries threadId;
-      // the banner shows the thread's reply, so the tap must open the
-      // thread view (the main chat filters threaded blocks out).
-      buildResponse("expo.modules.notifications.actions.DEFAULT", {
-        sessionId: "chat_7",
-        threadId: "thread_3"
-      }),
-      deps
-    );
-    expect(outcome).toEqual({ kind: "tap", sessionId: "chat_7", threadId: "thread_3" });
-    expect(deps.calls.navigate).toEqual([{ sessionId: "chat_7", threadId: "thread_3" }]);
     expect(deps.calls.api).toEqual([]);
   });
 
@@ -217,23 +199,13 @@ describe("dispatchNotificationResponse", () => {
 });
 
 describe("resolveLaunchTapRoute (cold-start launch tap)", () => {
-  test("a default tap resolves to the main chat route", () => {
+  test("a default tap resolves to the chat route", () => {
     const route = resolveLaunchTapRoute(
       buildResponse("expo.modules.notifications.actions.DEFAULT", {
         sessionId: "chat_cold_1"
       })
     );
-    expect(route).toEqual({ sessionId: "chat_cold_1", threadId: null });
-  });
-
-  test("a threaded completion launch tap carries threadId so it opens the thread view", () => {
-    const route = resolveLaunchTapRoute(
-      buildResponse("expo.modules.notifications.actions.DEFAULT", {
-        sessionId: "chat_cold_2",
-        threadId: "thread_cold_2"
-      })
-    );
-    expect(route).toEqual({ sessionId: "chat_cold_2", threadId: "thread_cold_2" });
+    expect(route).toEqual({ sessionId: "chat_cold_1" });
   });
 
   test("an APPROVE action launch does not navigate (resolves to null)", () => {
@@ -254,7 +226,7 @@ describe("resolveLaunchTapRoute (cold-start launch tap)", () => {
 
   test("a launch response with no sessionId resolves to null (silent wake / malformed)", () => {
     const route = resolveLaunchTapRoute(
-      buildResponse("expo.modules.notifications.actions.DEFAULT", { threadId: "thread_only" })
+      buildResponse("expo.modules.notifications.actions.DEFAULT", { approvalId: "authz_only" })
     );
     expect(route).toBeNull();
   });
@@ -268,29 +240,17 @@ describe("resolveLaunchTapRoute (cold-start launch tap)", () => {
 });
 
 describe("buildChatRoute", () => {
-  test("a main-chat route omits the thread segment", () => {
-    expect(buildChatRoute("chat_1", null)).toBe("/chat/chat_1");
-  });
-
-  test("a thread route includes both segments", () => {
-    expect(buildChatRoute("chat_1", "thread_2")).toBe("/chat/chat_1/thread/thread_2");
+  test("builds the chat-detail route", () => {
+    expect(buildChatRoute("chat_1")).toBe("/chat/chat_1");
   });
 
   test("a well-formed id passes through unchanged (encode is a no-op)", () => {
     // Server ids are `[a-z0-9_]`, all URL-unreserved — encoding must not alter them.
-    expect(buildChatRoute("chat_a1b2c3d4", "thread_e5f6")).toBe(
-      "/chat/chat_a1b2c3d4/thread/thread_e5f6"
-    );
+    expect(buildChatRoute("chat_a1b2c3d4")).toBe("/chat/chat_a1b2c3d4");
   });
 
   test("a malformed sessionId is percent-encoded so it can't reshape the route", () => {
-    expect(buildChatRoute("../setup?x=", null)).toBe("/chat/..%2Fsetup%3Fx%3D");
-  });
-
-  test("both segments are encoded on the thread path (the second is the easy one to miss)", () => {
-    expect(buildChatRoute("../a?x=", "../b#y")).toBe(
-      "/chat/..%2Fa%3Fx%3D/thread/..%2Fb%23y"
-    );
+    expect(buildChatRoute("../setup?x=")).toBe("/chat/..%2Fsetup%3Fx%3D");
   });
 });
 
@@ -298,13 +258,13 @@ describe("consumeLaunchTap (get → clear-once → navigate orchestration)", () 
   // Records the order and arguments of the injected native seams so each
   // test can pin both WHAT fired and the clear-before-navigate sequencing.
   function buildConsumeDeps(last: ResponseLike | null): LaunchConsumeDeps & {
-    calls: { clear: number; navigate: Array<{ sessionId: string; threadId: string | null }> };
+    calls: { clear: number; navigate: Array<{ sessionId: string }> };
   } {
-    const calls = { clear: 0, navigate: [] as Array<{ sessionId: string; threadId: string | null }> };
+    const calls = { clear: 0, navigate: [] as Array<{ sessionId: string }> };
     return {
       getLast: () => last,
       clear: () => { calls.clear += 1; },
-      navigate: (sessionId, threadId) => { calls.navigate.push({ sessionId, threadId }); },
+      navigate: (sessionId) => { calls.navigate.push({ sessionId }); },
       calls
     };
   }
@@ -322,28 +282,16 @@ describe("consumeLaunchTap (get → clear-once → navigate orchestration)", () 
       buildResponse("expo.modules.notifications.actions.DEFAULT", { sessionId: "chat_launch_1" })
     );
     const route = consumeLaunchTap(deps);
-    expect(route).toEqual({ sessionId: "chat_launch_1", threadId: null });
+    expect(route).toEqual({ sessionId: "chat_launch_1" });
     expect(deps.calls.clear).toBe(1);
-    expect(deps.calls.navigate).toEqual([{ sessionId: "chat_launch_1", threadId: null }]);
-  });
-
-  test("threaded completion tap: navigates into the thread view", () => {
-    const deps = buildConsumeDeps(
-      buildResponse("expo.modules.notifications.actions.DEFAULT", {
-        sessionId: "chat_launch_2",
-        threadId: "thread_launch_2"
-      })
-    );
-    const route = consumeLaunchTap(deps);
-    expect(route).toEqual({ sessionId: "chat_launch_2", threadId: "thread_launch_2" });
-    expect(deps.calls.navigate).toEqual([{ sessionId: "chat_launch_2", threadId: "thread_launch_2" }]);
+    expect(deps.calls.navigate).toEqual([{ sessionId: "chat_launch_1" }]);
   });
 
   test("non-navigable response (no sessionId): still clears once, never navigates", () => {
     // The clear-before-null-gate invariant: a silent wake / malformed launch
     // response must be cleared so it isn't re-evaluated on the next mount.
     const deps = buildConsumeDeps(
-      buildResponse("expo.modules.notifications.actions.DEFAULT", { threadId: "thread_only" })
+      buildResponse("expo.modules.notifications.actions.DEFAULT", { approvalId: "authz_only" })
     );
     const route = consumeLaunchTap(deps);
     expect(route).toBeNull();

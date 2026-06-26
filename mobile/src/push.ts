@@ -211,18 +211,17 @@ export async function refreshBadge(): Promise<void> {
   }
 }
 
-// Deep-links to the chat (or thread) a notification names. A threaded
-// completion opens the thread view — the main chat filters threaded blocks
-// out, so opening it would hide the reply the banner previewed. Shared by
-// the live-tap response listener and the cold-start launch-tap consume so
-// both navigate to exactly the same route.
-function navigateToChat(sessionId: string, threadId: string | null): void {
-  // Route construction (encode + thread/main branch) lives in the native-free
-  // buildChatRoute so it's unit-testable; this wrapper just performs the push.
-  // buildChatRoute returns a plain string (it's native-free); cast to Href for
-  // expo-router's typed-route signature — the path always matches a declared
-  // /chat/[sessionId][/thread/[threadId]] route.
-  router.push(buildChatRoute(sessionId, threadId) as Href);
+// Deep-links to the chat a notification names. A completion surfaces in its
+// session (a Topic or a Chat), so the tap opens that session's chat detail.
+// Shared by the live-tap response listener and the cold-start launch-tap
+// consume so both navigate to exactly the same route.
+function navigateToChat(sessionId: string): void {
+  // Route construction (encode) lives in the native-free buildChatRoute so
+  // it's unit-testable; this wrapper just performs the push. buildChatRoute
+  // returns a plain string (it's native-free); cast to Href for expo-router's
+  // typed-route signature — the path always matches the declared
+  // /chat/[sessionId] route.
+  router.push(buildChatRoute(sessionId) as Href);
 }
 
 // Installs the live notification-response listener that routes taps and
@@ -237,7 +236,7 @@ function navigateToChat(sessionId: string, threadId: string | null): void {
 //
 // Handles three cases via dispatchNotificationResponse:
 //   - Default tap (no actionIdentifier, or the OS default action) → deep-link
-//     to the chat / thread the payload names.
+//     to the chat the payload names.
 //   - APPROVE action → POST /api/authorizations/:id/approve.
 //   - DENY action → POST /api/authorizations/:id/deny.
 // Both action endpoints pre-date the push surface and enforce auth +
@@ -291,7 +290,7 @@ export function installNotificationResponseListener(): void {
 // Approve/Deny action launches resolve to null in resolveLaunchTapRoute, so
 // they never navigate here. Returns the route it navigated to (or null) so
 // callers/tests can assert the outcome.
-export function consumeLaunchNotificationRoute(): { sessionId: string; threadId: string | null } | null {
+export function consumeLaunchNotificationRoute(): { sessionId: string } | null {
   if (Platform.OS !== "ios") return null;
   try {
     // The get → clear-once → navigate sequence lives in the native-free

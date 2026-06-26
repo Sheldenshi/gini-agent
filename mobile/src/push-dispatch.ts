@@ -60,34 +60,29 @@ export const APPROVAL_CATEGORY_ACTIONS: readonly ApprovalActionSpec[] = [
 ];
 
 export type NotificationDispatchOutcome =
-  | { kind: "tap"; sessionId: string; threadId: string | null }
+  | { kind: "tap"; sessionId: string }
   | { kind: "approve"; approvalId: string }
   | { kind: "deny"; approvalId: string }
   | { kind: "approve-failed"; approvalId: string }
   | { kind: "deny-failed"; approvalId: string }
   | { kind: "ignored" };
 
-// The deep-link route a notification tap resolves to. `threadId` is set
-// only for a threaded completion (the tap opens the thread view); a plain
-// main-chat tap carries null.
+// The deep-link route a notification tap resolves to. A completion now
+// surfaces in its own session — a Topic or a Chat — so the tap always opens
+// that session's chat detail.
 export interface LaunchTapRoute {
   sessionId: string;
-  threadId: string | null;
 }
 
-// Builds the deep-link route string a notification tap opens. A threaded
-// completion opens the thread view (the main chat filters threaded blocks
-// out, so opening it would hide the reply the banner previewed); a main-chat
-// tap omits the thread segment. Both dynamic segments are percent-encoded as
-// a boundary guard so a malformed id from the push payload can't reshape the
-// route path — the ids are server-generated opaque tokens, so the encode is a
-// no-op for well-formed input. Pure (no expo-router) so the encode + the
-// thread-vs-main branch are unit-testable; the push.ts navigateToChat wrapper
-// just feeds the result to router.push.
-export function buildChatRoute(sessionId: string, threadId: string | null): string {
-  return threadId
-    ? `/chat/${encodeURIComponent(sessionId)}/thread/${encodeURIComponent(threadId)}`
-    : `/chat/${encodeURIComponent(sessionId)}`;
+// Builds the deep-link route string a notification tap opens. A completion
+// surfaces in its session (a Topic or a Chat), so the tap opens that
+// session's chat detail. The dynamic segment is percent-encoded as a boundary
+// guard so a malformed id from the push payload can't reshape the route path —
+// the ids are server-generated opaque tokens, so the encode is a no-op for
+// well-formed input. Pure (no expo-router) so the encode is unit-testable; the
+// push.ts navigateToChat wrapper just feeds the result to router.push.
+export function buildChatRoute(sessionId: string): string {
+  return `/chat/${encodeURIComponent(sessionId)}`;
 }
 
 // Reads the routing fields the server-side dispatcher writes into a push
@@ -97,16 +92,14 @@ export function buildChatRoute(sessionId: string, threadId: string | null): stri
 function readRouting(data: unknown): {
   sessionId: string | null;
   approvalId: string | null;
-  threadId: string | null;
 } {
   const raw = data as
-    | { sessionId?: unknown; approvalId?: unknown; threadId?: unknown }
+    | { sessionId?: unknown; approvalId?: unknown }
     | null
     | undefined;
   return {
     sessionId: typeof raw?.sessionId === "string" ? raw.sessionId : null,
-    approvalId: typeof raw?.approvalId === "string" ? raw.approvalId : null,
-    threadId: typeof raw?.threadId === "string" ? raw.threadId : null
+    approvalId: typeof raw?.approvalId === "string" ? raw.approvalId : null
   };
 }
 
@@ -129,8 +122,7 @@ function readRouting(data: unknown): {
  *   - a payload with no sessionId (silent wake, malformed, or a non-routing
  *     notification).
  *
- * A genuine default tap returns `{ sessionId, threadId }`; threadId is
- * non-null only for a threaded completion, matching the live-tap branch.
+ * A genuine default tap returns `{ sessionId }`, matching the live-tap branch.
  */
 export function resolveLaunchTapRoute(response: ResponseLike): LaunchTapRoute | null {
   if (
@@ -139,9 +131,9 @@ export function resolveLaunchTapRoute(response: ResponseLike): LaunchTapRoute | 
   ) {
     return null;
   }
-  const { sessionId, threadId } = readRouting(response.notification.request.content.data);
+  const { sessionId } = readRouting(response.notification.request.content.data);
   if (!sessionId) return null;
-  return { sessionId, threadId };
+  return { sessionId };
 }
 
 // Native seams the launch-tap consume orchestration depends on, injected so
@@ -153,8 +145,8 @@ export interface LaunchConsumeDeps {
   // Notifications.clearLastNotificationResponse — drops the stored response
   // so it isn't re-evaluated on a later mount.
   clear: () => void;
-  // Deep-link into the resolved chat / thread.
-  navigate: (sessionId: string, threadId: string | null) => void;
+  // Deep-link into the resolved chat.
+  navigate: (sessionId: string) => void;
 }
 
 /**
@@ -176,13 +168,13 @@ export function consumeLaunchTap(deps: LaunchConsumeDeps): LaunchTapRoute | null
   const route = resolveLaunchTapRoute(last);
   deps.clear();
   if (!route) return null;
-  deps.navigate(route.sessionId, route.threadId);
+  deps.navigate(route.sessionId);
   return route;
 }
 
 export interface DispatchDeps {
   apiCall: <T = unknown>(path: string, init?: { method?: string }) => Promise<T>;
-  navigate: (sessionId: string, threadId: string | null) => void;
+  navigate: (sessionId: string) => void;
   notifyFailure: (verb: "approve" | "deny") => Promise<void>;
 }
 
@@ -199,10 +191,7 @@ export interface ResponseLike {
  *   - APPROVE button → POST /api/authorizations/:id/approve
  *   - DENY button → POST /api/authorizations/:id/deny
  *   - any other actionIdentifier (default tap, future actions) →
- *     navigate to the chat the payload names; a threaded completion
- *     carries `threadId` so the tap deep-links into the thread view
- *     (the main chat filters threaded blocks out, so opening it would
- *     hide the very reply the banner previewed)
+ *     navigate to the chat the payload names (a Topic or a Chat session)
  *
  * The action buttons only ride on `authorization_requested` pushes (the
  * server-side NSE attaches the APPROVAL_REQUEST category for that event
@@ -220,7 +209,7 @@ export async function dispatchNotificationResponse(
   response: ResponseLike,
   deps: DispatchDeps
 ): Promise<NotificationDispatchOutcome> {
-  const { sessionId, approvalId, threadId } = readRouting(
+  const { sessionId, approvalId } = readRouting(
     response.notification.request.content.data
   );
 
@@ -256,8 +245,8 @@ export async function dispatchNotificationResponse(
   // default-action constant so a future custom action that doesn't
   // need an API call still routes to the chat.
   if (sessionId) {
-    deps.navigate(sessionId, threadId);
-    return { kind: "tap", sessionId, threadId };
+    deps.navigate(sessionId);
+    return { kind: "tap", sessionId };
   }
   return { kind: "ignored" };
 }

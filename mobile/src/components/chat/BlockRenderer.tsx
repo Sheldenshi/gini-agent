@@ -1,3 +1,4 @@
+import { View } from "react-native";
 import type { ChatBlock, ToolResultBlock } from "@/src/types";
 import { BlockAuthorizationRequested } from "./BlockAuthorizationRequested";
 import { BlockSetupRequested } from "./BlockSetupRequested";
@@ -6,6 +7,7 @@ import { BlockPhase } from "./BlockPhase";
 import { BlockSystemNote } from "./BlockSystemNote";
 import { BlockToolCall } from "./BlockToolCall";
 import { BlockUserText } from "./BlockUserText";
+import { TopicForwardChip } from "./TopicForwardChip";
 
 // Dispatcher for the typed ChatBlock union. The switch is exhaustive on
 // `block.kind` — adding a new block kind to src/types.ts (via the
@@ -26,7 +28,19 @@ export function BlockRenderer({
     case "user_text":
       return <BlockUserText block={block} />;
     case "assistant_text":
-      return <BlockAssistantText block={block} />;
+      // A forwarded Topic answer carries its source Topic; render a deep-link
+      // chip below the answer text so the user can open the Topic conversation.
+      return block.forwardedFromTopicId ? (
+        <View style={{ gap: 8 }}>
+          <BlockAssistantText block={block} />
+          <TopicForwardChip
+            topicId={block.forwardedFromTopicId}
+            topicTitle={block.forwardedFromTopicTitle}
+          />
+        </View>
+      ) : (
+        <BlockAssistantText block={block} />
+      );
     case "tool_call":
       return <BlockToolCall block={block} result={toolResult} />;
     case "tool_result":

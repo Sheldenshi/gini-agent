@@ -1,8 +1,8 @@
 import { StyleSheet, Text, View } from "react-native";
 import { family } from "@/src/theme";
 
-// Rounded-square initial avatar used across the Channels list, agent
-// header, and thread views. Colors come from a fixed brand-ish palette
+// Rounded-square initial avatar used across the Channels list and the
+// chat detail's agent header. Colors come from a fixed brand-ish palette
 // keyed deterministically off the agent name so the same agent always
 // gets the same swatch (matches the Pencil reference: Atlas violet, Nova
 // green, Sage indigo, Scout terracotta, …). One swatch is a light gray

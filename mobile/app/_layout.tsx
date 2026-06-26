@@ -161,20 +161,9 @@ export default function RootLayout() {
                 <Stack.Screen name="channels" options={{ headerShown: false }} />
                 <Stack.Screen name="settings" options={{ title: "Settings" }} />
                 {/* Chat detail draws its own header (back arrow + agent
-                    header + tab bar). */}
+                    header + tab bar). Topics open the same screen. */}
                 <Stack.Screen
                   name="chat/[sessionId]"
-                  options={{ headerShown: false }}
-                />
-                {/* Slack-style Thread View, pushed as a card over the
-                    chat detail. Draws its own header. */}
-                <Stack.Screen
-                  name="chat/[sessionId]/thread/[threadId]"
-                  options={{ headerShown: false }}
-                />
-                {/* Cross-agent Threads Inbox. Draws its own header. */}
-                <Stack.Screen
-                  name="threads/inbox"
                   options={{ headerShown: false }}
                 />
               </Stack>

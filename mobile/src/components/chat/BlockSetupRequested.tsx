@@ -8,16 +8,13 @@ import { family, theme } from "@/src/theme";
 import type { SetupRequestedBlock } from "@/src/types";
 
 // Query keys invalidated after a Confirm/Cancel — the web set
-// (["setup-requests","approvals","tasks","task","chat","threads",
-// "threads-inbox","events","audit"]) intersected with the keys the mobile
-// app actually registers, plus "chats" (the per-agent list) so the chat row
-// preview refreshes once the turn resumes.
+// (["setup-requests","approvals","tasks","task","chat","events","audit"])
+// intersected with the keys the mobile app actually registers, plus "chats"
+// (the per-agent list) so the chat row preview refreshes once the turn resumes.
 const CONFIRMATION_INVALIDATE_KEYS = [
   "setup-requests",
   "chat",
   "chats",
-  "threads",
-  "threads-inbox",
   "unread"
 ] as const;
 
