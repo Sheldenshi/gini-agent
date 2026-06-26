@@ -5,7 +5,7 @@ import { buildAgentSystemContext, renderEphemeralContext } from "./system-prompt
 import { loadInstructions, loadSoul, loadUserProfile } from "./runtime/identity-files";
 import { readState } from "./state";
 import { appendTrace } from "./state/trace";
-import { bedrockSupportsFineGrainedToolStreaming, bedrockSupportsStreamingWithTools, bedrockSupportsToolUse, estimateUsd, FALLBACK_MAX_OUTPUT_TOKENS, resolveMaxOutputTokens, resolveProviderModality } from "./provider-capabilities";
+import { bedrockSupportsStreamingWithTools, bedrockSupportsToolUse, claudeSupportsFineGrainedToolStreaming, estimateUsd, FALLBACK_MAX_OUTPUT_TOKENS, resolveMaxOutputTokens, resolveProviderModality } from "./provider-capabilities";
 import { resolveAwsCredentials, signAwsRequest } from "./aws-sigv4";
 import type { CostRecord, ProviderAuthFailureRecord, ProviderAuthStatus, ProviderCatalogItem, ProviderConfig, ProviderName, ProviderReauthInfo, ProviderResult, RuntimeConfig, SystemNoteAuthError } from "./types";
 
@@ -1817,6 +1817,16 @@ async function callAnthropicMessages(
     body.tools = anthropicTools;
     body.tool_choice = { type: "auto" };
   }
+  // Fine-grained tool streaming, symmetric with the Bedrock path: without it the
+  // first-party Messages API also buffers a tool_use block's input JSON
+  // server-side and emits nothing until the whole argument is generated, so a
+  // large inline tool argument idles the stream past the socket timeout and
+  // fails the turn. Here the mechanism is the HTTP `anthropic-beta` header (NOT
+  // the body field Converse uses, and verified more effective than the per-tool
+  // `eager_input_streaming` property). Only on a streaming Claude-4-family tool
+  // turn — the beta is rejected with a 400 on models that don't support it.
+  const wantFineGrainedToolStreaming =
+    wantStream && anthropicTools.length > 0 && claudeSupportsFineGrainedToolStreaming(provider.model);
 
   const bodyJson = JSON.stringify(body);
   const response = await fetch(messagesUrl, {
@@ -1824,6 +1834,7 @@ async function callAnthropicMessages(
     headers: {
       "content-type": "application/json",
       "anthropic-version": ANTHROPIC_VERSION,
+      ...(wantFineGrainedToolStreaming ? { "anthropic-beta": FINE_GRAINED_TOOL_STREAMING_BETA } : {}),
       ...(wantStream ? { accept: "text/event-stream" } : {}),
       ...anthropicAuthHeaders(provider)
     },
@@ -2548,7 +2559,7 @@ async function callBedrockConverse(
   // anthropic_beta entry inside additionalModelRequestFields — the tool-level
   // `eager_input_streaming` property used by the first-party Messages API is
   // silently ignored here. See AWS Bedrock "Anthropic Claude tool use" docs.
-  if (wantStream && toolConfig && bedrockSupportsFineGrainedToolStreaming(provider.model)) {
+  if (wantStream && toolConfig && claudeSupportsFineGrainedToolStreaming(provider.model)) {
     body.additionalModelRequestFields = { anthropic_beta: [FINE_GRAINED_TOOL_STREAMING_BETA] };
   }
 

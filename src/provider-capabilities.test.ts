@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import {
-  bedrockSupportsFineGrainedToolStreaming,
   bedrockSupportsStreamingWithTools,
   bedrockSupportsToolUse,
+  claudeSupportsFineGrainedToolStreaming,
   estimateUsd,
   FALLBACK_CONTEXT_WINDOW_TOKENS,
   FALLBACK_MAX_OUTPUT_TOKENS,
@@ -209,20 +209,22 @@ describe("bedrockSupportsStreamingWithTools", () => {
   });
 });
 
-describe("bedrockSupportsFineGrainedToolStreaming", () => {
-  test("Claude 4+ family (bedrock-prefixed or bare) accept the flag; others don't", () => {
-    // AWS documents fine-grained tool streaming for the Claude 4 family only.
+describe("claudeSupportsFineGrainedToolStreaming", () => {
+  test("Claude 4+ family (bedrock-prefixed or bare first-party) accept the flag; others don't", () => {
+    // Fine-grained tool streaming is documented for the Claude 4 family only,
+    // on both the bedrock (prefixed) and first-party (bare) id shapes.
     for (const m of [
       "us.anthropic.claude-sonnet-4-6",
       "us.anthropic.claude-opus-4-8",
       "eu.anthropic.claude-haiku-4-5-20251001-v1:0",
       "anthropic.claude-sonnet-4-20250514-v1:0",
       "claude-opus-4-8",
-      "claude-sonnet-4-12"
+      "claude-sonnet-4-12",
+      "claude-sonnet-4-5-20250929"
     ]) {
-      expect(bedrockSupportsFineGrainedToolStreaming(m)).toBe(true);
+      expect(claudeSupportsFineGrainedToolStreaming(m)).toBe(true);
     }
-    // Claude 3.x/3.5 are NOT in AWS's supported list — sending the beta to them
+    // Claude 3.x/3.5 are NOT in the supported list — sending the beta to them
     // risks a 400, so the gate must exclude them even though they're Claude.
     for (const m of [
       "us.anthropic.claude-3-5-sonnet-20241022-v1:0",
@@ -230,7 +232,7 @@ describe("bedrockSupportsFineGrainedToolStreaming", () => {
       "us.anthropic.claude-3-haiku-20240307-v1:0",
       "claude-3-5-sonnet-20241022"
     ]) {
-      expect(bedrockSupportsFineGrainedToolStreaming(m)).toBe(false);
+      expect(claudeSupportsFineGrainedToolStreaming(m)).toBe(false);
     }
     // Non-Claude families don't support the beta flag, and an empty/unknown id
     // stays off.
@@ -242,7 +244,7 @@ describe("bedrockSupportsFineGrainedToolStreaming", () => {
       "some.custom.future-model",
       ""
     ]) {
-      expect(bedrockSupportsFineGrainedToolStreaming(m)).toBe(false);
+      expect(claudeSupportsFineGrainedToolStreaming(m)).toBe(false);
     }
   });
 });

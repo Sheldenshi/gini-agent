@@ -4246,11 +4246,91 @@ describe("anthropic provider", () => {
       const headers = call.init.headers as Record<string, string>;
       expect(headers["x-api-key"]).toBe("bedrock-api-key-xyz&Version=1");
       expect(headers["accept"]).toBe("text/event-stream");
+      // Streaming Claude-4 tool turn requests fine-grained tool streaming via the
+      // HTTP beta header so the tool input streams incrementally instead of
+      // buffering the whole block past the socket timeout.
+      expect(headers["anthropic-beta"]).toBe("fine-grained-tool-streaming-2025-05-14");
       expect(JSON.parse(String(call.init.body)).stream).toBe(true);
       // Streaming resolves the model's full output ceiling (opus-4-8 → 128000)
       // so a large tool-call argument isn't truncated mid-JSON. The companion
       // non-streaming test above keeps the conservative 8192 floor.
       expect(JSON.parse(String(call.init.body)).max_tokens).toBe(128000);
+    } finally {
+      fetchStub.restore();
+      restoreEnv();
+    }
+  });
+
+  test("anthropic: a tool-less streaming turn does NOT send the fine-grained-tool-streaming header", async () => {
+    const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    const fetchStub = installFetch(() =>
+      anthropicSse([
+        { event: "message_start", data: { type: "message_start", message: { id: "m", usage: { input_tokens: 1 } } } },
+        { event: "content_block_start", data: { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } } },
+        { event: "content_block_delta", data: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "hi" } } },
+        { event: "content_block_stop", data: { type: "content_block_stop", index: 0 } },
+        { event: "message_delta", data: { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } } },
+        { event: "message_stop", data: { type: "message_stop" } }
+      ])
+    );
+    try {
+      const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], [], () => {});
+      const headers = fetchStub.calls[0]!.init.headers as Record<string, string>;
+      // No tools ⟹ the tool-streaming beta is meaningless and must be absent.
+      expect(headers["anthropic-beta"]).toBeUndefined();
+    } finally {
+      fetchStub.restore();
+      restoreEnv();
+    }
+  });
+
+  test("anthropic: a non-streaming tool turn does NOT send the fine-grained-tool-streaming header", async () => {
+    const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    const fetchStub = installFetch(() =>
+      anthropicJson({
+        id: "m",
+        content: [{ type: "tool_use", id: "toolu_1", name: "file_list", input: { path: "/tmp" } }],
+        stop_reason: "tool_use",
+        usage: { input_tokens: 2, output_tokens: 1 }
+      })
+    );
+    try {
+      const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
+      // No onDelta ⟹ non-streaming /v1/messages; the beta is streaming-only.
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: "go" }], [
+        { type: "function", function: { name: "file_list", description: "list", parameters: { type: "object" } } }
+      ]);
+      const headers = fetchStub.calls[0]!.init.headers as Record<string, string>;
+      expect(headers["anthropic-beta"]).toBeUndefined();
+      expect(JSON.parse(String(fetchStub.calls[0]!.init.body)).stream).toBe(false);
+    } finally {
+      fetchStub.restore();
+      restoreEnv();
+    }
+  });
+
+  test("anthropic: a non-Claude-4 model (3.5) does NOT send the fine-grained-tool-streaming header", async () => {
+    const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    const fetchStub = installFetch(() =>
+      anthropicSse([
+        { event: "message_start", data: { type: "message_start", message: { id: "m", usage: { input_tokens: 1 } } } },
+        { event: "content_block_start", data: { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "toolu_1", name: "file_list" } } },
+        { event: "content_block_delta", data: { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: "{}" } } },
+        { event: "content_block_stop", data: { type: "content_block_stop", index: 0 } },
+        { event: "message_delta", data: { type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 1 } } },
+        { event: "message_stop", data: { type: "message_stop" } }
+      ])
+    );
+    try {
+      // Claude 3.5 is not in the fine-grained-streaming supported list; sending
+      // the beta risks a 400, so the header must be gated off.
+      const provider = normalizeProvider({ name: "anthropic", model: "claude-3-5-sonnet-20241022" });
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: "go" }], [
+        { type: "function", function: { name: "file_list", description: "list", parameters: { type: "object" } } }
+      ], () => {});
+      const headers = fetchStub.calls[0]!.init.headers as Record<string, string>;
+      expect(headers["anthropic-beta"]).toBeUndefined();
     } finally {
       fetchStub.restore();
       restoreEnv();
