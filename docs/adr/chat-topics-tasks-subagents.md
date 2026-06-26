@@ -144,14 +144,16 @@ When a user posts in **Chat**, a lightweight **router** decides one of:
    (the "drafted an email, then later 'book the game tickets' → find the world-cup Topic"
    case), then forward back.
 
-**Recommended mechanism (hybrid):** an embedding/recall pre-filter over Topic
-`topicSummary`/`topicTitle` surfaces candidate Topics; a small router model call (the Chat
-turn) makes the final 3-way decision with those candidates in context, via control tools
-`open_topic(title, message)` and `route_to_topic(topicId, message)`. This mirrors the
-codebase's existing "retrieval + model decision" pattern and the `start_thread`-as-control-
-tool precedent — but the decision now happens **at intake** (selecting which transcript
-loads) instead of mid-stream (tagging already-streamed blocks). A bias toward
-new-vs-existing-vs-inline lives in `INSTRUCTIONS.md`, not in hard-coded heuristics.
+**Mechanism (hybrid):** an embedding/recall pre-filter over Topic
+`topicSummary`/`title` surfaces candidate Topics; a small **structured router call**
+(`routeChatMessage`, built like the chat-title generator `generateChatTitleFromBlocks`)
+makes the final 3-way decision with those candidates in context, returning
+`{decision: "chat"|"new_topic"|"existing_topic", topicId?, title?}`. The decision happens
+**at intake** (it selects which transcript loads) instead of mid-stream (tagging
+already-streamed blocks). A structured classifier is used instead of agent control tools
+because the decision must precede context loading and a forced structured output is more
+reliable than hoping the agent calls a tool. The new-vs-existing-vs-inline bias lives in
+the router's own prompt, not in hard-coded heuristics.
 
 ## Jobs → Topics
 
@@ -206,10 +208,10 @@ into Chat tagged with the Topic. Consequences:
 
 1. **Topic creation is agent-decided per message.** A 3-way router (answer-in-chat /
    open-new-topic / continue-existing-topic) classifies each Chat message; the bias lives in
-   `INSTRUCTIONS.md`, not a hard rule.
-2. **Routing is hybrid.** Embedding recall over Topic `topicSummary`/`topicTitle` surfaces
-   candidate Topics; a small router model call makes the final 3-way decision via the
-   `open_topic` / `route_to_topic` control tools.
+   the router's prompt (a structured intake classifier), not a hard rule.
+2. **Routing is hybrid.** Embedding recall over Topic `topicSummary`/`title` surfaces
+   candidate Topics; a small structured router call (`routeChatMessage`) makes the final
+   3-way decision, returning `{decision, topicId?, title?}`.
 3. **Legacy threads are converted into the linear Chat history** — not displayed as threads,
    and not split into separate Topic sessions. Their `thread_id`/`parent_block_id` tags are
    nulled so the blocks read as one linear Chat history in ordinal order; new subjects become

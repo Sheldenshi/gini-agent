@@ -4,6 +4,7 @@ import {
   appendLog,
   createChatMessage,
   createChatSession,
+  createTopic,
   deleteChatSession,
   enqueuePendingChatMessage,
   getLatestMessagesBySession,
@@ -27,6 +28,7 @@ import { getSttProvider } from "../stt";
 import { generateStructured, providerAuthFailureText, providerDisplayLabel, providerReauth } from "../provider";
 import { providerOverrideForRuntime, resolveEffectiveContext } from "./effective-context";
 import { createConversationRun, linkRunToTask } from "./runs";
+import { routeChatMessage } from "./chat-route";
 import { isSilentReply } from "../jobs/silent";
 
 // Statuses where a task is no longer producing partial text. Once a task
@@ -496,6 +498,11 @@ async function runChatSubmission(
 // interactive clients that must handle the queued case.
 type RunNowResult = Awaited<ReturnType<typeof runChatSubmission>>;
 type QueuedResult = { sessionId: string; queued: true; pendingId: string };
+// A Chat-routed message dispatched into a Topic returns the Topic-shaped result
+// (topicId-keyed instead of sessionId-keyed). submitChatMessage's union widens to
+// include it; the HTTP handler JSON-stringifies the result without destructuring,
+// so the topic shape serializes correctly alongside the chat-direct shapes.
+type TopicDispatchResult = Awaited<ReturnType<typeof dispatchChatMessageToTopic>>;
 export function submitChatMessage(
   config: RuntimeConfig,
   sessionId: string,
@@ -507,13 +514,13 @@ export function submitChatMessage(
   sessionId: string,
   input: Record<string, unknown>,
   options?: { bypassQueue?: boolean }
-): Promise<RunNowResult | QueuedResult>;
+): Promise<RunNowResult | QueuedResult | TopicDispatchResult>;
 export async function submitChatMessage(
   config: RuntimeConfig,
   sessionId: string,
   input: Record<string, unknown>,
   options?: { bypassQueue?: boolean }
-): Promise<RunNowResult | QueuedResult> {
+): Promise<RunNowResult | QueuedResult | TopicDispatchResult> {
   const prepared = await prepareChatSubmission(config, sessionId, input);
   // The queue is for interactive clients (web/mobile/CLI composer), where a
   // human queues follow-ups while watching a turn. The messaging bridge is a
@@ -522,6 +529,29 @@ export async function submitChatMessage(
   // See ADR chat-message-queue.md.
   if (options?.bypassQueue) {
     return runChatSubmission(config, sessionId, prepared);
+  }
+  // Intake routing (ADR chat-topics-tasks-subagents.md). A message posted in a
+  // user's Chat (kind:"agent") is classified BEFORE context loads — the route
+  // selects which transcript loads. A new/existing Topic dispatches into the
+  // Topic's isolated context; a "chat" decision falls through to the
+  // chat-direct queue/run path below. The bypassQueue run-now path and
+  // non-Chat sessions (topic/channel/bridge) are never routed.
+  if (prepared.liveSession.kind === "agent") {
+    const decision = await routeChatMessage(config, sessionId, prepared.content);
+    if (decision.decision === "new_topic") {
+      const topicId = await mutateState(config.instance, (state) =>
+        createTopic(state, {
+          agentId: prepared.liveSession.agentId,
+          title: decision.title,
+          parentChatSessionId: sessionId
+        }).id
+      );
+      return dispatchChatMessageToTopic(config, sessionId, topicId, prepared);
+    }
+    if (decision.decision === "existing_topic") {
+      return dispatchChatMessageToTopic(config, sessionId, decision.topicId, prepared);
+    }
+    // decision === "chat" → fall through to the chat-direct queue/run below.
   }
   // Enqueue instead of running when a turn is already in flight for this
   // session, or when the queue is already non-empty (so a later submit can't

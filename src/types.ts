@@ -1997,6 +1997,7 @@ export type UsageSource =
   | "subagent"
   | "memory"
   | "chat-title"
+  | "chat-route"
   | "vision"
   | "aux"
   | "imperative"

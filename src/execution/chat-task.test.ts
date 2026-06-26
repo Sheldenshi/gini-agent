@@ -73,9 +73,11 @@ import {
 import type { ToolCatalogTool } from "./tool-catalog";
 import type { EffectiveContext } from "./effective-context";
 
-// These tests submit on idle sessions, which always run immediately. Narrow
-// the submit union to the run-now branch so the existing `.taskId` reads stay
-// typed (a queued result here is a test-setup bug). See ADR
+// These tests submit on idle sessions, which always run immediately. They also
+// don't seed a "chat-route" stub, so the router coerces to a chat-direct
+// decision and the turn runs in the submitted session. Narrow the submit union
+// to the chat-direct run-now branch so the existing `.taskId` reads stay typed
+// (a queued or topic-dispatched result here is a test-setup bug). See ADR
 // chat-message-queue.md.
 async function submitChatMessage(
   config: RuntimeConfig,
@@ -85,6 +87,7 @@ async function submitChatMessage(
   const { submitChatMessage: submitChatMessageRaw } = await import("./chat");
   const result = await submitChatMessageRaw(config, sessionId, input);
   if ("queued" in result) throw new Error("expected run-now submission, got queued");
+  if ("topicId" in result) throw new Error("expected chat-direct submission, got topic dispatch");
   return result;
 }
 
