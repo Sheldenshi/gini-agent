@@ -374,16 +374,25 @@ export function bedrockSupportsStreamingWithTools(model: string): boolean {
 // "Anthropic Claude tool use" docs; the first-party Messages API matches). Older
 // Claude 3.x/3.5 ids and the non-Claude Bedrock families (Nova, Llama, DeepSeek,
 // Mistral) are NOT listed, and the API rejects an unsupported beta with a 400
-// rather than ignoring it — so the allowlist must match the 4+ family precisely,
-// not any `claude` id. The minor class ([4-9]|\d\d) keeps future point releases
-// on it while excluding 3.x. The slug may carry a Bedrock inference-profile
-// prefix ("us.anthropic.claude-sonnet-4-6") or be a bare first-party id
+// rather than ignoring it.
+//
+// The flag we send is DATE-STAMPED (fine-grained-tool-streaming-2025-05-14), so
+// the gate matches the major version `-4-` EXACTLY rather than `[4-9]` — a
+// future Claude 5+ that either GA's the feature flag-free or uses a newer dated
+// beta would otherwise be force-fed this 2025-05-14 string and hard-400 on
+// every streaming tool turn (strictly worse than the safe non-match fallback,
+// which is just the pre-existing buffering stall). Unlike the numeric ceiling
+// tables (claudeMaxOutputTokens / claudeContextWindowTokens), which forward-
+// match the MINOR within `-4-` because an over-classified ceiling degrades
+// gracefully, this gate is binary accept/400 and must not forward-match the
+// major. The slug may carry a Bedrock inference-profile prefix
+// ("us.anthropic.claude-sonnet-4-6") or be a bare first-party id
 // ("claude-sonnet-4-6"); both match because the pattern keys off the
-// `claude-<tier>-<major>` shape. Used by both the bedrock (Converse, via
+// `claude-<tier>-4-` shape. Used by both the bedrock (Converse, via
 // additionalModelRequestFields) and first-party anthropic (HTTP anthropic-beta
 // header) send paths.
 export function claudeSupportsFineGrainedToolStreaming(model: string): boolean {
-  return /claude-(?:sonnet|haiku|opus)-(?:[4-9]|\d\d)/.test(normalizeModel(model));
+  return /claude-(?:sonnet|haiku|opus)-4-/.test(normalizeModel(model));
 }
 
 export interface ModelPricing {

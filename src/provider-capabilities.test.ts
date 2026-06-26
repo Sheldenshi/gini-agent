@@ -234,6 +234,18 @@ describe("claudeSupportsFineGrainedToolStreaming", () => {
     ]) {
       expect(claudeSupportsFineGrainedToolStreaming(m)).toBe(false);
     }
+    // Future MAJORS (Claude 5+, 10+) must NOT match: the beta flag we send is
+    // date-stamped (…-2025-05-14), so force-feeding it to a future major that
+    // GA's the feature or uses a newer beta would hard-400 every streaming tool
+    // turn — worse than the safe non-match fallback. The gate pins major 4.
+    for (const m of [
+      "claude-sonnet-5-0",
+      "claude-opus-5-1",
+      "us.anthropic.claude-sonnet-5-0-20260101-v1:0",
+      "claude-sonnet-10-0"
+    ]) {
+      expect(claudeSupportsFineGrainedToolStreaming(m)).toBe(false);
+    }
     // Non-Claude families don't support the beta flag, and an empty/unknown id
     // stays off.
     for (const m of [
