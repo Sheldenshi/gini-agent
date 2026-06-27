@@ -4,6 +4,7 @@ import {
   bankIdForAgent,
   createAgentRecord,
   deleteBankAndUnits,
+  deleteChatSession,
   ensureAgentBank,
   mutateState,
   readState
@@ -245,6 +246,13 @@ export async function setAgentProvider(
 //   - The active agent cannot be deleted — the caller must switch first.
 //   - Unknown agent id/name throws (mapped to 404 by the HTTP layer).
 // Cascade:
+//   - The agent's conversation surfaces — its Chat (`kind:"agent"`) and
+//     every Topic (`kind:"topic"`) it owns — are deleted with their
+//     chat_blocks (ADR chat-topics-tasks-subagents.md Decision D). Job
+//     channels (`kind:"channel"`) are deliberately left untouched; the
+//     job lifecycle detaches them separately. Removing the topic rows here
+//     is what keeps normalizeState's orphan-rehome pass from re-stamping a
+//     deleted agent's Topics onto another agent.
 //   - Per-agent Hindsight bank (`bank_${agentId}`) + all units in it.
 //   - The agent row is removed from `state.agents`.
 // The legacy `state.memories` per-agent purge was removed alongside the
@@ -268,6 +276,21 @@ export async function deleteAgent(
     if (state.activeAgentId === agent.id) {
       throw new Error("Cannot delete the active agent; switch to another agent first.");
     }
+    // Delete the agent's conversation surfaces — its Chat (`kind:"agent"`)
+    // and every Topic (`kind:"topic"`) it owns. Without this, those rows
+    // survive the agent and normalizeState's orphan-rehome pass re-stamps
+    // them onto the default agent, piling duplicate Topics into another
+    // agent's list. Job channels (`kind:"channel"`) are left alone — they
+    // have their own lifecycle. Collect the ids first so we don't mutate
+    // `state.chatSessions` while iterating it.
+    const surfaceIds = state.chatSessions
+      .filter(
+        (session) =>
+          session.agentId === agent.id &&
+          (session.kind === "agent" || session.kind === "topic")
+      )
+      .map((session) => session.id);
+    for (const id of surfaceIds) deleteChatSession(state, id);
     state.agents = state.agents.filter((item) => item.id !== agent.id);
     return { id: agent.id, name: agent.name };
   });

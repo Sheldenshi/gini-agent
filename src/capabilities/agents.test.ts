@@ -13,6 +13,8 @@ import { soulPath } from "../runtime/identity-files";
 import { install } from "../runtime";
 import {
   bankIdForAgent,
+  createChatSession,
+  createTopic,
   ensureAgentBank,
   getBank,
   insertMemoryUnit,
@@ -325,6 +327,51 @@ describe("createAgent", () => {
     expect(getBank(config.instance, bankIdForAgent(created.id))).toBeNull();
     expect(listMemoryUnits(config.instance, bankIdForAgent(created.id))).toEqual([]);
     expect(after.audit.some((event) => event.action === "agent.deleted" && event.target === created.id)).toBe(true);
+  });
+
+  test("deleteAgent deletes the agent's Chat and Topic sessions but keeps its job channel", async () => {
+    // A Topic is a `kind:"topic"` ChatSessionRecord owned by the agent (ADR
+    // chat-topics-tasks-subagents.md Decision D). If deleteAgent left these
+    // behind, the orphan-rehome pass in normalizeState would re-stamp them
+    // onto the default agent, piling duplicate Topics into another agent's
+    // list. Job channels (`kind:"channel"`) have their own lifecycle and
+    // must survive.
+    const config = buildConfig(workspaceRoot, "delete-agent-sessions", root);
+    await install(config);
+    const created = await createAgent(config, { name: "scratch" });
+
+    const ids = await mutateState(config.instance, (state) => {
+      const chat = createChatSession(state, "agent chat", undefined, created.id, undefined, "agent");
+      const topicA = createTopic(state, { agentId: created.id, title: "topic A" });
+      const topicB = createTopic(state, { agentId: created.id, title: "topic B" });
+      const channel = createChatSession(state, "job channel", undefined, created.id, "job", "channel");
+      return { chat: chat.id, topicA: topicA.id, topicB: topicB.id, channel: channel.id };
+    });
+
+    await deleteAgent(config, created.id);
+
+    // readState runs normalizeState (including the orphan-rehome pass), so
+    // this snapshot reflects what survives delete + rehome.
+    const after = readState(config.instance);
+    const present = new Set(after.chatSessions.map((session) => session.id));
+    // The Chat and both Topics are gone — record and (via deleteChatSession)
+    // their chat_blocks.
+    expect(present.has(ids.chat)).toBe(false);
+    expect(present.has(ids.topicA)).toBe(false);
+    expect(present.has(ids.topicB)).toBe(false);
+    // The job channel survives.
+    expect(present.has(ids.channel)).toBe(true);
+    // No deleted Topic was re-homed onto another agent: no surviving session
+    // carries one of the deleted topic ids.
+    expect(after.chatSessions.some((session) => session.id === ids.topicA)).toBe(false);
+    expect(after.chatSessions.some((session) => session.id === ids.topicB)).toBe(false);
+    // And no Topic at all references the deleted agent (the orphan that the
+    // rehome pass would otherwise re-attribute is simply gone).
+    expect(
+      after.chatSessions.some(
+        (session) => session.kind === "topic" && session.agentId === created.id
+      )
+    ).toBe(false);
   });
 
   test("deleteAgent resolves by name", async () => {
