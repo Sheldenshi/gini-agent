@@ -324,7 +324,10 @@ function MarkdownForeignImage({ alt, href }: { alt: string; href: string }) {
         presentLinkMenu(href, e.nativeEvent.pageX, e.nativeEvent.pageY)
       }
       accessibilityRole="button"
-      accessibilityLabel={`Open image: ${alt || linkHostname(href)}`}
+      // Always name the host: a screen-reader user must hear WHERE a
+      // model-authored link goes before activating it, not just the
+      // model-controlled alt text. Mirrors the host shown visually.
+      accessibilityLabel={`Open image ${alt || "Image"} — ${linkHostname(href)}`}
     >
       <Feather name="image" size={15} color={theme.muted} />
       <Text style={foreignImageStyles.label} numberOfLines={1}>

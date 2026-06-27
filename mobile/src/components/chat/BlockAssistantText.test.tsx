@@ -304,7 +304,7 @@ describe("inline image rule (gini-upload:// image ref)", () => {
     expect(seen).toEqual([{ href: "https://evil.example/p.gif", x: 5, y: 9 }]);
   });
 
-  test("an alt-less foreign image chip falls back to a host-derived label", () => {
+  test("a foreign image chip's a11y label always names the host (where the link goes)", () => {
     const node: Node = {
       key: "imgna",
       type: "image",
@@ -315,10 +315,13 @@ describe("inline image rule (gini-upload:// image ref)", () => {
     const el = rule("image")(node, [], [], styles);
     expect(el).not.toBeNull();
     const Comp = el.type as (p: { alt: string; href: string }) => any;
-    // alt is "" → the accessibility label falls back to the host; invoking the
-    // component exercises that fallback branch and the label/host Text nodes.
-    const rendered = Comp({ alt: "", href: "https://cataas.com/cat" });
-    expect(rendered.props.accessibilityLabel).toBe("Open image: cataas.com");
+    // With alt: the host is still appended so a screen-reader user hears the
+    // destination, not just the model-controlled alt text.
+    expect(Comp({ alt: "a cat", href: "https://cataas.com/cat" }).props.accessibilityLabel)
+      .toBe("Open image a cat — cataas.com");
+    // Without alt: falls back to "Image" + host (exercises the alt-less branch).
+    expect(Comp({ alt: "", href: "https://cataas.com/cat" }).props.accessibilityLabel)
+      .toBe("Open image Image — cataas.com");
   });
 
   test("a non-web image src (data:/no src) is DROPPED (returns null) — never even a chip", () => {

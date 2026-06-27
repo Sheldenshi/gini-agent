@@ -10,7 +10,7 @@ coverageDir = "coverage"
 coverageSkipTestFiles = true
 
 # 100% line + function coverage. Bun reads these as 0-1 fractions; 1 means 100%.
-coverageThreshold = { lines = 0, functions = 0 }
+coverageThreshold = { lines = 1, functions = 1 }
 
 # The threshold is global across every non-ignored file that tests import. Scope
 # enforcement to the tunnel components this harness covers; shadcn primitives,
