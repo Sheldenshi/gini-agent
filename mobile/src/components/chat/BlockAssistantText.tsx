@@ -205,9 +205,10 @@ function hasUploadImageDescendant(node: MarkdownNode): boolean {
 // image renders as a View subtree (MarkdownUploadImage), which can't mount
 // inside the iOS TextInput a text wrapper resolves to, so the block renders as
 // a plain View (the library's own default paragraph rule is a View for the same
-// reason). Only the View-incompatible margin props of the text style carry over
-// — passing the text props (color/font/lineHeight) to a View is meaningless,
-// and the View's Text children already supply their own font via the cascade.
+// reason). It mirrors that default rule's row/wrap layout (imageBlock below) so
+// a mid-sentence image keeps inline, wrapping paragraph flow — prose, image,
+// prose flow left-to-right and wrap, rather than stacking vertically under RN's
+// default column direction — and carries over the text style's vertical margins.
 const renderAsText =
   (style: { marginTop?: number; marginBottom?: number }): RenderRule =>
   (node, children) => {
@@ -215,7 +216,10 @@ const renderAsText =
       return (
         <View
           key={node.key}
-          style={{ marginTop: style.marginTop, marginBottom: style.marginBottom }}
+          style={[
+            imageBlockStyles.block,
+            { marginTop: style.marginTop, marginBottom: style.marginBottom }
+          ]}
         >
           {children}
         </View>
@@ -231,6 +235,20 @@ const renderAsText =
       </SelectableBlockText>
     );
   };
+
+// Mirror of react-native-markdown-display's `_VIEW_SAFE_paragraph` layout
+// (flexWrap row, top-aligned, full width) so an image-bearing paragraph lays
+// its inline children out the same way the library's default paragraph View
+// would — see the View escape in renderAsText.
+const imageBlockStyles = StyleSheet.create({
+  block: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    alignItems: "flex-start",
+    justifyContent: "flex-start",
+    width: "100%"
+  }
+});
 // A markdown link is interactive (tap opens, long-press shows the menu), so
 // its label must not be selectable — otherwise iOS fires its own text
 // selection "Copy" callout on long-press alongside the link menu. The inline

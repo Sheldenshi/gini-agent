@@ -169,7 +169,17 @@ describe("an agent upload image renders outside the iOS text-selection wrapper",
     // The image's nearest block ancestor (the paragraph holding both the prose
     // and the image) renders as a View. Anchored from the leaf, like the
     // standalone case above, so a change in wrapping depth can't misindex it.
-    expect(path[path.length - 2].type).toBe(View);
+    const blockAncestor = path[path.length - 2];
+    expect(blockAncestor.type).toBe(View);
+    // It carries the library's row/wrap paragraph layout so prose and the image
+    // flow inline and wrap, rather than stacking under RN's default column
+    // direction. The style is an array [layout, margins]; flatten and assert.
+    const flat = Object.assign(
+      {},
+      ...[blockAncestor.props?.style].flat(Infinity).filter(Boolean)
+    ) as { flexDirection?: string; flexWrap?: string };
+    expect(flat.flexDirection).toBe("row");
+    expect(flat.flexWrap).toBe("wrap");
   });
 
   test("a paragraph of plain prose still uses the iOS TextInput selection wrapper", () => {
