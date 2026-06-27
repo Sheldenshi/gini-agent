@@ -160,15 +160,21 @@ describe("MarkdownContent", () => {
     }
   });
 
+  // The outer link uses a same-page `#target` fragment, not an absolute URL: a
+  // dispatched click that reached the anchor would otherwise make happy-dom
+  // attempt a real navigation fetch (noisy ECONNREFUSED on stderr). A fragment
+  // exercises the identical nesting + cancel behavior with no network side
+  // effect — the point is the chip OWNS the click, which `defaultPrevented`
+  // proves regardless of the href's shape.
   test("a linked foreign image does NOT produce a nested anchor (chip is a span)", () => {
     const { container } = render(
-      <MarkdownContent text="[![a cat](https://evil.example/p.gif)](https://target.example)" dropForeignImages />
+      <MarkdownContent text="[![a cat](https://evil.example/p.gif)](#target)" dropForeignImages />
     );
     // Exactly one anchor (the outer link); the image chip is a span inside it,
     // never a second <a> — invalid nested anchors are avoided.
     const anchors = container.querySelectorAll("a");
     expect(anchors.length).toBe(1);
-    expect(anchors[0]?.getAttribute("href")).toBe("https://target.example");
+    expect(anchors[0]?.getAttribute("href")).toBe("#target");
     expect(anchors[0]?.querySelector("[role='link']")?.tagName).toBe("SPAN");
   });
 
@@ -179,7 +185,7 @@ describe("MarkdownContent", () => {
     window.open = (u: string) => { opened.push(u); return null; };
     try {
       const { container } = render(
-        <MarkdownContent text="[![a cat](https://evil.example/p.gif)](https://target.example)" dropForeignImages />
+        <MarkdownContent text="[![a cat](https://evil.example/p.gif)](#target)" dropForeignImages />
       );
       // Sanity: the chip is nested inside the outer anchor.
       const anchor = container.querySelector("a")!;
@@ -188,8 +194,8 @@ describe("MarkdownContent", () => {
       const evt = new MouseEvent("click", { bubbles: true, cancelable: true });
       chip.dispatchEvent(evt);
       // Only the image URL opened (window.open), and the chip called
-      // preventDefault — so the anchor's default navigation to the target URL is
-      // cancelled. One click → one model-authored destination, not two.
+      // preventDefault — so the anchor's default navigation is cancelled.
+      // One click → one model-authored destination, not two.
       expect(opened).toEqual(["https://evil.example/p.gif"]);
       expect(evt.defaultPrevented).toBe(true);
     } finally {
