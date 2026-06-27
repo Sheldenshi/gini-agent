@@ -8,6 +8,7 @@ import {
   type ReactNode
 } from "react";
 import { Animated, Easing, Pressable, StyleSheet, Text, View } from "react-native";
+import { Feather } from "@expo/vector-icons";
 import Markdown, { MarkdownIt } from "react-native-markdown-display";
 import { family, theme } from "@/src/theme";
 import type { AssistantTextBlock } from "@/src/types";
@@ -19,6 +20,7 @@ import { openUploadInBrowser } from "./uploadAttachment";
 import {
   handleMarkdownLinkPress,
   isWebUrl,
+  linkHostname,
   openLink,
   presentLinkMenu
 } from "./linkContextMenu";
@@ -301,6 +303,65 @@ const uploadImageStyles = StyleSheet.create({
   }
 });
 
+// A foreign (non-upload) image `![alt](https://…)` an agent may emit instead of
+// the canonical `gini-upload://` ref. The bytes are NOT fetched — auto-loading a
+// model-authored URL at render time is the SSRF / tracking-pixel surface the
+// image rule guards against. Rather than drop it silently (a blank gap the
+// reader can't explain), render an inert chip naming the image and its host;
+// the URL is only fetched on an explicit tap (in-app browser), and a long-press
+// raises the same link menu as a text link. This mirrors how a foreign text
+// link already behaves — nothing about an image should make it vanish.
+function MarkdownForeignImage({ alt, href }: { alt: string; href: string }) {
+  return (
+    <Pressable
+      style={foreignImageStyles.chip}
+      onPress={() => openLink(href)}
+      onLongPress={(e) =>
+        presentLinkMenu(href, e.nativeEvent.pageX, e.nativeEvent.pageY)
+      }
+      accessibilityRole="button"
+      accessibilityLabel={`Open image: ${alt || linkHostname(href)}`}
+    >
+      <Feather name="image" size={15} color={theme.muted} />
+      <Text style={foreignImageStyles.label} numberOfLines={1}>
+        {alt || "Image"}
+      </Text>
+      <Text style={foreignImageStyles.host} numberOfLines={1}>
+        {linkHostname(href)}
+      </Text>
+    </Pressable>
+  );
+}
+
+const foreignImageStyles = StyleSheet.create({
+  chip: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    marginVertical: 6,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: theme.border,
+    backgroundColor: theme.codeChipBg,
+    alignSelf: "flex-start",
+    maxWidth: "100%"
+  },
+  label: {
+    color: theme.assistantBubbleText,
+    fontFamily: family("HankenGrotesk", 600),
+    fontSize: 14,
+    flexShrink: 1
+  },
+  host: {
+    color: theme.muted,
+    fontFamily: family("HankenGrotesk", 400),
+    fontSize: 12,
+    flexShrink: 1
+  }
+});
+
 // Inline rules (text/textgroup/link/strong/em/s/inline) need their own
 // `selectable` because react-native-markdown-display emits <Text>
 // wrappers per rule and the defaults omit the prop — without these
@@ -391,14 +452,25 @@ export const markdownRules: Record<string, RenderRule> = {
   // An agent-produced image is authored as a `gini-upload://<id>` markdown
   // image ref. Override the default image rule (which renders a header-less
   // FitImage that 401s against the gateway) to render AuthedImage instead —
-  // it carries the bearer on native and fetches a blob on web. A non-upload
-  // src is DROPPED (returns null) rather than fetched: that allowlist closes
-  // the SSRF / tracking-pixel surface. The image rule has a special signature
+  // it carries the bearer on native and fetches a blob on web. A foreign
+  // http(s) src is NOT auto-fetched (that's the SSRF / tracking-pixel surface);
+  // it renders an inert chip that only loads on tap. Any other src (data:,
+  // javascript:, …) is dropped entirely. The image rule has a special signature
   // (extra allowedImageHandlers / defaultImageHandler args), so it's cast.
   image: ((node: MarkdownNode) => {
-    const id = uploadIdFromRef(node.attributes?.src);
-    if (!id) return null;
-    return <MarkdownUploadImage key={node.key} uploadId={id} />;
+    const src = node.attributes?.src;
+    const id = uploadIdFromRef(src);
+    if (id) return <MarkdownUploadImage key={node.key} uploadId={id} />;
+    if (src && isWebUrl(src)) {
+      return (
+        <MarkdownForeignImage
+          key={node.key}
+          alt={node.attributes?.alt ?? ""}
+          href={src}
+        />
+      );
+    }
+    return null;
   }) as RenderRule,
   // Code blocks render as `SelectableBlockText` so iOS gets the loupe
   // and drag handles on multi-line snippets. The library's defaults

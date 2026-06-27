@@ -8,7 +8,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { render, screen } from "@testing-library/react";
-import { fenceLang, hastText, MarkdownContent, resolveDocHref } from "./MarkdownContent";
+import { fenceLang, hastText, MarkdownContent, resolveDocHref, webHost } from "./MarkdownContent";
 
 describe("MarkdownContent", () => {
   test("renders markdown links with target=_blank and rel", () => {
@@ -105,11 +105,46 @@ describe("MarkdownContent", () => {
     expect(img?.getAttribute("src")).toBe("/api/runtime/uploads/up_abc123");
   });
 
-  test("with dropForeignImages, a foreign image URL is DROPPED (SSRF / tracking-pixel guard for model-authored text)", () => {
+  test("with dropForeignImages, a foreign image URL is NOT auto-fetched — it renders an inert chip, not an <img>", () => {
     const { container } = render(
-      <MarkdownContent text="![x](https://evil.example/pixel.gif)" dropForeignImages />
+      <MarkdownContent text="![a cat](https://evil.example/pixel.gif)" dropForeignImages />
+    );
+    // No <img>: nothing fetches the bytes at render time (the SSRF /
+    // tracking-pixel guard for model-authored text holds).
+    expect(container.querySelector("img")).toBeNull();
+    // A chip names the image + host and only navigates on an explicit click.
+    const chip = screen.getByText("a cat").closest("a");
+    expect(chip?.getAttribute("href")).toBe("https://evil.example/pixel.gif");
+    expect(chip?.getAttribute("target")).toBe("_blank");
+    expect(chip?.getAttribute("rel")).toBe("noopener noreferrer");
+    expect(chip?.textContent).toContain("evil.example");
+  });
+
+  test("with dropForeignImages, an alt-less foreign image chip falls back to the 'Image' label", () => {
+    const { container } = render(
+      <MarkdownContent text="![](https://evil.example/pixel.gif)" dropForeignImages />
     );
     expect(container.querySelector("img")).toBeNull();
+    const chip = screen.getByText("Image").closest("a");
+    expect(chip?.getAttribute("href")).toBe("https://evil.example/pixel.gif");
+  });
+
+  test("with dropForeignImages, a non-http(s) image src is dropped entirely (no chip, no img)", () => {
+    const { container } = render(
+      <MarkdownContent text="![x](data:image/png;base64,AAAA)" dropForeignImages />
+    );
+    // react-markdown's sanitizer already neutralizes data:/javascript: srcs;
+    // webHost also returns null for them, so no chip is rendered either.
+    expect(container.querySelector("img")).toBeNull();
+    expect(container.querySelector("a")).toBeNull();
+  });
+
+  test("webHost folds: http, https, non-http(s) protocol, unparseable", () => {
+    expect(webHost("https://cataas.com/cat?foo=1")).toBe("cataas.com");
+    expect(webHost("http://10.0.0.5:8080/x")).toBe("10.0.0.5:8080");
+    expect(webHost("data:image/png;base64,AAAA")).toBeNull();
+    expect(webHost("javascript:alert(1)")).toBeNull();
+    expect(webHost("not a url")).toBeNull();
   });
 
   test("by default (trusted doc/file/skill markdown), an ordinary image renders", () => {
