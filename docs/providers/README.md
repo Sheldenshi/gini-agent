@@ -11,6 +11,7 @@ provider in Gini (both the CLI and the web Add Provider form).
 | Amazon Bedrock | AWS SigV4 | AWS access key + secret you enter (stored in `~/.gini/secrets.env`) | [bedrock.md](bedrock.md) |
 | Azure OpenAI | API key / Entra | `AZURE_OPENAI_API_KEY` | [azure.md](azure.md) |
 | OpenRouter | API key | `OPENROUTER_API_KEY` | [openrouter.md](openrouter.md) |
+| Requesty | API key | `REQUESTY_API_KEY` | [requesty.md](requesty.md) |
 | DeepSeek | API key | `DEEPSEEK_API_KEY` | [deepseek.md](deepseek.md) |
 | Codex (OpenAI OAuth) | OAuth / CLI | `~/.codex/auth.json` (no key) | [codex.md](codex.md) |
 | Local (OpenAI-compatible) | none / optional key | `GINI_LOCAL_API_KEY` (optional) | [local.md](local.md) |

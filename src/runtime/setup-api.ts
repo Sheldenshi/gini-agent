@@ -56,7 +56,7 @@ import { isValidEnvVarName, removeKeyFromSecretsEnv, writeKeyToSecretsEnv } from
 import { requestAutostartRefresh } from "./autostart-refresh";
 import type { ProviderConfig, ProviderName, RuntimeConfig } from "../types";
 
-const SUPPORTED_PROVIDERS = ["openai", "codex", "openrouter", "deepseek", "local", "anthropic", "bedrock", "azure"] as const;
+const SUPPORTED_PROVIDERS = ["openai", "codex", "openrouter", "requesty", "deepseek", "local", "anthropic", "bedrock", "azure"] as const;
 type SupportedProvider = (typeof SUPPORTED_PROVIDERS)[number];
 
 // Env-keyed providers that authenticate via an env var written to
@@ -71,6 +71,7 @@ type SupportedProvider = (typeof SUPPORTED_PROVIDERS)[number];
 const ENV_KEY_PROVIDERS: Record<string, { envVar: string; allowEmptyKey: boolean; defaultModel: string }> = {
   openai: { envVar: "OPENAI_API_KEY", allowEmptyKey: false, defaultModel: "gpt-5.4-mini" },
   openrouter: { envVar: "OPENROUTER_API_KEY", allowEmptyKey: false, defaultModel: "openrouter/auto" },
+  requesty: { envVar: "REQUESTY_API_KEY", allowEmptyKey: false, defaultModel: "openai/gpt-4o-mini" },
   deepseek: { envVar: "DEEPSEEK_API_KEY", allowEmptyKey: false, defaultModel: "deepseek-v4-flash" },
   local: { envVar: "GINI_LOCAL_API_KEY", allowEmptyKey: true, defaultModel: "local/default" },
   // First-party Anthropic Messages API key.
@@ -107,7 +108,7 @@ export function getSetupStatus(config: RuntimeConfig): SetupStatus {
   // for browser onboarding. Anyone on echo needs to pick a real
   // provider in /setup. Other configured providers (openai with key,
   // codex with auth.json) pass through.
-  const isRealProvider = current === "openai" || current === "codex" || current === "openrouter" || current === "local" || current === "deepseek" || current === "anthropic" || current === "bedrock" || current === "azure";
+  const isRealProvider = current === "openai" || current === "codex" || current === "openrouter" || current === "requesty" || current === "local" || current === "deepseek" || current === "anthropic" || current === "bedrock" || current === "azure";
   // A graceful, transient fallback (the selected provider is unconfigured but
   // another real one is) keeps the app usable instead of bouncing to /setup:
   // resolveDispatchProvider returns usingFallback when a configured fallback

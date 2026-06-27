@@ -29,11 +29,11 @@ import { EditProviderDialog } from "./EditProviderDialog";
 // and the trash button is disabled for that row — a permanently-dead affordance.
 // Azure is managed by re-add via Add Provider; key cleanup is the CLI `gini
 // provider` path.
-const REMOVABLE_PROVIDERS = new Set(["openai", "openrouter", "deepseek", "anthropic", "bedrock"]);
+const REMOVABLE_PROVIDERS = new Set(["openai", "openrouter", "requesty", "deepseek", "anthropic", "bedrock"]);
 
 // Provider rows shown on the Settings page, in display order. Echo is
 // dev-only and never configured, so it can't appear.
-const SELECTABLE_PROVIDERS = ["codex", "openai", "anthropic", "bedrock", "deepseek", "openrouter", "azure", "local"] as const;
+const SELECTABLE_PROVIDERS = ["codex", "openai", "anthropic", "bedrock", "deepseek", "openrouter", "requesty", "azure", "local"] as const;
 
 // Friendly labels for how each provider authenticates; the brand icons live
 // in the shared PROVIDER_ICONS map (provider-logos.tsx).
@@ -44,6 +44,7 @@ const PROVIDER_AUTH_LABEL: Record<string, string> = {
   bedrock: "AWS",
   deepseek: "API key",
   openrouter: "API key",
+  requesty: "API key",
   azure: "API key",
   local: "Local"
 };

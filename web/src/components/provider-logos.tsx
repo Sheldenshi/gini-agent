@@ -10,7 +10,7 @@
 // the others rather than its teal service tile.
 
 import * as React from "react";
-import { SparklesIcon, Terminal as TerminalIcon, ZapIcon } from "lucide-react";
+import { RouteIcon, SparklesIcon, Terminal as TerminalIcon, ZapIcon } from "lucide-react";
 
 type LogoProps = React.SVGAttributes<SVGSVGElement>;
 
@@ -105,8 +105,8 @@ export function AzureLogo({ className, ...rest }: LogoProps) {
 
 // Brand icon per model-provider name, shared by the Settings provider rows
 // and the model picker (trigger + route flyout) so the surfaces can't drift.
-// Codex (Terminal) and OpenRouter (Zap) use Lucide because neither has a
-// widely-recognized brand mark; the rest are the brand SVGs above.
+// Codex (Terminal), OpenRouter (Zap), and Requesty (Route) use Lucide because
+// none has a widely-recognized brand mark; the rest are the brand SVGs above.
 export const PROVIDER_ICONS: Record<string, React.ComponentType<{ className?: string }>> = {
   codex: TerminalIcon,
   openai: OpenAILogo,
@@ -114,6 +114,7 @@ export const PROVIDER_ICONS: Record<string, React.ComponentType<{ className?: st
   bedrock: BedrockLogo,
   deepseek: DeepSeekLogo,
   openrouter: ZapIcon,
+  requesty: RouteIcon,
   azure: AzureLogo,
   local: OllamaLogo
 };
