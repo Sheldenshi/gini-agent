@@ -171,6 +171,21 @@ function hasLinkDescendant(node: MarkdownNode): boolean {
   return node.children?.some(hasLinkDescendant) ?? false;
 }
 
+// Walk an AST node's subtree for an `image` node that the image rule will
+// actually render — i.e. one whose `src` is a `gini-upload://` ref (a foreign
+// src is dropped to null, so it contributes no View to host). Such an image
+// renders as MarkdownUploadImage, a Pressable (a View subtree), which RN cannot
+// mount inside the iOS `<TextInput>` selection wrapper a text block resolves to.
+// A block carrying one must therefore render as a plain View instead, so the
+// image's View subtree has a valid host. The default markdown paragraph rule is
+// itself a View for exactly this reason; the app's text-wrapper override (for
+// clean URL wrapping + selection) is what would otherwise strand the image.
+function hasUploadImageDescendant(node: MarkdownNode): boolean {
+  if (node.type === "image" && uploadIdFromRef(node.attributes?.src) !== null)
+    return true;
+  return node.children?.some(hasUploadImageDescendant) ?? false;
+}
+
 // Block-level renderers wrap inline children in a single selectable
 // block. On iOS that's a `TextInput multiline editable={false}` (the
 // only RN primitive that exposes the loupe + drag handles for partial
@@ -185,17 +200,55 @@ function hasLinkDescendant(node: MarkdownNode): boolean {
 // platform: the iOS TextInput wrapper would swallow the link's taps, and a
 // selectable wrapper would let iOS hijack the long-press for text selection
 // instead of showing the link menu.
+//
+// A block that contains a renderable upload image takes a different escape: the
+// image renders as a View subtree (MarkdownUploadImage), which can't mount
+// inside the iOS TextInput a text wrapper resolves to, so the block renders as
+// a plain View (the library's own default paragraph rule is a View for the same
+// reason). It mirrors that default rule's row/wrap layout (imageBlock below) so
+// a mid-sentence image keeps inline, wrapping paragraph flow — prose, image,
+// prose flow left-to-right and wrap, rather than stacking vertically under RN's
+// default column direction — and carries over the text style's vertical margins.
 const renderAsText =
-  (style: object): RenderRule =>
-  (node, children) => (
-    <SelectableBlockText
-      key={node.key}
-      style={style}
-      containsLink={hasLinkDescendant(node)}
-    >
-      {children}
-    </SelectableBlockText>
-  );
+  (style: { marginTop?: number; marginBottom?: number }): RenderRule =>
+  (node, children) => {
+    if (hasUploadImageDescendant(node)) {
+      return (
+        <View
+          key={node.key}
+          style={[
+            imageBlockStyles.block,
+            { marginTop: style.marginTop, marginBottom: style.marginBottom }
+          ]}
+        >
+          {children}
+        </View>
+      );
+    }
+    return (
+      <SelectableBlockText
+        key={node.key}
+        style={style}
+        containsLink={hasLinkDescendant(node)}
+      >
+        {children}
+      </SelectableBlockText>
+    );
+  };
+
+// Mirror of react-native-markdown-display's `_VIEW_SAFE_paragraph` layout
+// (flexWrap row, top-aligned, full width) so an image-bearing paragraph lays
+// its inline children out the same way the library's default paragraph View
+// would — see the View escape in renderAsText.
+const imageBlockStyles = StyleSheet.create({
+  block: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    alignItems: "flex-start",
+    justifyContent: "flex-start",
+    width: "100%"
+  }
+});
 // A markdown link is interactive (tap opens, long-press shows the menu), so
 // its label must not be selectable — otherwise iOS fires its own text
 // selection "Copy" callout on long-press alongside the link menu. The inline

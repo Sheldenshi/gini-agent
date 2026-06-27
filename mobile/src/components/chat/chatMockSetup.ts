@@ -65,6 +65,8 @@ mock.module("react-native", () => ({
   Linking: { openURL: linkingOpenURL },
   StyleSheet: {
     create: (s: unknown) => s,
+    flatten: (s: unknown) =>
+      Array.isArray(s) ? Object.assign({}, ...s.filter(Boolean)) : s ?? {},
     hairlineWidth: 1,
     absoluteFillObject: {}
   },
