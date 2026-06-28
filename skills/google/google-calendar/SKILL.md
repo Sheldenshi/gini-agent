@@ -5,7 +5,7 @@ license: MIT
 compatibility: "macOS and Linux. Requires the `gws` CLI authenticated against a Google account with Calendar scopes."
 metadata:
   gini:
-    version: 1.1.2
+    version: 1.2.0
     author: Gini
     platforms: [macos, linux]
     prerequisites:
@@ -171,6 +171,33 @@ gws calendar freebusy query --json '{
 
 The response lists busy windows per calendar; free time is the complement within `[timeMin, timeMax]`.
 
+### Preview a calendar change inline
+
+Whenever you propose, confirm, reschedule, or cancel a timed event in chat — most often while drafting or sending an email about a meeting — also render a fenced `calendar` block that previews that day (or week) so the user can SEE the proposed slot against their existing schedule and spot any conflict, instead of reading a wall of text. First pull the surrounding agenda (`gws calendar +agenda` for that day/week, or `events list`) and include the user's existing events as context; mark the change you're making as `proposed` (or `cancel`). This is a **read-only preview** — the real create/update still goes through `+insert` / `events.patch`; the block has no Apply affordance.
+
+The block is plain text: optional `view:` / `date:` / `tz:` header lines up to the first blank line, then one event per line, pipe-delimited as `time-spec | title | status`:
+
+- `view:` — `day` or `week` (optional; defaults to `day` when every event is on the anchor date, else `week`).
+- `date:` — the anchor date `YYYY-MM-DD` (week view shows the Sunday-started week containing it).
+- `tz:` — a short timezone label shown in the header (e.g. `PT`).
+- time-spec — `YYYY-MM-DD HH:MM-HH:MM`, `YYYY-MM-DD all-day`, or just `HH:MM-HH:MM` / `all-day` (date then defaults to the anchor). Times are 24h.
+- status — `proposed` for the change you're making, `cancel` for an event going away; omit it for the user's existing events.
+
+````text
+Here's where that lands on your Thursday — your 9:30 standup is clear of it:
+
+```calendar
+date: 2026-07-02
+tz: PT
+
+2026-07-02 15:00-16:00 | Team sync | proposed
+2026-07-02 09:30-10:00 | Standup
+2026-07-02 12:00-13:00 | Lunch with Sam
+```
+````
+
+The app renders the `calendar` block as a day/week grid with the proposed change highlighted; any non-rendering client degrades it to a readable code block.
+
 ### Calendar list and ACLs
 
 ```bash
@@ -192,5 +219,6 @@ gws calendar acl insert --params '{"calendarId":"primary"}' \
 7. When listing events, set `singleEvents:true` and `orderBy:"startTime"` so recurring events expand into individual instances and arrive in chronological order. Without those, the response is grouped by recurrence master and confusing to summarize.
 8. Free/busy queries are read-only and cheap — prefer them over scraping multiple `events.list` calls when the user only needs availability, not event content.
 9. Respect the calendar's timezone, not just the host's. `+agenda` defaults to the Google account timezone; only override with `--timezone` when the user is travelling.
+10. When you propose, reschedule, or cancel a timed event in chat (especially while drafting an email about a meeting), preview it inline with a `calendar` block (see "Preview a calendar change inline") so the user sees the slot against their existing agenda. It is a read-only preview — still perform the actual change with `+insert` / `events.patch`.
 
 For flags not shown here, run `gws calendar --help` or `gws calendar <verb> --help` (e.g. `gws calendar +insert --help`).

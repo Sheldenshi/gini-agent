@@ -5,7 +5,7 @@ license: MIT
 compatibility: "macOS and Linux. Requires the `gws` CLI authenticated against a Google account with Gmail scopes."
 metadata:
   gini:
-    version: 1.2.0
+    version: 1.2.1
     author: Gini
     platforms: [macos, linux]
     prerequisites:
@@ -124,6 +124,8 @@ Thanks
 ````
 
 Use the same recipient, subject, and body you passed to `gws gmail +send … --draft` so the card matches the saved draft. The app renders the `email-draft` block as a draft card; any non-rendering client degrades it to a readable code block.
+
+If the draft proposes or changes a meeting time, also render a `calendar` block previewing that day/week so the user can see the slot against their schedule — see "Preview a calendar change inline" in the `google-calendar` skill.
 
 ### Read
 
