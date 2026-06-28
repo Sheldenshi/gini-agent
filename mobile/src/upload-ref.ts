@@ -9,8 +9,9 @@
 export const UPLOAD_REF_SCHEME = "gini-upload://";
 
 // Extract the upload id from a single ref. Returns null for any non-upload
-// value — the caller MUST then drop the node rather than fetch a foreign URL
-// (the allowlist that closes the SSRF / tracking-pixel surface).
+// value — the caller MUST NOT auto-fetch a foreign URL (the allowlist that
+// closes the SSRF / tracking-pixel surface); it renders an inert click-to-open
+// chip for a foreign http(s) image instead, or drops a non-http(s) src.
 export function uploadIdFromRef(ref: string | undefined | null): string | null {
   if (!ref || !ref.startsWith(UPLOAD_REF_SCHEME)) return null;
   const id = ref.slice(UPLOAD_REF_SCHEME.length);

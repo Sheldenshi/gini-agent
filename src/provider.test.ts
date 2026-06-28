@@ -20,6 +20,9 @@ import {
   isAuthExpiredError,
   isContextOverflowError,
   isProviderConfigured,
+  isStreamIdleTimeoutError,
+  IDLE_STREAM_TIMEOUT_MS,
+  StreamIdleTimeoutError,
   isValidAwsRegion,
   normalizeProvider,
   providerAuthFailureText,
@@ -4246,11 +4249,91 @@ describe("anthropic provider", () => {
       const headers = call.init.headers as Record<string, string>;
       expect(headers["x-api-key"]).toBe("bedrock-api-key-xyz&Version=1");
       expect(headers["accept"]).toBe("text/event-stream");
+      // Streaming Claude-4 tool turn requests fine-grained tool streaming via the
+      // HTTP beta header so the tool input streams incrementally instead of
+      // buffering the whole block past the socket timeout.
+      expect(headers["anthropic-beta"]).toBe("fine-grained-tool-streaming-2025-05-14");
       expect(JSON.parse(String(call.init.body)).stream).toBe(true);
       // Streaming resolves the model's full output ceiling (opus-4-8 → 128000)
       // so a large tool-call argument isn't truncated mid-JSON. The companion
       // non-streaming test above keeps the conservative 8192 floor.
       expect(JSON.parse(String(call.init.body)).max_tokens).toBe(128000);
+    } finally {
+      fetchStub.restore();
+      restoreEnv();
+    }
+  });
+
+  test("anthropic: a tool-less streaming turn does NOT send the fine-grained-tool-streaming header", async () => {
+    const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    const fetchStub = installFetch(() =>
+      anthropicSse([
+        { event: "message_start", data: { type: "message_start", message: { id: "m", usage: { input_tokens: 1 } } } },
+        { event: "content_block_start", data: { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } } },
+        { event: "content_block_delta", data: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "hi" } } },
+        { event: "content_block_stop", data: { type: "content_block_stop", index: 0 } },
+        { event: "message_delta", data: { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } } },
+        { event: "message_stop", data: { type: "message_stop" } }
+      ])
+    );
+    try {
+      const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], [], () => {});
+      const headers = fetchStub.calls[0]!.init.headers as Record<string, string>;
+      // No tools ⟹ the tool-streaming beta is meaningless and must be absent.
+      expect(headers["anthropic-beta"]).toBeUndefined();
+    } finally {
+      fetchStub.restore();
+      restoreEnv();
+    }
+  });
+
+  test("anthropic: a non-streaming tool turn does NOT send the fine-grained-tool-streaming header", async () => {
+    const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    const fetchStub = installFetch(() =>
+      anthropicJson({
+        id: "m",
+        content: [{ type: "tool_use", id: "toolu_1", name: "file_list", input: { path: "/tmp" } }],
+        stop_reason: "tool_use",
+        usage: { input_tokens: 2, output_tokens: 1 }
+      })
+    );
+    try {
+      const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
+      // No onDelta ⟹ non-streaming /v1/messages; the beta is streaming-only.
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: "go" }], [
+        { type: "function", function: { name: "file_list", description: "list", parameters: { type: "object" } } }
+      ]);
+      const headers = fetchStub.calls[0]!.init.headers as Record<string, string>;
+      expect(headers["anthropic-beta"]).toBeUndefined();
+      expect(JSON.parse(String(fetchStub.calls[0]!.init.body)).stream).toBe(false);
+    } finally {
+      fetchStub.restore();
+      restoreEnv();
+    }
+  });
+
+  test("anthropic: a non-Claude-4 model (3.5) does NOT send the fine-grained-tool-streaming header", async () => {
+    const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    const fetchStub = installFetch(() =>
+      anthropicSse([
+        { event: "message_start", data: { type: "message_start", message: { id: "m", usage: { input_tokens: 1 } } } },
+        { event: "content_block_start", data: { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "toolu_1", name: "file_list" } } },
+        { event: "content_block_delta", data: { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: "{}" } } },
+        { event: "content_block_stop", data: { type: "content_block_stop", index: 0 } },
+        { event: "message_delta", data: { type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 1 } } },
+        { event: "message_stop", data: { type: "message_stop" } }
+      ])
+    );
+    try {
+      // Claude 3.5 is not in the fine-grained-streaming supported list; sending
+      // the beta risks a 400, so the header must be gated off.
+      const provider = normalizeProvider({ name: "anthropic", model: "claude-3-5-sonnet-20241022" });
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: "go" }], [
+        { type: "function", function: { name: "file_list", description: "list", parameters: { type: "object" } } }
+      ], () => {});
+      const headers = fetchStub.calls[0]!.init.headers as Record<string, string>;
+      expect(headers["anthropic-beta"]).toBeUndefined();
     } finally {
       fetchStub.restore();
       restoreEnv();
@@ -4913,6 +4996,120 @@ describe("anthropic provider", () => {
     }
   });
 
+  test("bedrock: a streaming Claude tool turn requests fine-grained tool streaming", async () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const fetchStub = installFetch(() =>
+      converseEventStream([
+        { type: "messageStart", payload: { role: "assistant" } },
+        { type: "contentBlockStart", payload: { contentBlockIndex: 0, start: { toolUse: { toolUseId: "tu_1", name: "write_file" } } } },
+        { type: "contentBlockDelta", payload: { contentBlockIndex: 0, delta: { toolUse: { input: "{\"path\":\"a\"}" } } } },
+        { type: "contentBlockStop", payload: { contentBlockIndex: 0 } },
+        { type: "messageStop", payload: { stopReason: "tool_use" } }
+      ])
+    );
+    try {
+      const provider = normalizeProvider({ name: "bedrock", model: "us.anthropic.claude-sonnet-4-6", awsRegion: "us-east-1" });
+      const tools: ToolFunctionSpec[] = [
+        { type: "function", function: { name: "write_file", description: "d", parameters: { type: "object", properties: {} } } }
+      ];
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: "go" }], tools, () => {});
+      expect(fetchStub.calls[0]!.url).toContain("/converse-stream");
+      const body = JSON.parse(String(fetchStub.calls[0]!.init.body));
+      // Without this flag Bedrock buffers the whole tool_use input JSON before
+      // emitting any of it, stranding the stream past the socket idle timeout.
+      expect(body.additionalModelRequestFields).toEqual({
+        anthropic_beta: ["fine-grained-tool-streaming-2025-05-14"]
+      });
+    } finally {
+      fetchStub.restore();
+      restoreSk();
+      restoreAk();
+    }
+  });
+
+  test("bedrock: a tool-less streaming turn does NOT request fine-grained tool streaming", async () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const fetchStub = installFetch(() =>
+      converseEventStream([
+        { type: "messageStart", payload: { role: "assistant" } },
+        { type: "contentBlockDelta", payload: { contentBlockIndex: 0, delta: { text: "hi" } } },
+        { type: "contentBlockStop", payload: { contentBlockIndex: 0 } },
+        { type: "messageStop", payload: { stopReason: "end_turn" } }
+      ])
+    );
+    try {
+      const provider = normalizeProvider({ name: "bedrock", model: "us.anthropic.claude-sonnet-4-6", awsRegion: "us-east-1" });
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], [], () => {});
+      const body = JSON.parse(String(fetchStub.calls[0]!.init.body));
+      // No toolConfig is sent, so the tool-streaming flag would be meaningless.
+      expect(body.additionalModelRequestFields).toBeUndefined();
+    } finally {
+      fetchStub.restore();
+      restoreSk();
+      restoreAk();
+    }
+  });
+
+  test("bedrock: a non-streaming Claude tool turn does NOT request fine-grained tool streaming", async () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const fetchStub = installFetch(() =>
+      anthropicJson({
+        output: { message: { role: "assistant", content: [{ toolUse: { toolUseId: "tu_1", name: "lookup", input: { q: "x" } } }] } },
+        stopReason: "tool_use",
+        usage: {}
+      })
+    );
+    try {
+      const provider = normalizeProvider({ name: "bedrock", model: "us.anthropic.claude-opus-4-8", awsRegion: "us-east-1" });
+      const tools: ToolFunctionSpec[] = [
+        { type: "function", function: { name: "lookup", description: "d", parameters: { type: "object", properties: {} } } }
+      ];
+      // No onDelta ⟹ non-streaming /converse; the flag is streaming-only.
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: "go" }], tools);
+      expect(fetchStub.calls[0]!.url).toContain("/converse");
+      expect(fetchStub.calls[0]!.url).not.toContain("/converse-stream");
+      const body = JSON.parse(String(fetchStub.calls[0]!.init.body));
+      expect(body.additionalModelRequestFields).toBeUndefined();
+    } finally {
+      fetchStub.restore();
+      restoreSk();
+      restoreAk();
+    }
+  });
+
+  test("bedrock: a non-Claude model does NOT request fine-grained tool streaming", async () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const fetchStub = installFetch(() =>
+      converseEventStream([
+        { type: "messageStart", payload: { role: "assistant" } },
+        { type: "contentBlockStart", payload: { contentBlockIndex: 0, start: { toolUse: { toolUseId: "tu_1", name: "lookup" } } } },
+        { type: "contentBlockDelta", payload: { contentBlockIndex: 0, delta: { toolUse: { input: "{}" } } } },
+        { type: "contentBlockStop", payload: { contentBlockIndex: 0 } },
+        { type: "messageStop", payload: { stopReason: "tool_use" } }
+      ])
+    );
+    try {
+      // Nova supports tools + streaming, but the fine-grained flag is a Claude
+      // capability — sending it to a non-Claude family risks a 400, so it's gated off.
+      const provider = normalizeProvider({ name: "bedrock", model: "us.amazon.nova-pro-v1:0", awsRegion: "us-east-1" });
+      const tools: ToolFunctionSpec[] = [
+        { type: "function", function: { name: "lookup", description: "d", parameters: { type: "object", properties: {} } } }
+      ];
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: "go" }], tools, () => {});
+      expect(fetchStub.calls[0]!.url).toContain("/converse-stream");
+      const body = JSON.parse(String(fetchStub.calls[0]!.init.body));
+      expect(body.additionalModelRequestFields).toBeUndefined();
+    } finally {
+      fetchStub.restore();
+      restoreSk();
+      restoreAk();
+    }
+  });
+
   test("bedrock: a converse-stream exception frame throws", async () => {
     const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
     const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
@@ -5453,6 +5650,324 @@ describe("codex no-tools dispatch", () => {
     } finally {
       fetchStub.restore();
       restore();
+    }
+  });
+});
+
+// A ReadableStream that delivers `prefix` chunks then NEVER closes or enqueues
+// again — the perfect stand-in for a wedged provider stream. reader.read()
+// resolves for each prefix chunk, then hangs forever, so the idle timer is the
+// only thing that can end the read.
+function stallingStream(prefix: Uint8Array[] = []): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const chunk of prefix) controller.enqueue(chunk);
+      // Deliberately no controller.close() — the stream stalls open.
+    }
+  });
+}
+
+// Stub globalThis.setTimeout so a timer armed with EXACTLY the idle window fires
+// on the next macrotask tick instead of after the full 120000ms. Every other
+// delay (the debounce/backoff timers) passes through to the real setTimeout
+// unchanged, so only the idle-timeout race is accelerated. Returns a restore
+// closure.
+function accelerateIdleTimer(): () => void {
+  const realSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = ((handler: TimerHandler, delay?: number, ...args: unknown[]) => {
+    const actual = delay === IDLE_STREAM_TIMEOUT_MS ? 0 : delay;
+    return (realSetTimeout as typeof setTimeout)(handler as never, actual as never, ...(args as never[]));
+  }) as unknown as typeof setTimeout;
+  return () => { globalThis.setTimeout = realSetTimeout; };
+}
+
+describe("streaming max_tokens clamp", () => {
+  let restoreSessionToken: () => void;
+  beforeEach(() => { restoreSessionToken = setEnv("AWS_SESSION_TOKEN", undefined); });
+  afterEach(() => { restoreSessionToken(); });
+
+  test("anthropic: clamp is a no-op for a small-input streaming turn (full ceiling preserved)", async () => {
+    const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    const fetchStub = installFetch(() =>
+      anthropicSse([
+        { event: "message_start", data: { type: "message_start", message: { id: "m", usage: { input_tokens: 1 } } } },
+        { event: "content_block_start", data: { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } } },
+        { event: "content_block_delta", data: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "hi" } } },
+        { event: "content_block_stop", data: { type: "content_block_stop", index: 0 } },
+        { event: "message_delta", data: { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } } },
+        { event: "message_stop", data: { type: "message_stop" } }
+      ])
+    );
+    try {
+      const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], [], () => {});
+      // opus-4-8 → 128000 ceiling, 1M window; a tiny prompt leaves the ceiling
+      // far inside the window, so the clamp must NOT lower it.
+      expect(JSON.parse(String(fetchStub.calls[0]!.init.body)).max_tokens).toBe(128_000);
+    } finally {
+      fetchStub.restore();
+      restoreEnv();
+    }
+  });
+
+  test("anthropic: clamp lowers max_tokens to the floor when the prompt nearly fills the window", async () => {
+    const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    const fetchStub = installFetch(() =>
+      anthropicSse([
+        { event: "message_start", data: { type: "message_start", message: { id: "m", usage: { input_tokens: 1 } } } },
+        { event: "content_block_delta", data: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } } },
+        { event: "message_delta", data: { type: "message_delta", delta: { stop_reason: "end_turn" } } },
+        { event: "message_stop", data: { type: "message_stop" } }
+      ])
+    );
+    try {
+      // claude-opus-4-1 → 200000 window, 32000 output ceiling. 800000 chars of
+      // user content estimates to ceil(800000/4) = 200000 input tokens, so
+      // window - input - margin = 200000 - 200000 - 256 = -256 (< 0) and the
+      // clamp pins max_tokens to STREAM_MAX_TOKENS_FLOOR (1024).
+      const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-1" });
+      const bigContent = "x".repeat(800_000);
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: bigContent }], [], () => {});
+      expect(JSON.parse(String(fetchStub.calls[0]!.init.body)).max_tokens).toBe(1024);
+    } finally {
+      fetchStub.restore();
+      restoreEnv();
+    }
+  });
+
+  test("anthropic: a small user-pinned max_tokens is preserved on a streaming turn (clamp never raises it)", async () => {
+    const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    const fetchStub = installFetch(() =>
+      anthropicSse([
+        { event: "message_start", data: { type: "message_start", message: { id: "m", usage: { input_tokens: 1 } } } },
+        { event: "content_block_delta", data: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } } },
+        { event: "message_delta", data: { type: "message_delta", delta: { stop_reason: "end_turn" } } },
+        { event: "message_stop", data: { type: "message_stop" } }
+      ])
+    );
+    try {
+      // A deliberately small pinned value (256) on a small-prompt streaming turn:
+      // it fits the window with room to spare, so the clamp must pass it through
+      // untouched — it must NOT be raised to STREAM_MAX_TOKENS_FLOOR (1024). The
+      // floor only bounds the window-fit reduction, never the caller's request.
+      const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8", extraBody: { max_tokens: 256 } });
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], [], () => {});
+      expect(JSON.parse(String(fetchStub.calls[0]!.init.body)).max_tokens).toBe(256);
+    } finally {
+      fetchStub.restore();
+      restoreEnv();
+    }
+  });
+
+  test("anthropic: a non-streaming turn keeps the conservative floor (clamp does not apply)", async () => {
+    const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    const fetchStub = installFetch(() =>
+      anthropicJson({ id: "m", type: "message", role: "assistant", content: [{ type: "text", text: "ok" }], stop_reason: "end_turn", usage: { input_tokens: 1, output_tokens: 1 } })
+    );
+    try {
+      // Even with a near-full prompt, the non-streaming path is untouched by the
+      // clamp: it sends the 8192 floor (DEFAULT_ANTHROPIC_MAX_TOKENS), not 1024.
+      const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-1" });
+      const bigContent = "x".repeat(800_000);
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: bigContent }], []);
+      expect(JSON.parse(String(fetchStub.calls[0]!.init.body)).max_tokens).toBe(8192);
+    } finally {
+      fetchStub.restore();
+      restoreEnv();
+    }
+  });
+
+  test("bedrock: clamp lowers inferenceConfig.maxTokens to the floor on a near-full streaming prompt", async () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const fetchStub = installFetch(() =>
+      converseEventStream([
+        { type: "messageStart", payload: { role: "assistant" } },
+        { type: "contentBlockDelta", payload: { contentBlockIndex: 0, delta: { text: "ok" } } },
+        { type: "messageStop", payload: { stopReason: "end_turn" } }
+      ])
+    );
+    try {
+      // us.anthropic.claude-opus-4-1 → 200000 window, 32000 output ceiling.
+      const provider = normalizeProvider({ name: "bedrock", model: "us.anthropic.claude-opus-4-1", awsRegion: "us-east-1" });
+      const bigContent = "y".repeat(800_000);
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: bigContent }], [], () => {});
+      expect(JSON.parse(String(fetchStub.calls[0]!.init.body)).inferenceConfig.maxTokens).toBe(1024);
+    } finally {
+      fetchStub.restore();
+      restoreSk();
+      restoreAk();
+    }
+  });
+
+  test("bedrock: clamp is a no-op for a small-input streaming turn", async () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const fetchStub = installFetch(() =>
+      converseEventStream([
+        { type: "messageStart", payload: { role: "assistant" } },
+        { type: "contentBlockDelta", payload: { contentBlockIndex: 0, delta: { text: "ok" } } },
+        { type: "messageStop", payload: { stopReason: "end_turn" } }
+      ])
+    );
+    try {
+      const provider = normalizeProvider({ name: "bedrock", model: "us.anthropic.claude-opus-4-8", awsRegion: "us-east-1" });
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], [], () => {});
+      // opus-4-8 → 128000 ceiling, 1M window: small prompt leaves it untouched.
+      expect(JSON.parse(String(fetchStub.calls[0]!.init.body)).inferenceConfig.maxTokens).toBe(128_000);
+    } finally {
+      fetchStub.restore();
+      restoreSk();
+      restoreAk();
+    }
+  });
+});
+
+describe("streaming idle/stall timeout", () => {
+  let restoreSessionToken: () => void;
+  beforeEach(() => { restoreSessionToken = setEnv("AWS_SESSION_TOKEN", undefined); });
+  afterEach(() => { restoreSessionToken(); });
+
+  test("StreamIdleTimeoutError carries the stable name + message marker", () => {
+    const err = new StreamIdleTimeoutError(120_000);
+    expect(err.name).toBe("StreamIdleTimeoutError");
+    expect(err.message).toBe("Model stream idle timeout: no data for 120000ms");
+    expect(err.message.toLowerCase()).toContain("stream idle timeout");
+  });
+
+  test("isStreamIdleTimeoutError matches the class, the name, and the message; rejects others", () => {
+    expect(isStreamIdleTimeoutError(new StreamIdleTimeoutError(IDLE_STREAM_TIMEOUT_MS))).toBe(true);
+    // Reconstructed-by-name (e.g. crossing a serialization boundary).
+    const named = new Error("whatever");
+    named.name = "StreamIdleTimeoutError";
+    expect(isStreamIdleTimeoutError(named)).toBe(true);
+    // Matched by the message marker even with a different name.
+    expect(isStreamIdleTimeoutError(new Error("Model stream idle timeout: no data for 1ms"))).toBe(true);
+    // Non-matches.
+    expect(isStreamIdleTimeoutError(new Error("operation timed out"))).toBe(false);
+    expect(isStreamIdleTimeoutError(new DOMException("Aborted", "AbortError"))).toBe(false);
+    expect(isStreamIdleTimeoutError("not an error")).toBe(false);
+    expect(isStreamIdleTimeoutError(undefined)).toBe(false);
+  });
+
+  test("anthropic: a wedged stream throws StreamIdleTimeoutError (transient, not a cancel)", async () => {
+    const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    const restoreTimer = accelerateIdleTimer();
+    // The stream delivers one valid event, then stalls open forever.
+    const enc = new TextEncoder();
+    const firstEvent = enc.encode(
+      `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "m", usage: { input_tokens: 1 } } })}\n\n`
+    );
+    const fetchStub = installFetch(() =>
+      new Response(stallingStream([firstEvent]), { status: 200, headers: { "content-type": "text/event-stream" } })
+    );
+    try {
+      const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
+      const err = await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "hi" }],
+        [],
+        () => {}
+      ).then(() => undefined, (e) => e);
+      expect(err).toBeInstanceOf(StreamIdleTimeoutError);
+      expect(isStreamIdleTimeoutError(err)).toBe(true);
+      // Crucially NOT a user-cancel abort — the retry layer must be free to retry.
+      expect(isAbortError(err)).toBe(false);
+    } finally {
+      restoreTimer();
+      fetchStub.restore();
+      restoreEnv();
+    }
+  });
+
+  test("bedrock: a wedged converse-stream throws StreamIdleTimeoutError", async () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const restoreTimer = accelerateIdleTimer();
+    const fetchStub = installFetch(() =>
+      new Response(stallingStream(), { status: 200, headers: { "content-type": "application/vnd.amazon.eventstream" } })
+    );
+    try {
+      const provider = normalizeProvider({ name: "bedrock", model: "us.anthropic.claude-opus-4-8", awsRegion: "us-east-1" });
+      const err = await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "hi" }],
+        [],
+        () => {}
+      ).then(() => undefined, (e) => e);
+      expect(err).toBeInstanceOf(StreamIdleTimeoutError);
+      expect(isAbortError(err)).toBe(false);
+    } finally {
+      restoreTimer();
+      fetchStub.restore();
+      restoreSk();
+      restoreAk();
+    }
+  });
+
+  test("anthropic: a steadily-delivering stream completes WITHOUT firing the idle timeout", async () => {
+    const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    // Idle timer accelerated to fire on the next tick — yet a stream that closes
+    // promptly must still succeed (the read resolves before the timer; clearTimeout
+    // in finally tears the timer down).
+    const restoreTimer = accelerateIdleTimer();
+    const fetchStub = installFetch(() =>
+      anthropicSse([
+        { event: "message_start", data: { type: "message_start", message: { id: "m", usage: { input_tokens: 1 } } } },
+        { event: "content_block_start", data: { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } } },
+        { event: "content_block_delta", data: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "all good" } } },
+        { event: "content_block_stop", data: { type: "content_block_stop", index: 0 } },
+        { event: "message_delta", data: { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 2 } } },
+        { event: "message_stop", data: { type: "message_stop" } }
+      ])
+    );
+    try {
+      const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
+      let streamed = "";
+      const result = await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "hi" }],
+        [],
+        (d) => { streamed += d; }
+      );
+      expect(result.text).toBe("all good");
+      expect(streamed).toBe("all good");
+    } finally {
+      restoreTimer();
+      fetchStub.restore();
+      restoreEnv();
+    }
+  });
+
+  test("GINI_IDLE_STREAM_TIMEOUT_MS overrides the idle window at use time (real timing, no stub)", async () => {
+    const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    // Set a tiny window via the env seam — no accelerateIdleTimer stub here, so
+    // this exercises resolveIdleStreamTimeoutMs reading the override at use time.
+    const restoreIdle = setEnv("GINI_IDLE_STREAM_TIMEOUT_MS", "20");
+    const enc = new TextEncoder();
+    const firstEvent = enc.encode(
+      `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "m", usage: { input_tokens: 1 } } })}\n\n`
+    );
+    const fetchStub = installFetch(() =>
+      new Response(stallingStream([firstEvent]), { status: 200, headers: { "content-type": "text/event-stream" } })
+    );
+    try {
+      const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
+      const start = Date.now();
+      const err = await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "hi" }],
+        [],
+        () => {}
+      ).then(() => undefined, (e) => e);
+      // Fired off the 20ms override, far under the 120000ms default — proving the
+      // env value was read at use time, not the module-load default.
+      expect(err).toBeInstanceOf(StreamIdleTimeoutError);
+      expect(Date.now() - start).toBeLessThan(5000);
+    } finally {
+      fetchStub.restore();
+      restoreIdle();
+      restoreEnv();
     }
   });
 });

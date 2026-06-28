@@ -39,6 +39,7 @@ import {
   isAbortError,
   isAuthExpiredError,
   isContextOverflowError,
+  isStreamIdleTimeoutError,
   providerAuthNote,
   redactSecrets,
   type ToolCallingMessage,
@@ -154,6 +155,29 @@ const MAX_LOOP_ITERATIONS = 200;
 // call, including the first; after exhaustion the task exits gracefully
 // with a partial result.
 const MAX_CONTEXT_OVERFLOW_ATTEMPTS = 3;
+// Reactive recovery for *transient* provider failures, distinct from the
+// context-overflow path above. A stalled stream (idle-timeout abort), a dropped
+// connection, or an OS "operation timed out" all leave the conversation itself
+// valid — the next attempt may simply succeed. Retry with bounded exponential
+// backoff before failing the task. Counted separately from
+// MAX_CONTEXT_OVERFLOW_ATTEMPTS so a flaky network can't borrow the
+// overflow budget (and vice versa). Number of EXTRA retries after the first
+// attempt; 2 means up to 3 total tries.
+const MAX_TRANSIENT_RETRIES = 2;
+// Backoff base/cap for the transient-retry curve (base * 2^(n-1), capped).
+const TRANSIENT_RETRY_BASE_MS = 500;
+const TRANSIENT_RETRY_MAX_MS = 4_000;
+// Resolve the backoff base at use time (not module load) so a test can override
+// it via GINI_TRANSIENT_RETRY_BASE_MS to run the retry path at 0ms instead of
+// real wall-clock sleeps — mirrors the GINI_RESUME_WAIT_* env seams below.
+// Production (env unset) uses TRANSIENT_RETRY_BASE_MS. A 0 override is honored
+// explicitly (|| would treat 0 as falsy and fall back to 500).
+function transientRetryBaseMs(): number {
+  const raw = process.env.GINI_TRANSIENT_RETRY_BASE_MS;
+  if (raw === undefined) return TRANSIENT_RETRY_BASE_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : TRANSIENT_RETRY_BASE_MS;
+}
 const PRIOR_CONTEXT_RESPONSE_RESERVE_FRACTION = 0.05;
 const MIN_PRIOR_CONTEXT_RESPONSE_RESERVE_TOKENS = 1_024;
 const MAX_INLINE_SKILL_ROWS = 40;
@@ -533,6 +557,62 @@ function addCost(accumulator: CostRecord | undefined, increment: CostRecord | un
     totalTokens: sum(accumulator.totalTokens, increment.totalTokens),
     estimatedUsd: sum(accumulator.estimatedUsd, increment.estimatedUsd)
   };
+}
+
+// True when a model-call failure is a *transient* fault — the conversation is
+// fine, the wire/timeout flaked — so a retry can succeed. Deliberately narrow
+// so it never overlaps the cases the catch handles before it:
+//   - NOT a user-cancel abort: those are gated on `turnSignal?.aborted` first
+//     and bail to the cancelled path; a bare AbortError is excluded here too so
+//     an abort never re-enters the model call.
+//   - NOT a context overflow: that has its own compact-and-retry budget.
+// Matched signals: the streaming idle/stall timeout (classified by provider's
+// own isStreamIdleTimeoutError — the single source of truth for that error
+// shape, matching both its StreamIdleTimeoutError name and its "stream idle
+// timeout" message marker), and the connection/socket faults Bun's fetch
+// surfaces ("operation timed out", "fetch failed", "connection reset"/ECONNRESET,
+// ETIMEDOUT). The idle-timeout error is NOT an AbortError-named DOMException
+// (provider re-wraps it into a named Error), so the user-cancel gate above does
+// not claim it — by the time we reach here an AbortError is already excluded.
+const TRANSIENT_MODEL_ERROR_MARKERS = [
+  "operation timed out",
+  "fetch failed",
+  "connection reset",
+  "econnreset",
+  "etimedout",
+  "socket connection was closed"
+];
+function isTransientModelError(error: unknown, message: string | undefined): boolean {
+  // A user-cancel abort is never transient — it must reach the cancelled path.
+  if (isAbortError(error)) return false;
+  // The streaming idle/stall timeout: match provider's canonical predicate so
+  // this stays pinned to the exact shape provider.ts throws (name + message).
+  if (isStreamIdleTimeoutError(error)) return true;
+  if (!message) return false;
+  const lower = message.toLowerCase();
+  return TRANSIENT_MODEL_ERROR_MARKERS.some((marker) => lower.includes(marker));
+}
+
+// Backoff sleep for the transient-retry path that bails promptly if the turn is
+// cancelled mid-wait, mirroring the provider's abortableSleep: a cancel during
+// backoff rejects with the signal's reason (an AbortError-shaped DOMException),
+// which the catch's user-cancel gate then classifies on the next loop turn.
+// Kept local so this change stays confined to chat-task.ts.
+async function abortableBackoffSleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) throw signal.reason ?? new DOMException("Aborted", "AbortError");
+  const { promise, resolve, reject } = Promise.withResolvers<void>();
+  const timer = setTimeout(resolve, ms);
+  const onAbort = (): void => {
+    clearTimeout(timer);
+    reject(signal!.reason ?? new DOMException("Aborted", "AbortError"));
+  };
+  if (signal) signal.addEventListener("abort", onAbort, { once: true });
+  try {
+    await promise;
+  } finally {
+    clearTimeout(timer);
+    if (signal) signal.removeEventListener("abort", onAbort);
+  }
 }
 
 // Cap on Task.recentToolCalls length. The UI only renders this while a task
@@ -2465,6 +2545,10 @@ async function runLoop(
     // authenticate at start and survive an expiry).
     const callStartedAt = now();
     let result: Awaited<ReturnType<typeof generateToolCallingResponse>> | undefined;
+    // Transient-fault retries are counted separately from `attempt` (which
+    // counts context-overflow compactions): a flaky network and an oversized
+    // prompt are independent failure modes with independent budgets.
+    let transientAttempts = 0;
     for (let attempt = 1; result === undefined; attempt++) {
       try {
         result = await generateToolCallingResponse(
@@ -2493,6 +2577,63 @@ async function runLoop(
         const message = error instanceof Error ? error.message : String(error);
         if (!(error instanceof ProviderAuthError) && isAuthExpiredError(message)) {
           throw new ProviderAuthError(effective.provider.name, message);
+        }
+        // Transient fault (stalled stream / dropped connection / OS timeout):
+        // the transcript is valid, so retry with bounded backoff before failing
+        // the task. Runs ahead of the overflow check below because a stall and
+        // an overflow are disjoint (a transient error never matches an overflow
+        // marker), and the partial-stream reset here mirrors the overflow path's
+        // exactly — without it the retry's text would accrete onto the failed
+        // attempt's in the route buffer, the task partial, and the in-flight
+        // assistant block. With no retries left we fall through to the existing
+        // `throw error`, so a persistent fault still fails the task as today.
+        if (isTransientModelError(error, message) && transientAttempts < MAX_TRANSIENT_RETRIES) {
+          transientAttempts += 1;
+          // Drain queued flushes first so surfacedTextLen reflects everything
+          // the failed attempt surfaced, then trim exactly that much off
+          // partialSummary; the in-flight block id is kept (the retry's first
+          // flush overwrites it with its own full text).
+          await flushChain;
+          if (surfacedTextLen > 0) {
+            const surfaced = surfacedTextLen;
+            await mutateState(config.instance, (state) => {
+              const item = state.tasks.find((t) => t.id === taskId);
+              if (item?.partialSummary) {
+                item.partialSummary = item.partialSummary.slice(0, Math.max(0, item.partialSummary.length - surfaced));
+              }
+            });
+          }
+          pending = "";
+          streamedText = "";
+          surfacedTextLen = 0;
+          inFlightAssistantText = "";
+          const backoff = Math.min(
+            TRANSIENT_RETRY_MAX_MS,
+            transientRetryBaseMs() * 2 ** (transientAttempts - 1)
+          );
+          appendTrace(config.instance, taskId, {
+            type: "warning",
+            message: `Transient model-call fault; retrying after ${backoff}ms (attempt ${transientAttempts} of ${MAX_TRANSIENT_RETRIES}).`,
+            data: { iterations, transientAttempts, backoff, error: redactSecrets(message) }
+          });
+          // A cancel during backoff must still bail to the cancelled path, not
+          // sneak in a retry. abortableBackoffSleep rejects with an AbortError
+          // the instant the turn aborts (the only way it rejects); swallow that
+          // rejection, then check the turn signal explicitly — a throw from
+          // inside this catch block would escape the loop and bypass the cancel
+          // handling, so we route the abort through bailOnTurnAbort after the
+          // wait unwinds, with flushChain already drained above.
+          await abortableBackoffSleep(backoff, turnSignal).catch(() => {});
+          if (turnSignal?.aborted) return bailOnTurnAbort();
+          // Cancel the for-loop's `attempt++` for this transient retry: `attempt`
+          // is the context-overflow COMPACTION budget, and a transient stall must
+          // not spend it (the two budgets are independent — transientAttempts vs
+          // attempt). Without this, two transient retries would advance attempt to
+          // MAX_CONTEXT_OVERFLOW_ATTEMPTS and the first genuine overflow would exit
+          // with a partial result before any compaction ran.
+          attempt--;
+          // `result` stays undefined, so the for-loop re-runs the model call.
+          continue;
         }
         if (!isContextOverflowError(message)) throw error;
         if (attempt >= MAX_CONTEXT_OVERFLOW_ATTEMPTS) {

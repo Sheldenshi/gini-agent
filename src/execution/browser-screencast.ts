@@ -11,7 +11,7 @@
 // purpose-built channel, not a Playwright session. The raw WebSocket uses Bun's
 // native WebSocket, which is why this path always worked under Bun even when
 // playwright's connectOverCDP did not (that hang — playwright-core's bundled
-// `ws` — is fixed separately by patches/playwright-core@1.61.0.patch). The
+// `ws` — is fixed separately by patches/playwright-core@1.61.1.patch). The
 // agent's automation keeps driving the SAME Chrome over its pipe transport;
 // this screencast is a SEPARATE read/drive channel on the same process, so the
 // two never conflict.

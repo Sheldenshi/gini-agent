@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   bedrockSupportsStreamingWithTools,
   bedrockSupportsToolUse,
+  claudeSupportsFineGrainedToolStreaming,
   estimateUsd,
   FALLBACK_CONTEXT_WINDOW_TOKENS,
   FALLBACK_MAX_OUTPUT_TOKENS,
@@ -208,6 +209,58 @@ describe("bedrockSupportsStreamingWithTools", () => {
   });
 });
 
+describe("claudeSupportsFineGrainedToolStreaming", () => {
+  test("Claude 4 family (bedrock-prefixed or bare first-party) accept the flag; 3.x, 5+, and non-Claude don't", () => {
+    // Fine-grained tool streaming is documented for the Claude 4 family only,
+    // on both the bedrock (prefixed) and first-party (bare) id shapes.
+    for (const m of [
+      "us.anthropic.claude-sonnet-4-6",
+      "us.anthropic.claude-opus-4-8",
+      "eu.anthropic.claude-haiku-4-5-20251001-v1:0",
+      "anthropic.claude-sonnet-4-20250514-v1:0",
+      "claude-opus-4-8",
+      "claude-sonnet-4-12",
+      "claude-sonnet-4-5-20250929"
+    ]) {
+      expect(claudeSupportsFineGrainedToolStreaming(m)).toBe(true);
+    }
+    // Claude 3.x/3.5 are NOT in the supported list — sending the beta to them
+    // risks a 400, so the gate must exclude them even though they're Claude.
+    for (const m of [
+      "us.anthropic.claude-3-5-sonnet-20241022-v1:0",
+      "us.anthropic.claude-3-opus-20240229-v1:0",
+      "us.anthropic.claude-3-haiku-20240307-v1:0",
+      "claude-3-5-sonnet-20241022"
+    ]) {
+      expect(claudeSupportsFineGrainedToolStreaming(m)).toBe(false);
+    }
+    // Future MAJORS (Claude 5+, 10+) must NOT match: the beta flag we send is
+    // date-stamped (…-2025-05-14), so force-feeding it to a future major that
+    // GA's the feature or uses a newer beta would hard-400 every streaming tool
+    // turn — worse than the safe non-match fallback. The gate pins major 4.
+    for (const m of [
+      "claude-sonnet-5-0",
+      "claude-opus-5-1",
+      "us.anthropic.claude-sonnet-5-0-20260101-v1:0",
+      "claude-sonnet-10-0"
+    ]) {
+      expect(claudeSupportsFineGrainedToolStreaming(m)).toBe(false);
+    }
+    // Non-Claude families don't support the beta flag, and an empty/unknown id
+    // stays off.
+    for (const m of [
+      "us.amazon.nova-pro-v1:0",
+      "us.meta.llama4-scout-17b-instruct-v1:0",
+      "us.deepseek.r1-v1:0",
+      "us.mistral.mistral-large-2407-v1:0",
+      "some.custom.future-model",
+      ""
+    ]) {
+      expect(claudeSupportsFineGrainedToolStreaming(m)).toBe(false);
+    }
+  });
+});
+
 describe("resolveProviderContextWindowTokens", () => {
   test("openai known model families resolve to their context windows", () => {
     expect(resolveProviderContextWindowTokens(provider("openai", "gpt-5.5"))).toBe(1_000_000);
@@ -258,6 +311,10 @@ describe("resolveProviderContextWindowTokens", () => {
     expect(resolveProviderContextWindowTokens(provider("anthropic", "claude-haiku-4-5"))).toBe(200_000);
     expect(resolveProviderContextWindowTokens(provider("anthropic", "claude-opus-4-5"))).toBe(200_000);
     expect(resolveProviderContextWindowTokens(provider("bedrock", "us.anthropic.claude-haiku-4-5"))).toBe(200_000);
+    // A date-stamped major-only 4.0 id must NOT have its date digits ("20")
+    // misread as a 4.x minor version and jump to the 1M window — it stays 200K.
+    expect(resolveProviderContextWindowTokens(provider("anthropic", "claude-sonnet-4-20250514"))).toBe(200_000);
+    expect(resolveProviderContextWindowTokens(provider("bedrock", "us.anthropic.claude-opus-4-20250514-v1:0"))).toBe(200_000);
     expect(resolveProviderContextWindowTokens(provider("bedrock", "us.amazon.nova-premier-v1:0"))).toBe(1_000_000);
     expect(resolveProviderContextWindowTokens(provider("bedrock", "us.amazon.nova-pro-v1:0"))).toBe(300_000);
     expect(resolveProviderContextWindowTokens(provider("bedrock", "eu.amazon.nova-lite-v1:0"))).toBe(300_000);
@@ -302,6 +359,26 @@ describe("resolveMaxOutputTokens", () => {
   test("Opus 4.1 resolves to 32K", () => {
     expect(resolveMaxOutputTokens(provider("anthropic", "claude-opus-4-1"))).toBe(32_000);
     expect(resolveMaxOutputTokens(provider("bedrock", "us.anthropic.claude-opus-4-1-20250805-v1:0"))).toBe(32_000);
+  });
+
+  test("date-stamped 4.0 ids resolve to their real ceiling, not a date-digit overmatch", () => {
+    // Regression: a major-only 4.0 id carries a date stamp right after the major
+    // ("claude-sonnet-4-20250514"). A `4-(?:[6-9]|\d\d)` minor class without a
+    // trailing-digit anchor reads the date's "20" as a minor version and wrongly
+    // returns 128K, so a streaming turn would send max_tokens=128000 against the
+    // model's real 64K (Sonnet 4.0) / 32K (Opus 4.0) ceiling and 400. Pin the
+    // documented ceilings (verified via the Anthropic Models API + provider docs).
+    expect(resolveMaxOutputTokens(provider("anthropic", "claude-sonnet-4-20250514"))).toBe(64_000);
+    expect(resolveMaxOutputTokens(provider("bedrock", "us.anthropic.claude-sonnet-4-20250514-v1:0"))).toBe(64_000);
+    expect(resolveMaxOutputTokens(provider("anthropic", "claude-opus-4-20250514"))).toBe(32_000);
+    expect(resolveMaxOutputTokens(provider("bedrock", "us.anthropic.claude-opus-4-20250514-v1:0"))).toBe(32_000);
+    // The minor-version boundary is a whole segment (end / `-` / `.`), so a
+    // letter-glued suffix can't be misread as a 4.6+ minor either — it falls to
+    // the floor rather than the 128K tier. Real ids never glue letters onto the
+    // minor, but the boundary is segment-anchored so it can't.
+    expect(resolveMaxOutputTokens(provider("anthropic", "claude-sonnet-4-6preview"))).toBe(FALLBACK_MAX_OUTPUT_TOKENS);
+    // A dated 4.6 (minor delimited by `-`) still resolves to its 128K tier.
+    expect(resolveMaxOutputTokens(provider("bedrock", "us.anthropic.claude-sonnet-4-6-20260101-v1:0"))).toBe(128_000);
   });
 
   test("non-Claude Bedrock families carry their own probed ceilings", () => {

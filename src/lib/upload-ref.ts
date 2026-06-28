@@ -19,9 +19,12 @@
 //
 // A dedicated scheme (not a real http(s) URL or path) is deliberate: it can't
 // collide with a genuine external URL, so a client renderer can hard-allowlist
-// `gini-upload://` refs and DROP everything else — closing the SSRF /
-// tracking-pixel surface that arbitrary model-authored markdown images/links
-// would otherwise open. See ADR outbound-chat-attachments.md.
+// `gini-upload://` refs and never AUTO-FETCH any other image/link src — closing
+// the SSRF / tracking-pixel surface that arbitrary model-authored markdown
+// images/links would otherwise open. A foreign http(s) image isn't loaded
+// inline; it renders an inert click-to-open chip that fetches only on an
+// explicit click, while a non-http(s) src (data:/javascript:) is dropped
+// entirely. See ADR outbound-chat-attachments.md.
 
 export const UPLOAD_REF_SCHEME = "gini-upload://";
 

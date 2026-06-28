@@ -4,6 +4,8 @@ Gini Agent is a personal agent that remembers, improves, and runs without forcin
 
 Gini is not just a chat box, CLI, messaging bot, or pile of tools. Chat is an interaction surface. The runtime is the system of record for conversations, runs, tasks, approvals, memory, skills, jobs, tools, traces, audit events, and runtime health.
 
+It's also built to be a product, not plumbing. When the agent needs you, it hands you a purpose-built control right where the work is — a secure field, a choice, a sign-in handoff, a confirm-before-send — instead of a prose instruction or a detour. And because every client speaks the same runtime, those controls reach you on your phone as readily as the desktop, so the machine the agent runs on is not where you have to be.
+
 ## Docs
 
 - [Whitepaper](docs/whitepaper.md): the gaps this project is closing and the bar it's measured against
@@ -48,8 +50,20 @@ Gini's **runtime is the gateway**: a single Bun process per instance owns state 
 - Provider support: Codex OAuth; OpenAI / Azure OpenAI / DeepSeek / OpenRouter API keys; the first-party Anthropic Claude API; Amazon Bedrock (model-agnostic Converse, AWS SigV4 — Claude, Nova, Llama, Mistral, DeepSeek); and any OpenAI-compatible local server
 - Local embeddings, reranking, and voice-message speech-to-text by default
 - Parallel instances with isolated state, ports, and logs
+- In-chat actionable controls — secure credential/secret fields, sign-in and sensitive-step handoff into the agent's browser, choice prompts, and confirm-before-send — so the agent unblocks itself in context instead of stranding you
 
 See the [Whitepaper](docs/whitepaper.md) and [Architecture Overview](docs/architecture-overview.md) for the design.
+
+## Built to be used
+
+Gini treats the chat as a product surface, not a transcript. The agent takes initiative — it runs scheduled jobs, drives multi-step work, and reaches across your tools — and an agent that does that has to stay easy to steer. So whenever it needs you, it surfaces the exact interactive control inline and waits, instead of asking you to go do something elsewhere:
+
+- **Secrets stay out of the conversation.** A key, password, OTP, or payment field is typed into a secure card that flows straight to the gateway and never reaches the model, the transcript, or the audit trail. There's no "add a connector first" detour and no pasting credentials into chat — the agent requests exactly what it's missing, the moment it's missing it.
+- **The agent can be unblocked from anywhere.** When a task hits a sign-in wall or a step only you can finish, the agent hands you a live view of its own browser to sign in or complete the step, and picks up where it left off. You don't have to be sitting at the machine the gateway runs on.
+- **Choices instead of guesses.** When more than one path is reasonable, the agent offers a small set of choices to pick from rather than silently committing to one.
+- **Consent before anything goes out in your name.** Before it sends a message, replies, posts, or buys on your behalf, the agent shows you what's about to happen and a single button to send it — so it acts on your say-so, not its own.
+
+The same cards render on the web app and the iOS app off one wire protocol, and they reach your phone off-LAN through a runtime tunnel, so where you act is your choice, not the agent's constraint. The design intent behind each of these lives in the ADRs under [docs/adr/](docs/adr/) — [user-choice-prompt.md](docs/adr/user-choice-prompt.md), [user-confirmation-primitive.md](docs/adr/user-confirmation-primitive.md), [browser-fill-secret.md](docs/adr/browser-fill-secret.md), [chat-credential-provisioning.md](docs/adr/chat-credential-provisioning.md), and [browser-connect-handoff.md](docs/adr/browser-connect-handoff.md).
 
 ## Quick Start
 

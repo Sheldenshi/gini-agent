@@ -5,7 +5,8 @@ import { buildAgentSystemContext, renderEphemeralContext } from "./system-prompt
 import { loadInstructions, loadSoul, loadUserProfile } from "./runtime/identity-files";
 import { readState } from "./state";
 import { appendTrace } from "./state/trace";
-import { bedrockSupportsStreamingWithTools, bedrockSupportsToolUse, estimateUsd, FALLBACK_MAX_OUTPUT_TOKENS, resolveMaxOutputTokens, resolveProviderModality } from "./provider-capabilities";
+import { bedrockSupportsStreamingWithTools, bedrockSupportsToolUse, claudeSupportsFineGrainedToolStreaming, estimateUsd, FALLBACK_MAX_OUTPUT_TOKENS, resolveMaxOutputTokens, resolveProviderContextWindowTokens, resolveProviderModality } from "./provider-capabilities";
+import { estimateTextTokens, estimateToolCallingMessagesTokens } from "./execution/context-window";
 import { resolveAwsCredentials, signAwsRequest } from "./aws-sigv4";
 import type { CostRecord, ProviderAuthFailureRecord, ProviderAuthStatus, ProviderCatalogItem, ProviderConfig, ProviderName, ProviderReauthInfo, ProviderResult, RuntimeConfig, SystemNoteAuthError } from "./types";
 
@@ -41,6 +42,15 @@ const DEFAULT_BEDROCK_BASE_URL = bedrockRuntimeBaseUrl(DEFAULT_BEDROCK_REGION);
 // live versioning docs (newest entry; the SSE-named-events format). Honored by
 // both the first-party API and Claude in Amazon Bedrock.
 const ANTHROPIC_VERSION = "2023-06-01";
+// Anthropic beta flag that enables fine-grained tool streaming (tool_use input
+// JSON streamed incrementally instead of buffered whole). Carried two different
+// ways depending on the send path: the first-party Anthropic Messages path
+// sends it as the HTTP `anthropic-beta` request header (callAnthropicMessages),
+// while the Bedrock Converse path carries it as an `anthropic_beta` entry inside
+// the `additionalModelRequestFields` body object (callBedrockConverse) — Bedrock
+// takes no HTTP beta header. See the Anthropic "fine-grained tool streaming"
+// docs and the AWS Bedrock "Anthropic Claude tool use" docs.
+const FINE_GRAINED_TOOL_STREAMING_BETA = "fine-grained-tool-streaming-2025-05-14";
 // The Messages API REQUIRES max_tokens. The streaming send-path resolves the
 // model's real output ceiling via resolveMaxOutputTokens so a large tool-call
 // argument isn't truncated mid-JSON; this flat floor is the NON-streaming
@@ -555,6 +565,85 @@ async function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
   } finally {
     clearTimeout(timer);
     if (signal) signal.removeEventListener("abort", onAbort);
+  }
+}
+
+// Idle window for a streaming model call: if a single reader.read() delivers no
+// new bytes for this long, treat the stream as wedged and abort. Sized to sit
+// far above a healthy inter-chunk gap (fine-grained streaming emits deltas a
+// couple of seconds apart at most) yet well under the multi-minute OS socket
+// timeout a genuinely dead connection would otherwise hang on. The real failure
+// this catches is a provider that opens the stream, emits a little, then stalls
+// forever mid tool-arg generation — the read just never resolves, so a turn
+// would hang indefinitely without this. Module-level so tests can reference the
+// exact value.
+export const IDLE_STREAM_TIMEOUT_MS = 120_000;
+
+// Resolve the idle window at use time (not module load) so it can be overridden
+// via GINI_IDLE_STREAM_TIMEOUT_MS — an operability knob (a slow self-hosted
+// model may legitimately pause longer than 2 min) and the seam that lets a live
+// test trigger the stall path in well under a second. Mirrors transientRetryBaseMs
+// in chat-task.ts. Production (env unset) uses IDLE_STREAM_TIMEOUT_MS; a 0 or
+// invalid override falls back to the default rather than disabling the guard.
+function resolveIdleStreamTimeoutMs(): number {
+  const raw = process.env.GINI_IDLE_STREAM_TIMEOUT_MS;
+  if (raw === undefined) return IDLE_STREAM_TIMEOUT_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : IDLE_STREAM_TIMEOUT_MS;
+}
+
+// Thrown when a streaming read stalls past IDLE_STREAM_TIMEOUT_MS. A DISTINCT
+// name (not "AbortError") on purpose: the chat-task loop must NOT mistake this
+// for a user cancel (isAbortError stays false) nor for a context overflow — it
+// is a transient stall the retry layer is free to re-attempt. The retry
+// classifier keys off this name; the message also carries the stable substring
+// "stream idle timeout" as a fallback marker.
+export class StreamIdleTimeoutError extends Error {
+  constructor(ms: number) {
+    super(`Model stream idle timeout: no data for ${ms}ms`);
+    this.name = "StreamIdleTimeoutError";
+  }
+}
+
+// True when an error is a streaming idle/stall timeout (see StreamIdleTimeoutError).
+// Exposed so the chat-task retry layer can classify it as a transient failure
+// worth re-attempting, distinct from a user cancel (isAbortError) or a context
+// overflow (isContextOverflowError). Matches by name first, then the stable
+// message substring as a defensive fallback if the error is reconstructed.
+export function isStreamIdleTimeoutError(error: unknown): boolean {
+  if (error instanceof StreamIdleTimeoutError) return true;
+  if (!(error instanceof Error)) return false;
+  return error.name === "StreamIdleTimeoutError" || error.message.includes("stream idle timeout");
+}
+
+// Race a single reader.read() against the idle window. On a normal read the
+// timer is cleared and the chunk returned unchanged, so the happy path is
+// untouched. If the window elapses first, cancel the reader (tearing down the
+// underlying fetch/socket — no leak) and throw a StreamIdleTimeoutError. The
+// turn AbortSignal still aborts immediately and independently: the loop's
+// pre-read signal.aborted guard plus the aborted fetch rejecting read() with an
+// AbortError both win the race, and that AbortError stays classified as a user
+// cancel. The timer is always cleared in finally so a fast read never leaves a
+// dangling handle.
+async function readWithIdleTimeout<T>(
+  reader: ReadableStreamDefaultReader<T>,
+  idleMs: number = resolveIdleStreamTimeoutMs()
+): Promise<Awaited<ReturnType<ReadableStreamDefaultReader<T>["read"]>>> {
+  const { promise: timeout, reject } = Promise.withResolvers<never>();
+  const timer = setTimeout(() => {
+    // Reject FIRST, then cancel. Ordering matters: reader.cancel() settles the
+    // still-pending reader.read() with {done:true}, and that resolution would
+    // win the Promise.race over a reject scheduled after it — silently ending
+    // the stream as "done" instead of surfacing the stall. Rejecting before the
+    // cancel makes the StreamIdleTimeoutError the value the race adopts. The
+    // cancel still runs to tear down the fetch so the stalled socket is released.
+    reject(new StreamIdleTimeoutError(idleMs));
+    reader.cancel().catch(() => {});
+  }, idleMs);
+  try {
+    return await Promise.race([reader.read(), timeout]);
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -1766,6 +1855,35 @@ async function readResponsesToolCallingStream(
 // Mirrors callToolCallingChatCompletions/callToolCallingResponses: stream when
 // onDelta is present, otherwise parse the JSON body. No codex-style session
 // retry — an env-var key has no rotation surface.
+
+// Streaming raises max_tokens to the model's full output ceiling so a tool call
+// isn't truncated mid-JSON — but on a near-full prompt that ceiling can push
+// input_tokens + max_tokens past the context window and the request 400s before
+// a single token streams. Clamp the streaming ceiling DOWN so it always fits the
+// window, leaving the prior-context replay untouched (we shrink the *output*
+// budget, never the messages). The estimate mirrors chat-task's send-time
+// budgeting: estimateToolCallingMessagesTokens(messages) + serialized tool tokens.
+// Only ever clamps DOWN — it never raises `resolved`, so a deliberately small
+// caller value (a user-pinned extraBody.max_tokens) passes through untouched.
+// The STREAM_MAX_TOKENS_FLOOR bounds the WINDOW-FIT ceiling, not the caller's
+// request: on a near-full prompt where `fits` is small/negative we send at least
+// the floor rather than zero/negative (that overshoot is the context-overflow
+// retry path's job), but the floor can never lift a value the caller chose.
+const STREAM_MAX_TOKENS_CONTEXT_MARGIN = 256;
+const STREAM_MAX_TOKENS_FLOOR = 1024;
+function clampStreamingMaxTokens(
+  resolved: number,
+  provider: ProviderConfig,
+  messages: ToolCallingMessage[],
+  tools: ToolFunctionSpec[]
+): number {
+  const contextWindow = resolveProviderContextWindowTokens(provider);
+  const estimatedInputTokens =
+    estimateToolCallingMessagesTokens(messages) + estimateTextTokens(JSON.stringify(tools));
+  const fits = contextWindow - estimatedInputTokens - STREAM_MAX_TOKENS_CONTEXT_MARGIN;
+  return Math.min(resolved, Math.max(STREAM_MAX_TOKENS_FLOOR, fits));
+}
+
 async function callAnthropicMessages(
   provider: ProviderConfig,
   messages: ToolCallingMessage[],
@@ -1795,11 +1913,16 @@ async function callAnthropicMessages(
   const modelDefaultMaxTokens = wantStream ? resolveMaxOutputTokens(provider) : DEFAULT_ANTHROPIC_MAX_TOKENS;
   const resolvedMaxTokens =
     maxTokensOverride ?? (typeof extras.max_tokens === "number" ? extras.max_tokens : modelDefaultMaxTokens);
+  // The raised streaming ceiling must still fit the window; clamp down only on
+  // the streaming path (the non-streaming floor is already small and safe).
+  const maxTokens = wantStream
+    ? clampStreamingMaxTokens(resolvedMaxTokens, provider, messages, tools)
+    : resolvedMaxTokens;
   const body: Record<string, unknown> = {
     ...extras,
     model: provider.model,
     messages: anthropicMessages,
-    max_tokens: resolvedMaxTokens,
+    max_tokens: maxTokens,
     stream: wantStream
   };
   // `system` is stripped from extras by ANTHROPIC_RESERVED_EXTRA_BODY_KEYS, so
@@ -1812,6 +1935,16 @@ async function callAnthropicMessages(
     body.tools = anthropicTools;
     body.tool_choice = { type: "auto" };
   }
+  // Fine-grained tool streaming, symmetric with the Bedrock path: without it the
+  // first-party Messages API also buffers a tool_use block's input JSON
+  // server-side and emits nothing until the whole argument is generated, so a
+  // large inline tool argument idles the stream past the socket timeout and
+  // fails the turn. Here the mechanism is the HTTP `anthropic-beta` header (NOT
+  // the body field Converse uses, and verified more effective than the per-tool
+  // `eager_input_streaming` property). Only on a streaming Claude-4-family tool
+  // turn — the beta is rejected with a 400 on models that don't support it.
+  const wantFineGrainedToolStreaming =
+    wantStream && anthropicTools.length > 0 && claudeSupportsFineGrainedToolStreaming(provider.model);
 
   const bodyJson = JSON.stringify(body);
   const response = await fetch(messagesUrl, {
@@ -1819,6 +1952,7 @@ async function callAnthropicMessages(
     headers: {
       "content-type": "application/json",
       "anthropic-version": ANTHROPIC_VERSION,
+      ...(wantFineGrainedToolStreaming ? { "anthropic-beta": FINE_GRAINED_TOOL_STREAMING_BETA } : {}),
       ...(wantStream ? { accept: "text/event-stream" } : {}),
       ...anthropicAuthHeaders(provider)
     },
@@ -2166,7 +2300,10 @@ async function readAnthropicMessagesStream(
       // AbortError; this guard makes the stop deterministic (the finally
       // cancels the reader on the throw).
       if (signal?.aborted) throw signal.reason ?? new DOMException("Aborted", "AbortError");
-      const { value, done } = await reader.read();
+      // Idle-timeout guard: a wedged stream that stops emitting would otherwise
+      // hang this await forever. readWithIdleTimeout cancels the reader and
+      // throws a transient StreamIdleTimeoutError once the window elapses.
+      const { value, done } = await readWithIdleTimeout(reader);
       if (value) buffer += decoder.decode(value, { stream: true });
       let boundary = buffer.indexOf("\n\n");
       while (boundary >= 0) {
@@ -2526,13 +2663,31 @@ async function callBedrockConverse(
   // tolerates a large max_tokens, but matching the Anthropic path keeps one
   // rule for both.)
   const modelDefaultMaxTokens = wantStream ? resolveMaxOutputTokens(provider) : DEFAULT_ANTHROPIC_MAX_TOKENS;
-  const maxTokens = maxTokensOverride ?? extraMax ?? modelDefaultMaxTokens;
+  const resolvedMaxTokens = maxTokensOverride ?? extraMax ?? modelDefaultMaxTokens;
+  // The raised streaming ceiling must still fit the window; clamp down only on
+  // the streaming path (the non-streaming floor is already small and safe).
+  const maxTokens = wantStream
+    ? clampStreamingMaxTokens(resolvedMaxTokens, provider, messages, tools)
+    : resolvedMaxTokens;
   const body: Record<string, unknown> = {
     messages: converseMessages,
     inferenceConfig: { maxTokens }
   };
   if (system.length > 0) body.system = system;
   if (toolConfig) body.toolConfig = toolConfig;
+  // Fine-grained tool streaming. Without it, Bedrock buffers a tool_use block's
+  // entire input JSON server-side and emits nothing on the wire until the whole
+  // argument is generated; a large argument (e.g. a long file body written
+  // inline) leaves the stream idle past the socket timeout, surfacing as
+  // "The operation timed out." and failing the turn. The beta flag streams the
+  // tool input incrementally (field-by-field) so the connection stays fed.
+  // Only meaningful on a streaming tool turn. On Converse the flag is the
+  // anthropic_beta entry inside additionalModelRequestFields — the tool-level
+  // `eager_input_streaming` property used by the first-party Messages API is
+  // silently ignored here. See AWS Bedrock "Anthropic Claude tool use" docs.
+  if (wantStream && toolConfig && claudeSupportsFineGrainedToolStreaming(provider.model)) {
+    body.additionalModelRequestFields = { anthropic_beta: [FINE_GRAINED_TOOL_STREAMING_BETA] };
+  }
 
   const bodyJson = JSON.stringify(body);
   const response = await fetch(url, {
@@ -2721,7 +2876,10 @@ async function readConverseStream(
       // AbortError; this guard makes the stop deterministic (the finally
       // cancels the reader on the throw).
       if (signal?.aborted) throw signal.reason ?? new DOMException("Aborted", "AbortError");
-      const { value, done } = await reader.read();
+      // Idle-timeout guard: a wedged stream that stops emitting would otherwise
+      // hang this await forever. readWithIdleTimeout cancels the reader and
+      // throws a transient StreamIdleTimeoutError once the window elapses.
+      const { value, done } = await readWithIdleTimeout(reader);
       if (value) buf = bytesConcat(buf, value);
       while (buf.length >= 12) {
         const totalLen = readUint32BE(buf, 0);

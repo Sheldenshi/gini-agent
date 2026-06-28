@@ -8,7 +8,7 @@
 // natural transport for a browser we spawn ourselves, no TCP debug socket
 // needed for automation. (For attaching to a user's ALREADY-running Chrome the
 // cdp provider uses connectOverCDP over a TCP WebSocket, which works under Bun
-// via patches/playwright-core@1.61.0.patch.) We still inject a free
+// via patches/playwright-core@1.61.1.patch.) We still inject a free
 // `--remote-debugging-port` into the launch args so the spawned Chrome ALSO
 // exposes a debug endpoint — the sign-in screencast bridge attaches to it over
 // raw CDP — without routing the agent's automation through that endpoint.

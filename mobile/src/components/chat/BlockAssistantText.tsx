@@ -8,6 +8,7 @@ import {
   type ReactNode
 } from "react";
 import { Animated, Easing, Pressable, StyleSheet, Text, View } from "react-native";
+import { Feather } from "@expo/vector-icons";
 import Markdown, { MarkdownIt } from "react-native-markdown-display";
 import { family, theme } from "@/src/theme";
 import type { AssistantTextBlock } from "@/src/types";
@@ -19,6 +20,7 @@ import { openUploadInBrowser } from "./uploadAttachment";
 import {
   handleMarkdownLinkPress,
   isWebUrl,
+  linkHostname,
   openLink,
   presentLinkMenu
 } from "./linkContextMenu";
@@ -171,6 +173,24 @@ function hasLinkDescendant(node: MarkdownNode): boolean {
   return node.children?.some(hasLinkDescendant) ?? false;
 }
 
+// Walk an AST node's subtree for an `image` node the image rule renders as a
+// View subtree — either a `gini-upload://` ref (→ MarkdownUploadImage) or a
+// foreign http(s) src (→ MarkdownForeignImage chip). Both are Pressables, which
+// RN cannot mount inside the iOS `<TextInput>` selection wrapper a text block
+// resolves to; a block carrying one must render as a plain View instead so the
+// image's View subtree has a valid host. The condition mirrors the image rule's
+// own non-null branches exactly (a data:/other src still drops to null there, so
+// it stays on the text path). The default markdown paragraph rule is itself a
+// View for the same reason; the app's text-wrapper override (for clean URL
+// wrapping + selection) is what would otherwise strand the image.
+function hasRenderableImageDescendant(node: MarkdownNode): boolean {
+  if (node.type === "image") {
+    const src = node.attributes?.src;
+    if (uploadIdFromRef(src) !== null || (src != null && isWebUrl(src))) return true;
+  }
+  return node.children?.some(hasRenderableImageDescendant) ?? false;
+}
+
 // Block-level renderers wrap inline children in a single selectable
 // block. On iOS that's a `TextInput multiline editable={false}` (the
 // only RN primitive that exposes the loupe + drag handles for partial
@@ -185,17 +205,56 @@ function hasLinkDescendant(node: MarkdownNode): boolean {
 // platform: the iOS TextInput wrapper would swallow the link's taps, and a
 // selectable wrapper would let iOS hijack the long-press for text selection
 // instead of showing the link menu.
+//
+// A block that contains a renderable image (an upload preview or a foreign-image
+// chip) takes a different escape: the image renders as a View subtree, which
+// can't mount inside the iOS TextInput a text wrapper resolves to, so the block
+// renders as a plain View (the library's own default paragraph rule is a View
+// for the same reason). It mirrors that default rule's row/wrap layout
+// (imageBlock below) so a mid-sentence image keeps inline, wrapping paragraph
+// flow — prose, image, prose flow left-to-right and wrap, rather than stacking
+// vertically under RN's default column direction — and carries over the text
+// style's vertical margins.
 const renderAsText =
-  (style: object): RenderRule =>
-  (node, children) => (
-    <SelectableBlockText
-      key={node.key}
-      style={style}
-      containsLink={hasLinkDescendant(node)}
-    >
-      {children}
-    </SelectableBlockText>
-  );
+  (style: { marginTop?: number; marginBottom?: number }): RenderRule =>
+  (node, children) => {
+    if (hasRenderableImageDescendant(node)) {
+      return (
+        <View
+          key={node.key}
+          style={[
+            imageBlockStyles.block,
+            { marginTop: style.marginTop, marginBottom: style.marginBottom }
+          ]}
+        >
+          {children}
+        </View>
+      );
+    }
+    return (
+      <SelectableBlockText
+        key={node.key}
+        style={style}
+        containsLink={hasLinkDescendant(node)}
+      >
+        {children}
+      </SelectableBlockText>
+    );
+  };
+
+// Mirror of react-native-markdown-display's `_VIEW_SAFE_paragraph` layout
+// (flexWrap row, top-aligned, full width) so an image-bearing paragraph lays
+// its inline children out the same way the library's default paragraph View
+// would — see the View escape in renderAsText.
+const imageBlockStyles = StyleSheet.create({
+  block: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    alignItems: "flex-start",
+    justifyContent: "flex-start",
+    width: "100%"
+  }
+});
 // A markdown link is interactive (tap opens, long-press shows the menu), so
 // its label must not be selectable — otherwise iOS fires its own text
 // selection "Copy" callout on long-press alongside the link menu. The inline
@@ -245,6 +304,68 @@ const uploadImageStyles = StyleSheet.create({
   image: {
     width: 240,
     height: 170
+  }
+});
+
+// A foreign (non-upload) image `![alt](https://…)` an agent may emit instead of
+// the canonical `gini-upload://` ref. The bytes are NOT fetched — auto-loading a
+// model-authored URL at render time is the SSRF / tracking-pixel surface the
+// image rule guards against. Rather than drop it silently (a blank gap the
+// reader can't explain), render an inert chip naming the image and its host;
+// the URL is only fetched on an explicit tap (in-app browser), and a long-press
+// raises the same link menu as a text link. This mirrors how a foreign text
+// link already behaves — nothing about an image should make it vanish.
+function MarkdownForeignImage({ alt, href }: { alt: string; href: string }) {
+  return (
+    <Pressable
+      style={foreignImageStyles.chip}
+      onPress={() => openLink(href)}
+      onLongPress={(e) =>
+        presentLinkMenu(href, e.nativeEvent.pageX, e.nativeEvent.pageY)
+      }
+      accessibilityRole="button"
+      // Always name the host: a screen-reader user must hear WHERE a
+      // model-authored link goes before activating it, not just the
+      // model-controlled alt text. Mirrors the host shown visually.
+      accessibilityLabel={`Open image ${alt || "Image"} — ${linkHostname(href)}`}
+    >
+      <Feather name="image" size={15} color={theme.muted} />
+      <Text style={foreignImageStyles.label} numberOfLines={1}>
+        {alt || "Image"}
+      </Text>
+      <Text style={foreignImageStyles.host} numberOfLines={1}>
+        {linkHostname(href)}
+      </Text>
+    </Pressable>
+  );
+}
+
+const foreignImageStyles = StyleSheet.create({
+  chip: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    marginVertical: 6,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: theme.border,
+    backgroundColor: theme.codeChipBg,
+    alignSelf: "flex-start",
+    maxWidth: "100%"
+  },
+  label: {
+    color: theme.assistantBubbleText,
+    fontFamily: family("HankenGrotesk", 600),
+    fontSize: 14,
+    flexShrink: 1
+  },
+  host: {
+    color: theme.muted,
+    fontFamily: family("HankenGrotesk", 400),
+    fontSize: 12,
+    flexShrink: 1
   }
 });
 
@@ -338,14 +459,25 @@ export const markdownRules: Record<string, RenderRule> = {
   // An agent-produced image is authored as a `gini-upload://<id>` markdown
   // image ref. Override the default image rule (which renders a header-less
   // FitImage that 401s against the gateway) to render AuthedImage instead —
-  // it carries the bearer on native and fetches a blob on web. A non-upload
-  // src is DROPPED (returns null) rather than fetched: that allowlist closes
-  // the SSRF / tracking-pixel surface. The image rule has a special signature
+  // it carries the bearer on native and fetches a blob on web. A foreign
+  // http(s) src is NOT auto-fetched (that's the SSRF / tracking-pixel surface);
+  // it renders an inert chip that only loads on tap. Any other src (data:,
+  // javascript:, …) is dropped entirely. The image rule has a special signature
   // (extra allowedImageHandlers / defaultImageHandler args), so it's cast.
   image: ((node: MarkdownNode) => {
-    const id = uploadIdFromRef(node.attributes?.src);
-    if (!id) return null;
-    return <MarkdownUploadImage key={node.key} uploadId={id} />;
+    const src = node.attributes?.src;
+    const id = uploadIdFromRef(src);
+    if (id) return <MarkdownUploadImage key={node.key} uploadId={id} />;
+    if (src && isWebUrl(src)) {
+      return (
+        <MarkdownForeignImage
+          key={node.key}
+          alt={node.attributes?.alt ?? ""}
+          href={src}
+        />
+      );
+    }
+    return null;
   }) as RenderRule,
   // Code blocks render as `SelectableBlockText` so iOS gets the loupe
   // and drag handles on multi-line snippets. The library's defaults

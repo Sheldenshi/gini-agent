@@ -274,9 +274,59 @@ describe("inline image rule (gini-upload:// image ref)", () => {
     rendered.props.onPress();
   });
 
-  test("a non-upload image src is DROPPED (returns null) — SSRF/tracking-pixel guard", () => {
-    const node: Node = { key: "img2", type: "image", content: "", attributes: { src: "https://evil.example/p.gif" } as never, children: [] };
-    expect(rule("image")(node, [], [], styles)).toBeNull();
+  test("a foreign http(s) image src renders an inert chip, NOT an auto-fetched image", () => {
+    // The chip names the image + host and only loads on tap — it never fetches
+    // the bytes at render time (the SSRF / tracking-pixel guard holds), mirroring
+    // how a foreign text link behaves.
+    const node: Node = {
+      key: "img2",
+      type: "image",
+      content: "",
+      attributes: { src: "https://evil.example/p.gif", alt: "a cat" } as never,
+      children: []
+    };
+    const el = rule("image")(node, [], [], styles);
+    expect(el).not.toBeNull();
+    // It's the MarkdownForeignImage component, not the AuthedImage preview.
+    const Comp = el.type as (p: { alt: string; href: string }) => any;
+    const rendered = Comp({ alt: "a cat", href: "https://evil.example/p.gif" });
+    // Tap opens the in-app browser; long-press raises the link menu.
+    expect(typeof rendered.props.onPress).toBe("function");
+    expect(typeof rendered.props.onLongPress).toBe("function");
+    openBrowserAsync.mockClear();
+    rendered.props.onPress();
+    expect(openBrowserAsync).toHaveBeenCalledWith("https://evil.example/p.gif");
+    // Long-press raises the link menu at the touch point (same as a text link).
+    const seen: Array<{ href: string; x: number; y: number }> = [];
+    const unsub = subscribeLinkMenu((r) => seen.push(r));
+    rendered.props.onLongPress({ nativeEvent: { pageX: 5, pageY: 9 } });
+    unsub();
+    expect(seen).toEqual([{ href: "https://evil.example/p.gif", x: 5, y: 9 }]);
+  });
+
+  test("a foreign image chip's a11y label always names the host (where the link goes)", () => {
+    const node: Node = {
+      key: "imgna",
+      type: "image",
+      content: "",
+      attributes: { src: "https://cataas.com/cat" } as never,
+      children: []
+    };
+    const el = rule("image")(node, [], [], styles);
+    expect(el).not.toBeNull();
+    const Comp = el.type as (p: { alt: string; href: string }) => any;
+    // With alt: the host is still appended so a screen-reader user hears the
+    // destination, not just the model-controlled alt text.
+    expect(Comp({ alt: "a cat", href: "https://cataas.com/cat" }).props.accessibilityLabel)
+      .toBe("Open image a cat — cataas.com");
+    // Without alt: falls back to "Image" + host (exercises the alt-less branch).
+    expect(Comp({ alt: "", href: "https://cataas.com/cat" }).props.accessibilityLabel)
+      .toBe("Open image Image — cataas.com");
+  });
+
+  test("a non-web image src (data:/no src) is DROPPED (returns null) — never even a chip", () => {
+    const dataUri: Node = { key: "imgd", type: "image", content: "", attributes: { src: "data:image/png;base64,AAAA" } as never, children: [] };
+    expect(rule("image")(dataUri, [], [], styles)).toBeNull();
     const noSrc: Node = { key: "img3", type: "image", content: "", attributes: {} as never, children: [] };
     expect(rule("image")(noSrc, [], [], styles)).toBeNull();
   });

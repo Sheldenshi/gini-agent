@@ -4,7 +4,7 @@ OpenClaw gave us a glimpse of the future of autonomous AI agents by simply putti
 
 ## What we're building 
 
-A personal agent that can run without forcing you to read a log line. That's the bar.
+A personal agent that can run without forcing you to read a log line. That's the bar. And when it does need you, reaching you should feel like a product asking a clear question — a control you act on in place, from wherever you are — not a log demanding to be read or a chat asking you to go do something else first.
 
 ## Gaps
 
@@ -18,7 +18,9 @@ The hard part is recall, not storage. Persisting text is solved. Deciding which 
 
 You don't read the agent's skills to decide whether they are usable. You rely on them because they've run before, against real situations, and worked.
 
-**3. The interface fits the agent.** Current agents live inside messaging apps designed for human conversation, so the surface is a flat chat history. You can't see what's queued, what's running, or what's waiting on you. The agent is running scheduled jobs and multi-step work, and the interface treats all of it as just more chat. Working with your agent should feel like working with someone, not scrolling a thread.
+**3. The interface is a product, not a chat log.** Current agents live inside messaging apps built for human conversation, so the surface is a flat history. You can't see what's queued, what's running, or what's waiting on you, and when the agent needs something from you it can only ask in prose — go add a key in settings, go to the machine to sign in, reply "yes" to send. The agent is running scheduled jobs and multi-step work, and the interface treats all of it as just more chat. Working with your agent should feel like using something designed for the job, not scrolling a thread.
+
+So the interface earns two things. It shows the agent's real state — queued jobs, running tasks, what's blocked on you — instead of flattening all of it into more chat. And when the agent is stuck, it hands you the exact control to unblock it, in place: a secure field for a secret that never reaches the model, a sign-in or sensitive-step handoff into the agent's own browser, a set of choices when more than one path is reasonable, a confirm-before-it-goes-out in your name. No detour to a settings page, no pasting secrets into chat, no needing to be at the machine. Because every surface is a client of the same runtime, the same controls reach you on your phone as readily as the desktop — so the agent unblocks itself wherever you happen to be. Intuitive use isn't decoration here; it's how an agent that takes initiative stays answerable to you.
 
 ## Approach
 

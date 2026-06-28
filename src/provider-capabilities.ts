@@ -94,9 +94,14 @@ function openrouterContextWindowTokens(model: string): number {
 // ("us.anthropic.claude-opus-4-8") or arrive bare ("claude-opus-4-8") — both
 // match the family patterns. The minor-version classes ([6-9]|\d\d) keep
 // future point releases (Opus 4.9+) on 1M while leaving 4.5/4.1/4.0 at 200K.
+// The `(?=$|[-.])` boundary anchors the minor token to a whole segment so a
+// model id's DATE STAMP can't be misread as a minor version (e.g.
+// "claude-sonnet-4-20250514" must not match `4-\d\d` via the "20" of the date
+// and jump to 1M; it falls to 200K). Real ids delimit the minor with end-of-
+// string or a `-`/`.` separator, never a glued suffix.
 function claudeContextWindowTokens(slug: string): number {
-  if (/claude-opus-4-(?:[6-9]|\d\d)/.test(slug)) return 1_000_000;
-  if (/claude-sonnet-4-(?:[6-9]|\d\d)/.test(slug)) return 1_000_000;
+  if (/claude-opus-4-(?:[6-9]|\d\d)(?=$|[-.])/.test(slug)) return 1_000_000;
+  if (/claude-sonnet-4-(?:[6-9]|\d\d)(?=$|[-.])/.test(slug)) return 1_000_000;
   if (/claude-fable-\d/.test(slug)) return 1_000_000;
   if (/claude/.test(slug)) return 200_000;
   return FALLBACK_CONTEXT_WINDOW_TOKENS;
@@ -162,22 +167,42 @@ export const FALLBACK_MAX_OUTPUT_TOKENS = 8_192;
 // Max output tokens (synchronous Messages/Converse) by Claude family. The model
 // REJECTS a max_tokens above its real ceiling with a 400 (Bedrock
 // ValidationException "exceeds the model limit of N"; first-party Anthropic the
-// equivalent) — it does NOT clamp — so this must never overshoot. Values are
-// each model's documented/probed ceiling: 4.6+ Opus/Sonnet and Fable at 128K;
-// Haiku 4.5 and the 4.5 Opus/Sonnet tier at 64K; Opus 4.1 at 32K. The minor
-// classes ([6-9]|\d\d) keep future point releases on the 128K tier while the
-// explicit 4.5/4.1 patterns pin the older tiers. `slug` may carry a Bedrock
+// equivalent) — it does NOT clamp — so this must never overshoot. Ceilings:
+// Opus/Sonnet 4.6+ and Fable at 128K; Haiku 4.5, Opus 4.5, and Sonnet 4.5 at
+// 64K; Sonnet 4.0 at 64K; Opus 4.1 and Opus 4.0 at 32K. These are verified
+// against the Anthropic Models API AND the live Bedrock runtime (a Converse
+// call probes the exact boundary: us.anthropic.claude-sonnet-4-6 accepts
+// maxTokens=128000 and 400s at 128001 with "exceeds the model limit of
+// 128000"). NOTE: the AWS Bedrock model-card page is STALE for Sonnet 4.6 — it
+// lists "Max output tokens: 64K", but the runtime enforces 128000, so do NOT
+// "correct" this table down to match that doc. `slug` may carry a Bedrock
 // inference-profile prefix ("us.anthropic.claude-opus-4-8") or be bare
-// ("claude-opus-4-8"); both match. Anything else (3.x, EOL, unrecognized)
-// stays on the conservative floor.
+// ("claude-opus-4-8"); both match. Anything else (3.x, EOL, unrecognized) stays
+// on the conservative floor.
+//
+// The minor-version classes are anchored with a trailing `(?=$|[-.])` so a
+// model id's DATE STAMP can't be misread as a minor version: without a
+// boundary, `claude-sonnet-4-20250514` (Sonnet 4.0, dated) matches
+// `[…]4-(?:[6-9]|\d\d)` because `\d\d` eats "20" → a wrong 128K ceiling → a 400
+// on a real Sonnet-4.0 streaming turn. The boundary forces the minor token to be
+// a WHOLE segment (end of string, or followed by a `-`/`.` separator — the only
+// ways a minor version is delimited in real first-party and Bedrock ids), so a
+// date run or a glued suffix can't be misread as a minor version. The explicit
+// 4.5/4.1/4.0 patterns pin the older tiers; order matters (specific tiers before
+// the 6-9 class).
 function claudeMaxOutputTokens(slug: string): number {
-  if (/claude-opus-4-(?:[6-9]|\d\d)/.test(slug)) return 128_000;
-  if (/claude-sonnet-4-(?:[6-9]|\d\d)/.test(slug)) return 128_000;
+  if (/claude-opus-4-(?:[6-9]|\d\d)(?=$|[-.])/.test(slug)) return 128_000;
+  if (/claude-sonnet-4-(?:[6-9]|\d\d)(?=$|[-.])/.test(slug)) return 128_000;
   if (/claude-fable-\d/.test(slug)) return 128_000;
   if (/claude-haiku-4-5/.test(slug)) return 64_000;
   if (/claude-opus-4-5/.test(slug)) return 64_000;
   if (/claude-sonnet-4-5/.test(slug)) return 64_000;
   if (/claude-opus-4-1/.test(slug)) return 32_000;
+  // Bare major-version 4.0 ids (e.g. "claude-sonnet-4-20250514" — a date stamp
+  // follows the major, no minor version). Match the major followed directly by
+  // a non-minor segment so 4.5/4.6 (handled above) don't fall in here.
+  if (/claude-sonnet-4-20\d/.test(slug)) return 64_000;
+  if (/claude-opus-4-20\d/.test(slug)) return 32_000;
   return FALLBACK_MAX_OUTPUT_TOKENS;
 }
 
@@ -345,6 +370,34 @@ export function bedrockSupportsToolUse(model: string): boolean {
 // everything else supports tools + streaming together.
 export function bedrockSupportsStreamingWithTools(model: string): boolean {
   return !/llama4/i.test(model);
+}
+
+// Whether a Claude model accepts the fine-grained-tool-streaming beta flag,
+// which streams a tool_use block's input JSON incrementally instead of
+// buffering it whole. Documented for the Claude 4 FAMILY ONLY — "Claude Sonnet
+// 4.5, Claude Haiku 4.5, Claude Sonnet 4, and Claude Opus 4" (AWS Bedrock
+// "Anthropic Claude tool use" docs; the first-party Messages API matches). Older
+// Claude 3.x/3.5 ids and the non-Claude Bedrock families (Nova, Llama, DeepSeek,
+// Mistral) are NOT listed, and the API rejects an unsupported beta with a 400
+// rather than ignoring it.
+//
+// The flag we send is DATE-STAMPED (fine-grained-tool-streaming-2025-05-14), so
+// the gate matches the major version `-4-` EXACTLY rather than `[4-9]` — a
+// future Claude 5+ that either GA's the feature flag-free or uses a newer dated
+// beta would otherwise be force-fed this 2025-05-14 string and hard-400 on
+// every streaming tool turn (strictly worse than the safe non-match fallback,
+// which is just the pre-existing buffering stall). Unlike the numeric ceiling
+// tables (claudeMaxOutputTokens / claudeContextWindowTokens), which forward-
+// match the MINOR within `-4-` because an over-classified ceiling degrades
+// gracefully, this gate is binary accept/400 and must not forward-match the
+// major. The slug may carry a Bedrock inference-profile prefix
+// ("us.anthropic.claude-sonnet-4-6") or be a bare first-party id
+// ("claude-sonnet-4-6"); both match because the pattern keys off the
+// `claude-<tier>-4-` shape. Used by both the bedrock (Converse, via
+// additionalModelRequestFields) and first-party anthropic (HTTP anthropic-beta
+// header) send paths.
+export function claudeSupportsFineGrainedToolStreaming(model: string): boolean {
+  return /claude-(?:sonnet|haiku|opus)-4-/.test(normalizeModel(model));
 }
 
 export interface ModelPricing {

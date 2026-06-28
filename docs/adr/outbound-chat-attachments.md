@@ -54,12 +54,15 @@ Specific choices:
   `promote-file` can attach a PDF, CSV, or log, not just images.
 
 - **A dedicated scheme, not a real URL.** `gini-upload://` can't collide with a
-  genuine external URL, so each client's markdown renderer hard-allowlists it
-  and DROPS every other image/link `src` — closing the SSRF / tracking-pixel
-  surface that arbitrary model-authored markdown images would otherwise open. No
-  single real URL would work cross-client anyway: web uses a relative
-  `/api/runtime/uploads/<id>` (BFF injects the bearer), while mobile/CLI use an
-  absolute `<gatewayOrigin>/api/uploads/<id>` + a bearer header.
+  genuine external URL, so each client's markdown renderer hard-allowlists it and
+  never AUTO-FETCHES any other image `src` — closing the SSRF / tracking-pixel
+  surface that arbitrary model-authored markdown images would otherwise open. A
+  foreign `http(s)` image isn't loaded inline; it renders an inert chip (naming
+  the image + host) that fetches only on an explicit click, mirroring how a
+  foreign text link behaves. A non-`http(s)` `src` (`data:`/`javascript:`) is
+  dropped entirely. No single real URL would work cross-client anyway: web uses a
+  relative `/api/runtime/uploads/<id>` (BFF injects the bearer), while mobile/CLI
+  use an absolute `<gatewayOrigin>/api/uploads/<id>` + a bearer header.
 
 - **Tools hand the model a ready-to-paste tag, not a raw id.** `browser_vision`
   (`src/tools/browser.ts`) returns `imageMarkdown` in its envelope;
@@ -78,7 +81,12 @@ Specific choices:
   (`mobile/src/components/chat/BlockAssistantText.tsx`) overrides the markdown
   `image` rule to render `AuthedImage` (bearer on native, blob fetch on web — RN
   Web's `<img>` can't send a header) and the `link` rule to render the non-image
-  chip inline. Both DROP non-upload refs.
+  chip inline. Neither AUTO-FETCHES a non-upload ref: a foreign `http(s)` image
+  renders an inert chip (alt + host) that loads only on an explicit tap/click —
+  a role=link span on web (so a linked image can't form an invalid nested
+  anchor), a Pressable on mobile (which, like the upload image, makes its
+  paragraph escape the iOS text-selection wrapper to a plain View host). A
+  non-`http(s)` `src` is dropped entirely.
 
 - **A non-image chip OPENS A PREVIEW, not a forced download.** `GET
   /api/uploads/:id` defaults to `content-disposition: attachment`, but `?inline=1`
@@ -165,7 +173,9 @@ Specific choices:
   renders the screenshot inline in the reply bubble, and `GET /api/uploads/:id`
   serves the PNG.
 - `MarkdownContent` rewrites a `gini-upload://` image ref to the BFF URL and
-  DROPS a foreign `https://` image src (SSRF guard).
+  does NOT auto-fetch a foreign `https://` image src — it renders an inert
+  click-to-open chip (SSRF / tracking-pixel guard), while a `data:`/`javascript:`
+  src is dropped entirely.
 - `uploadIdsFromText` / `uploadIdFromRef` extract ids from reply text / a single
   ref and reject non-upload values.
 - A real chat turn that sends a PDF + a markdown file produces a reply whose text

@@ -4,7 +4,7 @@ import { memo } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
-import { Paperclip } from "lucide-react";
+import { ImageIcon, Paperclip } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { uploadInlineUrl, uploadUrl } from "@/lib/api";
 import { defaultUrlTransform } from "react-markdown";
@@ -67,22 +67,77 @@ export function resolveDocHref(href: string | undefined, base?: string): string 
   }
 }
 
+// The host of an http(s) URL (e.g. "cataas.com"), shown on the foreign-image
+// chip so the reader can see where a dropped image points. Returns null for a
+// non-http(s) or unparseable URL — the caller then renders nothing, so a
+// `javascript:`/`data:` src can never become a chip.
+export function webHost(url: string): string | null {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+    return parsed.host;
+  } catch {
+    return null;
+  }
+}
+
 function makeComponents(linkBaseUrl?: string, dropForeignImages = false) {
   return {
     // An agent-produced attachment is authored as a `gini-upload://<id>` ref →
     // an inline <img> served from the BFF (which injects the bearer).
     //
     // For a NON-upload `src`: in `dropForeignImages` mode (model-authored chat /
-    // thinking) it's DROPPED rather than fetched — that allowlist closes the
-    // SSRF / tracking-pixel surface that arbitrary model-authored image URLs
-    // would open. For trusted doc/file/skill markdown (the default) an ordinary
-    // image renders normally; `uploadAwareUrlTransform` has already neutralized
-    // any `javascript:`/`data:` src via react-markdown's default sanitizer.
-    // See ADR outbound-chat-attachments.md.
+    // thinking) the bytes are NOT auto-fetched — that allowlist closes the SSRF
+    // / tracking-pixel surface that arbitrary model-authored image URLs would
+    // open. Instead of dropping it silently (a blank gap the reader can't
+    // explain), render an inert chip naming the image + host that only loads on
+    // an explicit click — mirroring how a foreign text link already behaves. A
+    // non-http(s) src (webHost returns null) is dropped entirely. For trusted
+    // doc/file/skill markdown (the default) an ordinary image renders normally;
+    // `uploadAwareUrlTransform` has already neutralized any `javascript:`/`data:`
+    // src via react-markdown's default sanitizer. See ADR
+    // outbound-chat-attachments.md.
     img: ({ src, alt, ...props }: React.ImgHTMLAttributes<HTMLImageElement>) => {
       const id = uploadIdFromRef(typeof src === "string" ? src : undefined);
       if (!id) {
-        if (dropForeignImages || typeof src !== "string" || src.length === 0) return null;
+        if (typeof src !== "string" || src.length === 0) return null;
+        if (dropForeignImages) {
+          const host = webHost(src);
+          if (!host) return null;
+          // A SPAN, not an <a>: markdown can nest an image inside a link
+          // (`[![alt](img)](target)`), and an <a> chip there would produce an
+          // invalid nested anchor. The span opens the URL on explicit click via
+          // window.open (noopener) — nothing fetches at render time.
+          return (
+            <span
+              role="link"
+              tabIndex={0}
+              title={src}
+              // preventDefault + stopPropagation so the chip OWNS the
+              // activation: when it's nested inside a linked image's outer <a>
+              // (`[![](img)](target)`), a bare window.open would still let the
+              // click bubble to that anchor and navigate there too — one click,
+              // two model-authored destinations. Stopping here keeps it to one.
+              onClick={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                window.open(src, "_blank", "noopener,noreferrer");
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  window.open(src, "_blank", "noopener,noreferrer");
+                }
+              }}
+              className="my-1 inline-flex max-w-full cursor-pointer items-center gap-1.5 rounded-lg border bg-background px-3 py-1.5 text-sm hover:bg-accent"
+            >
+              <ImageIcon className="size-3.5 shrink-0 text-muted-foreground" />
+              <span className="min-w-0 flex-1 truncate font-medium text-foreground">{alt || "Image"}</span>
+              <span className="shrink-0 text-muted-foreground">{host}</span>
+            </span>
+          );
+        }
         return (
           <img
             {...props}
@@ -152,10 +207,12 @@ export const MarkdownContent = memo(function MarkdownContent({
   // When set, doc-relative links resolve absolute against this URL (the doc
   // viewer passes the doc's hosted URL); omit it for chat/skills rendering.
   linkBaseUrl?: string;
-  // When true, only `gini-upload://` image refs render and every other image
-  // `src` is dropped (the SSRF / tracking-pixel guard for UNTRUSTED
-  // model-authored chat/thinking text). Leave unset for trusted doc/file/skill
-  // markdown so ordinary images render. See ADR outbound-chat-attachments.md.
+  // When true, only `gini-upload://` image refs render inline; a foreign http(s)
+  // image is NOT auto-fetched (the SSRF / tracking-pixel guard for UNTRUSTED
+  // model-authored chat/thinking text) but renders an inert chip that loads only
+  // on explicit click, and a non-http(s) src is dropped entirely. Leave unset for
+  // trusted doc/file/skill markdown so ordinary images render. See ADR
+  // outbound-chat-attachments.md.
   dropForeignImages?: boolean;
 }) {
   return (

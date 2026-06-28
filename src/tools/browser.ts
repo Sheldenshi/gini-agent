@@ -461,7 +461,7 @@ const spawnedSessionProvider: BrowserSessionProvider = {
 // Attach to the user's OWN external Chrome over a CDP websocket URL they
 // supplied via /api/browser/connect. We NEVER spawn or kill this process — the
 // user owns it. connectOverCDP works under Bun via the bundled-ws→built-in-ws
-// patch (patches/playwright-core@1.61.0.patch); without it the CDP websocket
+// patch (patches/playwright-core@1.61.1.patch); without it the CDP websocket
 // handshake deadlocks. This is an opt-in transport for users who point us at
 // their own Chrome.
 const cdpSessionProvider: BrowserSessionProvider = {
