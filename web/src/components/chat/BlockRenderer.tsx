@@ -7,6 +7,7 @@ import { BlockSystemNote } from "./BlockSystemNote";
 import { BlockToolCall } from "./BlockToolCall";
 import { BlockUserText } from "./BlockUserText";
 import { TopicForwardChip } from "./TopicForwardChip";
+import { assertNever } from "@/lib/utils";
 
 // Dispatcher for the typed ChatBlock union. The switch is exhaustive on
 // `block.kind` — adding a new block kind requires a new case here, and
@@ -82,9 +83,7 @@ export function BlockRenderer({
       );
     case "system_note":
       return <BlockSystemNote block={block} />;
-    default: {
-      const exhaustive: never = block;
-      throw new Error(`Unknown chat block kind: ${JSON.stringify(exhaustive)}`);
-    }
+    default:
+      return assertNever(block);
   }
 }

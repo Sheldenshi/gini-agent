@@ -173,8 +173,12 @@ describe("BlockRenderer", () => {
   });
 
   test("an unknown kind throws via the exhaustive guard", () => {
+    // Call the dispatcher directly rather than through render(): React's
+    // reconciler swallows the synchronous throw into its own error path, which
+    // leaves the guard branch unattributed by coverage. A plain function call
+    // runs the switch in the test's own stack so the branch is counted.
     expect(() =>
-      render(<BlockRenderer block={{ ...base, kind: "nope" } as unknown as ChatBlock} />)
-    ).toThrow(/Unknown chat block kind/);
+      BlockRenderer({ block: { ...base, kind: "nope" } as unknown as ChatBlock })
+    ).toThrow(/Unexpected value/);
   });
 });
