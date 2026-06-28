@@ -1,8 +1,17 @@
 # ADR: One Chat Per Agent, Threads, And Job Channels
 
-- **Status:** Accepted
+- **Status:** Superseded by [Chat → Topics → Tasks → Subagents](./chat-topics-tasks-subagents.md) (2026-06-28)
 - **Date:** 2026-06-03
 - **See also:** [ChatBlock Protocol](./chat-block-protocol.md), [Agents Replace Profiles And Drive Runtime Behavior](./agents-replace-profiles.md), [Agent Loop With Native Tool Calling](./agent-loop-tool-calling.md), [Bounded Chat Context Window](./chat-context-window.md), [Mobile Push Notifications](./mobile-push-notifications.md)
+
+> **Superseded.** The thread model described below — one chat per agent, side-conversations as
+> `thread_id`-tagged spans of that one ordinal stream, the `start_thread` control tool, the
+> `<route>thread</route>` directive, and job channels — was replaced by **Topics**
+> ([Chat → Topics → Tasks → Subagents](./chat-topics-tasks-subagents.md)). Side-conversations are
+> now first-class subject-scoped Topic sessions with their own context windows; legacy threads were
+> converted into linear Chat history (their thread tags nulled), and job channels became job Topics
+> that forward their final answer into Chat. The decision below is retained as historical context for
+> how threading worked; see the replacement ADR for the current model.
 
 ## Decision
 

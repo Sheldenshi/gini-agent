@@ -12,7 +12,7 @@ Gini handles this by keeping chat as the interaction layer and creating durable 
 
 ## Records
 
-- **Chat session:** the conversation thread and messages.
+- **Chat session:** the conversation and its messages.
 - **Run:** a durable execution unit created from chat, CLI, jobs, messaging, or another runtime source.
 - **Plan step:** a visible step inside a run, with status and evidence.
 - **Task:** compatibility and tool-execution record for work that needs task semantics.
@@ -22,7 +22,7 @@ Gini handles this by keeping chat as the interaction layer and creating durable 
 Chat turns can create `conversation_turn` runs with plan steps and linked compatibility tasks. This preserves the seamless chat feel while keeping observability, approvals, retry, jobs, traces, and audit available.
 
 Chat history and model context are deliberately separate. Gini keeps the
-complete conversation durable, including thread blocks, tool transcripts,
+complete conversation durable, including chat blocks, tool transcripts,
 runs, traces, audit rows, and Hindsight memory. Each chat-task prompt gets a
 bounded prior-history replay tail instead of the whole transcript once the
 chat grows large; older exact details remain retrievable through

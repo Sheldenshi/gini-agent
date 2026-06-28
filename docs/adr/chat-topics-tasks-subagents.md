@@ -66,9 +66,9 @@ greenfield build:
 
 | New concept | Closest existing thing | Gap to close |
 |---|---|---|
-| **Topic** | `kind:"channel"` job session (a real session with its own stream) | Generalize beyond jobs; add `kind:"topic"` + `kind:"chat"`; give it a title/summary + findable identity |
+| **Topic** | `kind:"channel"` job session (a real session with its own stream) | Generalize beyond jobs; add `kind:"topic"` (Chat keeps `kind:"agent"`); give it a title/summary + findable identity |
 | **Chat** | the `kind:"agent"` canonical session (`getOrCreateAgentChat`) | Stop being the context owner; become a router/forwarder; keep "one per agent" |
-| **Task** | the parent `Task` that calls `spawn_subagent` | Add explicit task-states + a typed `{prompt,goal,context,tools,skills,memory}` input and a structured `{success|fail|needs_input}` return |
+| **Task** | the parent `Task` that calls `spawn_subagent` (already the Task tier) | Add the structured `needs_input` return so a unit of work can bubble "additional input needed" (no new record layer, no new status); optional `goal`/`context` framing |
 | **Subagent** | `SubagentRecord` + `spawnSubagent` (constrained child task, fresh narrow context) | Already the right shape; add the "needs input" return variant; elevate its fresh-context property to the Topic tier |
 | **Forward topic→chat** | job `finalize.ts` mirror + the "from \<job name\>" web/mobile segment badge | Generalize into a reusable Topic→Chat forwarder ("from #topic" + "View topic →") |
 | **Per-topic context window** | `priorChatMessages` already filters `m.sessionId === sessionId` | Once Topic = session, isolation is automatic; delete thread-priority packing |
@@ -91,19 +91,21 @@ The `kind:"agent"` session simply *plays the Chat role* in the new IA (surfaced 
   `getOrCreateAgentChat`, which only manages `kind:"agent"` sessions and therefore never
   demotes Topic siblings).
 - **`"topic"`** — a subject-scoped session (new). Carries:
-  - `topicTitle` — the `#name` shown in the sidebar.
-  - `topicSummary?` — a short rolling summary used for routing/retrieval (embedded).
-  - `parentChatSessionId?` — the Chat that spawned it (for forward-back).
+  - `title` (the existing session field, reused) — the `#name` shown in the sidebar.
+  - `topicSummary?` — a short rolling summary used for routing/retrieval (seeded from the
+    originating message; falls back to embedding-recall when there are many Topics).
+  - `parentChatSessionId?` — the Chat that spawned it (the forward-back target).
   - `origin?: "job"` for job-spawned Topics.
-- **`"channel"`** — legacy job channel; folds into `"topic"` during the Jobs→Topics phase
-  (kept readable until then).
+- **`"channel"`** — a job channel; functionally the job's Topic (its own session + context).
+  Kept as `kind:"channel"`; the cosmetic value-rename to `"topic"` is deferred (see
+  Implementation notes). Jobs forward into Chat via `JobRecord.forwardToChat`.
 
 `normalizeState` keeps existing `kind` values (no `"agent"`/`"channel"` rewrite) and only
 nulls legacy thread tags (Decision 3).
 
 ### Topic record vs. session extension
 
-**Recommended: a Topic IS a `ChatSessionRecord`** (a `kind:"topic"` session), not a new
+**A Topic IS a `ChatSessionRecord`** (a `kind:"topic"` session), not a new
 `TopicRecord` table. Rationale: per-topic context isolation, the block stream, SSE,
 `Last-Event-ID` resume, read-state, badge, and APNs all already key on `session_id` — a
 Topic-as-session inherits all of it for free. A parallel `TopicRecord` would re-derive that
@@ -113,20 +115,27 @@ unchanged.
 
 ### Task / Subagent
 
-- `Task` gains an explicit task-state lifecycle distinct from raw `TaskStatus` and a typed
-  input envelope `{prompt, goal, context, tools, skills, memory}`. The new **`needs_input`**
-  non-terminal state lets a Task bubble "additional input needed" up to its Topic (today the
-  only non-terminal pause is `waiting_approval`).
-- Subagent return becomes structured `{status, result | needsInput}` instead of the current
-  `resultSummary`/`resultError` strings.
-- The `parentTaskId` chain + `subagentDepth` cap (max 3) and `agentId` inheritance survive;
-  inserting the Task tier must preserve the depth-walk shape.
+- **The Task tier is the existing parent-`Task` + `spawnSubagent` edge** — a Topic turn *is*
+  the Task; `spawnSubagent` produces a constrained child Task. No new `TaskRecord` table and
+  no new persisted `TaskStatus`/`SubagentStatus` member is added (either would fork
+  `subagentDepth`, the cancel-cascade, `toolCallState` resume, and the renderers).
+- **"Additional input needed" is a structured return value**, not a persisted state: when a
+  subagent's `ask_user` has no answerable surface it returns `{needsInput, question}`, which
+  `spawnSubagentTool` surfaces to the parent (carried on `Task.needsInput` /
+  `SubagentRecord.resultNeedsInput`) so the parent re-asks via the existing
+  `ask_user`→forward path — no spurious wait-timeout. Optional `goal`/`context` framing
+  fields are added to the subagent input.
+- The `parentTaskId` chain + `subagentDepth` cap (max 3) and `agentId` inheritance are
+  preserved precisely *because* no record is inserted between parent and subagent.
 
 ### Forwarding
 
-A **forward** copies/links a Topic's final `assistant_text` into the Chat session as a
-forwarded block tagged with `topicId` + `topicTitle`, rendered as a "from #topic ·
-N messages · View topic →" chip (generalizing the existing "from \<job name\>" segment).
+A **forward** copies a Topic's final `assistant_text` into the Chat session as a render-only
+block tagged with `forwardedFromTopicId` + `forwardedFromTopicTitle` (carried in the block's
+`payload_json` — no schema migration), rendered as a "from #topic · View topic →" chip
+(generalizing the existing "from \<job name\>" segment). Pending gate cards
+(`setup_requested` / `authorization_requested`) from a Topic turn forward the same way and
+stay actionable in Chat (gates are global by id).
 The reverse — a Chat reply routed into a Topic — mirrors the user message into the Topic,
 runs the turn in the Topic's context, and forwards the answer back. `transcriptSessionId`
 for `persistFinalAnswerRow` must point at the **Topic** (replay correctness), even though
@@ -141,7 +150,7 @@ When a user posts in **Chat**, a lightweight **router** decides one of:
 2. **open-new-topic** — a new subject; mint a `kind:"topic"` session, run the work there,
    forward the final answer back to Chat.
 3. **continue-existing-topic** — find the right Topic for this subject and dispatch into it
-   (the "drafted an email, then later 'book the game tickets' → find the world-cup Topic"
+   (the "drafted an email about a trip, then later 'book the event tickets' → find the trip Topic"
    case), then forward back.
 
 **Mechanism (hybrid):** an embedding/recall pre-filter over Topic
@@ -192,8 +201,9 @@ into Chat tagged with the Topic. Consequences:
 
 ## Migration
 
-- `kind:"agent"` session → `kind:"chat"` (the renamed root). Untagged main-chat blocks stay.
-- `kind:"channel"` job session → `kind:"topic"` (trivial backfill — already separate sessions).
+- `kind:"agent"` session stays the Chat root (no rename). Its untagged main-chat blocks stay.
+- `kind:"channel"` job sessions stay `kind:"channel"` (each is the job's Topic) and gain
+  `forwardToChat` semantics — no kind rewrite.
 - Jobs whose `deliverTo:"chat"` pointed `chatSessionId` at the user's conversation get a
   **minted Topic** + `forwardToChat=true` (they have no dedicated Topic today).
 - **Legacy threads:** *recommended* — freeze in place, readable as-is; new subjects become
@@ -218,14 +228,16 @@ into Chat tagged with the Topic. Consequences:
    Topics. (No block re-homing / ordinal re-basing — the blocks already share the agent
    session's one ordinal stream, so this is a nulling backfill.)
 4. **The full hierarchy ships, including the Task tier.** Topics + routing + forwarding +
-   context isolation + Jobs→Topics **and** the explicit Task state-machine (`needs_input`
-   structured return). Thorough automated tests plus a live-gateway dogfood gate each phase.
+   context isolation + Jobs→Topics **and** the Task tier — realized as the `needs_input`
+   structured return on the existing parent-Task + `spawnSubagent` edge (no new record layer
+   or persisted status; see Implementation notes). Thorough automated tests plus a
+   live-gateway dogfood gate each phase.
 
 ## Phasing (proposed)
 
-1. **Topic data model + per-topic context isolation** — `kind:"chat"|"topic"`,
-   `getOrCreateChat`, `createTopic`, scope the packer to the topic session, delete
-   thread-priority packing; `normalizeState` backfill. (Backend; the core win.)
+1. **Topic data model + per-topic context isolation** — add `kind:"topic"`, `createTopic`,
+   per-topic packer scope (a topic replays its own session); `normalizeState` thread→linear
+   backfill. (Backend; the core win.)
 2. **Chat→Topic routing + forwarding** — the router (open/route + retrieval), the
    topic↔chat forward bus, cross-session queue handling.
 3. **Jobs → Topics** — job creates a Topic; `forwardToChat`; retire deferral-by-skip.

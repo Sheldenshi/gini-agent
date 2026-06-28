@@ -106,9 +106,11 @@ The source abort closes the issue-#395 stuck-cursor at the source, but a
 brief window still exists between the abort firing and the stream fully
 unwinding in which a buffered delta can arrive. As defense-in-depth the
 streaming flush re-checks terminal status and drops post-cancel deltas
-(no new `assistant_text` block is born after the cancel), and
-`switchTurnToThread` refuses to emit a main-chat `phase("Completed")`
-once the task is terminal. A streaming block leaked by a process that
+(no new `assistant_text` block is born after the cancel); the same
+terminal-status guard also suppressed a stray `phase("Completed")` once
+the task was terminal (formerly in the now-removed `switchTurnToThread`
+turn-routing helper — superseded by Topics, see
+[chat-topics-tasks-subagents.md](chat-topics-tasks-subagents.md)). A streaming block leaked by a process that
 died mid-stream before this protocol landed is healed on the next boot
 by `healOrphanedStreamingBlocks`. See
 [chat-block-protocol.md](chat-block-protocol.md) for the block-level wire
