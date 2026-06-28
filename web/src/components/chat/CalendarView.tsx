@@ -344,17 +344,20 @@ export function CalendarView({ raw }: { raw: string }) {
       </div>
 
       {allDay.length > 0 ? (
-        <div className="flex gap-2 border-b px-3 py-2">
+        <div className="flex gap-1 border-b px-3 py-2">
+          <div className="w-9 shrink-0" />
           {view === "week" ? (
-            days.map((d) => (
-              <div key={d} className="flex min-w-0 flex-1 flex-col gap-1">
-                {allDay
-                  .filter((e) => e.date === d)
-                  .map((e, k) => (
-                    <AllDayChip key={k} ev={e} />
-                  ))}
-              </div>
-            ))
+            <div className="flex flex-1 gap-1">
+              {days.map((d) => (
+                <div key={d} className="flex min-w-0 flex-1 flex-col gap-1">
+                  {allDay
+                    .filter((e) => e.date === d)
+                    .map((e, k) => (
+                      <AllDayChip key={k} ev={e} />
+                    ))}
+                </div>
+              ))}
+            </div>
           ) : (
             <div className="flex min-w-0 flex-1 flex-wrap gap-1">
               {allDay.map((e, k) => (
@@ -366,18 +369,21 @@ export function CalendarView({ raw }: { raw: string }) {
       ) : null}
 
       {view === "week" ? (
-        <div className="flex border-b px-3 pt-2 pl-12 text-[11px] font-medium text-muted-foreground">
-          {days.map((d) => (
-            <div
-              key={d}
-              className={cn(
-                "flex-1 text-center",
-                d === anchor && "text-foreground underline underline-offset-2"
-              )}
-            >
-              {WEEKDAYS[ymdToUTC(d).getUTCDay()]} {ymdToUTC(d).getUTCDate()}
-            </div>
-          ))}
+        <div className="flex border-b px-3 pt-2 text-[11px] font-medium text-muted-foreground">
+          <div className="w-9 shrink-0" />
+          <div className="flex flex-1 gap-1">
+            {days.map((d) => (
+              <div
+                key={d}
+                className={cn(
+                  "flex-1 text-center",
+                  d === anchor && "text-foreground underline underline-offset-2"
+                )}
+              >
+                {WEEKDAYS[ymdToUTC(d).getUTCDay()]} {ymdToUTC(d).getUTCDate()}
+              </div>
+            ))}
+          </div>
         </div>
       ) : null}
 
