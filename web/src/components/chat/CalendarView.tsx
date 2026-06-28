@@ -270,7 +270,7 @@ function DayColumn({
 }) {
   const placed = packDay(events);
   return (
-    <div className="relative flex-1" style={{ height: (endHour - startHour) * PX_PER_HOUR }}>
+    <div className="relative flex-1 overflow-hidden" style={{ height: (endHour - startHour) * PX_PER_HOUR }}>
       {Array.from({ length: endHour - startHour }, (_, k) => (
         <div key={k} className="border-b border-border/60" style={{ height: PX_PER_HOUR }} />
       ))}
