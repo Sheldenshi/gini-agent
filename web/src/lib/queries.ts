@@ -27,8 +27,7 @@ import type {
 import type {
   ChatMessage,
   ChatSession,
-  RuntimeStateSnapshot,
-  ThreadSummary
+  RuntimeStateSnapshot
 } from "@/lib/view-types";
 
 export function useStatus(options?: Partial<UseQueryOptions<RuntimeStatus>>) {
@@ -676,7 +675,7 @@ export function useChatBlocks(
   // terminal frame and strands the UI on "Thinking". 3s matches the
   // session-list / agent-chat cadence; clears once terminal or the
   // session changes.
-  const active = useMemo(() => anyConversationInFlight(blocks), [blocks]);
+  const active = useMemo(() => latestInFlightTaskId(blocks) !== null, [blocks]);
   useEffect(() => {
     if (!sessionId || !active) return;
     const id = setInterval(refetch, 3000);
@@ -703,20 +702,6 @@ export function useChatBlocks(
   return { blocks, isLoading, error, refetch, pendingMessages };
 }
 
-// True when the main chat OR any thread has a non-terminal tail. The flat
-// block list interleaves thread blocks in the same ordinal stream, so a
-// single tail-scan would conflate conversations — a thread's terminal
-// phase landing last would mask a still-running main turn (and vice
-// versa). Evaluate each conversation slice independently and OR them.
-export function anyConversationInFlight(blocks: ChatBlock[]): boolean {
-  const { main, byThread } = splitBlocks(blocks);
-  if (latestInFlightTaskId(main) !== null) return true;
-  for (const threadBlocks of byThread.values()) {
-    if (latestInFlightTaskId(threadBlocks) !== null) return true;
-  }
-  return false;
-}
-
 // The single canonical chat for an agent. Resolves via
 // GET /api/agents/:agentId/chat (the runtime get-or-create resolver), so the
 // first read for a fresh agent materializes its one session. Gated on a
@@ -729,165 +714,6 @@ export function useAgentChat(agentId: string | null | undefined) {
     // Match the session-list cadence so the header/tab badges pick up new
     // activity even when an SSE invalidation is missed.
     refetchInterval: 3000
-  });
-}
-
-// Split a session's block list into the main chat (threadId absent) and a
-// per-thread map. The chat transcript renders `main`; the thread panel reads
-// `byThread.get(threadId)`. Pure derivation over the live block list so both
-// views stay in lock-step with the same SSE stream — no second source of
-// truth. Exported for the chat page and ThreadPanel to share one fetch.
-export function splitBlocks(blocks: ChatBlock[]): {
-  main: ChatBlock[];
-  byThread: Map<string, ChatBlock[]>;
-} {
-  const main: ChatBlock[] = [];
-  const byThread = new Map<string, ChatBlock[]>();
-  for (const block of blocks) {
-    if (block.threadId) {
-      const list = byThread.get(block.threadId);
-      if (list) list.push(block);
-      else byThread.set(block.threadId, [block]);
-    } else {
-      main.push(block);
-    }
-  }
-  return { main, byThread };
-}
-
-// Thread summaries for one session — drives the per-agent Threads tab and the
-// inline reply chips. Validates the session exists server-side (404s a stale
-// link). Polled like the session list so reply counts stay fresh.
-export function useThreads(sessionId: string | null) {
-  return useQuery<ThreadSummary[]>({
-    queryKey: ["threads", sessionId ?? null],
-    queryFn: () => api<ThreadSummary[]>(`/chat/${sessionId}/threads`),
-    enabled: Boolean(sessionId),
-    refetchInterval: 3000
-  });
-}
-
-// One thread's blocks. Seeds from GET /chat/:id/threads/:threadId/blocks and
-// then rides the shared per-session SSE, filtering live frames by threadId —
-// so a reply streaming into the thread updates the open panel without a
-// second poll. Mirrors useChatBlocks' merge/seed/reset contract, narrowed to
-// the one thread.
-export function useThread(sessionId: string | null, threadId: string | null) {
-  const [blocks, setBlocks] = useState<ChatBlock[]>([]);
-  const [isLoading, setIsLoading] = useState<boolean>(Boolean(sessionId && threadId));
-  const [error, setError] = useState<Error | null>(null);
-
-  const activeKeyRef = useRef<string | null>(sessionId && threadId ? `${sessionId}::${threadId}` : null);
-  const key = sessionId && threadId ? `${sessionId}::${threadId}` : null;
-  activeKeyRef.current = key;
-
-  useEffect(() => {
-    setBlocks([]);
-    setError(null);
-
-    if (!sessionId || !threadId) {
-      setIsLoading(false);
-      return;
-    }
-
-    let cancelled = false;
-    setIsLoading(true);
-
-    const merge = (incoming: ChatBlock) => {
-      if (cancelled || activeKeyRef.current !== key) return;
-      // The shared session stream carries main-chat and thread frames alike;
-      // keep only this thread's.
-      if (incoming.threadId !== threadId) return;
-      setBlocks((prev) => {
-        const idx = prev.findIndex((b) => b.id === incoming.id);
-        if (idx >= 0) {
-          const next = prev.slice();
-          next[idx] = incoming;
-          return next;
-        }
-        const next = [...prev, incoming];
-        next.sort((a, b) => a.ordinal - b.ordinal);
-        return next;
-      });
-    };
-
-    api<ChatBlock[]>(`/chat/${sessionId}/threads/${threadId}/blocks`)
-      .then((initial) => {
-        if (cancelled || activeKeyRef.current !== key) return;
-        setBlocks((prev) => mergeSeedWithLive(initial, prev));
-        setIsLoading(false);
-      })
-      .catch((err: Error) => {
-        if (cancelled || activeKeyRef.current !== key) return;
-        setError(err);
-        setIsLoading(false);
-      });
-
-    // Same resilient transport as useChatBlocks — survives the gateway-down
-    // 503 that permanently closes a bare EventSource.
-    const stream = openResilientEventSource(`/api/runtime/chat/${sessionId}/stream`, {
-      attach: (source) => {
-        source.addEventListener("chat_block", (event) => {
-          const messageEvent = event as MessageEvent;
-          try {
-            merge(JSON.parse(messageEvent.data) as ChatBlock);
-          } catch {
-            // Ignore a malformed frame; the next one will land.
-          }
-        });
-      }
-    });
-    return () => {
-      cancelled = true;
-      stream.close();
-    };
-  }, [sessionId, threadId, key]);
-
-  return { blocks, isLoading, error };
-}
-
-// Cross-agent thread inbox. The server returns the full list (enriched with
-// agentName, newest first); `filter=unread` is applied client-side from
-// read-state, so we always fetch `all` and let the caller hide read rows.
-export function useThreadsInbox() {
-  return useQuery<ThreadSummary[]>({
-    queryKey: ["threads-inbox"],
-    queryFn: () => api<ThreadSummary[]>("/threads?filter=all"),
-    refetchInterval: 3000
-  });
-}
-
-// Post a reply into a thread. Invalidates chat/threads so the chip count and
-// inbox advance once the run is accepted. `parentBlockId` is required only when
-// the user starts a brand-new thread (no blocks yet) — it tells the backend
-// which main-chat message the thread branches from. Replies to an existing
-// thread omit it and the backend inherits the parent from the thread's blocks.
-export function useReplyToThread(sessionId: string | null, threadId: string | null) {
-  const qc = useQueryClient();
-  return useMutation<
-    // A reply runs immediately, or queues behind a live turn (ADR
-    // chat-message-queue.md) and returns the pending id instead.
-    | { sessionId: string; threadId: string; runId: string; taskId: string; status: string }
-    | { sessionId: string; queued: true; pendingId: string },
-    Error,
-    {
-      content: string;
-      images?: { id: string; mimeType: string; size: number }[];
-      alsoToMain?: boolean;
-      parentBlockId?: string;
-    }
-  >({
-    mutationFn: (input) =>
-      api(`/chat/${sessionId}/threads/${threadId}/messages`, {
-        method: "POST",
-        body: JSON.stringify({ ...input, client: "web" })
-      }),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["chat"] });
-      qc.invalidateQueries({ queryKey: ["threads"] });
-      qc.invalidateQueries({ queryKey: ["threads-inbox"] });
-      qc.invalidateQueries({ queryKey: ["tasks"] });
-    }
   });
 }
 

@@ -829,8 +829,8 @@ function stripDocumentPartsIfUnsupported(
 // Both APIs require every assistant `tool_use` block to be answered by a
 // `tool_result` in the immediately-following message, and reject an orphan
 // `tool_result` with no preceding `tool_use`. A history can carry an unpaired
-// pair when an inline-handled tool (load_tools, the deferred-not-loaded nudge,
-// start_thread) pushed its result into the live turn but never persisted a
+// pair when an inline-handled tool (load_tools, the deferred-not-loaded nudge)
+// pushed its result into the live turn but never persisted a
 // transcript row — so a later replay reconstructs the assistant tool_use
 // without its result. chat-task's priorChatMessages does a similar pass, but
 // this is the request-build backstop that catches ANY path (resume snapshots,

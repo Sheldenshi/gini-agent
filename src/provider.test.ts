@@ -5350,8 +5350,8 @@ describe("anthropic provider", () => {
   });
 
   // Issue #397: a transcript can carry an assistant tool_use whose tool_result
-  // was never persisted (inline-handled load_tools / deferred-nudge /
-  // start_thread push the result into the live turn only). Replaying it into a
+  // was never persisted (inline-handled load_tools / deferred-nudge push the
+  // result into the live turn only). Replaying it into a
   // tool-pairing-strict provider must NOT 400 — the request builder drops the
   // dangling tool_use (and any orphan tool_result) before translating.
   test("bedrock: drops a dangling tool_use whose tool_result is missing", async () => {

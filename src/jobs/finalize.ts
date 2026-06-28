@@ -13,7 +13,7 @@
 
 import type { RuntimeConfig, RuntimeState, Task } from "../types";
 import { addAudit, appendEvent, appendLog, insertChatBlock, isTerminalTaskStatus, mutateState, now, readState } from "../state";
-import { syncChatTaskResult } from "../execution/chat";
+import { getOrCreateAgentChat, syncChatTaskResult } from "../execution/chat";
 import { providerAuthFailureText, providerDisplayLabel, providerReauth } from "../provider";
 import { isSilentReply } from "./silent";
 // `sendMessagingOutput` is imported lazily inside the bridge-dispatch
@@ -46,6 +46,14 @@ export async function finalizeJobRunFromTask(config: RuntimeConfig, task: Task):
   let chatSessionIdToSync: string | undefined;
   let runFinalized = false;
   let skillSkips: Array<{ name: string; reason: string }> | undefined;
+  // Forward-to-Chat context (ADR chat-topics-tasks-subagents.md, "Jobs →
+  // Topics"). Captured inside the write so the post-write forward uses the same
+  // view we used to flip the run. When the job opted into forwardToChat, the
+  // final answer materialized in the job's Topic is also surfaced in the owning
+  // agent's Chat, tagged with the Topic.
+  let forwardToChat = false;
+  let forwardAgentId: string | undefined;
+  let forwardTopicTitle: string | undefined;
   await mutateState(config.instance, (state) => {
     // Match the run by taskId first (most reliable), fall back to the
     // most recent running run for the job (covers older runs whose
@@ -109,6 +117,15 @@ export async function finalizeJobRunFromTask(config: RuntimeConfig, task: Task):
       // deadlock the state queue.
       if (job.chatSessionId) {
         chatSessionIdToSync = job.chatSessionId;
+        // Stage the Topic → Chat forward when the job opted in. The Topic is
+        // the dedicated job session; its title is the forward chip label, and
+        // job.agentId resolves the owning agent's Chat after the write closes.
+        if (job.forwardToChat === true && run.status === "completed" && job.agentId) {
+          forwardToChat = true;
+          forwardAgentId = job.agentId;
+          forwardTopicTitle =
+            state.chatSessions.find((s) => s.id === job.chatSessionId)?.title ?? job.name;
+        }
       }
     }
     appendEvent(
@@ -182,6 +199,41 @@ export async function finalizeJobRunFromTask(config: RuntimeConfig, task: Task):
             jobId: task.jobId,
             taskId: task.id,
             sessionId: chatSessionIdToSync,
+            error: error instanceof Error ? error.message : String(error)
+          });
+        }
+      }
+      // Topic → Chat forward (ADR chat-topics-tasks-subagents.md, "Jobs →
+      // Topics"). When the job opted into forwardToChat, surface a render-only
+      // copy of the final answer in the owning agent's Chat, tagged with the
+      // job's Topic for a deep-link chip — instead of burying the job's reports
+      // inside the user's conversation. The replay-authoritative answer already
+      // landed in the Topic (syncChatTaskResult above). Empty / `[SILENT]`
+      // replies forward nothing (resolveJobReplyText suppresses them).
+      // Best-effort: a forward failure must never fail the job run.
+      if (forwardToChat && forwardAgentId) {
+        try {
+          const forwardText = resolveJobReplyText(readState(config.instance), chatSessionIdToSync, task);
+          if (forwardText !== undefined) {
+            const chat = await getOrCreateAgentChat(config.instance, forwardAgentId);
+            insertChatBlock(config.instance, {
+              kind: "assistant_text",
+              sessionId: chat.id,
+              text: forwardText,
+              streaming: false,
+              taskId: task.id,
+              runId: task.runId,
+              agentId: forwardAgentId,
+              forwardedFromTopicId: chatSessionIdToSync,
+              forwardedFromTopicTitle: forwardTopicTitle ?? "Job"
+            });
+          }
+        } catch (error) {
+          appendLog(config.instance, "job.chat.forward.error", {
+            jobId: task.jobId,
+            taskId: task.id,
+            topicId: chatSessionIdToSync,
+            agentId: forwardAgentId,
             error: error instanceof Error ? error.message : String(error)
           });
         }

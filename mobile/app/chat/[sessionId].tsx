@@ -28,9 +28,8 @@ import { BlockRenderer } from "@/src/components/chat/BlockRenderer";
 import { BlockToolCallsCollapsed } from "@/src/components/chat/BlockToolCallsCollapsed";
 import { GeneratedFilesCard } from "@/src/components/chat/GeneratedFilesCard";
 import { QueuedMessages } from "@/src/components/chat/QueuedMessages";
-import { ReplyInThreadPill, ThreadRepliesChip } from "@/src/components/chat/ThreadChip";
 import { VoiceRecorder, type VoiceRef } from "@/src/components/chat/VoiceRecorder";
-import { chatListTime, jobCadence, relativeTime } from "@/src/format";
+import { chatListTime, jobCadence } from "@/src/format";
 import { groupExchanges, type ChatRenderItem } from "@/src/group-exchanges";
 import { getCachedDeviceToken, refreshBadge, registerForPushAsync } from "@/src/push";
 import {
@@ -42,14 +41,12 @@ import {
   useJobs,
   useRemovePendingChatMessage,
   useSendMessage,
-  useThreads,
   useVoiceStatus
 } from "@/src/queries";
-import { indexThreadsByParentBlock } from "@/src/thread-routing";
 import { family, theme } from "@/src/theme";
-import type { ChatBlock, JobRecord, ThreadSummary } from "@/src/types";
+import type { ChatBlock, JobRecord } from "@/src/types";
 
-type ChatTab = "messages" | "threads" | "jobs";
+type ChatTab = "messages" | "jobs";
 
 interface PendingAttachment {
   localId: string;
@@ -101,28 +98,6 @@ function describeAsset(asset: ImagePicker.ImagePickerAsset): {
 
 const TERMINAL_PHASE_LABELS = new Set<string>(["Completed", "Cancelled", "Failed"]);
 
-// Mint a thread id and open the Thread View for a brand-new thread the user
-// is starting off an assistant message. The thread doesn't exist yet (no
-// blocks), so the parent block id + its text ride along as route params; the
-// Thread View renders them as the pinned parent and the first reply (carrying
-// parentBlockId) brings the thread into existence. crypto.randomUUID isn't
-// available under Hermes, so the id is timestamp + random.
-function openNewThread(
-  sessionId: string,
-  block: Extract<ChatBlock, { kind: "assistant_text" }>
-): void {
-  const threadId = `thread_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
-  router.push({
-    pathname: "/chat/[sessionId]/thread/[threadId]",
-    params: {
-      sessionId,
-      threadId,
-      parentBlockId: block.id,
-      rootPreview: block.text
-    }
-  });
-}
-
 function findInFlightTaskId(blocks: ChatBlock[]): string | null {
   for (let i = blocks.length - 1; i >= 0; i -= 1) {
     const b = blocks[i]!;
@@ -150,16 +125,15 @@ function itemJobName(item: ChatRenderItem, runIdToJobName: Map<string, string>):
   return undefined;
 }
 
-// Single-agent chat: an agent header, a Messages / Threads / Jobs tab
-// bar, and the active tab's content. Messages reuses the existing block
-// pipeline (filtered to the main chat — threaded blocks live in the
-// Thread View) and attaches inline thread chips to the assistant blocks
-// that host a thread. Threads lists the session's threads; Jobs lists
-// the agent's recurring jobs. The composer stays mounted under every tab.
+// Single-agent chat: an agent header, a Messages / Jobs tab bar, and the
+// active tab's content. Messages renders every block of the session linearly
+// in ordinal order (side-conversations now live in their own Topic sessions,
+// not threads). Jobs lists the agent's recurring jobs. The composer stays
+// mounted under every tab. A `kind:"topic"` session reads as `#<title>` in the
+// header and hides the Jobs tab.
 export default function ChatDetailScreen() {
   const { sessionId } = useLocalSearchParams<{ sessionId: string }>();
   const stream = useChatStream(sessionId ?? null);
-  const threads = useThreads(sessionId ?? null);
   const send = useSendMessage(sessionId ?? null);
   const voice = useVoiceStatus();
   const cancel = useCancelTask();
@@ -206,18 +180,17 @@ export default function ChatDetailScreen() {
   const agentName = agent?.name ?? stream.session?.title?.trim() ?? "Chat";
   const agentOnline = agent?.status === "ready" || agent?.status === "active";
 
+  // A `kind:"topic"` session is a subject-scoped side-conversation: it carries
+  // its own title and reads as `#<title>` in the header. Its Jobs tab is hidden
+  // (topics don't own recurring jobs) and it shows no agent online status.
+  const isTopic = stream.session?.kind === "topic";
+  const headerName = isTopic
+    ? `#${stream.session?.title?.trim() || "topic"}`
+    : agentName;
+
   // The Jobs tab is per-agent; gate the fetch on the resolved agent id so
   // it doesn't run before the session record loads.
   const jobs = useJobs(agent?.id ?? null);
-
-  const threadSummaries = threads.data ?? [];
-  // Index threads by the main-chat block they branched from so the
-  // Messages tab can attach a "N replies" chip under that assistant
-  // block. parentBlockId is the assistant_text the thread roots at.
-  const threadByParentBlock = useMemo(
-    () => indexThreadsByParentBlock(threadSummaries),
-    [threadSummaries]
-  );
 
   // Mark the chat as read once we know which block id is latest.
   const lastReadBlockIdRef = useRef<string | null>(null);
@@ -591,40 +564,13 @@ export default function ChatDetailScreen() {
     if (item.kind === "file_artifact") {
       return <GeneratedFilesCard key={item.id} files={item.files} />;
     }
-    // A thread can branch off either an assistant reply (the user's own
-    // "Reply in thread") or the user's message (an agent-routed turn), so look
-    // up a chip for both. Render the block then the inline "N replies" chip
-    // beneath it. A finished assistant reply with no thread yet shows the
-    // "Reply in thread" pill so the user can start one.
     const block = item.block;
-    const thread =
-      block.kind === "assistant_text" || block.kind === "user_text"
-        ? threadByParentBlock.get(block.id)
-        : undefined;
-    const canStartThread = block.kind === "assistant_text" && !block.streaming && !thread;
     return (
-      <View key={block.id}>
-        <BlockRenderer
-          block={block}
-          toolResult={block.kind === "tool_call" ? toolResultsByCallId.get(block.callId) : undefined}
-        />
-        {thread ? (
-          <View style={styles.threadChipWrap}>
-            <ThreadRepliesChip
-              replyCount={thread.replyCount}
-              lastReplyAt={thread.lastReplyAt}
-              // User messages are right-aligned, so align the chip to the
-              // message it branched from.
-              align={block.kind === "user_text" ? "end" : "start"}
-              onPress={() => router.push(`/chat/${sessionId}/thread/${thread.threadId}`)}
-            />
-          </View>
-        ) : canStartThread ? (
-          <View style={styles.threadChipWrap}>
-            <ReplyInThreadPill onPress={() => openNewThread(sessionId, block)} />
-          </View>
-        ) : null}
-      </View>
+      <BlockRenderer
+        key={block.id}
+        block={block}
+        toolResult={block.kind === "tool_call" ? toolResultsByCallId.get(block.callId) : undefined}
+      />
     );
   };
 
@@ -645,43 +591,46 @@ export default function ChatDetailScreen() {
         >
           <Feather name="chevron-left" size={26} color={theme.text} />
         </TouchableOpacity>
-        <AgentAvatar name={agentName} size={38} />
+        <AgentAvatar name={isTopic ? headerName : agentName} size={38} />
         <View style={styles.headerText}>
           <Text style={styles.headerName} numberOfLines={1}>
-            {agentName}
+            {headerName}
           </Text>
-          <View style={styles.headerStatusRow}>
-            <View
-              style={[
-                styles.statusDot,
-                { backgroundColor: agentOnline ? "#34C759" : "#C7C7CC" }
-              ]}
-            />
-            <Text style={styles.headerStatus}>{agentOnline ? "Ready" : "Idle"}</Text>
-          </View>
+          {/* A topic isn't an agent, so it shows no online status — just the
+              subject title. The agent surface keeps its Ready/Idle dot. */}
+          {isTopic ? (
+            <Text style={styles.headerStatus}>topic</Text>
+          ) : (
+            <View style={styles.headerStatusRow}>
+              <View
+                style={[
+                  styles.statusDot,
+                  { backgroundColor: agentOnline ? "#34C759" : "#C7C7CC" }
+                ]}
+              />
+              <Text style={styles.headerStatus}>{agentOnline ? "Ready" : "Idle"}</Text>
+            </View>
+          )}
         </View>
         <View style={styles.headerSpacer} />
       </View>
 
-      {/* Tab bar — Messages / Threads (count) / Jobs (count). */}
+      {/* Tab bar — Messages / Jobs (count). The Jobs tab is hidden on a
+          topic surface (topics don't own recurring jobs). */}
       <View style={styles.tabBar}>
         <TabButton
           label="Messages"
           active={tab === "messages"}
           onPress={() => setTab("messages")}
         />
-        <TabButton
-          label="Threads"
-          active={tab === "threads"}
-          count={threadSummaries.length}
-          onPress={() => setTab("threads")}
-        />
-        <TabButton
-          label="Jobs"
-          active={tab === "jobs"}
-          count={jobs.data?.length ?? 0}
-          onPress={() => setTab("jobs")}
-        />
+        {!isTopic ? (
+          <TabButton
+            label="Jobs"
+            active={tab === "jobs"}
+            count={jobs.data?.length ?? 0}
+            onPress={() => setTab("jobs")}
+          />
+        ) : null}
       </View>
 
       <KeyboardAvoidingView
@@ -762,18 +711,12 @@ export default function ChatDetailScreen() {
             </TouchableOpacity>
           ) : null}
           </View>
-        ) : tab === "threads" ? (
-          <ThreadsTab
-            sessionId={sessionId ?? null}
-            threads={threadSummaries}
-            loading={threads.isLoading}
-          />
         ) : (
           <JobsTab jobs={jobs.data ?? []} loading={jobs.isLoading} />
         )}
 
         {/* Composer — shared across tabs; sending always posts to the
-            main chat. */}
+            session's chat. */}
         <View style={styles.inputBar}>
           <QueuedMessages
             pending={pendingMessages}
@@ -867,7 +810,7 @@ export default function ChatDetailScreen() {
             <TextInput
               value={text}
               onChangeText={setText}
-              placeholder={`Message ${agentName}…`}
+              placeholder={`Message ${headerName}…`}
               placeholderTextColor={theme.inputPlaceholder}
               multiline
               editable={!!sessionId}
@@ -979,64 +922,6 @@ function TabButton({
         ) : null}
       </View>
     </TouchableOpacity>
-  );
-}
-
-// Threads tab — a list of the session's threads. Each row opens the
-// Slack-style Thread View.
-function ThreadsTab({
-  sessionId,
-  threads,
-  loading
-}: {
-  sessionId: string | null;
-  threads: ThreadSummary[];
-  loading: boolean;
-}) {
-  if (loading && threads.length === 0) {
-    return (
-      <View style={styles.center}>
-        <ActivityIndicator color={theme.muted} />
-      </View>
-    );
-  }
-  if (threads.length === 0) {
-    return (
-      <View style={styles.tabEmpty}>
-        <Feather name="message-square" size={28} color={theme.placeholder} />
-        <Text style={styles.tabEmptyText}>No threads yet</Text>
-        <Text style={styles.tabEmptySub}>
-          Threads branch off the agent&apos;s replies for deeper back-and-forth.
-        </Text>
-      </View>
-    );
-  }
-  return (
-    <ScrollView contentContainerStyle={styles.tabListContent}>
-      {threads.map((thread) => (
-        <TouchableOpacity
-          key={thread.threadId}
-          onPress={() => router.push(`/chat/${sessionId}/thread/${thread.threadId}`)}
-          activeOpacity={0.7}
-          style={styles.threadRow}
-          accessibilityRole="button"
-          accessibilityLabel={`Open thread, ${thread.replyCount} replies`}
-        >
-          <Text style={styles.threadRowPreview} numberOfLines={2}>
-            {thread.rootPreview?.trim() || thread.lastReplyPreview?.trim() || "Thread"}
-          </Text>
-          <View style={styles.threadRowFooter}>
-            <Text style={styles.threadRowReplies}>
-              {thread.replyCount} {thread.replyCount === 1 ? "reply" : "replies"}
-            </Text>
-            <Text style={styles.threadRowSep}>·</Text>
-            <Text style={styles.threadRowLast}>
-              last reply {relativeTime(thread.lastReplyAt)}
-            </Text>
-          </View>
-        </TouchableOpacity>
-      ))}
-    </ScrollView>
   );
 }
 
@@ -1168,7 +1053,6 @@ const styles = StyleSheet.create({
     paddingBottom: 24,
     gap: 16
   },
-  threadChipWrap: { marginTop: 8 },
   // Job-delivered run container: light-blue left border + faint tint so a
   // scheduled job's messages stand apart from the user's own conversation.
   jobRun: {
@@ -1198,7 +1082,7 @@ const styles = StyleSheet.create({
     fontSize: 18
   },
 
-  // Threads / Jobs tab shared list.
+  // Jobs tab list.
   tabListContent: { paddingVertical: 4 },
   tabEmpty: {
     flex: 1,
@@ -1218,37 +1102,6 @@ const styles = StyleSheet.create({
     fontSize: 14,
     textAlign: "center",
     lineHeight: 20
-  },
-
-  // Thread list row.
-  threadRow: {
-    paddingHorizontal: 16,
-    paddingVertical: 14,
-    gap: 8,
-    borderBottomWidth: 1,
-    borderBottomColor: theme.border
-  },
-  threadRowPreview: {
-    color: "#2A2A2C",
-    fontFamily: family("HankenGrotesk", 500),
-    fontSize: 15,
-    lineHeight: 21
-  },
-  threadRowFooter: { flexDirection: "row", alignItems: "center", gap: 6 },
-  threadRowReplies: {
-    color: "#2F6BFF",
-    fontFamily: family("HankenGrotesk", 700),
-    fontSize: 13
-  },
-  threadRowSep: {
-    color: "#AEBBE8",
-    fontFamily: family("HankenGrotesk", 600),
-    fontSize: 12
-  },
-  threadRowLast: {
-    color: "#7A86A8",
-    fontFamily: family("HankenGrotesk", 500),
-    fontSize: 12
   },
 
   // Job list row.

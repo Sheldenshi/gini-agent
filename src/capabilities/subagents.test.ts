@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   clearEchoToolCallingResponses,
+  getEchoToolCallingCalls,
   setEchoToolCallingResponse,
   normalizeProvider
 } from "../provider";
@@ -476,5 +477,146 @@ describe("subagent runtime (Slice 4)", () => {
     expect(child?.status).toBe("cancelled");
     const subRecord = stateAfter.subagents.find((s) => s.parentTaskId === parent.id);
     expect(subRecord?.status).toBe("cancelled");
+  });
+
+  test("a subagent's unanswerable ask_user bubbles up as status:needs_input (no timeout)", async () => {
+    const config = buildConfig(workspaceRoot, "subagent-needs-input");
+    const provider = normalizeProvider(config.provider);
+
+    // Parent turn 1: spawn a subagent (with a short timeout so a regression to
+    // the busy-poll-to-timeout path would be caught quickly by waitForTerminal,
+    // not mask itself as a pass).
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        {
+          id: "call_spawn",
+          type: "function",
+          function: {
+            name: "spawn_subagent",
+            arguments: JSON.stringify({ name: "picker", prompt: "decide a thing", timeout_ms: 4000 })
+          }
+        }
+      ],
+      finishReason: "tool_calls"
+    });
+    // Subagent turn 1: it calls ask_user. The child task has no chat surface,
+    // so the surface guard returns the structured needs_input marker as the
+    // tool result instead of parking on waiting_approval.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        {
+          id: "call_ask",
+          type: "function",
+          function: {
+            name: "ask_user",
+            arguments: JSON.stringify({
+              question: "Which option do you want?",
+              options: [{ label: "A" }, { label: "B" }]
+            })
+          }
+        }
+      ],
+      finishReason: "tool_calls"
+    });
+    // Subagent turn 2: having seen the marker, it just finishes (its own loop
+    // produces a final answer and the child task completes — terminal).
+    setEchoToolCallingResponse({
+      provider,
+      text: "I need to know which option.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+    // Parent turn 2: final answer (consumed after the subagent terminates).
+    setEchoToolCallingResponse({
+      provider,
+      text: "Relaying the subagent's question.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const parent = await submitTask(config, "delegate a decision", { mode: "chat" });
+    const finished = await waitForTerminal(config, parent.id, 8000);
+    expect(finished.status).toBe("completed");
+
+    const state = readState(config.instance);
+    const sub = state.subagents.find((s) => s.parentTaskId === parent.id);
+    expect(sub).toBeDefined();
+    // The record mirrors the bubbled-up question.
+    expect(sub!.resultNeedsInput).toEqual({ question: "Which option do you want?" });
+    // The child task is terminal (completed) — NOT stranded in waiting_approval,
+    // and NOT timed out.
+    const childTask = state.tasks.find((t) => t.id === sub!.taskId);
+    expect(childTask?.status).toBe("completed");
+    expect(childTask?.needsInput).toEqual({ question: "Which option do you want?" });
+
+    // The parent's spawn_subagent tool result is a parseable JSON string
+    // carrying status:"needs_input" + the question, so the parent model can
+    // re-ask via its own ask_user.
+    const calls = getEchoToolCallingCalls();
+    const parentTurn2 = calls[calls.length - 1]!;
+    const toolMsg = parentTurn2.find(
+      (m) => m.role === "tool" && typeof m.content === "string" && m.content.includes("\"status\":\"needs_input\"")
+    );
+    expect(toolMsg).toBeDefined();
+    const payload = JSON.parse(String(toolMsg!.content));
+    expect(payload.status).toBe("needs_input");
+    expect(payload.needsInput).toEqual({ question: "Which option do you want?" });
+  });
+
+  test("goal and context render as labeled sections in the subagent system prompt", async () => {
+    const config = buildConfig(workspaceRoot, "subagent-goal-context");
+    const provider = normalizeProvider(config.provider);
+
+    // Parent turn 1: spawn with goal + context framing fields.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        {
+          id: "call_spawn",
+          type: "function",
+          function: {
+            name: "spawn_subagent",
+            arguments: JSON.stringify({
+              name: "framed",
+              prompt: "do the framed work",
+              goal: "Ship the report",
+              context: "The deadline is Friday and the data is in /tmp/data."
+            })
+          }
+        }
+      ],
+      finishReason: "tool_calls"
+    });
+    // Subagent turn: answers directly.
+    setEchoToolCallingResponse({ provider, text: "framed done", toolCalls: [], finishReason: "stop" });
+    // Parent turn 2: final answer.
+    setEchoToolCallingResponse({ provider, text: "All set.", toolCalls: [], finishReason: "stop" });
+
+    const parent = await submitTask(config, "delegate with framing", { mode: "chat" });
+    const finished = await waitForTerminal(config, parent.id);
+    expect(finished.status).toBe("completed");
+
+    const state = readState(config.instance);
+    const sub = state.subagents.find((s) => s.parentTaskId === parent.id)!;
+    expect(sub.goal).toBe("Ship the report");
+    expect(sub.context).toBe("The deadline is Friday and the data is in /tmp/data.");
+
+    // The subagent's system message (first message of its model call) carries
+    // the labeled Goal/Context sections ahead of the prompt.
+    const calls = getEchoToolCallingCalls();
+    const subagentCall = calls.find((messages) => {
+      const system = messages.find((m) => m.role === "system");
+      return typeof system?.content === "string" && system.content.includes("## Goal\nShip the report");
+    });
+    expect(subagentCall).toBeDefined();
+    const system = subagentCall!.find((m) => m.role === "system")!;
+    const systemText = String(system.content);
+    expect(systemText).toContain("## Goal\nShip the report");
+    expect(systemText).toContain("## Context\nThe deadline is Friday and the data is in /tmp/data.");
   });
 });

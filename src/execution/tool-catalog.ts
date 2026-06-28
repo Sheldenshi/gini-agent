@@ -279,6 +279,8 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
         properties: {
           name: { type: "string", description: "Short label for the subagent (e.g. 'research', 'patch-author')." },
           prompt: { type: "string", description: "The user-facing instruction for the subagent." },
+          goal: { type: "string", description: "Optional one-line objective for the subagent, rendered as a '## Goal' section ahead of the prompt." },
+          context: { type: "string", description: "Optional background the subagent needs (constraints, prior findings), rendered as a '## Context' section ahead of the prompt." },
           system_prompt: { type: "string", description: "Optional override for the subagent's system instructions. Defaults to a generic 'focused subagent' preamble." },
           toolsets: { type: "array", items: { type: "string" }, description: "Optional list of toolset names to expose. Subset of the parent's enabled toolsets." },
           skills: { type: "array", items: { type: "string" }, description: "Optional list of enabled skill names to advertise. Subset of the parent's enabled skills." },
@@ -313,29 +315,6 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
           }
         },
         required: ["names"]
-      }
-    }
-  },
-  {
-    // start_thread: the agent-decided threading control tool. CORE
-    // (always-on, never deferred, never approval-gated). Handled INLINE in
-    // the chat-task loop (not via the dispatch switch) so it branches the
-    // current turn into a thread WITHOUT emitting any phase/tool_call/
-    // tool_result chat block — it's a control action, not visible work.
-    // The `<route>thread</route>` text directive remains as a silent
-    // fallback; this tool is the primary mechanism because models call
-    // tools reliably but don't reliably emit the leading directive token.
-    toolset: "core",
-    displayLabel: "Start thread",
-    type: "function",
-    function: {
-      name: "start_thread",
-      description: "Branch your reply into a thread off the user's message, keeping the main chat scannable. Call this as your FIRST action (before any text or other tool) when the user's message opens multi-turn work — research, brainstorming, debugging, planning, a comparison, anything you expect follow-ups about. Do nothing (reply in the main chat) for quick answers, confirmations, single facts, or one-shot actions. Never call it when you are already replying inside a thread.",
-      parameters: {
-        type: "object",
-        properties: {
-          topic: { type: "string", description: "Optional short thread title / summary of what the thread is about." }
-        }
       }
     }
   },
@@ -1181,10 +1160,10 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     }
   },
   {
-    // Schedule a real cron/job. The job's output is delivered into a
-    // dedicated job channel by default, or into the originating chat
-    // session with deliverTo "chat" (see the dispatcher for the binding
-    // logic). Low-risk: no approval gate — the user can pause/delete the
+    // Schedule a real cron/job. The job ALWAYS runs in its own dedicated job
+    // channel (its Topic); with deliverTo "chat" each fire also FORWARDS its
+    // final answer into the originating Chat, tagged with the Topic (see the
+    // dispatcher + finalizeJobRunFromTask). Low-risk: no approval gate — the user can pause/delete the
     // job at any time, and gating reminders behind an approval dialog
     // would defeat the UX (`remind me in 2 minutes` should not pop a
     // modal). Always exposed (like read_skill / spawn_subagent) so a
@@ -1194,7 +1173,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "create_job",
-      description: "Schedule a recurring or one-shot job that runs a prompt. ALWAYS set `skillNames` when the prompt touches an integration covered by an Available skill (e.g. google-calendar + google-gmail for a daily briefing, linear for an issue digest): attached skills' instructions are inlined into every fire, so the job follows the recipe instead of rediscovering CLI usage each run — omitting them makes every fire slower, costlier, and less reliable. By default each fire's output is delivered into a dedicated job channel — a fresh chat thread listed under Recurring jobs — keeping this conversation uncluttered; pass `deliverTo: \"chat\"` to deliver each fire into THIS conversation instead. Choosing the destination: for a RECURRING job created from chat where the user has NOT already said where the output should go, FIRST call `ask_user` with options \"Job channel\" (recommended — keeps this conversation uncluttered; appears under Recurring jobs) and \"This chat\" (each fire posts into this conversation); when you have reason to think a dispatchable messaging bridge is configured, check `list_messaging_bridges` and include up to 4 bridge options (\"Send to <name>\") — `ask_user` allows at most 6 options total — each mapping to `deliveryTargets`. A bridge pick is IN ADDITION to the chat-vs-channel binding, not instead of it: pair the bridge selection with whichever binding the user prefers, defaulting to the job channel. For ONE-SHOT reminders skip the question and pass `deliverTo: \"chat\"` (a reminder belongs in the conversation that set it) unless the user said otherwise. When the user already specified a destination, don't ask. Provide EITHER `intervalSeconds` OR `cronExpression` (with `cronTimezone`), never both. Use `intervalSeconds` for 'in N minutes' or 'every N hours' (from-now timing). Use `cronExpression` + `cronTimezone` for wall-clock or weekday patterns ('daily at 9am', 'weekdays at 8:30'). Set oneShot=true for single-fire reminders. When a scheduled job needs to run UNATTENDED (e.g. recurring with no human present at fire-time), set `approvalMode: \"yolo\"` for tasks that need broad action, or use `autoApproveCommands` for narrow shell-pattern opt-ins — otherwise the job may stall at a gated approval forever (the instance default is \"auto\", which auto-approves file writes and safe shell commands but still gates dangerous patterns like rm -rf, sudo, pipe-to-sh, chmod 777, and destructive git operations). `dangerouslyAutoApprove: true` is a deprecated alias for `approvalMode: \"yolo\"` kept for back-compat. The default `timeoutSeconds` is 600 (10 min) — drop it lower for trivial reminders, or raise it (e.g. 1800+) when the prompt invokes external CLIs like codex or claude-code that can take several minutes.",
+      description: "Schedule a recurring or one-shot job that runs a prompt. ALWAYS set `skillNames` when the prompt touches an integration covered by an Available skill (e.g. google-calendar + google-gmail for a daily briefing, linear for an issue digest): attached skills' instructions are inlined into every fire, so the job follows the recipe instead of rediscovering CLI usage each run — omitting them makes every fire slower, costlier, and less reliable. Every job runs in its own dedicated job channel — a fresh chat thread listed under Recurring jobs — keeping this conversation uncluttered; pass `deliverTo: \"chat\"` to ALSO forward each fire's final answer into THIS conversation, tagged with the job channel. Choosing the destination: for a RECURRING job created from chat where the user has NOT already said where the output should go, FIRST call `ask_user` with options \"Job channel\" (recommended — keeps this conversation uncluttered; appears under Recurring jobs) and \"This chat\" (each fire posts into this conversation); when you have reason to think a dispatchable messaging bridge is configured, check `list_messaging_bridges` and include up to 4 bridge options (\"Send to <name>\") — `ask_user` allows at most 6 options total — each mapping to `deliveryTargets`. A bridge pick is IN ADDITION to the chat-vs-channel binding, not instead of it: pair the bridge selection with whichever binding the user prefers, defaulting to the job channel. For ONE-SHOT reminders skip the question and pass `deliverTo: \"chat\"` (a reminder belongs in the conversation that set it) unless the user said otherwise. When the user already specified a destination, don't ask. Provide EITHER `intervalSeconds` OR `cronExpression` (with `cronTimezone`), never both. Use `intervalSeconds` for 'in N minutes' or 'every N hours' (from-now timing). Use `cronExpression` + `cronTimezone` for wall-clock or weekday patterns ('daily at 9am', 'weekdays at 8:30'). Set oneShot=true for single-fire reminders. When a scheduled job needs to run UNATTENDED (e.g. recurring with no human present at fire-time), set `approvalMode: \"yolo\"` for tasks that need broad action, or use `autoApproveCommands` for narrow shell-pattern opt-ins — otherwise the job may stall at a gated approval forever (the instance default is \"auto\", which auto-approves file writes and safe shell commands but still gates dangerous patterns like rm -rf, sudo, pipe-to-sh, chmod 777, and destructive git operations). `dangerouslyAutoApprove: true` is a deprecated alias for `approvalMode: \"yolo\"` kept for back-compat. The default `timeoutSeconds` is 600 (10 min) — drop it lower for trivial reminders, or raise it (e.g. 1800+) when the prompt invokes external CLIs like codex or claude-code that can take several minutes.",
       parameters: {
         type: "object",
         properties: {
@@ -1241,7 +1220,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
           deliverTo: {
             type: "string",
             enum: ["channel", "chat"],
-            description: "Where each fire's output is delivered. \"channel\" (default when invoked from chat): a dedicated job channel — a fresh chat thread listed under Recurring jobs; an imperative/CLI invocation gets a session-less job instead. \"chat\": the conversation this tool call was made from (only valid when invoked from a chat conversation). Pass \"chat\" for one-shot reminders; for recurring jobs ask the user first when they haven't said (see tool description)."
+            description: "Where each fire's final answer surfaces. The job ALWAYS runs in its own dedicated job channel (a fresh chat thread listed under Recurring jobs), so an imperative/CLI invocation always gets a session-less job. \"channel\" (default when invoked from chat): the answer stays in that job channel only. \"chat\" (only valid when invoked from a chat conversation): each fire ALSO forwards its final answer into this conversation, tagged with the job channel — without burying the job's reports inline. Pass \"chat\" for one-shot reminders; for recurring jobs ask the user first when they haven't said (see tool description)."
           },
           deliveryTargets: {
             type: "array",
@@ -2196,12 +2175,8 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     // the live tools array. Deferral itself is applied later by
     // applyDeferralFilter, not by this gate — load_tools is never deferred.
     if (tool.function.name === "load_tools") return true;
-    // start_thread is the always-on threading control tool. Core, never
-    // deferred; the agent needs it on every turn to branch multi-turn work
-    // into a thread regardless of which toolsets are enabled.
-    if (tool.function.name === "start_thread") return true;
-    // get_current_time is the always-on read-only clock. Like load_tools /
-    // start_thread it lives on `core` (not a legacy default toolset); the model
+    // get_current_time is the always-on read-only clock. Like load_tools it
+    // lives on `core` (not a legacy default toolset); the model
     // must be able to answer "what time is it" on any instance regardless of
     // which toolsets are enabled, and it has no side effects to gate.
     if (tool.function.name === "get_current_time") return true;

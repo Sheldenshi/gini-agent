@@ -163,6 +163,7 @@ export {
   createRun,
   createPlanStep,
   createChatSession,
+  createTopic,
   deleteChatSession,
   renameChatSession,
   enqueuePendingChatMessage,

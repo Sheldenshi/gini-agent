@@ -16,11 +16,9 @@
 //   1. The flush guard settles the in-flight streaming assistant_text (not
 //      left streaming:true) when a delta arrives post-cancel — no "stuck
 //      cursor".
-//   2. The switchTurnToThread guard keeps a routed turn from appending a
-//      "Completed" phase after "Cancelled" when the route resolves post-cancel.
-//   3. A tool_call awaiting approval is settled (not left `running`) when the
+//   2. A tool_call awaiting approval is settled (not left `running`) when the
 //      task is cancelled — the gate card stops reading as live work.
-//   4. A tool_call whose approval row exists but whose loop snapshot has not
+//   3. A tool_call whose approval row exists but whose loop snapshot has not
 //      yet been persisted is still settled on cancel (the mid-dispatch window).
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -44,7 +42,6 @@ import {
   mutateState,
   readState
 } from "../state";
-import { submitChatMessage } from "./chat";
 import type { RuntimeConfig } from "../types";
 
 let scratchHome: string;
@@ -209,70 +206,6 @@ describe("issue #395 — cancel mid-stream", () => {
     const phases = blocks.filter((b) => b.kind === "phase");
     const lastPhase = phases[phases.length - 1];
     expect(lastPhase?.kind === "phase" && lastPhase.label).toBe("Cancelled");
-  });
-
-  test("a routed turn does not append a 'Completed' phase after 'Cancelled'", async () => {
-    const config = buildConfig(makeWorkspace(), uniqueInstance("cancel-midstream-route"), "auto");
-    const provider = normalizeProvider(config.provider);
-
-    const session = await mutateState(config.instance, (state) =>
-      createChatSession(state, "cancel-midstream-route", undefined, "agent_r")
-    );
-
-    // The model's reply begins with a <route>thread</route> directive. The
-    // turn is held open by delayMs; we cancel during the hold. streamAfterAbort
-    // makes the echo call SWALLOW the abort and still return its text AFTER the
-    // cancel landed (modeling a real provider whose response was already on the
-    // wire). The route then resolves post-model in finalizeTurnRoute →
-    // switchTurnToThread. Without the terminal guard inside switchTurnToThread,
-    // it would emit a main-chat "Completed" phase AFTER cancelTask's
-    // "Cancelled" phase. (Without streamAfterAbort the abortable sleep rejects
-    // and switchTurnToThread is never reached, so the guard would go untested.)
-    // We submit via submitChatMessage (not submitTask) so the turn has a
-    // user_text block to branch the thread from — otherwise switchTurnToThread
-    // bails at no-parent and the buggy emit never runs.
-    setEchoToolCallingResponse(
-      {
-        provider,
-        text: "<route>thread</route>Here is the answer in a thread.",
-        toolCalls: [],
-        finishReason: "stop"
-      },
-      undefined,
-      { delayMs: 400, streamAfterAbort: true }
-    );
-
-    const submitted = await submitChatMessage(config, session.id, { content: "answer me" }, { bypassQueue: true });
-    if ("queued" in submitted) throw new Error("expected run-now submission, got queued");
-    const taskId = submitted.taskId;
-    // Wait for the "Thinking" phase — the loop emits it right before the (held)
-    // model call, so the call is genuinely in flight. Cancelling merely on
-    // status "running" can land before "Thinking", bailing at the pre-model
-    // guard and never reaching finalizeTurnRoute (where the bug lives).
-    await waitFor(() =>
-      listChatBlocks(config.instance, session.id).some((b) => b.kind === "phase" && b.label === "Thinking")
-    );
-    await cancelTask(config, taskId);
-
-    await waitFor(() => {
-      const phases = listChatBlocks(config.instance, session.id).filter((b) => b.kind === "phase");
-      return phases.some((b) => b.kind === "phase" && b.label === "Cancelled");
-    });
-    // The buggy "Completed" emit happens LATER than cancel: it fires when the
-    // held model call returns (delayMs after submit) and the loop runs
-    // finalizeTurnRoute → switchTurnToThread. cancelTask sets the terminal
-    // status synchronously, so polling task status reads too early. Wait for
-    // the turn to fully drain — the block list stays stable for a window that
-    // comfortably exceeds the 400ms model-call delay, so any post-cancel emit
-    // has definitely landed.
-    await waitForStable(() => listChatBlocks(config.instance, session.id).length, 600);
-
-    const phases = listChatBlocks(config.instance, session.id).filter((b) => b.kind === "phase");
-    const cancelledIdx = phases.findIndex((b) => b.kind === "phase" && b.label === "Cancelled");
-    expect(cancelledIdx).toBeGreaterThanOrEqual(0);
-    // No "Completed" phase may appear at all — and certainly not after the
-    // Cancelled marker.
-    expect(phases.some((b) => b.kind === "phase" && b.label === "Completed")).toBe(false);
   });
 
   test("a tool_call awaiting approval is settled (not left running) when the task is cancelled", async () => {

@@ -92,9 +92,6 @@ const ALWAYS_ON = new Set([
   // The deferred-tools loader. Toolset "core" (not in defaults); always-on
   // so the model can pull any deferred schema live. Never deferred itself.
   "load_tools",
-  // The agent-decided threading control tool. Toolset "core"; always-on so
-  // the model can branch any turn into a thread. Never deferred itself.
-  "start_thread",
   // Always-on read-only clock on the `core` toolset (not in defaults); the
   // model must be able to answer "what time is it" regardless of toolset state.
   "get_current_time",

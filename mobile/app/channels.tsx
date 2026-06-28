@@ -27,17 +27,19 @@ import {
   useChannels,
   useCreateAgent,
   useJobs,
+  useTopics,
   useUnarchiveAgent,
   useUnreadCounts
 } from "@/src/queries";
 import { family, theme } from "@/src/theme";
 import type { AgentRecord, ChatSession, JobRecord } from "@/src/types";
 
-// Channels — the redesigned home. Two sections: "Agents" (each agent is
-// a DM with its single canonical chat) and "Recurring Jobs" (channels =
-// job-derived sessions). A header inbox icon routes to the cross-agent
-// Threads Inbox. Tapping an agent resolves its one chat and pushes into
-// the chat detail; tapping a channel pushes directly into that session.
+// Channels — the redesigned home. Three sections: "Agents" (each agent is
+// a DM with its single canonical chat), "Topics" (the active agent's
+// subject-scoped side-conversations), and "Recurring Jobs" (channels =
+// job-derived sessions). Tapping an agent resolves its one chat and pushes
+// into the chat detail; tapping a topic or channel pushes directly into that
+// session.
 export default function ChannelsScreen() {
   const agents = useAgents();
   const channels = useChannels();
@@ -47,6 +49,10 @@ export default function ChannelsScreen() {
   const unarchiveMutation = useUnarchiveAgent();
   const unreadCountsQuery = useUnreadCounts();
   const unreadCounts = unreadCountsQuery.data ?? {};
+  // Topics belong to the active agent (the runtime scopes new topics to it),
+  // so the Topics section lists that agent's `kind:"topic"` sessions.
+  const topics = useTopics(agents.data?.activeAgentId ?? null);
+  const topicList = topics.data ?? [];
 
   // Index jobs by their delivery channel so each channel row can show the
   // job's schedule + next-run (the design's "Every day · 9:00 AM" / "2h").
@@ -72,6 +78,7 @@ export default function ChannelsScreen() {
   // open by default (the primary content); Archived stays closed — it's a
   // tucked-away dropdown beneath the active agent list.
   const [agentsCollapsed, setAgentsCollapsed] = useState(false);
+  const [topicsCollapsed, setTopicsCollapsed] = useState(false);
   const [jobsCollapsed, setJobsCollapsed] = useState(false);
   const [archivedCollapsed, setArchivedCollapsed] = useState(true);
 
@@ -203,20 +210,10 @@ export default function ChannelsScreen() {
     <SafeAreaView style={styles.safe} edges={["top", "bottom"]}>
       <Stack.Screen options={{ headerShown: false }} />
 
-      {/* Header — brand title left, inbox + compose icons right. The
-          inbox icon routes to the cross-agent Threads Inbox. */}
+      {/* Header — brand title left, compose icon right. */}
       <View style={styles.header}>
         <Text style={styles.brand}>Gini</Text>
         <View style={styles.headerActions}>
-          <TouchableOpacity
-            onPress={() => router.push("/threads/inbox")}
-            hitSlop={8}
-            style={styles.headerIconButton}
-            accessibilityRole="button"
-            accessibilityLabel="Open threads inbox"
-          >
-            <Feather name="inbox" size={22} color={theme.text} />
-          </TouchableOpacity>
           <TouchableOpacity
             onPress={() => {
               setNewAgentError(null);
@@ -279,6 +276,7 @@ export default function ChannelsScreen() {
               onRefresh={() => {
                 agents.refetch();
                 channels.refetch();
+                topics.refetch();
               }}
               tintColor={theme.muted}
             />
@@ -372,6 +370,42 @@ export default function ChannelsScreen() {
                     : null}
                 </>
               ) : null}
+            </>
+          ) : null}
+
+          {/* Topics section — the active agent's subject-scoped
+              side-conversations, collapsible and ordered most-recent first.
+              Each row reads as `#<title>` and opens the topic's chat detail. */}
+          {topicList.length > 0 ? (
+            <>
+              <TouchableOpacity
+                style={[styles.sectionHeader, styles.jobsHeader]}
+                onPress={() => setTopicsCollapsed((v) => !v)}
+                activeOpacity={0.6}
+                accessibilityRole="button"
+                accessibilityLabel={
+                  topicsCollapsed ? "Expand topics" : "Collapse topics"
+                }
+              >
+                <View style={styles.sectionHeaderLeft}>
+                  <Feather
+                    name={topicsCollapsed ? "chevron-right" : "chevron-down"}
+                    size={14}
+                    color="#8A8A90"
+                  />
+                  <Text style={styles.sectionLabel}>Topics</Text>
+                </View>
+                <Text style={styles.sectionCount}>{topicList.length}</Text>
+              </TouchableOpacity>
+              {!topicsCollapsed
+                ? topicList.map((topic) => (
+                    <TopicRow
+                      key={topic.id}
+                      topic={topic}
+                      unreadCount={unreadCounts[topic.id] ?? 0}
+                    />
+                  ))
+                : null}
             </>
           ) : null}
 
@@ -589,6 +623,53 @@ function ChannelRow({
             {schedule}
           </Text>
         </View>
+      </View>
+      {isUnread ? (
+        <View style={styles.channelBadge}>
+          <Text style={styles.channelBadgeText}>
+            {unreadCount > 99 ? "99+" : unreadCount}
+          </Text>
+        </View>
+      ) : (
+        <Text style={styles.channelNext}>{time}</Text>
+      )}
+    </TouchableOpacity>
+  );
+}
+
+// Topic row — a `#<title>` side-conversation. Mirrors the channel row's
+// shape (tile icon + title/preview + unread badge / last-activity time) but
+// uses a hash glyph and the topic's last-message preview as the subtitle.
+function TopicRow({
+  topic,
+  unreadCount
+}: {
+  topic: ChatSession;
+  unreadCount: number;
+}) {
+  const title = topic.title?.trim() || "topic";
+  const preview =
+    topic.lastMessagePreview?.trim() || topic.summary?.trim() || "Topic";
+  const time = chatListTime(topic.updatedAt ?? topic.createdAt);
+  const isUnread = unreadCount > 0;
+  return (
+    <TouchableOpacity
+      onPress={() => router.push(`/chat/${topic.id}`)}
+      activeOpacity={0.7}
+      style={styles.channelRow}
+      accessibilityRole="button"
+      accessibilityLabel={`Open topic ${title}`}
+    >
+      <View style={styles.channelIcon}>
+        <Feather name="hash" size={18} color={theme.placeholder} />
+      </View>
+      <View style={styles.channelBody}>
+        <Text style={styles.channelName} numberOfLines={1}>
+          #{title}
+        </Text>
+        <Text style={styles.channelCadence} numberOfLines={1}>
+          {preview}
+        </Text>
       </View>
       {isUnread ? (
         <View style={styles.channelBadge}>

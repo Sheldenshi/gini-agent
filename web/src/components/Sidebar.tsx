@@ -8,7 +8,6 @@ import {
   ArchiveRestore,
   ChevronDown,
   Menu,
-  MessagesSquare,
   Moon,
   MoreVertical,
   Plus,
@@ -26,8 +25,8 @@ import { useMemo, useState, useSyncExternalStore } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { api } from "@/lib/api";
-import { useAllChatSessions, useInvalidate, useStatus, useThreadsInbox } from "@/lib/queries";
-import { useChatReadState, useThreadReadState } from "@/lib/use-chat-read-state";
+import { useAllChatSessions, useInvalidate, useStatus } from "@/lib/queries";
+import { useChatReadState } from "@/lib/use-chat-read-state";
 import { isOpenableJobChannel } from "@/lib/job-channel";
 import {
   DropdownMenu,
@@ -55,6 +54,7 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
   const [agentsCollapsed, toggleAgents] = useSectionCollapsed("agents");
   const [archivedCollapsed, toggleArchived] = useSectionCollapsed("agents-archived");
   const [jobsCollapsed, toggleJobs] = useSectionCollapsed("jobs");
+  const [topicsCollapsed, toggleTopics] = useSectionCollapsed("topics");
 
   const status = useStatus();
   const activeAgentId = status.data?.activeAgent?.id;
@@ -102,6 +102,21 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
       );
   }, [allJobs.data, allSessions.data]);
 
+  // Topics for the active agent: `kind:"topic"` sessions that aren't archived,
+  // newest-activity first so the most recently touched subject sits on top.
+  // Scoped to the active agent (each Topic belongs to that agent's Chat) so the
+  // section tracks the selected agent, like the Messages/agent rows.
+  const topics = useMemo<ChatSession[]>(() => {
+    return (allSessions.data ?? [])
+      .filter(
+        (s) =>
+          s.kind === "topic" &&
+          !s.archivedAt &&
+          (activeAgentId == null || s.agentId === activeAgentId)
+      )
+      .sort((a, b) => (b.updatedAt ?? "").localeCompare(a.updatedAt ?? ""));
+  }, [allSessions.data, activeAgentId]);
+
   const { isUnread } = useChatReadState(allSessions.data);
 
   // Per-agent unread: the sidebar shows one row per agent, but read-state is
@@ -116,16 +131,8 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
     return map;
   }, [allSessions.data, isUnread]);
 
-  const threadsInbox = useThreadsInbox();
-  const { isThreadUnread } = useThreadReadState(threadsInbox.data);
-  const unreadThreadCount = useMemo(
-    () => (threadsInbox.data ?? []).filter((t) => isThreadUnread(t)).length,
-    [threadsInbox.data, isThreadUnread]
-  );
-
   const selectedSession = params?.get("session") ?? null;
   const onChat = pathname === "/chat";
-  const onThreads = pathname === "/threads";
 
   const useAgentMutation = useMutation({
     mutationFn: (id: string) => api(`/agents/${encodeURIComponent(id)}/use`, { method: "POST" }),
@@ -382,21 +389,67 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
             </div>
           ) : null}
 
+          {/* Topics */}
+          {topics.length > 0 ? (
+            <div className="flex flex-col gap-1">
+              <div className="flex items-center justify-between px-2">
+                <button
+                  type="button"
+                  onClick={toggleTopics}
+                  aria-expanded={!topicsCollapsed}
+                  className="flex items-center gap-1.5 text-sidebar-foreground/55 hover:text-sidebar-foreground/80"
+                >
+                  <ChevronDown
+                    className={cn("size-3 transition-transform", topicsCollapsed && "-rotate-90")}
+                  />
+                  <span className="text-[11px] font-semibold tracking-[0.5px]">Topics</span>
+                </button>
+              </div>
+              <ul className={cn("flex flex-col gap-0.5", topicsCollapsed && "hidden")}>
+                {topics.map((topic) => {
+                  const active = onChat && selectedSession === topic.id;
+                  const unread = !active && isUnread(topic);
+                  return (
+                    <li key={topic.id}>
+                      <button
+                        type="button"
+                        onClick={() => selectChannel(topic.id)}
+                        className={cn(
+                          "group flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors",
+                          active ? "bg-sidebar-accent" : "hover:bg-sidebar-accent/50"
+                        )}
+                      >
+                        <span
+                          aria-hidden
+                          className="w-3.5 shrink-0 text-center text-sm font-medium text-sidebar-foreground/55"
+                        >
+                          #
+                        </span>
+                        <span
+                          className={cn(
+                            "min-w-0 flex-1 truncate text-[13px]",
+                            active || unread
+                              ? "font-semibold text-sidebar-accent-foreground"
+                              : "font-medium text-sidebar-foreground"
+                          )}
+                        >
+                          {topic.title}
+                        </span>
+                        {unread ? (
+                          <span aria-hidden className="size-[7px] shrink-0 rounded-full bg-sidebar-primary" />
+                        ) : null}
+                      </button>
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
+          ) : null}
+
           <div className="h-px bg-sidebar-border" />
 
-          {/* Nav: Threads, Skills, Settings */}
+          {/* Nav: Skills, Logs, Settings */}
           <ul className="flex flex-col gap-0.5">
-            <li>
-              <Link href="/threads" onClick={onNavigate} className={navItem(onThreads)}>
-                <MessagesSquare className="size-3.5 text-sidebar-foreground/70" />
-                <span className="flex-1">Threads</span>
-                {unreadThreadCount > 0 ? (
-                  <span className="flex items-center justify-center rounded-full bg-sidebar-primary px-[7px] py-px text-[10px] font-bold text-sidebar-primary-foreground">
-                    {unreadThreadCount}
-                  </span>
-                ) : null}
-              </Link>
-            </li>
             <li>
               <Link href="/skills" onClick={onNavigate} className={navItem(pathname === "/skills")}>
                 <WandSparkles className="size-3.5 text-sidebar-foreground/70" />

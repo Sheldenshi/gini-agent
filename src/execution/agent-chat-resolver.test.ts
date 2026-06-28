@@ -143,6 +143,29 @@ describe("getOrCreateAgentChat", () => {
     expect(resolved.kind).toBe("agent");
   });
 
+  test("never promotes a kind:'topic' session into the canonical chat", async () => {
+    const instance = "agent-chat-topic";
+    await registerAgent(instance, "agent_t");
+    let topicId = "";
+    await mutateState(instance, (state) => {
+      // A topic session is the agent's only existing session. It must NOT be
+      // promoted into the canonical chat (ADR chat-topics-tasks-subagents.md).
+      const topic = createChatSession(state, "World cup trip", undefined, "agent_t", undefined, "topic");
+      topic.updatedAt = "2024-05-01T00:00:00.000Z";
+      topicId = topic.id;
+    });
+
+    const resolved = await getOrCreateAgentChat(instance, "agent_t");
+    // The resolver mints a fresh canonical chat instead of promoting the topic.
+    expect(resolved.id).not.toBe(topicId);
+    expect(resolved.kind).toBe("agent");
+
+    // The topic keeps its kind — never demoted or promoted.
+    const state = readState(instance);
+    const topic = state.chatSessions.find((s) => s.id === topicId);
+    expect(topic?.kind).toBe("topic");
+  });
+
   test("throws Agent not found for an unknown agent id", async () => {
     const instance = "agent-chat-unknown";
     await expect(getOrCreateAgentChat(instance, "agent_missing")).rejects.toThrow(

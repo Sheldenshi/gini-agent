@@ -73,9 +73,11 @@ import {
 import type { ToolCatalogTool } from "./tool-catalog";
 import type { EffectiveContext } from "./effective-context";
 
-// These tests submit on idle sessions, which always run immediately. Narrow
-// the submit union to the run-now branch so the existing `.taskId` reads stay
-// typed (a queued result here is a test-setup bug). See ADR
+// These tests submit on idle sessions, which always run immediately. They also
+// don't seed a "chat-route" stub, so the router coerces to a chat-direct
+// decision and the turn runs in the submitted session. Narrow the submit union
+// to the chat-direct run-now branch so the existing `.taskId` reads stay typed
+// (a queued or topic-dispatched result here is a test-setup bug). See ADR
 // chat-message-queue.md.
 async function submitChatMessage(
   config: RuntimeConfig,
@@ -85,6 +87,7 @@ async function submitChatMessage(
   const { submitChatMessage: submitChatMessageRaw } = await import("./chat");
   const result = await submitChatMessageRaw(config, sessionId, input);
   if ("queued" in result) throw new Error("expected run-now submission, got queued");
+  if ("topicId" in result) throw new Error("expected chat-direct submission, got topic dispatch");
   return result;
 }
 
@@ -3937,7 +3940,7 @@ describe("chat-task loop", () => {
   });
 
   // Issue #397: an inline-handled tool (load_tools here; the deferred-not-loaded
-  // nudge and start_thread share the branch) must PERSIST its tool result to
+  // nudge shares the branch) must PERSIST its tool result to
   // the durable transcript, paired with the assistant tool_use row. Otherwise a
   // later turn (or any rebuild) replays the assistant tool_use with no result,
   // and a tool-pairing-strict provider (Bedrock Converse, Anthropic Messages)
@@ -5379,7 +5382,7 @@ describe("chat-task loop", () => {
 
   // A transient failure that streamed partial text before erroring must have
   // that partial trimmed from partialSummary before the retry (mirrors the
-  // overflow path's discard). Exercises the routeSurfacedLen > 0 reset branch.
+  // overflow path's discard). Exercises the surfacedTextLen > 0 reset branch.
   test("a transient fault that streamed partial text trims it before the successful retry", async () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
     const config = buildConfig(workspaceRoot, "chat-task-transient-partial-trim");

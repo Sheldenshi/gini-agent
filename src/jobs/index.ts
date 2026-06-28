@@ -1,7 +1,7 @@
 import { submitTask } from "../agent";
 import { spawnSubagent } from "../capabilities/subagents";
 import type { JobRecord, JobRoute, JobRunRecord, RuntimeConfig, RuntimeState, SkillRecord } from "../types";
-import { addAudit, appendEvent, appendLog, appendTrace, createChatMessage, createChatSession, createJob, createJobRun, createRun, insertChatBlock, isTerminalTaskStatus, mutateState, now, readState } from "../state";
+import { addAudit, appendEvent, appendLog, appendTrace, createChatMessage, createChatSession, createJob, createJobRun, createRun, insertChatBlock, mutateState, now, readState } from "../state";
 import { isSkillActive } from "../integrations/connectors";
 import { resolveEffectiveContext } from "../execution/effective-context";
 import { isKnownHook, runHook, type HookConfig } from "../hooks";
@@ -263,6 +263,18 @@ export async function createScheduledJob(
     }
     oneShot = input.oneShot;
   }
+  // Forward-to-Chat flag (ADR chat-topics-tasks-subagents.md). When true, each
+  // fire forwards its final answer into the owning agent's Chat (in addition to
+  // materializing it in the job's dedicated Topic). The tool dispatcher sets
+  // this from `deliverTo:"chat"`; the job still runs in its own Topic either
+  // way. Absent ⇒ channel-only delivery.
+  let forwardToChat: boolean | undefined;
+  if (input.forwardToChat !== undefined && input.forwardToChat !== null) {
+    if (typeof input.forwardToChat !== "boolean") {
+      throw new Error(`Invalid input: forwardToChat must be a boolean (got ${String(input.forwardToChat)})`);
+    }
+    forwardToChat = input.forwardToChat;
+  }
   // Pre-LLM hook. Validate shape up-front so a bad payload returns a typed
   // `Invalid input: …` (400 at the HTTP layer) instead of persisting a job
   // whose hook can never resolve. The handlerId MUST be a key in the trusted
@@ -461,6 +473,7 @@ export async function createScheduledJob(
       costBudget: typeof input.costBudget === "number" ? input.costBudget : undefined,
       chatSessionId: resolvedChatSessionId,
       oneShot,
+      forwardToChat,
       preRunHook,
       dangerouslyAutoApprove,
       approvalMode,
@@ -474,24 +487,6 @@ export async function createScheduledJob(
 // Returns the most recent running run for the given jobId, or undefined.
 function findRunningRun(state: RuntimeState, jobId: string): JobRunRecord | undefined {
   return state.jobRuns.find((run) => run.jobId === jobId && run.status === "running");
-}
-
-// A "live turn" is a non-terminal task bound to this session that was NOT
-// spawned by a job (job-spawned tasks carry `jobId`). Used to defer a
-// scheduled chat-bound job while the user's own conversation turn is in
-// flight, so the job's messages never interleave with the active turn.
-//
-// EVERY non-terminal status counts, including `waiting_approval` — do NOT
-// narrow this to `status === "running"`. A parked turn (awaiting approval)
-// resumes and emits higher-ordinal blocks that bracket a job's blocks; a job
-// allowed to run in that gap would re-trigger the `groupExchanges` reorder
-// bug (its group renders out of order relative to the resumed turn). Deferring
-// through the entire non-terminal lifetime is what keeps jobs off the live
-// turn's ordinal range.
-function sessionHasActiveLiveTurn(state: RuntimeState, sessionId: string): boolean {
-  return state.tasks.some(
-    (t) => t.chatSessionId === sessionId && t.jobId === undefined && !isTerminalTaskStatus(t.status)
-  );
 }
 
 // Drift-free advance: starting from the previous nextRunAt, advance forward
@@ -846,13 +841,6 @@ export async function runDueJobs(config: RuntimeConfig): Promise<void> {
       // for the same job is still in-flight. Leave nextRunAt alone — the
       // next tick will retry once the in-flight run completes.
       if (findRunningRun(state, job.id)) continue;
-
-      // Defer a chat-bound job while its session has a live (user-initiated)
-      // turn in flight, so the job's messages never interleave with the active
-      // conversation. Leave nextRunAt untouched — the ~1s-tick scheduler
-      // retries once the live turn finishes. Mirrors the overlap-protection
-      // skip above.
-      if (job.chatSessionId && sessionHasActiveLiveTurn(state, job.chatSessionId)) continue;
 
       // Drift-free nextRunAt + missedRuns. The first advance consumes the
       // tick we're claiming now; each additional advance is a missed run.
@@ -1949,46 +1937,34 @@ export async function updateJob(
   });
 }
 
-// Rebind where a job's fires are delivered, after creation. Tool-path only
-// (the `update_job` tool's `deliverTo` field) — the raw PATCH /api/jobs stays
-// permissive and never routes here. Semantics:
-//   - "channel": mint a FRESH dedicated channel session (same shape
-//     createScheduledJob's createDedicatedSession path produces: kind
-//     "channel", origin "job", title = job name) and rebind the job to it.
-//     A previously archived channel is never unarchived — always a fresh
-//     channel (so a job stuck on an archived channel is NOT a no-op). The
-//     previously bound conversation is NOT archived (it's the user's chat).
-//     No-op only when the job is already bound to a live channel.
-//   - "chat": rebind the job to `options.originatingSessionId` (the
-//     conversation the tool call came from). If the job's current bound
-//     session is a live dedicated channel, stamp its `archivedAt` — history
-//     is preserved and the session stays addressable, it just leaves the
-//     session/channel lists. The archive is skipped (rebind still proceeds)
-//     when any other job's `chatSessionId` or any job's fan-out routes still
-//     reference the channel — raw POST/PATCH /api/jobs can bind several jobs
-//     to one channel, and archiving would hide their live delivery surface.
-//     No-op when already bound to that conversation. An in-flight fire
-//     claimed pre-rebind may land its final message in the just-archived
-//     channel (archived = hidden but addressable; finalize re-reads
-//     job.chatSessionId, so the synced summary follows the new binding).
+// Rebind a job's delivery mode, after creation. Tool-path only (the
+// `update_job` tool's `deliverTo` field) — the raw PATCH /api/jobs stays
+// permissive and never routes here. The job ALWAYS runs in its own dedicated
+// Topic (ADR chat-topics-tasks-subagents.md, "Jobs → Topics"); `deliverTo` now
+// toggles the `forwardToChat` flag, NOT the job's session binding. Semantics:
+//   - "channel": set forwardToChat=false (deliver into the Topic only).
+//   - "chat": set forwardToChat=true (each fire ALSO forwards its final answer
+//     into the owning agent's Chat, tagged with the Topic). The Topic is NEVER
+//     archived just because delivery moved to Chat.
+// Either mode first ensures the job has a LIVE channel Topic: a job stuck on an
+// archived channel, on a `kind:"agent"` session (a legacy deliverTo:"chat"
+// rebind result), or with no session at all gets a FRESH dedicated channel
+// session (kind "channel", origin "job", title = job name; bridge mirror
+// preserved). No-op when the job already has a live Topic AND the forward flag
+// already matches.
 // Jobs with a preRunHook or fan-out routes are rejected: their sessions
 // carry routing state (watcher dedupe anchors, per-concern channels) that
 // a rebind would orphan.
 // Everything happens inside ONE mutateState write so a validation failure
 // leaves no half-rebound job or orphan channel.
 export interface RebindJobDeliveryOptions {
-  // Required for deliverTo "chat": the originating conversation resolved by
-  // the dispatcher from a lock-free readState (task → run.conversationId).
-  // Re-verified inside the mutateState callback — same serialization
-  // rationale as createScheduledJob's requireChatSession option.
-  originatingSessionId?: string;
   // Same trusted parent-task terminal re-check as the sibling mutators.
   parentTaskId?: string;
 }
 
 export type RebindJobDeliveryResult =
   | { outcome: "noop"; job: JobRecord }
-  | { outcome: "rebound"; job: JobRecord; previousSessionId?: string; archivedSessionId?: string };
+  | { outcome: "rebound"; job: JobRecord; previousSessionId?: string };
 
 export async function rebindJobDelivery(
   config: RuntimeConfig,
@@ -2011,87 +1987,41 @@ export async function rebindJobDelivery(
     const current = job.chatSessionId !== undefined
       ? state.chatSessions.find((s) => s.id === job.chatSessionId)
       : undefined;
-    if (deliverTo === "chat") {
-      const target = options.originatingSessionId;
-      if (target === undefined) {
-        throw new Error("Invalid input: deliverTo \"chat\" requires an originating chat session.");
-      }
-      if (job.chatSessionId === target) return { outcome: "noop", job };
-      // Re-verify the originating session INSIDE the lock — the dispatcher
-      // resolved it from a lock-free readState, so a deletion racing this
-      // call must fail the rebind instead of binding to a dead conversation.
-      if (!state.chatSessions.some((s) => s.id === target)) {
-        throw new Error(`Cannot rebind job delivery: chat session ${target} no longer exists.`);
-      }
-      const previousSessionId = job.chatSessionId;
-      let archivedSessionId: string | undefined;
-      let archiveSkipped: string | undefined;
-      // Already-archived channels are left untouched: re-stamping
-      // archivedAt would lie about when the channel left the lists and
-      // emit a duplicate chat.session.archived audit row.
-      if (current && current.kind === "channel" && !current.archivedAt) {
-        const shared = state.jobs.some(
-          (other) =>
-            (other.id !== job.id && other.chatSessionId === current.id) ||
-            Object.values(other.routes ?? {}).some((route) => route.chatSessionId === current.id)
-        );
-        if (shared) {
-          // Another job still delivers into this channel (bindable via
-          // raw POST/PATCH /api/jobs) — archiving would hide its live
-          // delivery surface. The rebind itself still proceeds.
-          archiveSkipped = "channel shared";
-        } else {
-          current.archivedAt = now();
-          current.updatedAt = now();
-          archivedSessionId = current.id;
-          addAudit(
-            state,
-            {
-              actor: "agent",
-              action: "chat.session.archived",
-              target: current.id,
-              risk: "low",
-              evidence: { jobId: job.id, reason: "job.delivery.rebound" }
-            },
-            { jobId: job.id, agentId: job.agentId }
-          );
-        }
-      }
-      job.chatSessionId = target;
-      job.updatedAt = now();
-      addAudit(
-        state,
-        {
-          actor: "agent",
-          action: "job.delivery.rebound",
-          target: job.id,
-          risk: "low",
-          evidence: { deliverTo, from: previousSessionId, to: target, archivedSessionId, ...(archiveSkipped ? { archiveSkipped } : {}) }
-        },
-        { jobId: job.id, agentId: job.agentId }
-      );
-      return { outcome: "rebound", job, previousSessionId, archivedSessionId };
+    // The job ALWAYS runs in its own dedicated Topic (ADR
+    // chat-topics-tasks-subagents.md, "Jobs → Topics"); `deliverTo` now toggles
+    // the `forwardToChat` flag, NOT the job's session binding. "chat" forwards
+    // each fire's final answer into the owning agent's Chat (tagged with the
+    // Topic); "channel" delivers into the Topic only. The Topic is never
+    // archived just because delivery moved to Chat.
+    const desiredForward = deliverTo === "chat";
+    const hasLiveTopic = current !== undefined && current.kind === "channel" && !current.archivedAt;
+    // No-op when the job already has a live Topic AND the forward flag already
+    // matches — there is nothing to change.
+    if (hasLiveTopic && (job.forwardToChat ?? false) === desiredForward) {
+      return { outcome: "noop", job };
     }
-    // deliverTo === "channel"
-    // No-op only for a LIVE channel binding. A job stuck on an archived
-    // channel (bindable via raw PATCH /api/jobs) gets a fresh one — an
-    // archived channel is hidden from the lists, so leaving the job there
-    // would make its fires invisible.
-    if (current && current.kind === "channel" && !current.archivedAt) return { outcome: "noop", job };
     const previousSessionId = job.chatSessionId;
-    const session = createChatSession(state, job.name, undefined, job.agentId, "job", "channel");
-    // Mirror createScheduledJob's create-time semantics: a job created
-    // from a messaging-sourced conversation carries that conversation's
-    // `source` onto its dedicated channel as `outboundMirror` so scheduled
-    // fires still reach the bridge. Here `current` is either a
-    // conversation (carries `source`) or an archived previously-dedicated
-    // channel (carries only `outboundMirror`) — clone whichever is present
-    // so the rebind never silently drops bridge delivery. Spread-cloned so
-    // a later mutation on the old session's descriptor doesn't
-    // aliased-mutate the new channel's copy within this write.
-    const mirror = current?.source ?? current?.outboundMirror;
-    if (mirror) session.outboundMirror = { ...mirror };
-    job.chatSessionId = session.id;
+    // Ensure the job has a live channel Topic. A job stuck on an archived
+    // channel, on a `kind:"agent"` session (a legacy deliverTo:"chat" rebind
+    // result), or with no session at all gets a fresh dedicated Topic — an
+    // archived channel is hidden from the lists, so leaving the job there would
+    // make its fires invisible.
+    if (!hasLiveTopic) {
+      const session = createChatSession(state, job.name, undefined, job.agentId, "job", "channel");
+      // Mirror createScheduledJob's create-time semantics: a job created from a
+      // messaging-sourced conversation carries that conversation's `source`
+      // onto its dedicated channel as `outboundMirror` so scheduled fires still
+      // reach the bridge. `current` is either a conversation (carries `source`)
+      // or an archived previously-dedicated channel (carries only
+      // `outboundMirror`) — clone whichever is present so the rebind never
+      // silently drops bridge delivery. Spread-cloned so a later mutation on
+      // the old session's descriptor doesn't aliased-mutate the new channel's
+      // copy within this write.
+      const mirror = current?.source ?? current?.outboundMirror;
+      if (mirror) session.outboundMirror = { ...mirror };
+      job.chatSessionId = session.id;
+    }
+    job.forwardToChat = desiredForward;
     job.updatedAt = now();
     addAudit(
       state,
@@ -2100,7 +2030,7 @@ export async function rebindJobDelivery(
         action: "job.delivery.rebound",
         target: job.id,
         risk: "low",
-        evidence: { deliverTo, from: previousSessionId, to: session.id }
+        evidence: { deliverTo, forwardToChat: desiredForward, from: previousSessionId, to: job.chatSessionId }
       },
       { jobId: job.id, agentId: job.agentId }
     );

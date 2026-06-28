@@ -628,6 +628,94 @@ describe("archiveOrphanJobChannels (issue #369)", () => {
   });
 });
 
+describe("migrateJobsToTopics (Jobs → Topics)", () => {
+  const at = "2026-01-01T00:00:00.000Z";
+  function pushJob(state: RuntimeState, overrides: { id: string; chatSessionId?: string; forwardToChat?: boolean }) {
+    state.jobs.push({
+      id: overrides.id,
+      instance: state.instance,
+      agentId: "agent_default",
+      name: overrides.id,
+      prompt: "x",
+      intervalSeconds: 600,
+      status: "active",
+      nextRunAt: at,
+      deliveryTargets: [],
+      context: [],
+      retryLimit: 0,
+      timeoutSeconds: 600,
+      runIds: [],
+      taskIds: [],
+      runCount: 0,
+      missedRuns: 0,
+      createdAt: at,
+      updatedAt: at,
+      ...(overrides.chatSessionId !== undefined ? { chatSessionId: overrides.chatSessionId } : {}),
+      ...(overrides.forwardToChat !== undefined ? { forwardToChat: overrides.forwardToChat } : {})
+    });
+  }
+  function pushSession(state: RuntimeState, overrides: Partial<RuntimeState["chatSessions"][number]> & { id: string }) {
+    state.chatSessions.push({
+      instance: state.instance,
+      title: overrides.id,
+      createdAt: at,
+      updatedAt: at,
+      messageIds: [],
+      taskIds: [],
+      runIds: [],
+      ...overrides
+    });
+  }
+
+  test("mints a Topic + forwardToChat for a legacy job bound to a kind:agent Chat", () => {
+    const state = createEmptyState("jobs-topics-legacy-chat");
+    // The legacy deliverTo:"chat" rebind result: the job's chatSessionId points
+    // at the user's own kind:"agent" Chat — it has no dedicated Topic.
+    pushSession(state, { id: "chat_agent", kind: "agent", agentId: "agent_default" });
+    pushJob(state, { id: "job_legacy", chatSessionId: "chat_agent" });
+
+    const normalized = normalizeState(state.instance, state);
+
+    const job = normalized.jobs.find((j) => j.id === "job_legacy")!;
+    // Re-pointed at a fresh dedicated channel/Topic; forwardToChat set.
+    expect(job.chatSessionId).not.toBe("chat_agent");
+    expect(job.forwardToChat).toBe(true);
+    const topic = normalized.chatSessions.find((s) => s.id === job.chatSessionId);
+    expect(topic?.kind).toBe("channel");
+    expect(topic?.origin).toBe("job");
+    expect(topic?.title).toBe("job_legacy");
+    // The user's Chat is left intact.
+    expect(normalized.chatSessions.find((s) => s.id === "chat_agent")?.kind).toBe("agent");
+  });
+
+  test("a job already on a kind:channel Topic is left channel-only (no forwardToChat)", () => {
+    const state = createEmptyState("jobs-topics-channel");
+    pushSession(state, { id: "chat_channel", kind: "channel", origin: "job", agentId: "agent_default" });
+    pushJob(state, { id: "job_channel", chatSessionId: "chat_channel" });
+
+    const normalized = normalizeState(state.instance, state);
+
+    const job = normalized.jobs.find((j) => j.id === "job_channel")!;
+    expect(job.chatSessionId).toBe("chat_channel");
+    expect(job.forwardToChat ?? false).toBe(false);
+  });
+
+  test("is idempotent — a second normalize mints no further Topic", () => {
+    const state = createEmptyState("jobs-topics-idempotent");
+    pushSession(state, { id: "chat_agent", kind: "agent", agentId: "agent_default" });
+    pushJob(state, { id: "job_legacy", chatSessionId: "chat_agent" });
+
+    const once = normalizeState(state.instance, state);
+    const mintedTopicId = once.jobs.find((j) => j.id === "job_legacy")!.chatSessionId;
+    const sessionCount = once.chatSessions.length;
+
+    const twice = normalizeState(state.instance, once);
+    // The marker gates a second pass: same Topic, no new session minted.
+    expect(twice.jobs.find((j) => j.id === "job_legacy")!.chatSessionId).toBe(mintedTopicId);
+    expect(twice.chatSessions.length).toBe(sessionCount);
+  });
+});
+
 describe("normalizeState approval -> authorization/setup-request migration", () => {
   test("partitions a legacy approvals array by action", () => {
     const at = new Date().toISOString();
@@ -1302,5 +1390,55 @@ describe("normalizeState task.chatSessionId backfill", () => {
     state.tasks.find((t) => t.id === "task_chat")!.chatSessionId = "chat_explicit";
     normalizeState("backfill-preserve", state);
     expect(state.tasks.find((t) => t.id === "task_chat")!.chatSessionId).toBe("chat_explicit");
+  });
+});
+
+// Schema v10 (ADR chat-topics-tasks-subagents.md) — legacy threads convert to
+// linear Chat history by nulling the thread tags on durable chat messages and
+// on queued (pending) messages.
+describe("normalizeState thread-tag strip (v10)", () => {
+  // Seeds a state with one thread-tagged chatMessage and one session whose
+  // pendingMessages queue carries a thread-tagged entry.
+  function seedThreadTagged(instance: string): RuntimeState {
+    const state = createEmptyState(instance);
+    (state.chatMessages as RuntimeState["chatMessages"]).push({
+      id: "m_thread", instance, sessionId: "chat_x", role: "user",
+      content: "threaded reply", createdAt: "2026-01-01T00:00:00.000Z",
+      threadId: "thread_1", parentBlockId: "blk_root"
+    } as RuntimeState["chatMessages"][number]);
+    (state.chatSessions as RuntimeState["chatSessions"]).push({
+      id: "chat_x", instance, title: "Chat", createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z", messageIds: ["m_thread"], taskIds: [], runIds: [],
+      pendingMessages: [
+        { id: "p1", content: "queued reply", createdAt: "2026-01-01T00:00:01.000Z", threadId: "thread_1", parentBlockId: "blk_root" }
+      ]
+    } as RuntimeState["chatSessions"][number]);
+    return state;
+  }
+
+  test("strips threadId/parentBlockId from chatMessages and pendingMessages", () => {
+    const state = seedThreadTagged("thread-strip");
+    normalizeState("thread-strip", state);
+
+    const message = state.chatMessages.find((m) => m.id === "m_thread")!;
+    expect(message.threadId).toBeUndefined();
+    expect(message.parentBlockId).toBeUndefined();
+
+    const pending = state.chatSessions.find((s) => s.id === "chat_x")!.pendingMessages![0]!;
+    expect(pending.threadId).toBeUndefined();
+    expect(pending.parentBlockId).toBeUndefined();
+  });
+
+  test("is idempotent across two runs", () => {
+    const state = seedThreadTagged("thread-strip-idem");
+    const once = normalizeState("thread-strip-idem", state);
+    const twice = normalizeState("thread-strip-idem", once);
+
+    const message = twice.chatMessages.find((m) => m.id === "m_thread")!;
+    expect(message.threadId).toBeUndefined();
+    expect(message.parentBlockId).toBeUndefined();
+    const pending = twice.chatSessions.find((s) => s.id === "chat_x")!.pendingMessages![0]!;
+    expect(pending.threadId).toBeUndefined();
+    expect(pending.parentBlockId).toBeUndefined();
   });
 });

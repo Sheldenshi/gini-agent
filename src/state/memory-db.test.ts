@@ -372,6 +372,71 @@ describe("memory-db schema and storage", () => {
     expect(scoped.map((unit) => unit.id)).toEqual([stamped.id]);
   });
 
+  test("v9 → v10 nulls chat_blocks thread tags (linear chat history)", () => {
+    const instance = "mem-v10-thread-null";
+    mkdirSync(instanceRoot(instance), { recursive: true });
+    const path = memoryDbPath(instance);
+
+    // Hand-craft a v9-shape chat_blocks table: it already has the thread
+    // columns AND the current CHECK constraint (so the kind-constraint
+    // recreate does NOT fire) — this isolates the v10 UPDATE path. One row is
+    // thread-tagged, one is a plain main-chat row.
+    const raw = new Database(path, { create: true });
+    raw.exec("PRAGMA journal_mode = WAL");
+    raw.exec(`
+      CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      CREATE TABLE chat_blocks (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        instance TEXT NOT NULL,
+        agent_id TEXT,
+        ordinal INTEGER NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN (
+          'user_text','assistant_text','tool_call','tool_result',
+          'phase','approval_requested','authorization_requested',
+          'setup_requested','system_note'
+        )),
+        payload_json TEXT NOT NULL,
+        task_id TEXT,
+        run_id TEXT,
+        thread_id TEXT,
+        parent_block_id TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (session_id, ordinal)
+      );
+      INSERT INTO schema_meta(key, value) VALUES ('version', '9');
+      INSERT INTO chat_blocks
+        (id, session_id, instance, ordinal, kind, payload_json, thread_id, parent_block_id, created_at, updated_at)
+        VALUES ('blk_threaded', 'chat_x', '${instance}', 1, 'user_text', '{}', 'thread_1', 'blk_root', '2025-01-01', '2025-01-01');
+      INSERT INTO chat_blocks
+        (id, session_id, instance, ordinal, kind, payload_json, created_at, updated_at)
+        VALUES ('blk_main', 'chat_x', '${instance}', 2, 'assistant_text', '{}', '2025-01-01', '2025-01-01');
+    `);
+    raw.close();
+
+    // Reopen through the production code path — triggers the v10 migration.
+    const db = getMemoryDb(instance);
+
+    // schema_meta is bumped to the current version.
+    const versionRow = db
+      .query<{ value: string }, [string]>("SELECT value FROM schema_meta WHERE key = ?")
+      .get("version");
+    expect(versionRow?.value).toBe(String(MEMORY_SCHEMA_VERSION));
+
+    // Both rows survive; the formerly-threaded row reads back as main-chat.
+    const rows = db
+      .query<{ id: string; thread_id: string | null; parent_block_id: string | null }, []>(
+        "SELECT id, thread_id, parent_block_id FROM chat_blocks ORDER BY ordinal ASC"
+      )
+      .all();
+    expect(rows.map((r) => r.id)).toEqual(["blk_threaded", "blk_main"]);
+    for (const row of rows) {
+      expect(row.thread_id).toBeNull();
+      expect(row.parent_block_id).toBeNull();
+    }
+  });
+
   test("v5 → v6 chat_read_state migration copies cursors forward per device", () => {
     // Set up an in-memory v5-shape DB with one credential that has two
     // registered devices and one chat_read_state row. The migration

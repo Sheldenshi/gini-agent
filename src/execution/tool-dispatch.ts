@@ -1392,6 +1392,8 @@ async function spawnSubagentTool(
 ): Promise<string> {
   const name = requireString(args, "name");
   const prompt = requireString(args, "prompt");
+  const goal = typeof args.goal === "string" ? args.goal : undefined;
+  const context = typeof args.context === "string" ? args.context : undefined;
   const systemPrompt = typeof args.system_prompt === "string" ? args.system_prompt : undefined;
   const toolsets = Array.isArray(args.toolsets) ? args.toolsets.map(String) : undefined;
   const skills = Array.isArray(args.skills) ? args.skills.map(String) : undefined;
@@ -1453,6 +1455,8 @@ async function spawnSubagentTool(
     const created = await spawnSubagent(config, {
       name,
       prompt,
+      goal,
+      context,
       systemPrompt,
       toolsets,
       skills,
@@ -1498,12 +1502,16 @@ async function spawnSubagentTool(
   });
 
   // Format the result. We return a compact JSON-shaped string so the model
-  // can parse if it wants, but the strings inside are human-readable.
+  // can parse if it wants, but the strings inside are human-readable. When the
+  // subagent bubbled up an "additional input needed" question, surface it as
+  // status:"needs_input" with the question so the parent (which has a topic/chat
+  // session) re-asks via its own ask_user. See ADR chat-topics-tasks-subagents.md.
   const payload = {
     subagentId,
     status: final.status,
     summary: final.summary ?? null,
-    error: final.error ?? null
+    error: final.error ?? null,
+    ...(final.needsInput ? { needsInput: final.needsInput } : {})
   };
   return JSON.stringify(payload);
 }
@@ -1757,14 +1765,15 @@ async function createJobTool(
       cronExpression,
       cronTimezone,
       prompt,
-      // Dedicated chat thread for chat-driven jobs. Title defaults to
-      // the job name — the chat IS bound to that job's delivery, so the
-      // job name is the natural label in the session list. (createChatSession
-      // truncates to 80 chars.) With deliverTo "chat" we skip the dedicated
-      // thread and bind the job to the originating conversation instead;
-      // the session itself stays a normal chat (no kind/title mutation).
-      createDedicatedSession: invokedFromChat && deliverTo !== "chat" ? { title: name } : undefined,
-      chatSessionId: deliverTo === "chat" ? originatingSessionId : undefined,
+      // Dedicated Topic for chat-driven jobs (ADR
+      // chat-topics-tasks-subagents.md, "Jobs → Topics"). A job ALWAYS runs in
+      // its OWN Topic regardless of `deliverTo` — the originating conversation
+      // is never re-pointed. Title defaults to the job name, the natural label
+      // in the session list. (createChatSession truncates to 80 chars.)
+      // `deliverTo:"chat"` only flips `forwardToChat` below so each fire ALSO
+      // surfaces its final answer in Chat, tagged with this Topic.
+      createDedicatedSession: invokedFromChat ? { title: name } : undefined,
+      forwardToChat: deliverTo === "chat",
       oneShot,
       // Skill attachments pass through verbatim — createScheduledJob is the
       // single validation choke point (shape + enabled-skill resolution),
@@ -1783,12 +1792,11 @@ async function createJobTool(
       // doesn't reattribute the job to whichever agent happens to be
       // active at fire time. Threaded through the trusted options bag
       // so a malicious HTTP client can't spoof it via the request body.
-      originatingAgentId: task?.agentId,
-      // originatingSessionId came from a lock-free readState above; ask
-      // createScheduledJob to re-verify the session inside its mutateState
-      // callback so a deletion racing this call can't persist a job bound
-      // to a dead conversation.
-      requireChatSession: deliverTo === "chat"
+      originatingAgentId: task?.agentId
+      // No `requireChatSession`: the job no longer binds to the originating
+      // conversation — its dedicated Topic is minted inside the same
+      // mutateState write, so there is no caller-supplied chatSessionId to
+      // re-verify against a racing deletion.
     });
   } catch (err) {
     if (err instanceof Error && err.message.startsWith("Cannot create scheduled job: parent task ")) {
@@ -1799,9 +1807,10 @@ async function createJobTool(
     }
     throw err;
   }
-  // The job's chatSessionId is the freshly-minted dedicated thread when
-  // invokedFromChat (the originating conversation with deliverTo "chat"),
-  // or undefined for imperative/CLI invocations.
+  // The job's chatSessionId is the freshly-minted dedicated Topic when
+  // invokedFromChat (for BOTH deliverTo:"channel" and deliverTo:"chat" — the
+  // latter additionally sets forwardToChat), or undefined for imperative/CLI
+  // invocations.
   const chatSessionId = job.chatSessionId;
 
   await mutateState(config.instance, (current) => {
@@ -2112,52 +2121,42 @@ async function updateJobTool(
   if (statusPatch !== undefined) {
     await updateJobStatus(config, jobId, statusPatch, taskId);
   }
-  // Delivery rebind, applied last so a same-call `name` patch titles the
-  // freshly minted channel. rebindJobDelivery writes its own audit rows
-  // (job.delivery.rebound, chat.session.archived); the clause below feeds
-  // the result text so the model can describe the new binding.
+  // Delivery rebind, applied last so a same-call `name` patch titles a
+  // freshly minted channel. rebindJobDelivery toggles forwardToChat (keeping
+  // the job's Topic) and writes its own job.delivery.rebound audit row; the
+  // clause below feeds the result text so the model can describe the change.
   let deliveryClause: string | undefined;
   let deliverToApplied = false;
   if (deliverTo !== undefined) {
     let rebind: Awaited<ReturnType<typeof rebindJobDelivery>> | undefined;
     try {
-      rebind = await rebindJobDelivery(config, jobId, deliverTo, { originatingSessionId, parentTaskId: taskId });
+      rebind = await rebindJobDelivery(config, jobId, deliverTo, { parentTaskId: taskId });
     } catch (err) {
-      // The rebind can race a session deletion or a parent-task
-      // cancellation landing between the lock-free pre-checks above and
-      // rebindJobDelivery's serialized re-checks. By this point the
-      // sibling patches (name/schedule/oneShot/status) have already
-      // committed, so returning a bare `Error:` would tell the model the
-      // whole call failed while most of it persisted: when other fields
-      // were applied, fall through to the normal success return with a
-      // skip clause and leave `deliverTo` out of appliedFields. Only a
+      // The rebind can race a parent-task cancellation landing between the
+      // lock-free pre-checks above and rebindJobDelivery's serialized
+      // re-check. By this point the sibling patches (name/schedule/oneShot/
+      // status) have already committed, so returning a bare `Error:` would
+      // tell the model the whole call failed while most of it persisted: when
+      // other fields were applied, fall through to the normal success return
+      // with a skip clause and leave `deliverTo` out of appliedFields. Only a
       // deliverTo-only call (nothing applied) keeps the error surface.
-      const sessionVanished =
-        err instanceof Error && err.message.startsWith("Cannot rebind job delivery: chat session ");
       const parentTerminal =
         err instanceof Error && err.message.startsWith("Cannot rebind job delivery: parent task ");
-      if (!sessionVanished && !parentTerminal) throw err;
+      if (!parentTerminal) throw err;
       const otherFieldsApplied = hasFieldPatch || statusPatch !== undefined;
-      if (!otherFieldsApplied) {
-        if (sessionVanished) {
-          return `Error: update_job skipped the delivery rebind because the originating chat session was deleted mid-call.`;
-        }
-        throw err;
-      }
-      deliveryClause = sessionVanished
-        ? "Delivery rebind skipped: the originating chat session was deleted mid-call."
-        : "Delivery rebind skipped: the parent task went terminal mid-call.";
+      if (!otherFieldsApplied) throw err;
+      deliveryClause = "Delivery rebind skipped: the parent task went terminal mid-call.";
     }
     if (rebind) {
       deliverToApplied = true;
       if (rebind.outcome === "noop") {
         deliveryClause = deliverTo === "chat"
-          ? "Delivery already bound to this conversation — no change."
-          : "Delivery already bound to a dedicated channel — no change.";
+          ? "Delivery already forwards into this conversation — no change."
+          : "Delivery already stays in the job's dedicated channel — no change.";
       } else if (deliverTo === "channel") {
-        deliveryClause = `Delivery rebound to a new dedicated channel ${rebind.job.chatSessionId}.`;
+        deliveryClause = `Delivery now stays in the job's dedicated channel ${rebind.job.chatSessionId} (no longer forwarded into this conversation).`;
       } else {
-        deliveryClause = `Delivery rebound to this conversation (${originatingSessionId})${rebind.archivedSessionId ? `; the previous channel ${rebind.archivedSessionId} was archived (history preserved, removed from lists)` : ""}.`;
+        deliveryClause = `Each fire now forwards its final answer into this conversation, tagged with the job's channel ${rebind.job.chatSessionId}.`;
       }
     }
   }
@@ -3426,7 +3425,7 @@ async function waitForSubagentTerminal(
   subagentId: string,
   timeoutMs: number,
   parentTaskId?: string
-): Promise<{ status: string; summary?: string; error?: string }> {
+): Promise<{ status: string; summary?: string; error?: string; needsInput?: { question: string } }> {
   const deadline = Date.now() + Math.max(1000, timeoutMs);
   const pollMs = 100;
   while (Date.now() < deadline) {
@@ -3434,6 +3433,19 @@ async function waitForSubagentTerminal(
     const sub = state.subagents.find((item) => item.id === subagentId);
     if (!sub) return { status: "missing", error: `Subagent ${subagentId} disappeared.` };
     if (sub.status === "completed" || sub.status === "failed" || sub.status === "cancelled") {
+      // "Additional input needed" return: the subagent reached a terminal
+      // status but carries a question its ask_user could not answer in-band.
+      // Surface it as status:"needs_input" so the parent re-asks instead of
+      // treating the run as a plain completion. NOT a persisted
+      // SubagentStatus — only the return-value status string. See ADR
+      // chat-topics-tasks-subagents.md.
+      if (sub.resultNeedsInput) {
+        return {
+          status: "needs_input",
+          summary: sub.resultSummary ?? sub.summary,
+          needsInput: sub.resultNeedsInput
+        };
+      }
       return {
         status: sub.status,
         summary: sub.resultSummary ?? sub.summary,
@@ -4254,6 +4266,25 @@ async function askUserTool(
     : undefined;
   const surfaceKind = surfaceSession?.source?.kind ?? surfaceSession?.outboundMirror?.kind;
   if (!surfaceSession || surfaceSession.origin === "job" || surfaceKind === "telegram" || surfaceKind === "discord") {
+    // A subagent child has no chat surface of its own (it runs with no
+    // chatSessionId), so the question can't be answered here. Bubble it up:
+    // return a STRUCTURED marker the subagent loop carries to its terminal
+    // result, and stamp it onto the task so syncSubagentFromTask mirrors it
+    // onto the SubagentRecord. The parent's spawn_subagent tool result then
+    // surfaces the question, and the parent — which DOES have a topic/chat
+    // session — re-asks via its own ask_user. See ADR
+    // chat-topics-tasks-subagents.md (the "additional input needed" return).
+    if (surfaceTask.subagentId) {
+      await mutateState(config.instance, (mutable: RuntimeState) => {
+        const item = findTask(mutable, taskId);
+        item.needsInput = { question };
+        item.updatedAt = now();
+      });
+      return {
+        kind: "sync",
+        result: JSON.stringify({ ok: false, needsInput: true, question })
+      };
+    }
     return {
       kind: "sync",
       result: JSON.stringify({

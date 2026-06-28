@@ -239,6 +239,21 @@ export function createChatSession(
   return session;
 }
 
+// Mint a subject-scoped Topic session (`kind:"topic"`) with its own isolated
+// context window (ADR chat-topics-tasks-subagents.md). A Topic reuses the
+// chat-session machinery (block stream, SSE, read-state); `title` is the
+// topic's display name and `parentChatSessionId` records the Chat that
+// spawned it (for later forward-back).
+export function createTopic(
+  state: RuntimeState,
+  opts: { agentId?: string; title: string; parentChatSessionId?: string; origin?: ChatSessionRecord["origin"]; topicSummary?: string }
+): ChatSessionRecord {
+  const session = createChatSession(state, opts.title, undefined, opts.agentId, opts.origin, "topic");
+  if (opts.parentChatSessionId) session.parentChatSessionId = opts.parentChatSessionId;
+  if (opts.topicSummary) session.topicSummary = opts.topicSummary;
+  return session;
+}
+
 // Find an existing chat session bound to a (bridge, chat_id) pair, or
 // create one. We key on the bridge id + chat id so that if a user
 // disables and re-creates the bridge, conversations from a different

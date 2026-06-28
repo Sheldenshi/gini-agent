@@ -1,13 +1,10 @@
-// Integration tests for the per-turn chat-vs-thread routing directive.
+// Integration tests for the chat turn's emit-context resolution.
 //
-// The agent decides whether a reply lands in the main chat (default) or a
-// thread branched off its last message by emitting a leading control
-// directive `<route>thread</route>` / `<route>chat</route>` as the very first
-// text of its response. The runtime parses + STRIPS the directive before it
-// reaches the user (assistant_text block), the task summary, or the partial
-// summary, and — when `thread` — threads the entire turn off the turn's own
-// main-chat user message (falling back to the prior assistant message for
-// turns with no user message, e.g. job/channel turns).
+// Agent turns no longer route themselves into threads (Topics replace
+// threads, ADR chat-topics-tasks-subagents.md): a plain reply stays in the
+// session's main timeline. The dormant thread-reply path still pre-seeds
+// `task.threadId`/`task.parentBlockId`, and resolveEmitContext honors those
+// fields so a pre-seeded task threads its whole response.
 //
 // We drive real turns through submitChatMessage with the echo provider's
 // stubbed tool-calling responses so the loop is fully deterministic.
@@ -19,19 +16,11 @@ import { join } from "node:path";
 import {
   clearEchoToolCallingResponses,
   normalizeProvider,
-  setEchoToolCallingFailure,
   setEchoToolCallingResponse
 } from "../provider";
-import {
-  createTask,
-  listChatBlocks,
-  listThreadBlocks,
-  mutateState,
-  readState,
-  upsertTask
-} from "../state";
+import { createTask, listChatBlocks, mutateState, readState, upsertTask } from "../state";
 import { listMainChatBlocks } from "../state/chat-blocks";
-import type { ChatBlock, RuntimeConfig, Task } from "../types";
+import type { RuntimeConfig, Task } from "../types";
 import { createChat, submitChatMessage as submitChatMessageRaw } from "./chat";
 import { runChatTask } from "./chat-task";
 
@@ -77,21 +66,7 @@ async function waitForTerminal(config: RuntimeConfig, taskId: string, timeoutMs 
   throw new Error(`Task ${taskId} did not reach terminal state within ${timeoutMs}ms`);
 }
 
-function assistantText(block: ChatBlock): string {
-  return block.kind === "assistant_text" ? block.text : "";
-}
-
-// The main-chat user_text block a turn emits before its first model action;
-// an agent-routed thread roots here so the chip renders under the prompt.
-function userBlockId(config: RuntimeConfig, sessionId: string, taskId: string): string {
-  const block = listChatBlocks(config.instance, sessionId).find(
-    (b) => b.kind === "user_text" && b.taskId === taskId
-  );
-  if (!block) throw new Error(`no user_text block for task ${taskId}`);
-  return block.id;
-}
-
-describe("chat-task route directive", () => {
+describe("chat-task emit context", () => {
   let root: string;
   let workspaceRoot: string;
   let prevState: string | undefined;
@@ -117,9 +92,8 @@ describe("chat-task route directive", () => {
     clearEchoToolCallingResponses();
   });
 
-  // Runs a first main-chat turn so a prior assistant_text block exists for the
-  // routing turn to branch a thread from, then returns the session id + the
-  // last main-chat assistant block id.
+  // Runs a first main-chat turn so a prior assistant_text block exists, then
+  // returns the session id + the last main-chat assistant block id.
   async function seedFirstTurn(
     config: RuntimeConfig,
     provider: ReturnType<typeof normalizeProvider>
@@ -139,94 +113,7 @@ describe("chat-task route directive", () => {
     return { sessionId: session.id, parentBlockId: lastAssistant!.id };
   }
 
-  test("threads the turn, strips the directive from block + summary, roots at the turn's user message", async () => {
-    const config = buildConfig(workspaceRoot, "chat-route-thread");
-    const provider = normalizeProvider(config.provider);
-    // A prior main-chat assistant block exists; the routed turn must NOT
-    // anchor to it (that stale-anchor bug scattered every thread onto one
-    // ever-older message) — it anchors to this turn's own user message.
-    const { sessionId, parentBlockId: priorAssistant } = await seedFirstTurn(config, provider);
-
-    setEchoToolCallingResponse({
-      provider,
-      text: "<route>thread</route>\nLet's dig into this in a thread.",
-      toolCalls: [],
-      finishReason: "stop"
-    });
-    const second = await submitChatMessage(config, sessionId, { content: "research this" });
-    const finished = await waitForTerminal(config, second.taskId);
-    const userBlock = userBlockId(config, sessionId, second.taskId);
-
-    // (a) The directive never reaches the summary nor the partial summary.
-    expect(finished.status).toBe("completed");
-    expect(finished.summary).toBe("Let's dig into this in a thread.");
-    expect(finished.summary).not.toContain("<route>");
-    expect(finished.partialSummary ?? "").not.toContain("<route>");
-
-    // (b) The new assistant block carries threadId and parentBlockId pointing
-    //     at this turn's user message — not the stale prior assistant — and
-    //     its text is clean.
-    const threadAssistant = listChatBlocks(config.instance, sessionId)
-      .filter((b) => b.kind === "assistant_text" && b.taskId === second.taskId);
-    expect(threadAssistant.length).toBe(1);
-    const block = threadAssistant[0]!;
-    expect(assistantText(block)).toBe("Let's dig into this in a thread.");
-    expect(assistantText(block)).not.toContain("<route>");
-    expect(block.threadId).toBeDefined();
-    expect(block.parentBlockId).toBe(userBlock);
-    expect(block.parentBlockId).not.toBe(priorAssistant);
-
-    // The whole turn's blocks (assistant text + phases) share the thread id.
-    const threadId = block.threadId!;
-    const threadBlocks = listThreadBlocks(config.instance, sessionId, threadId);
-    expect(threadBlocks.length).toBeGreaterThan(0);
-    for (const tb of threadBlocks) {
-      expect(tb.threadId).toBe(threadId);
-    }
-
-    // (c) The thread id is persisted on the task.
-    expect(finished.threadId).toBe(threadId);
-    expect(finished.parentBlockId).toBe(userBlock);
-
-    // (d) The main chat's in-flight indicator is closed, not stranded on
-    //     "Thinking". The turn opened a "Thinking" phase in the main chat
-    //     before its work moved to the thread, so the switch must close it
-    //     with a TERMINAL phase the client recognizes ("Completed") — the
-    //     turn's own terminal phase lands in the thread and never reaches main.
-    const mainAfter = listMainChatBlocks(config.instance, sessionId);
-    const lastMainPhase = [...mainAfter].reverse().find((b) => b.kind === "phase");
-    expect(lastMainPhase).toBeDefined();
-    expect(lastMainPhase!.kind === "phase" && lastMainPhase!.label).toBe("Completed");
-    // The answer stays in the thread — the main chat carries none of it.
-    expect(mainAfter.some((b) => b.kind === "assistant_text" && b.taskId === second.taskId)).toBe(false);
-  });
-
-  test("<route>chat</route> stays in the main chat and strips the directive", async () => {
-    const config = buildConfig(workspaceRoot, "chat-route-chat");
-    const provider = normalizeProvider(config.provider);
-    const { sessionId } = await seedFirstTurn(config, provider);
-
-    setEchoToolCallingResponse({
-      provider,
-      text: "<route>chat</route>Quick answer, no thread.",
-      toolCalls: [],
-      finishReason: "stop"
-    });
-    const second = await submitChatMessage(config, sessionId, { content: "quick q" });
-    const finished = await waitForTerminal(config, second.taskId);
-
-    expect(finished.status).toBe("completed");
-    expect(finished.summary).toBe("Quick answer, no thread.");
-    expect(finished.threadId).toBeUndefined();
-
-    const blocks = listChatBlocks(config.instance, sessionId)
-      .filter((b) => b.kind === "assistant_text" && b.taskId === second.taskId);
-    expect(blocks.length).toBe(1);
-    expect(assistantText(blocks[0]!)).toBe("Quick answer, no thread.");
-    expect(blocks[0]!.threadId).toBeUndefined();
-  });
-
-  test("no directive stays in the main chat with text untouched", async () => {
+  test("a plain agent reply stays in the main chat with text untouched", async () => {
     const config = buildConfig(workspaceRoot, "chat-route-none");
     const provider = normalizeProvider(config.provider);
     const { sessionId } = await seedFirstTurn(config, provider);
@@ -250,211 +137,11 @@ describe("chat-task route directive", () => {
     expect(blocks[0]!.threadId).toBeUndefined();
   });
 
-  test("a directive on the very first turn threads off the user message and strips it", async () => {
-    const config = buildConfig(workspaceRoot, "chat-route-firstturn");
-    const provider = normalizeProvider(config.provider);
-
-    setEchoToolCallingResponse({
-      provider,
-      text: "<route>thread</route>Branching off your first message.",
-      toolCalls: [],
-      finishReason: "stop"
-    });
-    const session = await createChat(config, { title: "first-turn" });
-    const first = await submitChatMessage(config, session.id, { content: "go" });
-    const finished = await waitForTerminal(config, first.taskId);
-
-    expect(finished.status).toBe("completed");
-    expect(finished.summary).toBe("Branching off your first message.");
-    expect(finished.summary).not.toContain("<route>");
-
-    // No prior assistant exists, but the turn's own user message is a valid
-    // anchor, so even the first turn threads — with the chip under the prompt.
-    const userBlock = userBlockId(config, session.id, first.taskId);
-    const blocks = listChatBlocks(config.instance, session.id)
-      .filter((b) => b.kind === "assistant_text" && b.taskId === first.taskId);
-    expect(blocks.length).toBe(1);
-    expect(assistantText(blocks[0]!)).toBe("Branching off your first message.");
-    expect(blocks[0]!.threadId).toBeDefined();
-    expect(blocks[0]!.parentBlockId).toBe(userBlock);
-    expect(finished.parentBlockId).toBe(userBlock);
-  });
-
-  test("start_thread tool call branches the turn into a thread with no visible control blocks", async () => {
-    const config = buildConfig(workspaceRoot, "chat-route-startthread");
-    const provider = normalizeProvider(config.provider);
-    const { sessionId, parentBlockId: priorAssistant } = await seedFirstTurn(config, provider);
-
-    // Turn 1 of the routing turn: the model's FIRST action is a start_thread
-    // control tool call (no text). Turn 2: it replies with the actual answer
-    // plus a sibling tool call. Both must thread off the turn's user message.
-    setEchoToolCallingResponse({
-      provider,
-      text: "",
-      toolCalls: [
-        { id: "call_start", type: "function", function: { name: "start_thread", arguments: JSON.stringify({ topic: "app names" }) } }
-      ],
-      finishReason: "tool_calls"
-    });
-    setEchoToolCallingResponse({
-      provider,
-      text: "Here are 5 names to start.",
-      toolCalls: [
-        { id: "call_read", type: "function", function: { name: "file_list", arguments: JSON.stringify({ path: "." }) } }
-      ],
-      finishReason: "tool_calls"
-    });
-    setEchoToolCallingResponse({
-      provider,
-      text: "Done — pick a favorite and we'll iterate.",
-      toolCalls: [],
-      finishReason: "stop"
-    });
-
-    const second = await submitChatMessage(config, sessionId, { content: "brainstorm app names" });
-    const finished = await waitForTerminal(config, second.taskId);
-    expect(finished.status).toBe("completed");
-    const userBlock = userBlockId(config, sessionId, second.taskId);
-
-    const turnBlocks = listChatBlocks(config.instance, sessionId).filter((b) => b.taskId === second.taskId);
-
-    // start_thread emits NO phase / tool_call / tool_result control blocks.
-    const startThreadCallBlocks = turnBlocks.filter(
-      (b) => b.kind === "tool_call" && b.callId === "call_start"
-    );
-    expect(startThreadCallBlocks.length).toBe(0);
-    const startThreadToolBlocks = turnBlocks.filter(
-      (b) => b.kind === "tool_call" && b.toolName === "start_thread"
-    );
-    expect(startThreadToolBlocks.length).toBe(0);
-    expect(turnBlocks.some((b) => b.kind === "tool_result" && b.callId === "call_start")).toBe(false);
-
-    // The subsequent assistant text + the sibling file_list tool call all
-    // carry the minted threadId and root at the turn's user message, not the
-    // stale prior main-chat assistant.
-    const assistantBlocks = turnBlocks.filter((b) => b.kind === "assistant_text");
-    expect(assistantBlocks.length).toBeGreaterThan(0);
-    const threadId = assistantBlocks[0]!.threadId;
-    expect(threadId).toBeDefined();
-    expect(assistantBlocks[0]!.parentBlockId).toBe(userBlock);
-    expect(assistantBlocks[0]!.parentBlockId).not.toBe(priorAssistant);
-    // Every CONTENT block the turn produces after the switch carries the
-    // thread id: the assistant text, the sibling file_list tool call, and its
-    // result. (The routed turn's user_text prompt and the leading "Thinking"
-    // phase are emitted BEFORE the model's first action — start_thread — so
-    // they legitimately stay in the main chat, exactly like the `<route>`
-    // streaming path before its first delta resolves.)
-    const contentBlocks = turnBlocks.filter(
-      (b) => b.kind === "assistant_text" || b.kind === "tool_call" || b.kind === "tool_result"
-    );
-    expect(contentBlocks.length).toBeGreaterThan(0);
-    for (const b of contentBlocks) {
-      expect(b.threadId).toBe(threadId);
-    }
-    const siblingCall = turnBlocks.find((b) => b.kind === "tool_call" && b.toolName === "file_list");
-    expect(siblingCall?.threadId).toBe(threadId);
-
-    // The thread id is persisted onto the task and the thread surfaces.
-    expect(finished.threadId).toBe(threadId);
-    expect(finished.parentBlockId).toBe(userBlock);
-    const threadBlocks = listThreadBlocks(config.instance, sessionId, threadId!);
-    expect(threadBlocks.length).toBeGreaterThan(0);
-
-    // The main chat's in-flight phase is closed with a TERMINAL "Completed"
-    // marker when the turn switches to a thread, so its indicator can't strand
-    // on "Thinking"; the answer itself lives only in the thread.
-    const mainAfter = listMainChatBlocks(config.instance, sessionId);
-    const lastMainPhase = [...mainAfter].reverse().find((b) => b.kind === "phase");
-    expect(lastMainPhase).toBeDefined();
-    expect(lastMainPhase!.kind === "phase" && lastMainPhase!.label).toBe("Completed");
-    expect(mainAfter.some((b) => b.kind === "assistant_text" && b.taskId === second.taskId)).toBe(false);
-  });
-
-  test("start_thread on the first turn threads off the user message", async () => {
-    const config = buildConfig(workspaceRoot, "chat-route-startthread-firstturn");
-    const provider = normalizeProvider(config.provider);
-
-    // First-ever turn: no prior assistant block, but the user's own message
-    // anchors the thread.
-    setEchoToolCallingResponse({
-      provider,
-      text: "",
-      toolCalls: [
-        { id: "call_start", type: "function", function: { name: "start_thread", arguments: "{}" } }
-      ],
-      finishReason: "tool_calls"
-    });
-    setEchoToolCallingResponse({
-      provider,
-      text: "Replying in a thread.",
-      toolCalls: [],
-      finishReason: "stop"
-    });
-
-    const session = await createChat(config, { title: "startthread-firstturn" });
-    const first = await submitChatMessage(config, session.id, { content: "brainstorm app names" });
-    const finished = await waitForTerminal(config, first.taskId);
-
-    expect(finished.status).toBe("completed");
-    expect(finished.summary).toBe("Replying in a thread.");
-    const userBlock = userBlockId(config, session.id, first.taskId);
-
-    const blocks = listChatBlocks(config.instance, session.id)
-      .filter((b) => b.kind === "assistant_text" && b.taskId === first.taskId);
-    expect(blocks.length).toBe(1);
-    expect(blocks[0]!.threadId).toBeDefined();
-    expect(blocks[0]!.parentBlockId).toBe(userBlock);
-    expect(finished.parentBlockId).toBe(userBlock);
-  });
-
-  test("a turn with no user message (job/channel) does not thread, even if the model calls start_thread", async () => {
-    const config = buildConfig(workspaceRoot, "chat-route-jobnothread");
-    const provider = normalizeProvider(config.provider);
-    // A prior main-chat assistant block exists from a real turn — the agent
-    // must NOT seed a thread off it.
-    const { sessionId } = await seedFirstTurn(config, provider);
-
-    // Run a task directly (like a scheduled job) so NO user_text block is
-    // created for it; the model routes to a thread via start_thread.
-    setEchoToolCallingResponse({
-      provider,
-      text: "",
-      toolCalls: [
-        { id: "call_start", type: "function", function: { name: "start_thread", arguments: "{}" } }
-      ],
-      finishReason: "tool_calls"
-    });
-    setEchoToolCallingResponse({
-      provider,
-      text: "Job output stays in the channel.",
-      toolCalls: [],
-      finishReason: "stop"
-    });
-
-    const task = createTask(config.instance, "job run", undefined, undefined, undefined, undefined, undefined, sessionId);
-    task.mode = "chat";
-    await mutateState(config.instance, (state) => {
-      upsertTask(state, task);
-    });
-    const finished = await runChatTask(config, task.id);
-
-    expect(finished.status).toBe("completed");
-    // No human message to branch from → the agent never seeds a thread off
-    // its own message; the turn stays in the channel's main timeline.
-    expect(finished.threadId).toBeUndefined();
-    expect(finished.parentBlockId).toBeUndefined();
-    const blocks = listChatBlocks(config.instance, sessionId)
-      .filter((b) => b.kind === "assistant_text" && b.taskId === task.id);
-    expect(blocks.length).toBe(1);
-    expect(blocks[0]!.threadId).toBeUndefined();
-  });
-
-  test("a task pre-seeded with task.threadId threads its whole response with no directive", async () => {
+  test("a task pre-seeded with task.threadId threads its whole response", async () => {
     const config = buildConfig(workspaceRoot, "chat-route-preseed");
     const provider = normalizeProvider(config.provider);
     const { sessionId, parentBlockId } = await seedFirstTurn(config, provider);
 
-    // The reply carries NO directive — pre-seeding must thread it anyway.
     setEchoToolCallingResponse({
       provider,
       text: "Replying inside the existing thread.",
@@ -463,8 +150,8 @@ describe("chat-task route directive", () => {
     });
 
     // Build the task with the thread fields already set (mirrors how the
-    // Phase 0c thread-reply endpoint spawns it) and run it directly so the
-    // loop resolves its emit context from the pre-seeded fields with no race.
+    // dormant thread-reply path spawns it) and run it directly so the loop
+    // resolves its emit context from the pre-seeded fields with no race.
     const seededThreadId = "thread_preseed";
     const task = createTask(config.instance, "thread reply", undefined, undefined, undefined, undefined, undefined, sessionId);
     task.mode = "chat";
@@ -483,49 +170,5 @@ describe("chat-task route directive", () => {
     expect(blocks.length).toBe(1);
     expect(blocks[0]!.threadId).toBe(seededThreadId);
     expect(blocks[0]!.parentBlockId).toBe(parentBlockId);
-  });
-
-  // Mixed-streaming overflow retry: attempt 1 STREAMS the directive (the
-  // thread switch fires and the prefix is stripped mid-stream), the attempt
-  // fails with a context overflow, and the per-attempt reset clears the
-  // route state. A successful NON-streaming retry then repeats the
-  // directive — finalizeTurnRoute must still strip it (detection reads
-  // "already threaded", so without the first-call re-parse the raw
-  // directive lands in the summary and the settled block).
-  test("a non-streaming retry after a streamed directive still strips the directive", async () => {
-    const OVERFLOW_MESSAGE = "prompt is too long: 250000 tokens > 200000 maximum";
-    const config = buildConfig(workspaceRoot, "chat-route-retry-strip");
-    const provider = normalizeProvider(config.provider);
-    const { sessionId } = await seedFirstTurn(config, provider);
-
-    setEchoToolCallingFailure(OVERFLOW_MESSAGE, {
-      streamTextBeforeFailure: "<route>thread</route>Partial thread answer"
-    });
-    setEchoToolCallingResponse(
-      {
-        provider,
-        text: "<route>thread</route>Final thread answer.",
-        toolCalls: [],
-        finishReason: "stop"
-      },
-      undefined,
-      { nonStreaming: true }
-    );
-
-    const second = await submitChatMessage(config, sessionId, { content: "dig into this" });
-    const finished = await waitForTerminal(config, second.taskId);
-
-    expect(finished.status).toBe("completed");
-    expect(finished.summary).toBe("Final thread answer.");
-    expect(finished.summary).not.toContain("<route>");
-    // The streamed attempt's switch stands: the turn is threaded.
-    expect(finished.threadId).toBeDefined();
-
-    const blocks = listChatBlocks(config.instance, sessionId)
-      .filter((b) => b.kind === "assistant_text" && b.taskId === second.taskId);
-    expect(blocks.length).toBe(1);
-    expect(assistantText(blocks[0]!)).toBe("Final thread answer.");
-    expect(assistantText(blocks[0]!)).not.toContain("<route>");
-    expect(blocks[0]!.threadId).toBe(finished.threadId);
   });
 });

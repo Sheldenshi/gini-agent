@@ -351,6 +351,11 @@ interface ChatBlockBase {
   // meaningful on the thread's first block, but stamped on every thread
   // block for simplicity.
   parentBlockId?: string;
+  // Set on a forwarded copy of a Topic's final answer that lands in the parent
+  // Chat (kind:"agent") session. The replay-authoritative answer row lives in the
+  // Topic session; this Chat-side copy is render-only and deep-links back to the Topic.
+  forwardedFromTopicId?: string;
+  forwardedFromTopicTitle?: string;
 }
 
 // Inline image attached to a user message. The runtime stores the bytes on
@@ -878,17 +883,20 @@ export interface Task {
   // when the surface is unknown. See ADR client-surface-context.md.
   clientSurface?: ChatClientSurface;
   // Thread membership for the task's emitted chat blocks. Set when a task is
-  // spawned to reply inside a thread (Phase 0c thread-reply endpoint), in
-  // which case the whole response threads with no routing directive needed.
-  // The runtime may also set `threadId`/`parentBlockId` mid-turn when the
-  // agent's `<route>thread</route>` directive fires, persisting them so an
-  // approval-resume re-threads from the same parent. Absent for ordinary
-  // main-chat tasks.
+  // spawned to reply inside a thread (the thread-reply endpoint), in which
+  // case the whole response threads. Absent for ordinary main-chat tasks.
   threadId?: string;
   parentBlockId?: string;
   // Times this task has been re-dispatched after a gateway restart; capped to
   // break crash loops — see ADR task-resume-on-restart.md.
   bootResumeCount?: number;
+  // "Additional input needed" marker (ADR chat-topics-tasks-subagents.md). Set
+  // when this task is a subagent child whose ask_user call could not be
+  // answered in-band (no chat surface), so the question must bubble up to the
+  // parent's spawn_subagent tool result. syncSubagentFromTask mirrors it onto
+  // the SubagentRecord's resultNeedsInput; the parent then re-asks via its own
+  // ask_user. Render-only/return-value grain — NOT a TaskStatus.
+  needsInput?: { question: string };
 }
 
 export interface RuntimeEvent {
@@ -1003,12 +1011,23 @@ export interface ChatSessionRecord {
   // human opens them.
   origin?: "job";
   // The session's role in the new chats IA. `"agent"` = the single
-  // canonical chat for an agent; `"channel"` = a recurring-job-derived
-  // channel (always also carries `origin: "job"`). DISTINCT from
-  // `source?.kind` (the messaging-bridge kind). Legacy/non-canonical
-  // sessions may leave this undefined; the new UI treats undefined as
-  // hidden.
-  kind?: "agent" | "channel";
+  // canonical chat for an agent (this is Chat — the always-present main
+  // interface); `"channel"` = a recurring-job-derived channel (always also
+  // carries `origin: "job"`); `"topic"` = a subject-scoped session with its
+  // own isolated context window, spawned by Chat / a job / another topic
+  // (ADR chat-topics-tasks-subagents.md). `"channel"` folds into `"topic"`
+  // in a later phase. DISTINCT from `source?.kind` (the messaging-bridge
+  // kind). Legacy/non-canonical sessions may leave this undefined; the new
+  // UI treats undefined as hidden.
+  kind?: "agent" | "channel" | "topic";
+  // Short rolling summary of a `kind:"topic"` session, used later for
+  // routing/retrieval (Chat picks a topic to dispatch into by recalling over
+  // topic summaries). Absent until a topic accrues content.
+  topicSummary?: string;
+  // The Chat (`kind:"agent"`) session that spawned a `kind:"topic"` session,
+  // used later to forward a topic's final answer back into Chat. The topic's
+  // display name reuses the existing `title` field.
+  parentChatSessionId?: string;
   // Archived marker. Absent = active. An archived session keeps its full
   // history and stays directly addressable (GET /api/chat/<id>, deep links),
   // but is excluded from session/channel lists. Set when a job's delivery
@@ -1210,6 +1229,19 @@ export interface SubagentRecord {
   // joining against the task table.
   resultSummary?: string;
   resultError?: string;
+  // The "additional input needed" return variant (ADR
+  // chat-topics-tasks-subagents.md). A subagent has no chat surface of its
+  // own, so when its child task calls ask_user the question can't be answered
+  // in-band; instead the question bubbles up here and surfaces in the parent's
+  // spawn_subagent tool result so the PARENT (which does have a topic/chat
+  // session) can re-ask. This lives only on the return-value/marker types — it
+  // is NOT a persisted SubagentStatus.
+  resultNeedsInput?: { question: string };
+  // Optional framing the parent passes when delegating: a one-line objective and
+  // any background the subagent needs. Rendered as `## Goal` / `## Context`
+  // sections ahead of the subagent's prompt in its system context.
+  goal?: string;
+  context?: string;
 }
 
 // Cached `tools/list` entry from an HTTP MCP server. Populated on the
@@ -1881,6 +1913,17 @@ export interface JobRecord {
   // as an assistant chat message. Backwards-compatible: legacy jobs without
   // this field keep their existing imperative delivery semantics.
   chatSessionId?: string;
+  // Forward-to-Chat flag (ADR chat-topics-tasks-subagents.md, "Jobs →
+  // Topics"). A job ALWAYS runs in its own dedicated Topic (the
+  // `kind:"channel"`, `origin:"job"` session pointed at by `chatSessionId`).
+  // When `forwardToChat` is true, each fire additionally FORWARDS its final
+  // answer into the owning agent's Chat (the `kind:"agent"` session) as a
+  // render-only block tagged with the job's Topic — instead of burying the
+  // job's reports inside the user's conversation. This is the new shape of
+  // "deliver to chat": the originating `deliverTo:"chat"` choice flips this
+  // flag rather than re-pointing `chatSessionId` at the user's conversation.
+  // Absent/false ⇒ channel-only delivery (the Topic is the only surface).
+  forwardToChat?: boolean;
   // One-shot reminder semantics: when true the job is auto-paused after its
   // first terminal run (success or fail). The user can resume manually
   // through /jobs. Defaults to undefined/false (recurring behavior).
@@ -1981,6 +2024,7 @@ export type UsageSource =
   | "subagent"
   | "memory"
   | "chat-title"
+  | "chat-route"
   | "vision"
   | "aux"
   | "imperative"

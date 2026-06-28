@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useSyncExternalStore } from "react";
-import type { ChatSession, ThreadSummary } from "./view-types";
+import type { ChatSession } from "./view-types";
 
 // Per-browser tracking of when the user last viewed each chat session.
 // A session is "unread" when its activity timestamp is newer than the
@@ -173,112 +173,4 @@ export function useChatReadState(sessions: ChatSession[] | undefined) {
   // timestamp advances (e.g., its task finishes while it's open),
   // not just when `session.updatedAt` does.
   return { isUnread, markRead, activityAt: (session: ChatSession) => activityAt(session as SessionLike) };
-}
-
-// Per-thread read tracking, parallel to the session read-state above but keyed
-// by threadId and compared against `lastReplyAt`. A thread is unread when its
-// last reply is newer than the stored last-seen. State is per-device
-// (localStorage); opening the main chat does NOT clear thread badges
-// (decision F) — a thread only clears when the user opens that thread.
-
-const THREAD_STORAGE_KEY = "gini.thread.lastRead";
-const THREAD_INIT_FLAG_KEY = "gini.thread.lastRead.init";
-
-let threadCache: State | null = null;
-const threadListeners = new Set<() => void>();
-
-function readThreadStorage(): State {
-  if (typeof window === "undefined") return { map: {}, initialized: false };
-  let map: ReadMap = {};
-  try {
-    const raw = window.localStorage.getItem(THREAD_STORAGE_KEY);
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed === "object") map = parsed as ReadMap;
-    }
-  } catch {
-    map = {};
-  }
-  const initialized = window.localStorage.getItem(THREAD_INIT_FLAG_KEY) === "1";
-  return { map, initialized };
-}
-
-function persistThread(state: State) {
-  if (typeof window === "undefined") return;
-  try {
-    window.localStorage.setItem(THREAD_STORAGE_KEY, JSON.stringify(state.map));
-    if (state.initialized) window.localStorage.setItem(THREAD_INIT_FLAG_KEY, "1");
-  } catch {
-    // Quota or disabled storage — silently ignore.
-  }
-}
-
-function getThreadState(): State {
-  if (threadCache === null) threadCache = readThreadStorage();
-  return threadCache;
-}
-
-function setThreadState(next: State) {
-  threadCache = next;
-  persistThread(next);
-  for (const listener of threadListeners) listener();
-}
-
-function subscribeThread(listener: () => void) {
-  threadListeners.add(listener);
-  return () => {
-    threadListeners.delete(listener);
-  };
-}
-
-function getThreadSnapshot(): State {
-  return getThreadState();
-}
-
-export function useThreadReadState(threads: ThreadSummary[] | undefined) {
-  const state = useSyncExternalStore(subscribeThread, getThreadSnapshot, getServerSnapshot);
-
-  // First-run seeding: mark every existing thread read so the inbox doesn't
-  // flash all-unread on first load after the feature ships. Threads arriving
-  // later default to unread.
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    if (threads === undefined) return;
-    const current = getThreadState();
-    if (current.initialized) return;
-    const map: ReadMap = { ...current.map };
-    for (const t of threads) {
-      if (!map[t.threadId]) map[t.threadId] = t.lastReplyAt;
-    }
-    setThreadState({ map, initialized: true });
-  }, [threads]);
-
-  const markThreadRead = useCallback((thread: ThreadSummary) => {
-    const at = thread.lastReplyAt;
-    const current = getThreadState();
-    if (current.map[thread.threadId] === at) return;
-    setThreadState({
-      map: { ...current.map, [thread.threadId]: at },
-      initialized: true
-    });
-  }, []);
-
-  const markAllThreadsRead = useCallback((all: ThreadSummary[]) => {
-    const current = getThreadState();
-    const map: ReadMap = { ...current.map };
-    for (const t of all) map[t.threadId] = t.lastReplyAt;
-    setThreadState({ map, initialized: true });
-  }, []);
-
-  const isThreadUnread = useCallback(
-    (thread: ThreadSummary) => {
-      if (!state.initialized) return false;
-      const seen = state.map[thread.threadId];
-      if (!seen) return true;
-      return thread.lastReplyAt > seen;
-    },
-    [state]
-  );
-
-  return { isThreadUnread, markThreadRead, markAllThreadsRead };
 }

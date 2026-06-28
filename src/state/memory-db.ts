@@ -58,10 +58,18 @@ import { id, now } from "./ids";
 // ensureColumn calls. The (session_id, thread_id, ordinal) index covers
 // thread playback; the existing UNIQUE(session_id, ordinal) is untouched.
 //
+// Bumped to 10 for the Chat → Topics model (ADR
+// chat-topics-tasks-subagents.md): legacy threads are converted into linear
+// Chat history by nulling chat_blocks.thread_id / parent_block_id once on
+// upgrade from a pre-10 schema, so previously-threaded blocks read as
+// main-chat in ordinal order. The idx_chat_blocks_thread index is left in
+// place (later-phase cleanup). Fresh installs skip the UPDATE — their
+// thread tags are already NULL.
+//
 // The agent-database primitive (ADR agent-database.md) intentionally lives in a
 // SEPARATE per-agent SQLite file (src/state/agent-data-db.ts), NOT here — so the
 // agent's own SQL can never reach memory.db. This DB stays Gini-system-only.
-export const MEMORY_SCHEMA_VERSION = 9;
+export const MEMORY_SCHEMA_VERSION = 10;
 export const DEFAULT_BANK_ID = "bank_default";
 
 // Builds a deterministic per-agent bank id from an agent id. Used by
@@ -326,6 +334,16 @@ function applyMigrations(db: Database): void {
     CREATE INDEX IF NOT EXISTS idx_links_entity ON memory_links(entity_id) WHERE entity_id IS NOT NULL;
   `);
 
+  // Read the version already on disk (schema_meta exists after the block
+  // above) BEFORE the INSERT OR REPLACE at the end rewrites it. Used to gate
+  // one-time data migrations that must NOT re-run on every open. A fresh DB
+  // has no row → 0; a legacy row parses to its stored version.
+  const priorVersion = Number(
+    db
+      .query<{ value: string }, [string]>("SELECT value FROM schema_meta WHERE key = ?")
+      .get("version")?.value ?? "0"
+  );
+
   // Step 2 — Phase C additive migration: pre-Phase-C databases were created
   // without the agent_id columns on memory_banks / memory_units. Add them
   // in-place with a runtime check — SQLite has no IF NOT EXISTS on ALTER
@@ -407,6 +425,18 @@ function applyMigrations(db: Database): void {
   // before the split keeps the stale constraint and rejects every new
   // setup_requested / authorization_requested insert at runtime.
   ensureChatBlocksKindConstraint(db);
+
+  // Schema v10 (ADR chat-topics-tasks-subagents.md) — convert legacy threads
+  // into linear Chat history by nulling the thread tags. Runs ONCE, only when
+  // upgrading from a pre-10 schema (priorVersion < 10), so it can't wipe tags
+  // a later phase may set. Placed after the ensureColumn / recreate paths
+  // above so both leave thread tags NULL: the recreate copies thread_id /
+  // parent_block_id forward, and this UPDATE then nulls those copied values.
+  // Threaded blocks already share the session's one ordinal stream, so once
+  // the tags are NULL they read back as main-chat in ordinal order.
+  if (priorVersion < 10) {
+    db.exec("UPDATE chat_blocks SET thread_id = NULL, parent_block_id = NULL;");
+  }
 
   // Step 5 — devices table (schema version 4). Stores APNs push tokens
   // per credential so the runtime can fan an `approval_requested` block

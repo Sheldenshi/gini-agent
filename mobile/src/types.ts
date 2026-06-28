@@ -24,27 +24,9 @@ export type {
   SetupRequest,
   SetupRequestStatus,
   SystemNoteBlock,
-  ThreadSummary,
   JobRecord,
   RunRecord
 } from "@runtime/types";
-
-// Cross-agent thread row from GET /api/threads. Same shape as the
-// per-session ThreadSummary plus the owning agent's display name, which
-// the gateway joins in so the inbox can render the agent chip without a
-// second /agents lookup.
-export interface InboxThreadSummary {
-  threadId: string;
-  sessionId: string;
-  agentId?: string;
-  agentName?: string;
-  parentBlockId?: string;
-  rootPreview?: string;
-  replyCount: number;
-  lastReplyAt: string;
-  lastReplyPreview?: string;
-  lastReplyAuthor?: "user" | "agent";
-}
 
 export interface ChatSession {
   id: string;
@@ -64,9 +46,10 @@ export interface ChatSession {
   // list to render a one-line subtitle below the title.
   lastMessagePreview?: string | null;
   // Role in the chats IA. `"agent"` = an agent's single canonical chat;
-  // `"channel"` = a recurring-job-derived channel. Undefined for legacy /
+  // `"channel"` = a recurring-job-derived channel; `"topic"` = a
+  // subject-scoped session with its own context window. Undefined for legacy /
   // non-canonical sessions.
-  kind?: "agent" | "channel";
+  kind?: "agent" | "channel" | "topic";
   // `"job"` marks a session spawned by a scheduled job — channels carry
   // both this and `kind: "channel"`.
   origin?: "job";

@@ -6,6 +6,8 @@ import { BlockPhase } from "./BlockPhase";
 import { BlockSystemNote } from "./BlockSystemNote";
 import { BlockToolCall } from "./BlockToolCall";
 import { BlockUserText } from "./BlockUserText";
+import { TopicForwardChip } from "./TopicForwardChip";
+import { assertNever } from "@/lib/utils";
 
 // Dispatcher for the typed ChatBlock union. The switch is exhaustive on
 // `block.kind` — adding a new block kind requires a new case here, and
@@ -27,7 +29,21 @@ export function BlockRenderer({
     case "user_text":
       return <BlockUserText block={block} />;
     case "assistant_text":
-      return <BlockAssistantText block={block} agent={agent} />;
+      // A forwarded Topic answer carries its source Topic; render a deep-link
+      // chip under the answer text, aligned to the message in the avatar gutter.
+      return block.forwardedFromTopicId ? (
+        <div className="space-y-2">
+          <BlockAssistantText block={block} agent={agent} />
+          <div className="pl-[46px]">
+            <TopicForwardChip
+              topicId={block.forwardedFromTopicId}
+              topicTitle={block.forwardedFromTopicTitle}
+            />
+          </div>
+        </div>
+      ) : (
+        <BlockAssistantText block={block} agent={agent} />
+      );
     case "tool_call":
       return <BlockToolCall block={block} result={toolResult} />;
     case "tool_result":
@@ -35,14 +51,39 @@ export function BlockRenderer({
     case "phase":
       return <BlockPhase block={block} />;
     case "authorization_requested":
-      return <BlockAuthorizationRequested block={block} />;
+      // A gate forwarded from a Topic carries its source Topic; render the same
+      // deep-link chip under the (fully actionable) card, aligned like the
+      // assistant_text chip above.
+      return block.forwardedFromTopicId ? (
+        <div className="space-y-2">
+          <BlockAuthorizationRequested block={block} />
+          <div className="pl-[46px]">
+            <TopicForwardChip
+              topicId={block.forwardedFromTopicId}
+              topicTitle={block.forwardedFromTopicTitle}
+            />
+          </div>
+        </div>
+      ) : (
+        <BlockAuthorizationRequested block={block} />
+      );
     case "setup_requested":
-      return <BlockSetupRequested block={block} />;
+      return block.forwardedFromTopicId ? (
+        <div className="space-y-2">
+          <BlockSetupRequested block={block} />
+          <div className="pl-[46px]">
+            <TopicForwardChip
+              topicId={block.forwardedFromTopicId}
+              topicTitle={block.forwardedFromTopicTitle}
+            />
+          </div>
+        </div>
+      ) : (
+        <BlockSetupRequested block={block} />
+      );
     case "system_note":
       return <BlockSystemNote block={block} />;
-    default: {
-      const exhaustive: never = block;
-      throw new Error(`Unknown chat block kind: ${JSON.stringify(exhaustive)}`);
-    }
+    default:
+      return assertNever(block);
   }
 }

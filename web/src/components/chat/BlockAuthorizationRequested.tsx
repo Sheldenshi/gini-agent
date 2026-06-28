@@ -54,7 +54,7 @@ export function BlockAuthorizationRequested({ block }: { block: AuthorizationReq
     mutationFn: ({ op }: { op: "approve" | "deny" }) =>
       api<Authorization>(`/authorizations/${block.authorizationId}/${op}`, { method: "POST" }),
     onSuccess: () => {
-      invalidate(["authorizations", "approvals", "tasks", "task", "chat", "threads", "threads-inbox", "events", "audit"]);
+      invalidate(["authorizations", "approvals", "tasks", "task", "chat", "events", "audit"]);
     },
     onError: (error: Error) => toast.error(error.message)
   });

@@ -37,7 +37,7 @@ export function BlockSetupRequested({ block }: { block: SetupRequestedBlock }) {
     mutationFn: () =>
       api<SetupRequest>(`/setup-requests/${block.setupRequestId}/cancel`, { method: "POST" }),
     onSuccess: () => {
-      invalidate(["setup-requests", "approvals", "tasks", "task", "chat", "threads", "threads-inbox", "events", "audit"]);
+      invalidate(["setup-requests", "approvals", "tasks", "task", "chat", "events", "audit"]);
     },
     onError: (error: Error) => toast.error(error.message),
     onSettled: () => {
@@ -73,7 +73,7 @@ export function BlockSetupRequested({ block }: { block: SetupRequestedBlock }) {
       if (result.ok) {
         setConnectOpen(false);
         setConnectError(null);
-        invalidate(["setup-requests", "approvals", "tasks", "task", "chat", "threads", "threads-inbox", "events", "audit", "connectors"]);
+        invalidate(["setup-requests", "approvals", "tasks", "task", "chat", "events", "audit", "connectors"]);
       } else {
         // The backend now claims the setup row BEFORE createConnector, so a
         // failed connect leaves the row `completed` (with a persisted
@@ -86,7 +86,7 @@ export function BlockSetupRequested({ block }: { block: SetupRequestedBlock }) {
         // re-issue request_connector for a fresh card.
         setConnectOpen(false);
         setConnectError(result.message ?? "Could not connect. Please verify the credentials and try again.");
-        invalidate(["setup-requests", "approvals", "tasks", "task", "chat", "threads", "threads-inbox", "events", "audit", "connectors"]);
+        invalidate(["setup-requests", "approvals", "tasks", "task", "chat", "events", "audit", "connectors"]);
       }
     },
     onError: (error: Error) => {
@@ -98,7 +98,7 @@ export function BlockSetupRequested({ block }: { block: SetupRequestedBlock }) {
       // in that summary.
       setConnectOpen(false);
       setConnectError(error.message);
-      invalidate(["setup-requests", "approvals", "tasks", "task", "chat", "threads", "threads-inbox", "events", "audit", "connectors"]);
+      invalidate(["setup-requests", "approvals", "tasks", "task", "chat", "events", "audit", "connectors"]);
     }
   });
 
@@ -116,7 +116,7 @@ export function BlockSetupRequested({ block }: { block: SetupRequestedBlock }) {
       });
     },
     onSuccess: () => {
-      invalidate(["setup-requests", "approvals", "tasks", "task", "chat", "threads", "threads-inbox", "events", "audit", "browser"]);
+      invalidate(["setup-requests", "approvals", "tasks", "task", "chat", "events", "audit", "browser"]);
     },
     onError: (error: Error) => toast.error(error.message)
   });
@@ -132,7 +132,7 @@ export function BlockSetupRequested({ block }: { block: SetupRequestedBlock }) {
         body: JSON.stringify({})
       }),
     onSuccess: () => {
-      invalidate(["setup-requests", "approvals", "tasks", "task", "chat", "threads", "threads-inbox", "events", "audit", "skills"]);
+      invalidate(["setup-requests", "approvals", "tasks", "task", "chat", "events", "audit", "skills"]);
     },
     onError: (error: Error) => toast.error(error.message)
   });
@@ -149,7 +149,7 @@ export function BlockSetupRequested({ block }: { block: SetupRequestedBlock }) {
         body: JSON.stringify({})
       }),
     onSuccess: () => {
-      invalidate(["setup-requests", "approvals", "tasks", "task", "chat", "threads", "threads-inbox", "events", "audit"]);
+      invalidate(["setup-requests", "approvals", "tasks", "task", "chat", "events", "audit"]);
     },
     onError: (error: Error) => toast.error(error.message)
   });
@@ -300,7 +300,7 @@ export function BlockSetupRequested({ block }: { block: SetupRequestedBlock }) {
       // atomically before running fills, so on both ok and !ok paths the
       // status has flipped out of "pending" and the card needs to
       // re-render with isPending=false (Submit disabled, inputs hidden).
-      invalidate(["setup-requests", "approvals", "tasks", "task", "chat", "threads", "threads-inbox", "events", "audit"]);
+      invalidate(["setup-requests", "approvals", "tasks", "task", "chat", "events", "audit"]);
     },
     onError: (error: Error) => toast.error(error.message),
     onSettled: () => setFillValues({})
@@ -336,7 +336,7 @@ export function BlockSetupRequested({ block }: { block: SetupRequestedBlock }) {
       // re-render with isPending=false. Without this, a failed create would
       // leave the Add button enabled and a retry would be 410-Gone. Mirrors
       // the fillSubmit precedent above.
-      invalidate(["setup-requests", "approvals", "tasks", "task", "chat", "threads", "threads-inbox", "events", "audit", "messaging"]);
+      invalidate(["setup-requests", "approvals", "tasks", "task", "chat", "events", "audit", "messaging"]);
       if (!result.ok) {
         setBridgeError(result.message ?? "Could not add bridge. Please verify the bot token and try again.");
         return;
@@ -353,7 +353,7 @@ export function BlockSetupRequested({ block }: { block: SetupRequestedBlock }) {
       // card out of the stale pending state. The fillSubmit precedent fires
       // its own invalidate via onSuccess on both ok and !ok paths; the
       // onError seam is the equivalent for pre-response throws.
-      invalidate(["setup-requests", "approvals", "tasks", "task", "chat", "threads", "threads-inbox", "events", "audit", "messaging"]);
+      invalidate(["setup-requests", "approvals", "tasks", "task", "chat", "events", "audit", "messaging"]);
     },
     onSettled: () => {
       // Drop the typed bot token regardless of outcome — the token has
@@ -428,7 +428,7 @@ export function BlockSetupRequested({ block }: { block: SetupRequestedBlock }) {
       // side effect, so the cache must refresh regardless of ok value to
       // flip the card out of pending state. Same precedent as the bridge
       // submitter and fillSubmit.
-      invalidate(["setup-requests", "approvals", "tasks", "task", "chat", "threads", "threads-inbox", "events", "audit", "messaging"]);
+      invalidate(["setup-requests", "approvals", "tasks", "task", "chat", "events", "audit", "messaging"]);
       setPairingResultOk(response.ok);
       setPairingResultMessage(response.message ?? null);
       if (!response.ok) {
@@ -443,7 +443,7 @@ export function BlockSetupRequested({ block }: { block: SetupRequestedBlock }) {
       setPairingError(error.message);
       setPairingResultOk(false);
       setPairingResultMessage(error.message);
-      invalidate(["setup-requests", "approvals", "tasks", "task", "chat", "threads", "threads-inbox", "events", "audit", "messaging"]);
+      invalidate(["setup-requests", "approvals", "tasks", "task", "chat", "events", "audit", "messaging"]);
     },
     onSettled: () => {
       pairingSubmittingRef.current = false;
@@ -470,7 +470,7 @@ export function BlockSetupRequested({ block }: { block: SetupRequestedBlock }) {
       return response;
     },
     onSuccess: (response) => {
-      invalidate(["setup-requests", "approvals", "tasks", "task", "chat", "threads", "threads-inbox", "events", "audit", "messaging"]);
+      invalidate(["setup-requests", "approvals", "tasks", "task", "chat", "events", "audit", "messaging"]);
       setRemoveResultOk(response.ok);
       if (!response.ok) {
         setRemoveError(response.message ?? "Could not remove bridge.");
@@ -482,7 +482,7 @@ export function BlockSetupRequested({ block }: { block: SetupRequestedBlock }) {
     onError: (error: Error) => {
       setRemoveError(error.message);
       setRemoveResultOk(false);
-      invalidate(["setup-requests", "approvals", "tasks", "task", "chat", "threads", "threads-inbox", "events", "audit", "messaging"]);
+      invalidate(["setup-requests", "approvals", "tasks", "task", "chat", "events", "audit", "messaging"]);
     },
     onSettled: () => {
       removeSubmittingRef.current = false;
@@ -1128,7 +1128,7 @@ function ChoiceCard({
         )
       }),
     onSuccess: () => {
-      invalidate(["setup-requests", "approvals", "tasks", "task", "chat", "threads", "threads-inbox", "events", "audit"]);
+      invalidate(["setup-requests", "approvals", "tasks", "task", "chat", "events", "audit"]);
     },
     onError: (error: Error) => toast.error(error.message)
   });

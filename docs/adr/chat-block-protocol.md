@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-05-21
-- **See also:** [Agent Loop With Native Tool Calling](./agent-loop-tool-calling.md), [Per-Agent Memory Isolation](./agent-memory-isolation.md), [One Chat Per Agent, Threads, And Job Channels](./agent-chat-threads-and-channels.md)
+- **See also:** [Agent Loop With Native Tool Calling](./agent-loop-tool-calling.md), [Per-Agent Memory Isolation](./agent-memory-isolation.md), [Chat → Topics → Tasks → Subagents](./chat-topics-tasks-subagents.md), [One Chat Per Agent, Threads, And Job Channels](./agent-chat-threads-and-channels.md)
 
 ## Decision
 
@@ -139,11 +139,17 @@ remote previews, screen readers) would need the same translation code.
   invariant is preserved. `listThreadBlocks` / `listMainChatBlocks` /
   `summarizeThreads` / `summarizeThreadsForInstance` query thread
   membership; inserts and upserts carry the columns forward so streaming
-  preserves membership with no extra arguments. See ADR
-  agent-chat-threads-and-channels.md for the threading model, the
-  agent-decided routing (`start_thread` control tool +
-  `<route>thread</route>` fallback), and the one-chat-per-agent /
-  job-channel IA.
+  preserves membership with no extra arguments.
+  **Superseded:** thread tagging is replaced by **Topics**
+  ([Chat → Topics → Tasks → Subagents](./chat-topics-tasks-subagents.md)) — a
+  side-conversation is now its own `kind:"topic"` session rather than a tag on
+  the agent's one stream. The `thread_id` / `parent_block_id` columns are retained
+  but dormant (legacy threads had their tags nulled), and the thread-read helpers
+  above are unused. The block wire protocol itself (block shapes, ordinal stream,
+  SSE, `Last-Event-ID` resume) is unchanged and applies per Topic session. See ADR
+  agent-chat-threads-and-channels.md for the historical threading model and its
+  agent-decided routing (`start_thread` control tool + `<route>thread</route>`
+  fallback).
 
 - Emission in `src/execution/chat-task.ts` via helpers in
   `src/execution/chat-task-emit.ts`. The loop resolves an emission
@@ -337,9 +343,11 @@ remote previews, screen readers) would need the same translation code.
     natural end (see `src/execution/turn-abort.ts`). As defense-in-depth
     for the brief window before the abort unwinds the stream, the streaming
     flush re-checks terminal status and drops post-cancel deltas (no new
-    `assistant_text` block is born after the cancel), and
-    `switchTurnToThread` likewise refuses to emit a main-chat
-    `phase("Completed")` once the task is terminal. A stuck streaming block
+    `assistant_text` block is born after the cancel); the same
+    terminal-status guard also suppressed a stray `phase("Completed")` once
+    the task was terminal (formerly in the now-removed `switchTurnToThread`
+    turn-routing helper, superseded by Topics — see
+    chat-topics-tasks-subagents.md). A stuck streaming block
     left by a process that died mid-stream (before this landed) is healed:
     `runChatTask` settles a resumed task's own stale block, and a one-shot
     boot sweep (`healOrphanedStreamingBlocks`) settles orphaned blocks whose

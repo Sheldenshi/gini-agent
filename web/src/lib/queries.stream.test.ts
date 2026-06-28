@@ -1,17 +1,17 @@
 /// <reference lib="dom" />
 
-// useChatBlocks / useThread SSE transport tests. These render the real hooks
-// against a stubbed fetch (the REST seed) and a fake global EventSource (the
-// transport the resilient wrapper opens), pinning the stream contract:
-// seed-then-merge, upsert-by-id with ordinal re-sort, thread filtering,
-// malformed-frame tolerance, and close-on-unmount.
+// useChatBlocks SSE transport tests. These render the real hook against a
+// stubbed fetch (the REST seed) and a fake global EventSource (the transport
+// the resilient wrapper opens), pinning the stream contract: seed-then-merge,
+// upsert-by-id with ordinal re-sort, malformed-frame tolerance, and
+// close-on-unmount.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { act, renderHook, waitFor } from "@testing-library/react";
 import type { ChatBlock, UserTextBlock } from "@runtime/types";
-import { useChatBlocks, useThread } from "./queries";
+import { useChatBlocks } from "./queries";
 
-function block(id: string, ordinal: number, text: string, threadId?: string): UserTextBlock {
+function block(id: string, ordinal: number, text: string): UserTextBlock {
   return {
     id,
     sessionId: "s1",
@@ -19,8 +19,7 @@ function block(id: string, ordinal: number, text: string, threadId?: string): Us
     ordinal,
     createdAt: "2026-06-10T00:00:00.000Z",
     kind: "user_text",
-    text,
-    ...(threadId ? { threadId } : {})
+    text
   } as UserTextBlock;
 }
 
@@ -111,42 +110,6 @@ describe("useChatBlocks (SSE transport)", () => {
   test("a seed failure surfaces the error without leaving the hook loading", async () => {
     // No stub registered → the seed GET 404s with a JSON error envelope.
     const { result } = renderHook(() => useChatBlocks("missing"));
-    await waitFor(() => expect(result.current.isLoading).toBe(false));
-    expect(result.current.error).not.toBeNull();
-  });
-});
-
-describe("useThread (shared session stream)", () => {
-  test("filters live frames to its thread and closes on unmount", async () => {
-    seedBodies["/chat/s1/threads/t1/blocks"] = [block("t1-b1", 1, "thread start", "t1")];
-    const { result, unmount } = renderHook(() => useThread("s1", "t1"));
-    await waitFor(() => expect(result.current.isLoading).toBe(false));
-    expect(result.current.blocks.map((b) => b.id)).toEqual(["t1-b1"]);
-    const transport = FakeEventSource.instances[0]!;
-    expect(transport.url).toBe("/api/runtime/chat/s1/stream");
-
-    // Same-thread frames merge (upsert + append); other-thread/main frames drop.
-    act(() => transport.emit("chat_block", JSON.stringify(block("t1-b2", 2, "reply", "t1"))));
-    act(() => transport.emit("chat_block", JSON.stringify(block("main-b9", 9, "main chat"))));
-    act(() => transport.emit("chat_block", JSON.stringify(block("t2-b1", 4, "other thread", "t2"))));
-    act(() => transport.emit("chat_block", JSON.stringify(block("t1-b2", 2, "reply (edited)", "t1"))));
-    act(() => transport.emit("chat_block", "{not json"));
-    expect(result.current.blocks.map((b) => b.id)).toEqual(["t1-b1", "t1-b2"]);
-    expect((result.current.blocks[1] as UserTextBlock).text).toBe("reply (edited)");
-
-    unmount();
-    expect(transport.closed).toBe(true);
-  });
-
-  test("null ids: no stream and not loading", () => {
-    const { result } = renderHook(() => useThread(null, null));
-    expect(result.current.isLoading).toBe(false);
-    expect(FakeEventSource.instances.length).toBe(0);
-  });
-
-  test("a seed failure surfaces the error without leaving the hook loading", async () => {
-    // No stub registered → the thread seed GET 404s.
-    const { result } = renderHook(() => useThread("s1", "missing"));
     await waitFor(() => expect(result.current.isLoading).toBe(false));
     expect(result.current.error).not.toBeNull();
   });

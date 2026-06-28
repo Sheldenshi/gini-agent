@@ -19,8 +19,7 @@ import type {
   ImprovementProposal,
   PairedDevice,
   RuntimeEvent,
-  JobRunRecord,
-  ThreadSummary as RuntimeThreadSummary
+  JobRunRecord
 } from "@runtime/types";
 
 // UI-friendly aliases for chat records.
@@ -33,15 +32,6 @@ export interface ChatSession extends ChatSessionRecord {
   pendingApprovalCount?: number;
 }
 export type ChatMessage = ChatMessageRecord;
-
-// One row per distinct thread in a session (mirrors the runtime contract).
-// The cross-agent `GET /api/threads` endpoint enriches each summary with the
-// owning agent's display name, so the inbox can chip it without a second
-// lookup. `agentName` is wire-only enrichment — absent on the per-session
-// `GET /api/chat/:id/threads` response.
-export interface ThreadSummary extends RuntimeThreadSummary {
-  agentName?: string;
-}
 
 // Trimmed agent shape returned by `GET /api/agents`. Derived from the
 // runtime `AgentRecord` so the fields can't drift; the Pick drops the

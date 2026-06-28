@@ -2,7 +2,15 @@
 
 - **Status:** Accepted
 - **Date:** 2026-06-05
-- **See also:** [One Chat Per Agent, Threads, And Job Channels](./agent-chat-threads-and-channels.md), [Stable System Prefix For Chat Prompt Caching](./stable-system-prefix.md), [Agent Loop With Native Tool Calling](./agent-loop-tool-calling.md), [Per-Agent Memory Isolation](./agent-memory-isolation.md)
+- **See also:** [Chat → Topics → Tasks → Subagents](./chat-topics-tasks-subagents.md), [One Chat Per Agent, Threads, And Job Channels](./agent-chat-threads-and-channels.md), [Stable System Prefix For Chat Prompt Caching](./stable-system-prefix.md), [Agent Loop With Native Tool Calling](./agent-loop-tool-calling.md), [Per-Agent Memory Isolation](./agent-memory-isolation.md)
+
+> **Per-topic isolation replaced thread-priority packing.** [Chat → Topics → Tasks → Subagents](./chat-topics-tasks-subagents.md)
+> made each Topic its own session, so bounded replay now scopes naturally to the Topic's own
+> transcript — a turn replays only the rows of the session it runs in. The thread-priority packing
+> described below (preferring the active thread's rows, the `groupPriority`/`activeThreadId`
+> heuristic, and the `threadId` / `parentBlockId` replay fields on `ChatMessageRecord`) was removed;
+> those mentions are legacy. The bounded-replay tail, in-turn tool-result elision, the per-turn
+> compaction backstop, and the overflow compact-and-retry are all unchanged and still accurate.
 
 ## Decision
 
@@ -11,9 +19,9 @@ Gini keeps complete chat history durable, but the model prompt receives a bounde
 - The JSON `chatMessages` list, SQLite `chat_blocks`, traces, audits, runs, and Hindsight memory remain append-only durable history. Context packing never deletes or rewrites them.
 - `runChatTask` rebuilds prior transcript rows, then packs them under `config.agent.priorContextTokens` before the ephemeral identity/memory tail and current user message. When unset, the default prior-history budget is 65% of the effective provider/model context window; unknown routed or local models fall back to a conservative 32K window. The effective replay budget is then capped to the room left after the live system prompt, current turn, tool schemas, and a response reserve.
 - Packing walks from newest to oldest and preserves chronological order among retained rows. Assistant `tool_calls` rows are atomic with their paired `role:"tool"` results so provider replay never sees orphan tool messages or unanswered calls.
-- For thread replies, rows from the active thread and main chat are preferred before unrelated thread rows. Main-chat turns prefer main-chat rows before thread rows. Legacy rows without thread metadata are treated as main-chat context.
+- A turn replays the transcript of the session it runs in: each Topic is its own session, so packing scopes to that Topic's own rows. (The earlier thread-priority preference — favoring an active thread's rows over unrelated thread rows within one shared session — was removed when Topics replaced threads.)
 - When any prior rows are omitted, the prompt gets a fixed `role:"user"` elision note telling the model that older history is still stored, that tool-call/result pairs are omitted together, and that it should use `recall_memory`, `search_history`, or `read_skill` again when needed.
-- `ChatMessageRecord` now carries optional `threadId` / `parentBlockId` for provider replay. ChatBlock remains the UI source of truth; the JSON fields exist so the packer can prioritize the active thread.
+- ChatBlock remains the UI source of truth. (`ChatMessageRecord` retains legacy optional `threadId` / `parentBlockId` fields that once let the packer prioritize the active thread; with per-topic scoping the packer no longer consults them.)
 - Turn-start packing bounds *prior* history, but a single long turn (e.g. a browser tool loop) keeps appending tool results within the turn. Before each provider call the loop also elides the *content* of older tool results down to the live budget (provider window minus the response reserve and tool schemas), replacing them with a short marker while keeping the message and its `tool_call_id` so call/result pairing stays valid. The most-recent results are protected so the model keeps fresh state to act on.
 - Every individual tool result is capped at dispatch (`MAX_TOOL_RESULT_CHARS`, truncated middle-out — head + marker + tail) so no single oversized result (a large file read, schema dump, or search) can dominate the window or evade the recent-result protection. Tools that already self-cap below the ceiling are unaffected.
 - The live budget is calibrated to the provider's reported prompt-token count from the previous call when present (falling back to the chars/4 estimate), so in-turn trimming and the compaction trigger track the model's real accounting rather than drifting from an approximation.
@@ -45,16 +53,16 @@ Deleting or rewriting old chat would violate the product promise that the agent 
 - Full stored chat history remains in `RuntimeState.chatMessages` after older rows are omitted from provider messages.
 - The first provider call for a long chat includes the fixed elision note, recent prior messages, and the current user message, but not oversized older rows beyond the budget.
 - Packing never emits a `role:"tool"` result without its preceding assistant `tool_calls` row.
-- A thread reply prefers that thread plus main chat over unrelated thread history when the budget cannot fit all rows.
+- A turn packs only its own session's rows; an unrelated session's history never enters the budget (per-topic scoping; the former thread-priority preference was removed).
 - A turn that crosses the in-turn high-water line compacts once (head and recent tail preserved) and continues; anti-thrash bails to a partial result rather than compacting repeatedly. A provider context-overflow error triggers bounded compact-and-retry, then a graceful partial result.
 - `bun test src/execution/context-window.test.ts`
 - `bun test src/execution/chat-task.test.ts`
 
 ## Critical Files
 
-- `src/execution/context-window.ts` — prior-history packing, approximate token accounting, tool-call grouping, thread priority, elision note.
+- `src/execution/context-window.ts` — prior-history packing, approximate token accounting, tool-call grouping, elision note. (Replay now scopes to the running session's own rows; the former thread-priority pass was removed with the Topics migration.)
 - `src/execution/chat-task.ts` — rebuilds durable prior rows, applies the packer, records retained/omitted context metrics in task trace, and within the loop: calibrates the live budget to the provider's reported prompt tokens, elides older tool-result content (`elideOldToolResultsToBudget`) before each provider call, runs the in-turn high-water compaction (prune-then-summarize, splicing the synthetic `[Context compacted]` message with head/tail protection and per-turn anti-thrash), and on a provider overflow error compacts-and-retries before completing with a graceful partial result.
 - `src/provider.ts` — `generateAuxText` (the auxiliary-model call that summarizes the in-turn middle) and `isContextOverflowError` (the predicate that classifies a provider error as a recoverable context overflow).
-- `src/execution/chat.ts` and `src/execution/tool-dispatch.ts` — stamp thread metadata onto provider-replay chat rows; `tool-dispatch.ts` also caps each tool result at dispatch (`capToolResultText`, `MAX_TOOL_RESULT_CHARS`).
+- `src/execution/tool-dispatch.ts` — caps each tool result at dispatch (`capToolResultText`, `MAX_TOOL_RESULT_CHARS`). (`src/execution/chat.ts` previously stamped thread metadata onto provider-replay rows; that thread-tagging path is legacy under the Topics model.)
 - `src/provider-capabilities.ts` — per-provider/model context-window sizes that set the budget (the codex backend is capped at its real effective window via `CODEX_BACKEND_CONTEXT_WINDOW_TOKENS`).
-- `src/types.ts` — `RuntimeConfig.agent.priorContextTokens` and provider-replay `ChatMessageRecord.threadId` / `parentBlockId`.
+- `src/types.ts` — `RuntimeConfig.agent.priorContextTokens`. (`ChatMessageRecord.threadId` / `parentBlockId` survive as legacy provider-replay fields the packer no longer consults under per-topic scoping.)
