@@ -213,6 +213,22 @@ describe("CalendarView", () => {
     expect(screen.queryByText("Offsite")).not.toBeNull();
   });
 
+  test("a proposed all-day chip shows the visible Proposed marker", () => {
+    render(<CalendarView raw={"date: 2026-07-02\n\nall-day | Company offsite | proposed"} />);
+    expect(screen.queryByText("Proposed")).not.toBeNull();
+    expect(screen.queryByText("Company offsite")).not.toBeNull();
+  });
+
+  test("a canceled timed event exposes Canceled text to screen readers", () => {
+    render(<CalendarView raw={"date: 2026-07-02\n\n15:00-16:00 | Old meeting | cancel"} />);
+    expect(screen.queryByText("Canceled")).not.toBeNull();
+  });
+
+  test("a canceled all-day chip exposes Canceled text to screen readers", () => {
+    render(<CalendarView raw={"date: 2026-07-02\n\nall-day | Old offsite | cancel"} />);
+    expect(screen.queryByText("Canceled")).not.toBeNull();
+  });
+
   test("a bad date: header in a week-inferred layout renders without throwing", () => {
     render(<CalendarView raw={"date: tomorrow\n\n2026-07-02 15:00-16:00 | A\n2026-07-03 09:00-10:00 | B"} />);
     expect(screen.queryByText("A")).not.toBeNull();

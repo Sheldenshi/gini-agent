@@ -253,6 +253,7 @@ function EventBlock({ ev, windowStart }: { ev: Placed; windowStart: number }) {
         </span>
       ) : null}
       <div className={cn("truncate font-medium", ev.status === "cancel" && "line-through")}>{ev.title}</div>
+      {ev.status === "cancel" ? <span className="sr-only">Canceled</span> : null}
       <div className="truncate opacity-70">{fmtTime(ev.startMin)}</div>
     </div>
   );
@@ -290,11 +291,17 @@ function AllDayChip({ ev }: { ev: CalEvent }) {
   return (
     <span
       className={cn(
-        "inline-block max-w-full truncate rounded border px-1.5 py-0.5 text-[11px] font-medium",
+        "inline-flex max-w-full items-center gap-1 rounded border px-1.5 py-0.5 text-[11px] font-medium",
         ALLDAY_CHIP_CLASS[ev.status]
       )}
     >
-      {ev.title}
+      {ev.status === "proposed" ? (
+        <span className="rounded bg-primary px-1 text-[9px] font-semibold uppercase text-primary-foreground">
+          Proposed
+        </span>
+      ) : null}
+      <span className="truncate">{ev.title}</span>
+      {ev.status === "cancel" ? <span className="sr-only">Canceled</span> : null}
     </span>
   );
 }
