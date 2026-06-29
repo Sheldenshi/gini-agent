@@ -247,12 +247,16 @@ function EventBlock({ ev, windowStart }: { ev: Placed; windowStart: number }) {
       )}
       style={{ top, height, left: `${ev.col * width}%`, width: `calc(${width}% - 2px)` }}
     >
-      {ev.status === "proposed" ? (
-        <span className="mb-0.5 inline-block rounded bg-primary px-1 text-[9px] font-semibold uppercase text-primary-foreground">
-          Proposed
+      <div className="flex items-center gap-1">
+        {ev.status === "proposed" ? (
+          <span className="shrink-0 rounded bg-primary px-1 text-[9px] font-semibold uppercase text-primary-foreground">
+            Proposed
+          </span>
+        ) : null}
+        <span className={cn("min-w-0 truncate font-medium", ev.status === "cancel" && "line-through")}>
+          {ev.title}
         </span>
-      ) : null}
-      <div className={cn("truncate font-medium", ev.status === "cancel" && "line-through")}>{ev.title}</div>
+      </div>
       {ev.status === "cancel" ? <span className="sr-only">Canceled</span> : null}
       <div className="truncate opacity-70">{fmtTime(ev.startMin)}</div>
     </div>
