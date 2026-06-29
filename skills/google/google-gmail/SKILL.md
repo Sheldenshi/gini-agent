@@ -5,7 +5,7 @@ license: MIT
 compatibility: "macOS and Linux. Requires the `gws` CLI authenticated against a Google account with Gmail scopes."
 metadata:
   gini:
-    version: 1.2.4
+    version: 1.2.5
     author: Gini
     platforms: [macos, linux]
     prerequisites:
@@ -112,6 +112,8 @@ I drafted this reply for you:
 ```email-draft
 To: support@plaud.ai
 Subject: Follow-up on your Request #527545
+DraftId: r5210160734100018781
+Account: you@example.com
 
 Hi there,
 
@@ -125,19 +127,25 @@ Thanks
 
 Use the same recipient, subject, and body you passed to `gws gmail +send … --draft` so the card matches the saved draft. The app renders the `email-draft` block as a draft card; any non-rendering client degrades it to a readable code block.
 
+The `DraftId` and `Account` lines let the user send the draft straight from the card (its **Send** button), with no extra chat turn: use the exact draft id `gws gmail +send … --draft` returned at `.id`, and the account you saved the draft under. They are metadata, not recipients — the card extracts them and never shows them as `To`/`Cc` rows. Omit both only when there is no saved draft to send (then the card is read-only).
+
 ### Preview a meeting change inline
 
-When the draft proposes, confirms, reschedules, or cancels a meeting at a specific time, show a `calendar` preview so the user can see the proposed slot against their existing schedule and catch a conflict. **Order matters: render the `calendar` preview FIRST, then the `email-draft` card LAST** — the draft is the actionable item, so it should be the final thing in the message. First pull that day's agenda (`gws calendar +agenda --today` / `--tomorrow`, or `gws calendar events list` for the date) so existing events show as context, then emit the calendar block, then the draft block:
+When the draft proposes, confirms, reschedules, or cancels a meeting at a specific time, show a `calendar` preview so the user can see the proposed slot against their existing schedule and catch a conflict. **Order matters: render the `calendar` preview FIRST, then the `email-draft` card LAST** — the draft is the actionable item, so it should be the final thing in the message. The preview is a **full-week view**, so pull the WHOLE week's agenda (the Sunday–Saturday week containing the meeting) — `gws calendar +agenda --week`, or `gws calendar events list` for that week's range — and include **every** event across the week (each line carries its own date), not just the meeting day. Every day the user has something should be populated; only the proposed/changed slot gets `proposed` (or `cancel`). Emit the calendar block, then the draft block:
 
 ````text
-Here's where that lands on your Thursday — your morning is clear of it:
+Here's where that lands this week — your Thursday afternoon is clear of it:
 
 ```calendar
 date: 2026-07-02
 tz: PT
 
 2026-07-02 15:00-16:00 | Team sync | proposed
-2026-07-02 09:30-10:00 | Standup
+2026-06-30 09:30-10:00 | Monday standup
+2026-07-01 13:00-14:00 | Design review
+2026-07-02 12:00-12:30 | Lunch
+2026-07-03 10:00-11:00 | 1:1 with Dana
+2026-07-04 18:00-19:00 | Dinner
 ```
 
 Here's the draft:
@@ -145,6 +153,8 @@ Here's the draft:
 ```email-draft
 To: dana@example.com
 Subject: 30-minute sync this Thursday
+DraftId: r5210160734100018781
+Account: you@example.com
 
 Hi Dana,
 

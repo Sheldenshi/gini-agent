@@ -1,12 +1,11 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { ChevronDown, X } from "lucide-react";
 import { toast } from "sonner";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { BlockRenderer } from "@/components/chat/BlockRenderer";
-import { ChatActionsProvider } from "@/components/chat/ChatActionsContext";
 import { BlockToolCallsCollapsed } from "@/components/chat/BlockToolCallsCollapsed";
 import { GeneratedFilesCard } from "@/components/chat/GeneratedFilesCard";
 import { Composer } from "@/components/chat/Composer";
@@ -154,22 +153,6 @@ export function ChatSurface({
     // so concurrent POSTs are safe.
     send.mutate({ content: trimmed, images });
   };
-
-  // Inline cards (e.g. the email-draft Send button) post a user message through
-  // the same send path the composer uses, so the action runs through Gini's
-  // normal flow rather than a bespoke endpoint.
-  const sendUserMessage = useCallback(
-    (content: string) => {
-      const trimmed = content.trim();
-      if (!trimmed) return;
-      send.mutate({ content: trimmed, images: [] });
-    },
-    [send]
-  );
-  const chatActions = useMemo(
-    () => ({ sessionId, sendUserMessage }),
-    [sessionId, sendUserMessage]
-  );
 
   // In-flight detection over the main-chat block stream.
   const inflightTaskId: string | null = useMemo(
@@ -404,7 +387,7 @@ export function ChatSurface({
         )}
 
         {tab === "messages" ? (
-          <ChatActionsProvider value={chatActions}>
+          <>
             <div className="relative flex min-h-0 flex-1 flex-col">
               <ScrollArea className="min-h-0 flex-1">
               <div className={`mx-auto w-full max-w-3xl py-6 ${panel ? "px-4" : "px-6"}`}>
@@ -483,7 +466,7 @@ export function ChatSurface({
                 />
               </div>
             </div>
-          </ChatActionsProvider>
+          </>
         ) : tab === "jobs" ? (
           <JobsTab />
         ) : tab === "settings" && !isPinned ? (

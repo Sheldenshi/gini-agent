@@ -1,8 +1,8 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Mail, Copy, Check, Send } from "lucide-react";
-import { useChatActions } from "./ChatActionsContext";
+import { api } from "@/lib/api";
 
 // Inline email-draft card. The agent emits a ```email-draft fenced block after
 // saving a Gmail draft; MarkdownContent routes that block here so the user can
@@ -10,11 +10,14 @@ import { useChatActions } from "./ChatActionsContext";
 //
 // The fenced block is plain text: optional RFC-style header lines
 // (To/Cc/Bcc/From/Subject, case-insensitive) up to the first blank line, then
-// the body. The header reads read-only; inside a chat surface (where the
-// ChatActions context is present) a Send button posts a precise instruction
-// back to Gini so it delivers THAT draft via its gmail skill. Outside a chat
-// (doc viewer / file preview / skills page) the context is null and the card
-// stays read-only.
+// the body. Two extra metadata header lines — DraftId and Account — carry the
+// saved gws draft id and the account it was saved under; they are EXTRACTED
+// (never rendered as recipient rows). When a DraftId is present the card shows a
+// Send button that sends the SAVED draft directly server-side (POST
+// /api/email/drafts/send) with no agent turn; on mount it asks the gateway
+// whether that draft was already sent so the "Sent" state persists across a
+// page refresh. With no DraftId the card stays read-only (doc viewer / file
+// preview / skills page).
 
 const HEADER_KEYS = ["to", "cc", "bcc", "from", "subject"] as const;
 type HeaderKey = (typeof HEADER_KEYS)[number];
@@ -26,9 +29,21 @@ const HEADER_LABEL: Record<HeaderKey, string> = {
   subject: "Subject"
 };
 
-function parseDraft(raw: string): { headers: Array<[HeaderKey, string]>; body: string } {
+// The metadata header lines extracted from the fence (not shown as recipients).
+const META_KEYS = ["draftid", "account"] as const;
+
+interface ParsedDraft {
+  headers: Array<[HeaderKey, string]>;
+  body: string;
+  draftId?: string;
+  account?: string;
+}
+
+function parseDraft(raw: string): ParsedDraft {
   const lines = raw.replace(/\r\n/g, "\n").split("\n");
   const headers: Array<[HeaderKey, string]> = [];
+  let draftId: string | undefined;
+  let account: string | undefined;
   let i = 0;
   for (; i < lines.length; i++) {
     const line = lines[i]!;
@@ -42,32 +57,67 @@ function parseDraft(raw: string): { headers: Array<[HeaderKey, string]>; body: s
       headers.push([key as HeaderKey, match[2]!.trim()]);
       continue;
     }
+    // DraftId / Account are metadata: extract, never render as recipient rows.
+    if (match && key && (META_KEYS as readonly string[]).includes(key)) {
+      const value = match[2]!.trim();
+      if (key === "draftid") draftId = value || undefined;
+      else account = value || undefined;
+      continue;
+    }
     break; // first non-header line ends the header section; body starts here
   }
   const body = lines.slice(i).join("\n").trim();
-  return { headers, body };
+  return { headers, body, draftId, account };
 }
 
-// Compose a precise, unambiguous instruction from the parsed headers so Gini
-// sends exactly this draft via its gmail skill (not a bespoke send endpoint).
-function composeSendInstruction(headers: Array<[HeaderKey, string]>): string {
-  const get = (key: HeaderKey) => headers.find(([k]) => k === key)?.[1] ?? "";
-  const to = get("to");
-  const cc = get("cc");
-  const subject = get("subject");
-  return `Send the draft to ${to}${cc ? `, cc ${cc}` : ""} — subject "${subject}". Send it now.`;
-}
+// The card's Send affordance state machine. "idle" shows Send; the click runs
+// the direct server-side send; "sent" is the durable terminal state (also the
+// initial state when the mount query reports the draft already sent).
+type SendState = "idle" | "sending" | "sent" | "error";
 
 export function EmailDraftCard({ raw }: { raw: string }) {
   const [copied, setCopied] = useState(false);
-  const [sent, setSent] = useState(false);
-  const chatActions = useChatActions();
-  const { headers, body } = parseDraft(raw.trim());
+  const { headers, body, draftId, account } = parseDraft(raw.trim());
+  const [sendState, setSendState] = useState<SendState>("idle");
+  const [sendError, setSendError] = useState<string | null>(null);
 
-  const onSend = () => {
-    if (!chatActions) return;
-    setSent(true); // disable immediately so the button can't double-fire
-    chatActions.sendUserMessage(composeSendInstruction(headers));
+  // On mount (with a draftId) ask the gateway whether THIS draft was already
+  // sent, so a page refresh restores the disabled "Sent" state. Best-effort: a
+  // failed query just leaves the button clickable.
+  useEffect(() => {
+    if (!draftId) return;
+    let cancelled = false;
+    api<{ sent: string[] }>(`/email/drafts/sent?ids=${encodeURIComponent(draftId)}`)
+      .then((res) => {
+        if (!cancelled && res.sent.includes(draftId)) setSendState("sent");
+      })
+      .catch(() => {
+        // Leave the button clickable; the send route is the source of truth.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [draftId]);
+
+  const onSend = async () => {
+    if (!draftId || sendState === "sending" || sendState === "sent") return;
+    setSendState("sending");
+    setSendError(null);
+    try {
+      const res = await api<{ ok: boolean; message?: string }>("/email/drafts/send", {
+        method: "POST",
+        body: JSON.stringify({ draftId, ...(account ? { account } : {}) })
+      });
+      if (res.ok) {
+        setSendState("sent");
+      } else {
+        setSendState("error");
+        setSendError(res.message ?? "Couldn't send the draft.");
+      }
+    } catch (error) {
+      setSendState("error");
+      setSendError(error instanceof Error ? error.message : "Couldn't send the draft.");
+    }
   };
 
   const onCopy = async () => {
@@ -80,6 +130,9 @@ export function EmailDraftCard({ raw }: { raw: string }) {
       // the card is still readable, so silently no-op.
     }
   };
+
+  const sendLabel =
+    sendState === "sending" ? "Sending…" : sendState === "sent" ? "Sent" : "Send";
 
   return (
     <div className="my-2 overflow-hidden rounded-xl border bg-card text-card-foreground">
@@ -123,16 +176,19 @@ export function EmailDraftCard({ raw }: { raw: string }) {
           {body}
         </div>
       </div>
-      {chatActions ? (
-        <div className="flex justify-end border-t px-3 py-2">
+      {draftId ? (
+        <div className="flex items-center justify-end gap-2 border-t px-3 py-2">
+          {sendState === "error" && sendError ? (
+            <span className="mr-auto min-w-0 break-words text-[12px] text-destructive">{sendError}</span>
+          ) : null}
           <button
             type="button"
             onClick={onSend}
-            disabled={sent}
+            disabled={sendState === "sending" || sendState === "sent"}
             className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-[13px] font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-60"
           >
             <Send className="size-[14px]" aria-hidden="true" />
-            {sent ? "Sent" : "Send"}
+            {sendLabel}
           </button>
         </div>
       ) : null}
