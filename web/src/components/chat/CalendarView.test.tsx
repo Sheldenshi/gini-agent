@@ -1,13 +1,16 @@
 /// <reference lib="dom" />
 
 // CalendarView parses a lenient ```calendar block (optional view/date/tz header
-// up to the first blank line, then pipe-delimited event lines) and renders a
-// read-only day/week grid with overlap packing and status styling. These tests
-// pin the parser folds (header vs no-header, view inference + override, every
+// up to the first blank line, then pipe-delimited event lines) and adapts the
+// parsed events onto the shared grid's generic CalendarEvent model, always
+// rendering the read-only 7-day week that contains the anchor. These tests pin
+// the parser folds (header vs no-header, view inference + override, every
 // time-spec shape, status normalization, malformed-line skipping, anchor
-// resolution) and the render folds (day vs week range, all-day chips, the
-// proposed tag / cancel line-through, overlap columns, the hour window, and the
-// no-dated-events placeholder) so the 100% coverage gate stays satisfied.
+// resolution) and the adapter/render folds (the week range, the adapted titles,
+// the proposed tag / cancel line-through + Canceled sr-only marker, all-day vs
+// timed mapping, and the no-dated-events placeholder) so the 100% coverage gate
+// stays satisfied. The shared grid internals are coverage-excluded, so these
+// assert the rendered chips, not the grid layout.
 
 import { describe, expect, test } from "bun:test";
 import { render, screen } from "@testing-library/react";
@@ -132,22 +135,24 @@ describe("parseCalendar", () => {
 });
 
 describe("CalendarView", () => {
-  test("day view renders the header label, day range, and tz", () => {
-    render(<CalendarView raw={"view: day\ndate: 2026-07-02\ntz: PT\n\n15:00-16:00 | Team sync | proposed"} />);
+  test("renders the CALENDAR header and the anchor week range", () => {
+    render(<CalendarView raw={"view: week\ndate: 2026-07-02\ntz: PT\n\n15:00-16:00 | Team sync | proposed"} />);
     expect(screen.queryByText("Calendar")).not.toBeNull();
-    expect(screen.queryByText(/Thu, Jul 2 · PT/)).not.toBeNull();
+    // 2026-07-02 is a Thursday; its Sunday-started week is Jun 28 – Jul 4 (2026).
+    expect(screen.getByText(/Jun 28, 2026 – Jul 4, 2026 · PT/)).not.toBeNull();
   });
 
-  test("a proposed event shows the Proposed tag", () => {
+  test("a proposed event shows the Proposed tag alongside its title", () => {
     render(<CalendarView raw={"date: 2026-07-02\n\n15:00-16:00 | Team sync | proposed"} />);
     expect(screen.queryByText("Proposed")).not.toBeNull();
     expect(screen.queryByText("Team sync")).not.toBeNull();
   });
 
-  test("a cancel event renders its title with line-through", () => {
+  test("a cancel event renders its title with line-through and a Canceled sr-only marker", () => {
     render(<CalendarView raw={"date: 2026-07-02\n\n15:00-16:00 | Old meeting | cancel"} />);
     const title = screen.getByText("Old meeting");
     expect(title.className).toContain("line-through");
+    expect(screen.queryByText("Canceled")).not.toBeNull();
   });
 
   test("an existing event renders without the Proposed tag", () => {
@@ -156,93 +161,22 @@ describe("CalendarView", () => {
     expect(screen.queryByText("Lunch")).not.toBeNull();
   });
 
-  test("two overlapping events both render side by side (column packing)", () => {
-    const { container } = render(
-      <CalendarView raw={"date: 2026-07-02\n\n09:00-10:30 | A\n09:30-10:00 | B"} />
-    );
-    expect(screen.queryByText("A")).not.toBeNull();
-    expect(screen.queryByText("B")).not.toBeNull();
-    // Two clustered events get half-width columns at distinct left offsets.
-    const lefts = Array.from(container.querySelectorAll("[style*='left']")).map(
-      (el) => (el as HTMLElement).style.left
-    );
-    expect(new Set(lefts).size).toBeGreaterThan(1);
-  });
-
-  test("a later non-overlapping event starts a fresh cluster (full width)", () => {
-    const { container } = render(
-      <CalendarView raw={"date: 2026-07-02\n\n09:00-10:00 | First\n11:00-12:00 | Second"} />
-    );
-    expect(screen.queryByText("First")).not.toBeNull();
-    expect(screen.queryByText("Second")).not.toBeNull();
-    // Disjoint events each occupy the full column width at left 0 — a packing
-    // regression that collapses them into half-width columns fails here.
-    const blocks = Array.from(container.querySelectorAll("[style*='left']")) as HTMLElement[];
-    expect(blocks).toHaveLength(2);
-    for (const el of blocks) {
-      expect(el.style.left).toBe("0%");
-      expect(el.style.width).toBe("calc(100% - 2px)");
-    }
-  });
-
-  test("an early and a late event widen the hour window beyond [8,18]", () => {
-    render(<CalendarView raw={"date: 2026-07-02\n\n06:00-07:00 | Early\n20:00-21:00 | Late"} />);
-    expect(screen.queryByText("6 AM")).not.toBeNull();
-    expect(screen.queryByText("8 PM")).not.toBeNull();
-  });
-
-  test("with no timed events the window falls back to [8,18] (8 AM to 5 PM gutter)", () => {
-    render(<CalendarView raw={"date: 2026-07-02\n\nall-day | Holiday"} />);
-    expect(screen.queryByText("8 AM")).not.toBeNull();
-    expect(screen.queryByText("5 PM")).not.toBeNull();
-    expect(screen.queryByText("6 PM")).toBeNull();
-  });
-
-  test("day view all-day chips render under the header", () => {
-    render(<CalendarView raw={"view: day\ndate: 2026-07-02\n\nall-day | Company offsite"} />);
+  test("an all-day event renders its chip in the week grid", () => {
+    render(<CalendarView raw={"date: 2026-07-02\n\nall-day | Company offsite"} />);
     expect(screen.queryByText("Company offsite")).not.toBeNull();
   });
 
-  test("week view shows day-of-week headers with the anchor day emphasized and the week range", () => {
-    const { container } = render(
+  test("events spanning multiple days of the anchor week all render", () => {
+    render(
       <CalendarView raw={"view: week\ndate: 2026-07-02\n\n2026-07-02 15:00-16:00 | Team sync\n2026-07-03 09:00-10:00 | Standup"} />
     );
-    // 2026-07-02 is a Thursday; its Sunday-started week is Jun 28 – Jul 4.
-    expect(screen.queryByText("Jun 28 – Jul 4")).not.toBeNull();
-    // The anchor column header is underlined/emphasized.
-    const emphasized = Array.from(container.querySelectorAll(".underline")).map((el) => el.textContent);
-    expect(emphasized.some((t) => t?.includes("Thu"))).toBe(true);
     expect(screen.queryByText("Team sync")).not.toBeNull();
     expect(screen.queryByText("Standup")).not.toBeNull();
   });
 
-  test("week view renders all-day chips per day column", () => {
-    render(
-      <CalendarView raw={"view: week\ndate: 2026-07-02\n\n2026-07-02 all-day | Offsite\n2026-07-04 09:00-10:00 | Sync"} />
-    );
-    expect(screen.queryByText("Offsite")).not.toBeNull();
-  });
-
-  test("a proposed all-day chip shows the visible Proposed marker", () => {
-    render(<CalendarView raw={"date: 2026-07-02\n\nall-day | Company offsite | proposed"} />);
-    expect(screen.queryByText("Proposed")).not.toBeNull();
-    expect(screen.queryByText("Company offsite")).not.toBeNull();
-  });
-
-  test("a canceled timed event exposes Canceled text to screen readers", () => {
-    render(<CalendarView raw={"date: 2026-07-02\n\n15:00-16:00 | Old meeting | cancel"} />);
-    expect(screen.queryByText("Canceled")).not.toBeNull();
-  });
-
-  test("a canceled all-day chip exposes Canceled text to screen readers", () => {
-    render(<CalendarView raw={"date: 2026-07-02\n\nall-day | Old offsite | cancel"} />);
-    expect(screen.queryByText("Canceled")).not.toBeNull();
-  });
-
-  test("a bad date: header in a week-inferred layout renders without throwing", () => {
-    render(<CalendarView raw={"date: tomorrow\n\n2026-07-02 15:00-16:00 | A\n2026-07-03 09:00-10:00 | B"} />);
-    expect(screen.queryByText("A")).not.toBeNull();
-    expect(screen.queryByText("B")).not.toBeNull();
+  test("a week range without a tz omits the trailing tz suffix", () => {
+    render(<CalendarView raw={"date: 2026-07-02\n\n2026-07-02 15:00-16:00 | Sync"} />);
+    expect(screen.getByText("Jun 28, 2026 – Jul 4, 2026")).not.toBeNull();
   });
 
   test("no dated events renders the placeholder card", () => {

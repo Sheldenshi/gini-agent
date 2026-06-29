@@ -2,17 +2,26 @@
 
 import { CalendarClock } from "lucide-react";
 import { cn } from "@/lib/utils";
+import type { EventColor } from "@/components/calendar/calendar-colors";
+import {
+  buildWeekDays,
+  type CalendarEvent,
+  dayKey,
+  formatRange
+} from "@/components/calendar/calendar-utils";
+import { WeekView } from "@/components/calendar/week-view";
 
 // Inline calendar preview. The agent emits a ```calendar fenced block when it
 // proposes, reschedules, or cancels a timed event (most often while drafting an
 // email about a meeting); MarkdownContent routes that block here so the user can
-// SEE the proposed slot against their existing agenda for the day/week and spot
-// any conflict, instead of being handed a wall of text.
+// SEE the proposed slot against their existing agenda for the week and spot any
+// conflict, instead of being handed a wall of text.
 //
 // The block is plain text: optional `view:` / `date:` / `tz:` header lines up to
-// the first blank line, then pipe-delimited event lines. Everything renders
-// read-only — there is no Apply affordance; the real calendar write still goes
-// through Gini's normal flow. Mirrors the read-only EmailDraftCard.
+// the first blank line, then pipe-delimited event lines. The preview always
+// renders the shared 7-day WeekView (the same macOS-Calendar-style grid the Jobs
+// tab uses) for the week containing the anchor, read-only — there is no Apply
+// affordance; the real calendar write still goes through Gini's normal flow.
 
 type Status = "proposed" | "cancel" | "existing";
 
@@ -144,177 +153,44 @@ export function parseCalendar(raw: string): ParsedCalendar {
   return { view, anchor, tz: header.tz, events };
 }
 
-// ── Date helpers (string YYYY-MM-DD math, no Date timezone surprises) ──────────
+// ── Adapter: parsed events → generic grid events ───────────────────────────────
 
-const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-
-function ymdToUTC(ymd: string): Date {
+// A local Date for a YYYY-MM-DD day so dayKey() (which reads local
+// getFullYear/Month/Date) lines up with the shared grid's day buckets.
+function ymdToLocal(ymd: string): Date {
   const [y, m, d] = ymd.split("-").map(Number);
-  return new Date(Date.UTC(y!, m! - 1, d!));
+  return new Date(y!, m! - 1, d!);
 }
 
-function utcToYmd(date: Date): string {
-  return date.toISOString().slice(0, 10);
-}
+// Inline preview colors are driven by status, not by a per-id palette: proposed
+// → accent (blue), cancel → muted (gray), existing → gray.
+const STATUS_COLOR: Record<Status, EventColor> = {
+  proposed: "blue",
+  cancel: "gray",
+  existing: "gray"
+};
 
-function addDays(ymd: string, days: number): string {
-  const dt = ymdToUTC(ymd);
-  dt.setUTCDate(dt.getUTCDate() + days);
-  return utcToYmd(dt);
-}
-
-// Sunday-started week containing the anchor.
-function weekDays(anchor: string): string[] {
-  const start = addDays(anchor, -ymdToUTC(anchor).getUTCDay());
-  return Array.from({ length: 7 }, (_, k) => addDays(start, k));
-}
-
-function fmtDayLabel(ymd: string): string {
-  const dt = ymdToUTC(ymd);
-  return `${WEEKDAYS[dt.getUTCDay()]}, ${MONTHS[dt.getUTCMonth()]} ${dt.getUTCDate()}`;
-}
-
-function fmtShort(ymd: string): string {
-  const dt = ymdToUTC(ymd);
-  return `${MONTHS[dt.getUTCMonth()]} ${dt.getUTCDate()}`;
-}
-
-function fmtHourLabel(hour: number): string {
-  const period = hour < 12 ? "AM" : "PM";
-  const h12 = hour % 12 === 0 ? 12 : hour % 12;
-  return `${h12} ${period}`;
-}
-
-function fmtTime(min: number): string {
-  const h = Math.floor(min / 60);
-  const m = min % 60;
-  const period = h < 12 ? "AM" : "PM";
-  const h12 = h % 12 === 0 ? 12 : h % 12;
-  return `${h12}:${String(m).padStart(2, "0")} ${period}`;
-}
-
-// ── Overlap column packing (interval-graph greedy coloring per day) ────────────
-
-type Placed = CalEvent & { col: number; cols: number };
-
-function packDay(dayEvents: CalEvent[]): Placed[] {
-  const sorted = [...dayEvents].sort((a, b) => a.startMin - b.startMin || a.endMin - b.endMin);
-  const placed: Placed[] = [];
-  // Cluster = a maximal run of events where each overlaps the running cluster
-  // span; within a cluster, assign each event the lowest free column.
-  let cluster: Placed[] = [];
-  let clusterEnd = -1;
-  const flush = () => {
-    const cols = cluster.reduce((mx, e) => Math.max(mx, e.col + 1), 0);
-    for (const e of cluster) {
-      e.cols = cols;
-      placed.push(e);
-    }
-    cluster = [];
-    clusterEnd = -1;
+function adaptEvent(e: CalEvent, index: number): CalendarEvent {
+  const day = ymdToLocal(e.date);
+  const status = e.status === "existing" ? undefined : e.status;
+  return {
+    day,
+    key: `${e.date}-${index}`,
+    title: e.title,
+    hour: e.allDay ? null : Math.floor(e.startMin / 60),
+    minute: e.allDay ? null : e.startMin % 60,
+    endHour: e.allDay ? null : Math.floor(e.endMin / 60),
+    endMinute: e.allDay ? null : e.endMin % 60,
+    sortKey: e.allDay ? Number.POSITIVE_INFINITY : e.startMin,
+    timeLabel: "",
+    color: STATUS_COLOR[e.status],
+    status
   };
-  for (const ev of sorted) {
-    if (cluster.length > 0 && ev.startMin >= clusterEnd) flush();
-    const taken = new Set(cluster.filter((e) => e.endMin > ev.startMin).map((e) => e.col));
-    let col = 0;
-    while (taken.has(col)) col++;
-    cluster.push({ ...ev, col, cols: 1 });
-    clusterEnd = Math.max(clusterEnd, ev.endMin);
-  }
-  if (cluster.length > 0) flush();
-  return placed;
-}
-
-const PX_PER_HOUR = 44;
-const MIN_EVENT_HEIGHT = 16;
-
-const STATUS_CLASS: Record<Status, string> = {
-  proposed: "border-primary bg-primary/15 text-foreground",
-  cancel: "border-dashed border-border bg-muted text-muted-foreground",
-  existing: "border-border bg-secondary text-secondary-foreground"
-};
-
-function EventBlock({ ev, windowStart }: { ev: Placed; windowStart: number }) {
-  const top = ((ev.startMin - windowStart * 60) / 60) * PX_PER_HOUR;
-  const height = Math.max(MIN_EVENT_HEIGHT, ((ev.endMin - ev.startMin) / 60) * PX_PER_HOUR);
-  const width = 100 / ev.cols;
-  return (
-    <div
-      className={cn(
-        "absolute overflow-hidden rounded-md border px-1.5 py-0.5 text-[11px] leading-tight",
-        STATUS_CLASS[ev.status]
-      )}
-      style={{ top, height, left: `${ev.col * width}%`, width: `calc(${width}% - 2px)` }}
-    >
-      <div className="flex items-center gap-1">
-        {ev.status === "proposed" ? (
-          <span className="shrink-0 rounded bg-primary px-1 text-[9px] font-semibold uppercase text-primary-foreground">
-            Proposed
-          </span>
-        ) : null}
-        <span className={cn("min-w-0 truncate font-medium", ev.status === "cancel" && "line-through")}>
-          {ev.title}
-        </span>
-      </div>
-      {ev.status === "cancel" ? <span className="sr-only">Canceled</span> : null}
-      <div className="truncate opacity-70">{fmtTime(ev.startMin)}</div>
-    </div>
-  );
-}
-
-function DayColumn({
-  events,
-  startHour,
-  endHour
-}: {
-  events: CalEvent[];
-  startHour: number;
-  endHour: number;
-}) {
-  const placed = packDay(events);
-  return (
-    <div className="relative flex-1 overflow-hidden" style={{ height: (endHour - startHour) * PX_PER_HOUR }}>
-      {Array.from({ length: endHour - startHour }, (_, k) => (
-        <div key={k} className="border-b border-border/60" style={{ height: PX_PER_HOUR }} />
-      ))}
-      {placed.map((ev, k) => (
-        <EventBlock key={k} ev={ev} windowStart={startHour} />
-      ))}
-    </div>
-  );
-}
-
-const ALLDAY_CHIP_CLASS: Record<Status, string> = {
-  proposed: "border-primary bg-primary/15 text-foreground",
-  cancel: "border-dashed border-border bg-muted text-muted-foreground line-through",
-  existing: "border-border bg-secondary text-secondary-foreground"
-};
-
-function AllDayChip({ ev }: { ev: CalEvent }) {
-  return (
-    <span
-      className={cn(
-        "inline-flex max-w-full items-center gap-1 rounded border px-1.5 py-0.5 text-[11px] font-medium",
-        ALLDAY_CHIP_CLASS[ev.status]
-      )}
-    >
-      {ev.status === "proposed" ? (
-        <span className="rounded bg-primary px-1 text-[9px] font-semibold uppercase text-primary-foreground">
-          Proposed
-        </span>
-      ) : null}
-      <span className="truncate">{ev.title}</span>
-      {ev.status === "cancel" ? <span className="sr-only">Canceled</span> : null}
-    </span>
-  );
 }
 
 export function CalendarView({ raw }: { raw: string }) {
   const parsed = parseCalendar(raw.trim());
-  const { view, anchor, tz, events } = parsed;
-
-  const days = view === "week" && anchor ? weekDays(anchor) : anchor ? [anchor] : [];
+  const { anchor, tz, events } = parsed;
 
   // No dated events at all → placeholder. Keep this branch minimal.
   if (!anchor) {
@@ -329,102 +205,33 @@ export function CalendarView({ raw }: { raw: string }) {
     );
   }
 
-  const timed = events.filter((e) => !e.allDay);
-  const allDay = events.filter((e) => e.allDay);
+  // Always render the 7-day week containing the anchor. The anchor day is
+  // circled (passed as the grid's `today`) so the proposed day stands out.
+  const anchorDate = ymdToLocal(anchor);
+  const days = buildWeekDays(anchorDate);
 
-  // Hour window from the timed events (default [8, 18]); always shows business
-  // hours so a single early/late event doesn't collapse the grid.
-  const startHour =
-    timed.length > 0
-      ? Math.max(0, Math.min(8, Math.floor(Math.min(...timed.map((e) => e.startMin)) / 60)))
-      : 8;
-  const endHour =
-    timed.length > 0
-      ? Math.min(24, Math.max(18, Math.ceil(Math.max(...timed.map((e) => e.endMin)) / 60)))
-      : 18;
+  const eventsByDay = new Map<string, CalendarEvent[]>();
+  events.forEach((e, index) => {
+    const adapted = adaptEvent(e, index);
+    const key = dayKey(adapted.day);
+    const list = eventsByDay.get(key) ?? [];
+    list.push(adapted);
+    eventsByDay.set(key, list);
+  });
 
-  const range =
-    view === "week"
-      ? `${fmtShort(days[0]!)} – ${fmtShort(days[6]!)}`
-      : fmtDayLabel(anchor);
+  const range = `${formatRange(days[0]!, days[6]!)}${tz ? ` · ${tz}` : ""}`;
 
   return (
     <div className="my-2 overflow-hidden rounded-xl border bg-card text-card-foreground">
       <div className="flex items-center gap-2 border-b px-3 py-2 text-muted-foreground">
         <CalendarClock className="size-[15px] shrink-0" aria-hidden="true" />
         <span className="text-[12px] font-semibold uppercase tracking-wide">Calendar</span>
-        <span className="ml-auto text-[12px] font-medium text-foreground">
-          {range}
-          {tz ? ` · ${tz}` : ""}
-        </span>
+        <span className="ml-auto text-[12px] font-medium text-foreground">{range}</span>
       </div>
 
-      {allDay.length > 0 ? (
-        <div className="flex gap-1 border-b px-3 py-2">
-          <div className="w-9 shrink-0" />
-          {view === "week" ? (
-            <div className="flex flex-1 gap-1">
-              {days.map((d) => (
-                <div key={d} className="flex min-w-0 flex-1 flex-col gap-1">
-                  {allDay
-                    .filter((e) => e.date === d)
-                    .map((e, k) => (
-                      <AllDayChip key={k} ev={e} />
-                    ))}
-                </div>
-              ))}
-            </div>
-          ) : (
-            <div className="flex min-w-0 flex-1 flex-wrap gap-1">
-              {allDay.map((e, k) => (
-                <AllDayChip key={k} ev={e} />
-              ))}
-            </div>
-          )}
-        </div>
-      ) : null}
-
-      {view === "week" ? (
-        <div className="flex border-b px-3 pt-2 text-[11px] font-medium text-muted-foreground">
-          <div className="w-9 shrink-0" />
-          <div className="flex flex-1 gap-1">
-            {days.map((d) => (
-              <div
-                key={d}
-                className={cn(
-                  "flex-1 text-center",
-                  d === anchor && "text-foreground underline underline-offset-2"
-                )}
-              >
-                {WEEKDAYS[ymdToUTC(d).getUTCDay()]} {ymdToUTC(d).getUTCDate()}
-              </div>
-            ))}
-          </div>
-        </div>
-      ) : null}
-
-      <div className="flex px-3 py-2">
-        <div className="w-9 shrink-0">
-          {Array.from({ length: endHour - startHour }, (_, k) => (
-            <div
-              key={k}
-              className="pr-1 text-right text-[10px] text-muted-foreground"
-              style={{ height: PX_PER_HOUR }}
-            >
-              {fmtHourLabel(startHour + k)}
-            </div>
-          ))}
-        </div>
-        <div className="flex flex-1 gap-1">
-          {days.map((d) => (
-            <DayColumn
-              key={d}
-              events={timed.filter((e) => e.date === d)}
-              startHour={startHour}
-              endHour={endHour}
-            />
-          ))}
-        </div>
+      {/* Fixed-height viewport so the grid opens on ~8 AM–8 PM and scrolls. */}
+      <div className="flex max-h-[520px] flex-col overflow-hidden">
+        <WeekView days={days} today={anchorDate} eventsByDay={eventsByDay} scrollToHour={8} />
       </div>
     </div>
   );
