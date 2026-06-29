@@ -126,7 +126,7 @@ the same session, and the agent loads the `gini-bug-report` skill to act:
 
 - **Yes** → the skill reads the queued redacted report(s), loads the
   `github-issues` skill, and files **one** issue per distinct fingerprint to the
-  canonical Gini repo (`Lilac-Labs/gini-agent`) — not whatever git remote the
+  canonical Gini repo (`Open-Curiosity/gini-agent`) — not whatever git remote the
   agent's sandbox workspace happens to have (`[gini-crash] <source>:
   <error.name>`, body assembled only from the queued JSON, label `gini-crash`).
   An open issue already carrying the fingerprint gets a recurrence comment

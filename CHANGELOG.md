@@ -74,7 +74,7 @@ All notable changes to this project are documented here. The format follows [Kee
 
 - Initial public open-source release. See [README.md](README.md) for what's included and the [Roadmap](ROADMAP.md) for what's planned.
 
-[Unreleased]: https://github.com/Lilac-Labs/gini-agent/compare/v0.3.0...HEAD
-[0.3.0]: https://github.com/Lilac-Labs/gini-agent/compare/v0.2.0...v0.3.0
-[0.2.0]: https://github.com/Lilac-Labs/gini-agent/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/Lilac-Labs/gini-agent/releases/tag/v0.1.0
+[Unreleased]: https://github.com/Open-Curiosity/gini-agent/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/Open-Curiosity/gini-agent/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/Open-Curiosity/gini-agent/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/Open-Curiosity/gini-agent/releases/tag/v0.1.0

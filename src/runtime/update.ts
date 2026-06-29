@@ -6,7 +6,12 @@ import { logDir, projectRoot, updateInProgressMarkerPath } from "../paths";
 import { isLoaded, supervisor } from "../integrations/launchd";
 import type { Instance } from "../types";
 
-const EXPECTED_ORIGIN = "https://github.com/Lilac-Labs/gini-agent";
+const EXPECTED_ORIGIN = "https://github.com/Open-Curiosity/gini-agent";
+// Origins from before the GitHub org rename. GitHub redirects these to the
+// current location, so a runtime whose origin still names the old org fetches
+// fine — keep accepting them so `gini update` doesn't refuse on installs that
+// predate the rename.
+const LEGACY_ORIGINS: readonly string[] = ["https://github.com/Lilac-Labs/gini-agent"];
 const MAX_INSTALL_FAILURE_OUTPUT = 4000;
 
 // Sha-keyed production web bundles. The update/install flows build the
@@ -500,12 +505,14 @@ function assertUpdateTarget(runtimeDir: string): void {
   if (!existsSync(runtimeDir) || !existsSync(join(runtimeDir, ".git"))) {
     throw new Error(
       "gini update operates on the installed runtime at ~/.gini/runtime, which is not present. " +
-      "Reinstall with: curl -fsSL https://raw.githubusercontent.com/Lilac-Labs/gini-agent/main/scripts/install.sh | bash"
+      "Reinstall with: curl -fsSL https://raw.githubusercontent.com/Open-Curiosity/gini-agent/main/scripts/install.sh | bash"
     );
   }
   const actualOrigin = requireGit(runtimeDir, ["remote", "get-url", "origin"], "could not read git origin");
   const normalize = (url: string): string => url.replace(/\.git$/, "");
-  const isExpectedRemote = normalize(actualOrigin) === normalize(EXPECTED_ORIGIN);
+  const isExpectedRemote = [EXPECTED_ORIGIN, ...LEGACY_ORIGINS].some(
+    (o) => normalize(actualOrigin) === normalize(o)
+  );
   const isLocalCheckout = actualOrigin.startsWith("/") && existsSync(join(actualOrigin, ".git"));
   if (!isExpectedRemote && !isLocalCheckout) {
     throw new Error(

@@ -68,7 +68,7 @@ The same cards render on the web app and the iOS app off one wire protocol, and 
 ## Quick Start
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Lilac-Labs/gini-agent/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Open-Curiosity/gini-agent/main/scripts/install.sh | bash
 ```
 
 On macOS the installer enables autostart (per-user LaunchAgents for the runtime and webapp), waits for the webapp to come up, and opens the `/setup` page in your browser. The form offers the full provider catalog — OpenAI, Codex, Anthropic, Amazon Bedrock, Azure OpenAI, OpenRouter, DeepSeek, and Local — and prompts for whatever the one you pick needs (an API key, the AWS access key pair for Bedrock, the resource endpoint for Azure, or your existing `codex login` auth). Save it and you land on the running app. The runtime stays alive across reboots and crashes until you explicitly run `gini stop` or `gini autostart disable`.
@@ -189,11 +189,11 @@ Contributions are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md) for dev
 
 ## Star History
 
-<a href="https://star-history.com/#Lilac-Labs/gini-agent&Date">
+<a href="https://star-history.com/#Open-Curiosity/gini-agent&Date">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=Lilac-Labs/gini-agent&type=Date&theme=dark" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=Lilac-Labs/gini-agent&type=Date" />
-   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=Lilac-Labs/gini-agent&type=Date" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=Open-Curiosity/gini-agent&type=Date&theme=dark" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=Open-Curiosity/gini-agent&type=Date" />
+   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=Open-Curiosity/gini-agent&type=Date" />
  </picture>
 </a>
 

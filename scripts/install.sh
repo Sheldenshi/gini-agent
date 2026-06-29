@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_URL="https://github.com/Lilac-Labs/gini-agent"
+REPO_URL="https://github.com/Open-Curiosity/gini-agent"
 RUNTIME_DIR="$HOME/.gini/runtime"
 BIN_DIR="$HOME/.local/bin"
 WRAPPER_PATH="$BIN_DIR/gini"

@@ -7,7 +7,7 @@
       "dependencies": {
         "@huggingface/transformers": "^4.2.0",
         "croner": "^10.0.1",
-        "gini-relay": "git+ssh://git@github.com/Lilac-Labs/gini-relay.git#eb1f8f89e26c22b8e5e7af8ab7fcf840c4114cf6",
+        "gini-relay": "git+ssh://git@github.com/Open-Curiosity/gini-relay.git#eb1f8f89e26c22b8e5e7af8ab7fcf840c4114cf6",
         "mammoth": "^1.12.0",
         "pdfjs-dist": "^6.0.227",
         "playwright-core": "^1.61.1",
@@ -178,7 +178,7 @@
 
     "flatbuffers": ["flatbuffers@25.9.23", "", {}, "sha512-MI1qs7Lo4Syw0EOzUl0xjs2lsoeqFku44KpngfIduHBYvzm8h2+7K8YMQh1JtVVVrUvhLpNwqVi4DERegUJhPQ=="],
 
-    "gini-relay": ["gini-relay@git+ssh://git@github.com/Lilac-Labs/gini-relay.git#eb1f8f89e26c22b8e5e7af8ab7fcf840c4114cf6", { "bin": { "frp": "src/client/bin.ts" } }, "eb1f8f89e26c22b8e5e7af8ab7fcf840c4114cf6"],
+    "gini-relay": ["gini-relay@git+ssh://git@github.com/Open-Curiosity/gini-relay.git#eb1f8f89e26c22b8e5e7af8ab7fcf840c4114cf6", { "bin": { "frp": "src/client/bin.ts" } }, "eb1f8f89e26c22b8e5e7af8ab7fcf840c4114cf6"],
 
     "global-agent": ["global-agent@3.0.0", "", { "dependencies": { "boolean": "^3.0.1", "es6-error": "^4.1.1", "matcher": "^3.0.0", "roarr": "^2.15.3", "semver": "^7.3.2", "serialize-error": "^7.0.1" } }, "sha512-PT6XReJ+D07JvGoxQMkT6qji/jVNfX/h364XHZOWeRzy64sSFr+xJ5OX7LI3b4MPQzdL4H8Y8M0xzPpsVMwA8Q=="],
 

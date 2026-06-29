@@ -44,8 +44,8 @@ describe("runtime update metadata", () => {
   test("repo checkout status does not offer web update for a separate installed runtime", () => {
     const home = scratch("repo-checkout-home");
     const checkout = scratch("repo-checkout");
-    initRepo(join(home, ".gini", "runtime"), "https://github.com/Lilac-Labs/gini-agent");
-    initRepo(checkout, "https://github.com/Lilac-Labs/gini-agent");
+    initRepo(join(home, ".gini", "runtime"), "https://github.com/Open-Curiosity/gini-agent");
+    initRepo(checkout, "https://github.com/Open-Curiosity/gini-agent");
 
     const info = withHome(home, () => currentVersionInfo(checkout));
 
@@ -57,7 +57,7 @@ describe("runtime update metadata", () => {
   test("installer-managed runtime status offers web update", () => {
     const home = scratch("installed-home");
     const runtimeDir = join(home, ".gini", "runtime");
-    initRepo(runtimeDir, "https://github.com/Lilac-Labs/gini-agent");
+    initRepo(runtimeDir, "https://github.com/Open-Curiosity/gini-agent");
 
     const info = withHome(home, () => currentVersionInfo(runtimeDir));
 
@@ -176,7 +176,7 @@ describe("web production bundle", () => {
   // resolveWebProdDistDir reads the real `git rev-parse --short=12 HEAD`, so
   // these tests commit into a scratch repo and key the dist dir off that sha.
   function initRepoWithCommit(path: string): string {
-    initRepo(path, "https://github.com/Lilac-Labs/gini-agent");
+    initRepo(path, "https://github.com/Open-Curiosity/gini-agent");
     spawnSync("git", [
       "-C", path,
       "-c", "user.email=test@example.invalid",
@@ -236,7 +236,7 @@ describe("updateRuntime", () => {
   // the sync `git reset --hard origin/HEAD` step then succeeds (up to date).
   function makeUpdateRepo(): string {
     const dir = scratch("update-repo");
-    initRepo(dir, "https://github.com/Lilac-Labs/gini-agent");
+    initRepo(dir, "https://github.com/Open-Curiosity/gini-agent");
     spawnSync("git", [
       "-C", dir,
       "-c", "user.email=test@example.invalid",

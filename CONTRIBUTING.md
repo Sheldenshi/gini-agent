@@ -13,7 +13,7 @@ Thanks for your interest in contributing. This guide covers the basics for outsi
 Prerequisites: [Bun](https://bun.sh) (latest), Git, macOS or Linux.
 
 ```bash
-git clone https://github.com/Lilac-Labs/gini-agent
+git clone https://github.com/Open-Curiosity/gini-agent
 cd gini-agent
 bun install
 bun run gini install

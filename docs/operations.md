@@ -7,7 +7,7 @@ This document covers local install, runtime lifecycle, parallel smoke testing, a
 One-line install:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Lilac-Labs/gini-agent/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Open-Curiosity/gini-agent/main/scripts/install.sh | bash
 ```
 
 The installer detects OS and arch, installs Bun if missing, ensures git is available (on macOS, where `/usr/bin/git` is an Xcode Command Line Tools stub until those tools are installed, it launches Apple's installer and waits for you to click Install — the install aborts cleanly if you Cancel, if no dialog appears, or after a timeout), clones the runtime into `~/.gini/runtime`, installs dependencies, drops a `gini` wrapper at `~/.local/bin/gini`, ensures `~/.local/bin` is on `PATH`, and initializes the `default` instance under `~/.gini/instances/default/`. The wrapper defaults `GINI_INSTANCE=default` (override via `--instance` or the `GINI_INSTANCE` env var) so installed users land on `default`. Repo-clone developers running `bun run gini` get an instance auto-derived from the repo directory basename so each worktree is isolated by default.
