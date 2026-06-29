@@ -7,8 +7,8 @@ import { formatMessageTimestamp } from "./relative-time";
 const BUBBLE = "max-w-[90%] rounded-xl border bg-card px-3 py-2.5 text-card-foreground";
 
 // Pull a COMPLETE ```calendar fence out of the assistant text so the calendar can
-// render as its own full-width component OUTSIDE the chat bubble — the bubble's
-// width cramps a 7-day week into unreadable columns. Returns null when there is no
+// render as its OWN full-width card — like the standalone Question/Setup cards —
+// instead of cramped inside the chat bubble. Returns null when there is no
 // complete fence (including mid-stream, before the closing ```), so the text just
 // renders normally inside the bubble until the block finishes.
 const CALENDAR_FENCE = /```calendar[^\n]*\n([\s\S]*?)\n```/;
@@ -42,37 +42,55 @@ export function BlockAssistantText({
   // other callers render sensibly.
   const name = agent?.name ?? "Gini";
   const seed = agent?.id ?? name;
+  const header = (
+    <div className="flex items-center gap-2 pl-1 pb-1 text-xs">
+      <span className="font-semibold text-foreground">{name}</span>
+      {timestamp ? <span className="text-muted-foreground">{timestamp}</span> : null}
+    </div>
+  );
+
   const split = splitCalendar(block.text);
-  return (
-    <div className="flex items-start gap-2.5">
-      <AgentAvatar name={name} seed={seed} size={24} className="mt-0.5" />
-      <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-2 pl-1 pb-1 text-xs">
-          <span className="font-semibold text-foreground">{name}</span>
-          {timestamp ? <span className="text-muted-foreground">{timestamp}</span> : null}
-        </div>
-        {split ? (
-          // Calendar hoisted out of the bubble: the prose around it stays in
-          // bubbles, the calendar spans the full message column on its own.
-          <div className="space-y-2">
-            {split.before.trim() ? (
-              <div className={BUBBLE}>
-                <MarkdownContent text={split.before} dropForeignImages />
-              </div>
-            ) : null}
-            <CalendarView raw={split.calendarRaw} />
-            {split.after.trim() ? (
-              <div className={BUBBLE}>
-                <MarkdownContent text={split.after} streaming={block.streaming} dropForeignImages />
-              </div>
-            ) : null}
-          </div>
-        ) : (
+  if (!split) {
+    return (
+      <div className="flex items-start gap-2.5">
+        <AgentAvatar name={name} seed={seed} size={24} className="mt-0.5" />
+        <div className="min-w-0 flex-1">
+          {header}
           <div className={BUBBLE}>
             <MarkdownContent text={block.text} streaming={block.streaming} dropForeignImages />
           </div>
-        )}
+        </div>
       </div>
+    );
+  }
+
+  // Calendar hoisted to its OWN full-width card (no avatar indent), with the prose
+  // before/after it kept in Gini's normal avatar-indented bubbles.
+  return (
+    <div className="space-y-2">
+      <div className="flex items-start gap-2.5">
+        <AgentAvatar name={name} seed={seed} size={24} className="mt-0.5" />
+        <div className="min-w-0 flex-1">
+          {header}
+          {split.before.trim() ? (
+            <div className={BUBBLE}>
+              <MarkdownContent text={split.before} dropForeignImages />
+            </div>
+          ) : null}
+        </div>
+      </div>
+      <CalendarView raw={split.calendarRaw} />
+      {split.after.trim() ? (
+        <div className="flex items-start gap-2.5">
+          {/* avatar-width spacer so the trailing prose stays aligned under Gini */}
+          <div className="w-6 shrink-0" aria-hidden="true" />
+          <div className="min-w-0 flex-1">
+            <div className={BUBBLE}>
+              <MarkdownContent text={split.after} streaming={block.streaming} dropForeignImages />
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
