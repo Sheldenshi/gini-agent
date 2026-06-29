@@ -72,6 +72,21 @@ import {
 } from "./chat-task";
 import type { ToolCatalogTool } from "./tool-catalog";
 import type { EffectiveContext } from "./effective-context";
+import { __resetDefaultGiniInstructionsCacheForTest } from "../system-prompt";
+
+// Compaction geometry in this file is calibrated against a FIXED instructions
+// size (alongside the pinned tool catalog). The real default INSTRUCTIONS.md
+// changes over time, which would otherwise shift the system-prompt slice and
+// move the compaction crossing point opaquely. Pin a frozen fixture (byte-for-
+// byte the default as of this calibration) so edits to the shipped default
+// never perturb these tests.
+const COMPACTION_INSTRUCTIONS_FIXTURE = join(
+  import.meta.dir,
+  "..",
+  "runtime",
+  "__fixtures__",
+  "instructions-compaction-geometry.md"
+);
 
 // These tests submit on idle sessions, which always run immediately. They also
 // don't seed a "chat-route" stub, so the router coerces to a chat-direct
@@ -106,6 +121,9 @@ beforeEach(() => {
   // loop into a real network call.
   prevEmbedding = process.env.GINI_EMBEDDING_PROVIDER;
   process.env.GINI_EMBEDDING_PROVIDER = "echo";
+  // Pin instructions to the frozen geometry fixture so the compaction tests'
+  // system-prompt slice is independent of edits to the shipped default.
+  __resetDefaultGiniInstructionsCacheForTest(COMPACTION_INSTRUCTIONS_FIXTURE);
 });
 
 afterEach(() => {
@@ -113,6 +131,7 @@ afterEach(() => {
   else process.env.HOME = prevHome;
   if (prevEmbedding === undefined) delete process.env.GINI_EMBEDDING_PROVIDER;
   else process.env.GINI_EMBEDDING_PROVIDER = prevEmbedding;
+  __resetDefaultGiniInstructionsCacheForTest();
   rmSync(scratchHome, { recursive: true, force: true });
 });
 
