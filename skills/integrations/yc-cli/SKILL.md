@@ -152,18 +152,24 @@ yc tools run search --input '{"entity":"companies","ids":"{comma_separated_ids}"
 # {investor_name}
 > {tag_1} · {tag_2} · {tag_3} · ...
 
+**Overview**
+
 | Field | Value |
 |---|---|
 | **Location** | {location} |
-| **LinkedIn** | {linkedin_url} |
+| **LinkedIn** | [{linkedin_handle}]({linkedin_url}) |
 | **Background** | {background} |
 | **Education** | {education} |
 | **Followers** | {followers} |
+
+**Ratings**
 
 | Rating | Score |
 |---|---|
 | **YC Rating** | {yc_rating} |
 | **Founder Rating** | {founder_rating} |
+
+**Investment Profile**
 
 | Metric | Value |
 |---|---|
@@ -172,6 +178,8 @@ yc tools run search --input '{"entity":"companies","ids":"{comma_separated_ids}"
 | **YC Seed Investments** | {yc_seed_investments} |
 | **Series A Leads** | {series_a_leads} |
 | **Invests Internationally** | {invests_internationally} |
+
+**Portfolio by Batch**
 
 | Batch | # | Companies |
 |---|---|---|
