@@ -51,6 +51,7 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
   const mounted = useMounted();
   const invalidate = useInvalidate();
   const [createOpen, setCreateOpen] = useState(false);
+  const [agentMenuOpen, setAgentMenuOpen] = useState(false);
   const [archiveTarget, setArchiveTarget] = useState<AgentRow | null>(null);
   const [topicsCollapsed, toggleTopics] = useSectionCollapsed("topics");
 
@@ -148,7 +149,7 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
         <Link href="/" onClick={onNavigate} aria-label="Home" className="flex shrink-0 items-center">
           <Image src="/gini-agent-logo.png" alt="Gini" width={20} height={20} unoptimized className="size-5 shrink-0" />
         </Link>
-        <DropdownMenu>
+        <DropdownMenu open={agentMenuOpen} onOpenChange={setAgentMenuOpen}>
           <DropdownMenuTrigger className="flex min-w-0 items-center gap-1.5 rounded-md px-1.5 py-1 hover:bg-sidebar-accent/50">
             <span className="min-w-0 truncate text-sm font-semibold text-sidebar-accent-foreground">
               {activeAgentName}
@@ -173,6 +174,7 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
                       onClick={(e) => {
                         e.stopPropagation();
                         e.preventDefault();
+                        setAgentMenuOpen(false);
                         setArchiveTarget(agent);
                       }}
                       className="absolute top-1/2 right-1.5 flex size-6 -translate-y-1/2 items-center justify-center rounded-md text-sidebar-foreground/60 opacity-0 transition-opacity hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:opacity-100 group-hover:opacity-100"
