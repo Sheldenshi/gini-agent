@@ -2,7 +2,7 @@
 name: yc-cli
 description: "Operator's guide to the YC CLI (`yc`) for the Gini batch demo — scoped to the yc commands the demo actually uses: the validated browser-forward login flow (tmux + browser_connect) and investor research against Bookface. Assumes yc is installed but NOT logged in yet. Load before staging or running the demo."
 license: MIT
-compatibility: "macOS and Linux. Requires the yc CLI installed (binary at ~/.yc/bin/yc or ~/.local/bin/yc) and tmux for the login flow."
+compatibility: "macOS and Linux. Installs the yc CLI if missing (binary at ~/.yc/bin/yc or ~/.local/bin/yc); requires tmux for the login flow."
 allowed-tools: "terminal_exec browser_connect browser_navigate"
 metadata:
   gini:
@@ -20,16 +20,26 @@ API. In our demo it's the **investor-research source** behind Step 5: pulling a
 fund's track record (check size, YC conversion, recent deals) from the terminal.
 This guide covers only the parts the demo touches.
 
-## 0. PATH gotcha (will bite you live)
+## 0. Install + PATH (do this first)
 
-The binary is often not on PATH (`~/.yc/bin/yc`, sometimes `~/.local/bin/yc`).
-A bare `yc` may say "command not found." Fix once at the top of any shell:
+First make sure `yc` is actually present, and install it if it isn't:
 
 ```bash
 export PATH="$HOME/.yc/bin:$HOME/.local/bin:$PATH"
+command -v yc || command -v ycp || \
+  curl -fsSL https://bookface.ycombinator.com/cli/install.sh | bash
 ```
 
-(Non-interactive SSH shells don't source `~/.zshrc`, so set it in the script.)
+- The installer drops the binary under the user's home (commonly `~/.yc/bin/yc`,
+  sometimes `~/.local/bin/yc`) and adds it to PATH.
+- If an existing `yc` was detected at install time, the CLI may be installed as
+  **`ycp`** instead — fall back to `ycp` if `yc` is absent.
+- After installing, re-export PATH (above) so the current shell sees it.
+
+**PATH gotcha (will bite you live):** the binary is often not on PATH, so a bare
+`yc` says "command not found." Non-interactive SSH shells don't source
+`~/.zshrc`, so set the `export PATH=...` line at the top of any script/shell
+before calling `yc`. Verify with `yc --version`.
 
 ## 1. The optimal login flow (VALIDATED — use this)
 
