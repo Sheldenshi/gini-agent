@@ -295,8 +295,6 @@ export function migrateInstructionsIdentityLine(instance: Instance): boolean {
 // (`git cat-file -p origin/main:src/runtime/defaults/INSTRUCTIONS.md`).
 // Drop the hash of the current bundled content, dedupe, sort.
 const HISTORICAL_DEFAULT_INSTRUCTIONS_HASHES = new Set<string>([
-  "6c9a1f42f500700012970aecc4326d73128c4dc17c03e1ecc6638bec2b5bcaea",
-  "5a5d8d1e96ba68b2f87cb8696e5b43402ba4428800b2f5f47655394e01f3a18a",
   "016cdcc38a2bf933d931d72a2204e5b0ddc5afe322763ce49083457f0997b8c1",
   "047e7fcd44054c3899e087acb8482174d59ac21da261fbbfe214febbb2015cd3",
   "05aecabda22bdb9df89a88221a928ea99cf14a77f9b1f12748f73487f8e5c2de",
