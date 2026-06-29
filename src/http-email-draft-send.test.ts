@@ -157,10 +157,35 @@ describe("email draft send routes", () => {
     });
     const result = await call(handler, config, "/api/email/drafts/sent?ids=rA,rB,rC", { method: "GET" });
     expect(result).toEqual({ sent: ["rA"] });
+  });
 
-    // No ids => empty set.
+  test("GET /api/email/drafts/sent with no ids param returns every recorded id", async () => {
+    const config = testConfig("draft-sent-all");
+    const handler = createHandler(config);
+
+    await call(handler, config, "/api/email/drafts/send", {
+      method: "POST",
+      body: JSON.stringify({ draftId: "rA" })
+    });
+    await call(handler, config, "/api/email/drafts/send", {
+      method: "POST",
+      body: JSON.stringify({ draftId: "rB" })
+    });
+
+    // No `ids` param => the chat surface's eager prime: every recorded id.
+    const all = await call(handler, config, "/api/email/drafts/sent", { method: "GET" });
+    expect(new Set((all as { sent: string[] }).sent)).toEqual(new Set(["rA", "rB"]));
+
+    // An empty `ids=` param is treated the same as absent (return all).
     const empty = await call(handler, config, "/api/email/drafts/sent?ids=", { method: "GET" });
-    expect(empty).toEqual({ sent: [] });
+    expect(new Set((empty as { sent: string[] }).sent)).toEqual(new Set(["rA", "rB"]));
+  });
+
+  test("GET /api/email/drafts/sent with no recorded sends returns an empty list", async () => {
+    const config = testConfig("draft-sent-none");
+    const handler = createHandler(config);
+    const all = await call(handler, config, "/api/email/drafts/sent", { method: "GET" });
+    expect(all).toEqual({ sent: [] });
   });
 });
 

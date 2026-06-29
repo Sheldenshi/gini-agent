@@ -1939,14 +1939,17 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       });
       return json({ ok: true, ...(result.messageId ? { messageId: result.messageId } : {}) });
     }],
-    // Persistent sent-marker read for the email-draft card. Given a CSV of draft
-    // ids, returns the subset already recorded in sentDrafts, so the card can
-    // render "Sent" on mount without re-sending.
+    // Persistent sent-marker read for the email-draft card. With a CSV `ids`
+    // param, returns the subset of those ids already recorded in sentDrafts.
+    // With no `ids` param, returns ALL recorded sentDrafts so the chat surface
+    // can prime an eager sent-id set before the draft cards render (no "Send"
+    // flash on refresh). Either way the card renders "Sent" without re-sending.
     ["GET", /^\/api\/email\/drafts\/sent$/, (request) => {
-      const requested = new URL(request.url).searchParams.get("ids") ?? "";
+      const requested = new URL(request.url).searchParams.get("ids");
+      const all = readState(config.instance).sentDrafts ?? [];
+      if (requested === null || requested.trim() === "") return json({ sent: all });
       const ids = new Set(requested.split(",").map((s) => s.trim()).filter(Boolean));
-      const sent = (readState(config.instance).sentDrafts ?? []).filter((id) => ids.has(id));
-      return json({ sent });
+      return json({ sent: all.filter((id) => ids.has(id)) });
     }],
     ["GET", /^\/api\/connectors$/, async () => {
       const connectors = readState(config.instance).connectors;
