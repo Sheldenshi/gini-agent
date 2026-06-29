@@ -1,14 +1,29 @@
 import type { CalendarJob as CronJob, CalendarRunEntry as CronRunLogEntry } from "./types";
+import type { EventColor } from "./calendar-colors";
 
 export type CalendarViewMode = "month" | "week" | "day";
 
+// A generic grid event. The shared week/day/month views render purely from these
+// fields so the same primitives can back both the Jobs calendar (jobs adapter
+// below) and the inline chat calendar preview. The optional `job` is set only for
+// job events (the detail dialog + highlight path read it); inline events leave it
+// undefined.
 export interface CalendarEvent {
   day: Date;
-  job: CronJob;
+  key: string; // stable react key (was implicitly job.id)
+  title: string; // was job.name || job.id
+  hour: number | null; // null = all-day
+  minute: number | null;
+  endHour?: number | null; // timed-event end → block height; absent ⇒ default 30-min
+  endMinute?: number | null;
   sortKey: number;
   timeLabel: string;
-  hour: number | null;
-  minute: number | null;
+  color: EventColor; // resolved on the event (jobs assign per id; inline by status)
+  status?: "proposed" | "cancel"; // inline-calendar emphasis; undefined = normal
+  dimmed?: boolean; // was !job.enabled (opacity-50)
+  runStatus?: "ok" | "error" | "skipped"; // history dot tone
+  onClick?: () => void; // jobs ⇒ open dialog; inline ⇒ undefined (read-only)
+  job?: CronJob; // set only for job events
 }
 
 export const WEEKDAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -293,9 +308,23 @@ export function getScheduleDescription(job: CronJob): string {
   return n === 1 ? "Every second" : `Every ${n} seconds`;
 }
 
-// ─── Event builder ─────────────────────────────────────────
+// ─── Event builder (jobs adapter) ──────────────────────────
 
-export function buildEventsForDays(days: Date[], jobs: CronJob[]): Map<string, CalendarEvent[]> {
+export interface BuildEventsOptions {
+  colors: Map<string, EventColor>;
+  runStatusMap: Map<string, CronRunLogEntry>;
+  onEventClick: (event: CalendarEvent) => void;
+}
+
+// Maps gini jobs onto the generic event model with identical Jobs-calendar
+// visuals: color per job id, run-status history dot, opacity for disabled jobs,
+// click → detail dialog, and the `job` back-reference the dialog reads. Jobs
+// carry no end time, so each event renders at the default half-hour height.
+export function buildEventsForDays(
+  days: Date[],
+  jobs: CronJob[],
+  opts: BuildEventsOptions
+): Map<string, CalendarEvent[]> {
   const sortedJobs = [...jobs].sort((a, b) => {
     if (a.enabled !== b.enabled) return a.enabled ? -1 : 1;
     const aName = (a.name || a.id).toLowerCase();
@@ -315,20 +344,25 @@ export function buildEventsForDays(days: Date[], jobs: CronJob[]): Map<string, C
           eventTimeMs == null
             ? Number.POSITIVE_INFINITY
             : new Date(eventTimeMs).getHours() * 60 + new Date(eventTimeMs).getMinutes();
-        return {
+        const event: CalendarEvent = {
           day,
+          key: job.id,
+          title: job.name || job.id,
           job,
           sortKey,
           timeLabel: eventTimeMs == null ? "Any time" : formatTimeLabel(eventTimeMs),
           hour,
-          minute
+          minute,
+          color: opts.colors.get(job.id) ?? "gray",
+          dimmed: !job.enabled,
+          runStatus: opts.runStatusMap.get(runKey(job.id, day))?.status,
+          onClick: () => opts.onEventClick(event)
         };
+        return event;
       })
       .sort((a, b) => {
         if (a.sortKey !== b.sortKey) return a.sortKey - b.sortKey;
-        const aName = (a.job.name || a.job.id).toLowerCase();
-        const bName = (b.job.name || b.job.id).toLowerCase();
-        return aName.localeCompare(bName);
+        return a.title.toLowerCase().localeCompare(b.title.toLowerCase());
       });
 
     if (dayEvents.length > 0) map.set(dayKey(day), dayEvents);
@@ -372,6 +406,20 @@ export interface OverlapLayout {
 
 const EVENT_DURATION_MINUTES = 30;
 
+// Start/end of an event in minutes from midnight. Timed events with an explicit
+// end use their real span; otherwise they fall back to the default half-hour so
+// jobs (which carry no end) behave exactly as before.
+export function getEventStartMin(event: CalendarEvent): number {
+  return (event.hour ?? 0) * 60 + (event.minute ?? 0);
+}
+
+export function getEventEndMin(event: CalendarEvent): number {
+  if (event.endHour != null) {
+    return event.endHour * 60 + (event.endMinute ?? 0);
+  }
+  return getEventStartMin(event) + EVENT_DURATION_MINUTES;
+}
+
 /**
  * Given a list of timed events for one day, compute column positions so
  * overlapping events sit side-by-side instead of stacking.
@@ -379,17 +427,18 @@ const EVENT_DURATION_MINUTES = 30;
 export function computeOverlapLayout(events: CalendarEvent[]): OverlapLayout[] {
   if (events.length === 0) return [];
 
-  // Build start/end in minutes
-  const items = events.map((event) => {
-    const start = (event.hour ?? 0) * 60 + (event.minute ?? 0);
-    return { event, start, end: start + EVENT_DURATION_MINUTES };
-  });
+  // Build start/end in minutes — real durations when an end is present.
+  const items = events.map((event) => ({
+    event,
+    start: getEventStartMin(event),
+    end: getEventEndMin(event)
+  }));
 
-  // Sort by start time, then by job name for stability
+  // Sort by start time, then by title/key for stability
   items.sort((a, b) => {
     if (a.start !== b.start) return a.start - b.start;
-    const aName = (a.event.job.name || a.event.job.id).toLowerCase();
-    const bName = (b.event.job.name || b.event.job.id).toLowerCase();
+    const aName = (a.event.title || a.event.key).toLowerCase();
+    const bName = (b.event.title || b.event.key).toLowerCase();
     return aName.localeCompare(bName);
   });
 
@@ -447,6 +496,14 @@ export function computeOverlapLayout(events: CalendarEvent[]): OverlapLayout[] {
 
 export function getEventTopPx(hour: number, minute: number): number {
   return (hour + minute / 60) * HOUR_PX;
+}
+
+// Block height from the event's duration, clamped to the half-hour minimum so a
+// short (or end-less) event stays legible. End-less events (jobs) get exactly
+// HALF_HOUR_PX, preserving the original fixed-height job rendering.
+export function getEventHeightPx(event: CalendarEvent): number {
+  const durationMin = getEventEndMin(event) - getEventStartMin(event);
+  return Math.max(HALF_HOUR_PX, (durationMin / 60) * HOUR_PX);
 }
 
 export function getCurrentTimeTopPx(): number {

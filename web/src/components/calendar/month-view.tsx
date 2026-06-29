@@ -1,14 +1,11 @@
 "use client";
 
-import type { CalendarRunEntry as CronRunLogEntry } from "./types";
 import { cn } from "@/lib/utils";
-import type { EventColor } from "./calendar-colors";
 import {
   type CalendarEvent,
   dayKey,
   isSameDay,
   isSameMonth,
-  runKey,
   WEEKDAY_LABELS
 } from "./calendar-utils";
 import { EventChip } from "./event-chip";
@@ -18,22 +15,10 @@ interface MonthViewProps {
   focusDate: Date;
   today: Date;
   eventsByDay: Map<string, CalendarEvent[]>;
-  jobColors: Map<string, EventColor>;
-  runStatusMap: Map<string, CronRunLogEntry>;
-  onEventClick: (event: CalendarEvent) => void;
   onDayClick: (date: Date) => void;
 }
 
-export function MonthView({
-  days,
-  focusDate,
-  today,
-  eventsByDay,
-  jobColors,
-  runStatusMap,
-  onEventClick,
-  onDayClick
-}: MonthViewProps) {
+export function MonthView({ days, focusDate, today, eventsByDay, onDayClick }: MonthViewProps) {
   const rows = Math.ceil(days.length / 7);
 
   return (
@@ -86,13 +71,7 @@ export function MonthView({
               {/* Events */}
               <div className="flex w-full flex-col gap-1">
                 {dayEvents.slice(0, 4).map((event) => (
-                  <EventChip
-                    key={`${event.job.id}-${key}`}
-                    event={event}
-                    color={jobColors.get(event.job.id) ?? "gray"}
-                    runEntry={runStatusMap.get(runKey(event.job.id, day))}
-                    onClick={onEventClick}
-                  />
+                  <EventChip key={`${event.key}-${key}`} event={event} />
                 ))}
                 {overflowCount > 0 && (
                   <button

@@ -2,20 +2,17 @@
 
 import React from "react";
 
-import type { CalendarRunEntry as CronRunLogEntry } from "./types";
 import { cn } from "@/lib/utils";
-import type { EventColor } from "./calendar-colors";
 import {
   type CalendarEvent,
   computeOverlapLayout,
   dayKey,
   getCurrentTimeTopPx,
+  getEventHeightPx,
   getEventTopPx,
-  HALF_HOUR_PX,
   HOUR_LABELS,
   HOUR_PX,
   isSameDay,
-  runKey,
   WEEKDAY_LABELS
 } from "./calendar-utils";
 import { EventChip } from "./event-chip";
@@ -24,29 +21,21 @@ interface WeekViewProps {
   days: Date[];
   today: Date;
   eventsByDay: Map<string, CalendarEvent[]>;
-  jobColors: Map<string, EventColor>;
-  runStatusMap: Map<string, CronRunLogEntry>;
-  onEventClick: (event: CalendarEvent) => void;
+  // Hour the time grid auto-scrolls to on mount (jobs default 7; inline 8).
+  scrollToHour?: number;
 }
 
-export function WeekView({
-  days,
-  today,
-  eventsByDay,
-  jobColors,
-  runStatusMap,
-  onEventClick
-}: WeekViewProps) {
+export function WeekView({ days, today, eventsByDay, scrollToHour = 7 }: WeekViewProps) {
   const scrollRef = React.useRef<HTMLDivElement>(null);
   const [currentTimePx, setCurrentTimePx] = React.useState(getCurrentTimeTopPx);
   const todayVisible = days.some((d) => isSameDay(d, today));
 
-  // Auto-scroll to 7 AM on mount
+  // Auto-scroll to the configured hour on mount
   React.useEffect(() => {
     if (scrollRef.current) {
-      scrollRef.current.scrollTop = 7 * HOUR_PX - 20;
+      scrollRef.current.scrollTop = scrollToHour * HOUR_PX - 20;
     }
-  }, []);
+  }, [scrollToHour]);
 
   // Update current time indicator every 60s
   React.useEffect(() => {
@@ -94,17 +83,11 @@ export function WeekView({
       {/* All-day row */}
       {hasAllDay && (
         <div className="grid grid-cols-7 border-b border-border pl-[72px]">
-          {dayData.map(({ day, key, allDay }) => (
+          {dayData.map(({ key, allDay }) => (
             <div key={`ad-${key}`} className="border-r border-border p-1.5">
               <div className="flex flex-col gap-1">
                 {allDay.map((event) => (
-                  <EventChip
-                    key={`ad-${event.job.id}-${key}`}
-                    event={event}
-                    color={jobColors.get(event.job.id) ?? "gray"}
-                    runEntry={runStatusMap.get(runKey(event.job.id, day))}
-                    onClick={onEventClick}
-                  />
+                  <EventChip key={`ad-${event.key}-${key}`} event={event} />
                 ))}
               </div>
             </div>
@@ -136,7 +119,7 @@ export function WeekView({
 
         {/* Day columns */}
         <div className="grid flex-1 grid-cols-7">
-          {dayData.map(({ day, key, timed, isToday }) => {
+          {dayData.map(({ key, timed, isToday }) => {
             return (
               <div key={`wc-${key}`} className="relative" style={{ height: `${totalHeight}px` }}>
                 {/* Hour grid lines */}
@@ -155,22 +138,17 @@ export function WeekView({
                   const leftPct = column * widthPct;
                   return (
                     <div
-                      key={`ev-${event.job.id}-${key}`}
+                      key={`ev-${event.key}-${key}`}
                       className="absolute px-0.5 py-0.5"
                       style={{
                         top: `${top}px`,
-                        height: `${HALF_HOUR_PX}px`,
+                        height: `${getEventHeightPx(event)}px`,
                         left: `${leftPct}%`,
                         width: `${widthPct}%`,
                         zIndex: 1
                       }}
                     >
-                      <EventChip
-                        event={event}
-                        color={jobColors.get(event.job.id) ?? "gray"}
-                        runEntry={runStatusMap.get(runKey(event.job.id, day))}
-                        onClick={onEventClick}
-                      />
+                      <EventChip event={event} />
                     </div>
                   );
                 })}

@@ -6,9 +6,8 @@ import type {
   CalendarJob as CronJob,
   CalendarRunEntry as CronRunLogEntry,
   CalendarStatus as CronStatus
-} from "./types";
-import { assignJobColors } from "./calendar-colors";
-import { CalendarHeader } from "./calendar-header";
+} from "@/components/calendar/types";
+import { assignJobColors } from "@/components/calendar/calendar-colors";
 import {
   addDays,
   addMonths,
@@ -20,11 +19,12 @@ import {
   type CalendarViewMode,
   startOfDay,
   startOfMonth
-} from "./calendar-utils";
-import { DayView } from "./day-view";
+} from "@/components/calendar/calendar-utils";
+import { DayView } from "@/components/calendar/day-view";
+import { MonthView } from "@/components/calendar/month-view";
+import { WeekView } from "@/components/calendar/week-view";
+import { CalendarHeader } from "./calendar-header";
 import { EventDetailDialog } from "./event-detail-dialog";
-import { MonthView } from "./month-view";
-import { WeekView } from "./week-view";
 
 interface CalendarViewProps {
   status: CronStatus | null;
@@ -63,6 +63,8 @@ export function CalendarView({
   const [viewMode, setViewMode] = React.useState<CalendarViewMode>("week");
   const [focusDate, setFocusDate] = React.useState<Date>(() => startOfDay(new Date()));
 
+  const jobColors = React.useMemo(() => assignJobColors(jobs), [jobs]);
+
   // Auto-select a job when navigating from an external highlight signal.
   React.useEffect(() => {
     if (!highlightJobId || jobs.length === 0) return;
@@ -70,15 +72,18 @@ export function CalendarView({
     if (job) {
       setSelectedEvent({
         day: today,
+        key: job.id,
+        title: job.name || job.id,
         job,
         sortKey: 0,
         timeLabel: "",
         hour: null,
-        minute: null
+        minute: null,
+        color: jobColors.get(job.id) ?? "gray"
       });
       onHighlightConsumed?.();
     }
-  }, [highlightJobId, jobs, onHighlightConsumed, today]);
+  }, [highlightJobId, jobs, jobColors, onHighlightConsumed, today]);
 
   const activeDays = React.useMemo(() => {
     if (viewMode === "month") return buildMonthDays(focusDate);
@@ -86,11 +91,17 @@ export function CalendarView({
     return [startOfDay(focusDate)];
   }, [focusDate, viewMode]);
 
-  const eventsByDay = React.useMemo(() => buildEventsForDays(activeDays, jobs), [activeDays, jobs]);
-
-  const jobColors = React.useMemo(() => assignJobColors(jobs), [jobs]);
-
   const runStatusMap = React.useMemo(() => buildRunStatusMap(runs), [runs]);
+
+  const eventsByDay = React.useMemo(
+    () =>
+      buildEventsForDays(activeDays, jobs, {
+        colors: jobColors,
+        runStatusMap,
+        onEventClick: setSelectedEvent
+      }),
+    [activeDays, jobs, jobColors, runStatusMap]
+  );
 
   const handleRefresh = async () => {
     setRefreshing(true);
@@ -145,36 +156,23 @@ export function CalendarView({
           focusDate={focusDate}
           today={today}
           eventsByDay={eventsByDay}
-          jobColors={jobColors}
-          runStatusMap={runStatusMap}
-          onEventClick={setSelectedEvent}
           onDayClick={handleDayClick}
         />
       ) : viewMode === "week" ? (
-        <WeekView
-          days={activeDays}
-          today={today}
-          eventsByDay={eventsByDay}
-          jobColors={jobColors}
-          runStatusMap={runStatusMap}
-          onEventClick={setSelectedEvent}
-        />
+        <WeekView days={activeDays} today={today} eventsByDay={eventsByDay} />
       ) : (
         <DayView
           day={startOfDay(focusDate)}
           today={today}
           jobs={jobs}
           eventsByDay={eventsByDay}
-          jobColors={jobColors}
-          runStatusMap={runStatusMap}
-          onEventClick={setSelectedEvent}
           onDayChange={(date) => setFocusDate(startOfDay(date))}
         />
       )}
 
       <EventDetailDialog
         event={selectedEvent}
-        color={selectedEvent ? (jobColors.get(selectedEvent.job.id) ?? "gray") : null}
+        color={selectedEvent ? (selectedEvent.color ?? "gray") : null}
         today={today}
         runStatusMap={runStatusMap}
         onClose={() => setSelectedEvent(null)}

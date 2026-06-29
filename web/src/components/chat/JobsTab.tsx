@@ -12,7 +12,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { cn } from "@/lib/utils";
 import { scheduleLabel } from "@/app/jobs/_components/schedule-label";
 import { CalendarView } from "@/app/jobs/_components/calendar/calendar-view";
-import { adaptJob, adaptRun } from "@/app/jobs/_components/calendar/types";
+import { adaptJob, adaptRun } from "@/components/calendar/types";
 import { api } from "@/lib/api";
 import { useAllChatSessions, useInvalidate, useJobRuns, useJobs } from "@/lib/queries";
 import { JobFanout } from "@/components/chat/JobFanout";

@@ -18,6 +18,7 @@ coverageThreshold = { lines = 1, functions = 1 }
 # don't drag (or falsely satisfy) the tunnel threshold.
 coveragePathIgnorePatterns = [
   "src/components/ui/**",
+  "src/components/calendar/**",
   "src/lib/**",
   "src/app/**",
   "src/proxy.ts",

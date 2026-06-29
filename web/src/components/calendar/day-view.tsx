@@ -3,9 +3,8 @@
 import { ChevronLeft, ChevronRight } from "lucide-react";
 import React from "react";
 
-import type { CalendarJob as CronJob, CalendarRunEntry as CronRunLogEntry } from "./types";
+import type { CalendarJob as CronJob } from "./types";
 import { cn } from "@/lib/utils";
-import type { EventColor } from "./calendar-colors";
 import {
   addMonths,
   buildMonthDays,
@@ -13,14 +12,13 @@ import {
   computeOverlapLayout,
   dayKey,
   getCurrentTimeTopPx,
+  getEventHeightPx,
   getEventTopPx,
-  HALF_HOUR_PX,
   HOUR_LABELS,
   HOUR_PX,
   isSameDay,
   isSameMonth,
   jobRunsOnDate,
-  runKey,
   startOfMonth,
   WEEKDAY_LABELS
 } from "./calendar-utils";
@@ -29,24 +27,13 @@ import { EventChip } from "./event-chip";
 interface DayViewProps {
   day: Date;
   today: Date;
+  // Jobs feed the mini-calendar's "has events" dots across the visible month.
   jobs: CronJob[];
   eventsByDay: Map<string, CalendarEvent[]>;
-  jobColors: Map<string, EventColor>;
-  runStatusMap: Map<string, CronRunLogEntry>;
-  onEventClick: (event: CalendarEvent) => void;
   onDayChange: (date: Date) => void;
 }
 
-export function DayView({
-  day,
-  today,
-  jobs,
-  eventsByDay,
-  jobColors,
-  runStatusMap,
-  onEventClick,
-  onDayChange
-}: DayViewProps) {
+export function DayView({ day, today, jobs, eventsByDay, onDayChange }: DayViewProps) {
   const scrollRef = React.useRef<HTMLDivElement>(null);
   const [currentTimePx, setCurrentTimePx] = React.useState(getCurrentTimeTopPx);
   const [miniMonth, setMiniMonth] = React.useState(() => startOfMonth(day));
@@ -101,13 +88,7 @@ export function DayView({
             <div className="mb-1 text-xs font-medium text-muted-foreground">All day</div>
             <div className="flex flex-col gap-1">
               {allDay.map((event) => (
-                <EventChip
-                  key={`ad-${event.job.id}`}
-                  event={event}
-                  color={jobColors.get(event.job.id) ?? "gray"}
-                  runEntry={runStatusMap.get(runKey(event.job.id, day))}
-                  onClick={onEventClick}
-                />
+                <EventChip key={`ad-${event.key}`} event={event} />
               ))}
             </div>
           </div>
@@ -153,22 +134,17 @@ export function DayView({
               const leftPct = column * widthPct;
               return (
                 <div
-                  key={`ev-${event.job.id}`}
+                  key={`ev-${event.key}`}
                   className="absolute px-0.5 py-0.5"
                   style={{
                     top: `${top}px`,
-                    height: `${HALF_HOUR_PX}px`,
+                    height: `${getEventHeightPx(event)}px`,
                     left: `${leftPct}%`,
                     width: `${widthPct}%`,
                     zIndex: 1
                   }}
                 >
-                  <EventChip
-                    event={event}
-                    color={jobColors.get(event.job.id) ?? "gray"}
-                    runEntry={runStatusMap.get(runKey(event.job.id, day))}
-                    onClick={onEventClick}
-                  />
+                  <EventChip event={event} />
                 </div>
               );
             })}

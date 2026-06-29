@@ -10,9 +10,9 @@ import {
   DialogHeader,
   DialogTitle
 } from "@/components/ui/dialog";
-import type { CalendarRunEntry as CronRunLogEntry } from "./types";
+import type { CalendarRunEntry as CronRunLogEntry } from "@/components/calendar/types";
 import { cn } from "@/lib/utils";
-import { COLOR_CLASSES, type EventColor } from "./calendar-colors";
+import { COLOR_CLASSES, type EventColor } from "@/components/calendar/calendar-colors";
 import {
   type CalendarEvent,
   formatTimestamp,
@@ -20,7 +20,7 @@ import {
   getTaskContent,
   isSameDay,
   runKey
-} from "./calendar-utils";
+} from "@/components/calendar/calendar-utils";
 
 type Tab = "run" | "task";
 

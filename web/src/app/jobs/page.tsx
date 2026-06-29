@@ -17,7 +17,7 @@ import { JobList } from "./_components/JobList";
 import { JobDetail } from "./_components/JobDetail";
 import { RunList } from "./_components/RunList";
 import { CalendarView } from "./_components/calendar/calendar-view";
-import { adaptJob, adaptRun } from "./_components/calendar/types";
+import { adaptJob, adaptRun } from "@/components/calendar/types";
 
 export default function JobsPage() {
   const jobs = useJobs();

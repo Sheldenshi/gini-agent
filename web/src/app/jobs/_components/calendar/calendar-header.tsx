@@ -11,13 +11,13 @@ import {
   SelectTrigger,
   SelectValue
 } from "@/components/ui/select";
-import type { CalendarStatus as CronStatus } from "./types";
+import type { CalendarStatus as CronStatus } from "@/components/calendar/types";
 import {
   type CalendarViewMode,
   formatMonthAbbrev,
   getHeaderSubtitle,
   getHeaderTitle
-} from "./calendar-utils";
+} from "@/components/calendar/calendar-utils";
 
 interface CalendarHeaderProps {
   focusDate: Date;
