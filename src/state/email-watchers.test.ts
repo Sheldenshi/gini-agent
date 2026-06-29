@@ -999,6 +999,41 @@ describe("triage concern + intelligent router", () => {
     expect(sharedJob(config)?.routes?.triage?.chatSessionId).toBe(triageId);
   });
 
+  test("triage-only lifecycle: enabling with ZERO targeted watchers provisions the job; disabling tears it down", async () => {
+    const config = buildConfig("ew-triage-only-lifecycle");
+    // The "watch my inbox and handle investor inbound" path: triage is opted in
+    // with NO targeted watcher ever added, so triage alone must provision + own
+    // the backing job. Before opt-in nothing exists.
+    expect(sharedJob(config)).toBeUndefined();
+    expect(triageChannels(config)).toHaveLength(0);
+
+    await enableTriage(config, true);
+    // Exactly one shared gmail-watch job is provisioned, so Gmail is actually polled.
+    const jobs = readState(config.instance).jobs.filter(
+      (j) => (j.preRunHook?.config as { skill?: string })?.skill === "gmail-watch"
+    );
+    expect(jobs).toHaveLength(1);
+    // Its watch list is the broad triage watch ALONE, and its routes include triage.
+    expect(new Set(allWatches(config).map((w) => w.watcherId))).toEqual(new Set(["triage"]));
+    expect(allWatches(config).find((w) => w.watcherId === "triage")).toMatchObject({
+      watcherId: "triage",
+      routeKey: "triage",
+      query: "in:inbox"
+    });
+    const triageId = triageChannels(config)[0]!.id;
+    expect(sharedJob(config)?.routes?.triage?.chatSessionId).toBe(triageId);
+
+    // Disabling with zero targeted watchers tears the job AND the triage channel down.
+    await enableTriage(config, false);
+    expect(
+      readState(config.instance).jobs.filter(
+        (j) => (j.preRunHook?.config as { skill?: string })?.skill === "gmail-watch"
+      )
+    ).toHaveLength(0);
+    expect(triageChannels(config)).toHaveLength(0);
+    expect(readState(config.instance).chatSessions.some((s) => s.id === triageId)).toBe(false);
+  });
+
   test("opting out (triage:false) removes the triage channel + watch + route", async () => {
     const config = buildConfig("ew-triage-optout");
     const watcher = await addEmailWatcher(config, { sender: "bob@x.com" });
@@ -1055,14 +1090,22 @@ describe("triage concern + intelligent router", () => {
     expect(route?.toolsets).not.toContain("messaging");
   });
 
-  test("the triage channel is torn down with the LAST watcher", async () => {
+  test("removing the last targeted watcher while triage stays on keeps the job + triage channel alive", async () => {
     const config = buildConfig("ew-triage-teardown");
     const watcher = await addEmailWatcher(config, { sender: "erin@x.com" });
     await enableTriage(config, true);
     const triageId = triageChannels(config)[0]!.id;
     expect(triageId).toBeString();
     await removeEmailWatcher(config, watcher.id);
-    // No shared job left, and the triage channel was deleted (not left orphaned).
+    // Triage is a self-sufficient reason for the shared job to exist: removing the
+    // last targeted watcher must NOT tear it down while triage is still opted in.
+    expect(sharedJob(config)).toBeDefined();
+    expect(readState(config.instance).chatSessions.some((s) => s.id === triageId)).toBe(true);
+    // The job now polls the whole inbox via the broad triage watch + route alone.
+    expect(new Set(allWatches(config).map((w) => w.watcherId))).toEqual(new Set(["triage"]));
+    expect(sharedJob(config)?.routes?.triage?.chatSessionId).toBe(triageId);
+    // Opting OUT then tears the job + triage channel down (no watchers, triage off).
+    await enableTriage(config, false);
     expect(sharedJob(config)).toBeUndefined();
     expect(readState(config.instance).chatSessions.some((s) => s.id === triageId)).toBe(false);
   });

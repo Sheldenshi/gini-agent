@@ -7,8 +7,10 @@
 // matches across all senders land in the one shared thread (each labeled by
 // sender). Adding the first watcher provisions the shared job + session; adding
 // more reuses them and rebuilds the job's watch list; removing the last enabled
-// watcher tears the shared job + session down; disable/enable rebuilds the watch
-// list (the job watches only ENABLED watchers). These helpers follow the
+// watcher tears the shared job + session down UNLESS the agent has opted into
+// whole-inbox triage (which keeps the job alive on its own — opting into triage
+// also provisions the job up front when no targeted watcher exists);
+// disable/enable rebuilds the watch list (the job watches only ENABLED watchers). These helpers follow the
 // createXRecord convention in records.ts: the builder mutates a RuntimeState in
 // place and emits an audit row; the config-level wrappers go through mutateState
 // so all state I/O serializes through the per-instance lock. Job lifecycle
@@ -588,9 +590,11 @@ async function ensureSharedJobAndSession(
 
 // Rebuild the agent's shared job's watch list from its ENABLED watchers (so a
 // disabled watcher stops being polled without removing it). When no enabled
-// watchers remain, tear the shared job + session down (recreated on the next
-// add) and clear the pointers on any leftover (disabled) watchers so they
-// re-provision cleanly on re-enable. Otherwise re-stamp jobId/chatSessionId onto
+// watchers remain AND triage is not opted in, tear the shared job + session down
+// (recreated on the next add) and clear the pointers on any leftover (disabled)
+// watchers so they re-provision cleanly on re-enable. When triage IS opted in,
+// the job survives with zero targeted watchers — it still polls the whole inbox
+// via the broad triage watch. Otherwise re-stamp jobId/chatSessionId onto
 // every enabled watcher (idempotent — they all share, so this also heals a
 // watcher whose pointers went stale across a prior teardown). Direct mutateState
 // on the backing job's declarative `preRunHook.config` — email-domain code
@@ -602,9 +606,15 @@ async function rebuildSharedJobWatches(config: RuntimeConfig, agentId: string | 
   const jobId = findSharedJobId(state, agentId);
   if (!jobId) return;
   const enabled = enabledWatchersForAgent(state, agentId);
+  // Whole-inbox triage is a legitimate reason for the shared job to exist on its
+  // own: it contributes the broad `in:inbox` triage watch + the `triage` route.
+  // Computed BEFORE the teardown so a triage-only agent (zero targeted watchers,
+  // triage opted in) keeps its job instead of having it torn down.
+  const triageEnabled = isTriageEnabled(state, agentId);
 
-  if (enabled.length === 0) {
-    // Last enabled watcher gone — remove the shared job + session.
+  if (enabled.length === 0 && !triageEnabled) {
+    // No enabled watchers AND triage not opted in — remove the shared job +
+    // session. (Triage alone keeps the job alive so it can poll the whole inbox.)
     await removeSharedJobAndSession(config, jobId, agentId);
     return;
   }
@@ -614,7 +624,6 @@ async function rebuildSharedJobWatches(config: RuntimeConfig, agentId: string | 
   // is an await, so the watch list + routes below are (re)derived from the LIVE
   // state INSIDE the final mutateState — never from the pre-await `enabled`
   // snapshot — so a concurrent add's watcher isn't dropped across this yield.
-  const triageEnabled = isTriageEnabled(state, agentId);
   const triageChannelId = triageEnabled ? await ensureTriageChannel(config, agentId) : undefined;
   // Resolve each watcher's account → gws configDir once per rebuild, against the
   // registered Google accounts (a cheap registry read + one `gws auth status`
@@ -877,11 +886,14 @@ export async function clearEmailWatcherObjective(
 // so the broad `in:inbox` triage concern (+ its channel + route) is provisioned
 // on opt-in and torn down on opt-out. Triage is OPT-IN: this is the ONLY thing
 // that adds the agent to the registry, so a normal sender/thread watch never
-// provisions triage. Opting in requires a shared job to attach the triage watch
-// to; ensureSharedJobAndSession is NOT called here, so triage takes effect once
-// the agent has at least one normal watcher (the rebuild is a no-op without a
-// shared job). Opting out removes the registry entry; the rebuild then drops the
-// triage watch/route, and removeTriageChannel sweeps the now-unreferenced
+// provisions triage. Opting in ENSURES the shared job up front (mirroring
+// setEmailWatcherEnabled's re-enable path): triage is a self-sufficient reason
+// for the backing job to exist, so a whole-inbox opt-in with zero targeted
+// watchers still provisions exactly one gmail-watch job and starts polling —
+// without this the rebuild would be a no-op (no job to attach the triage watch
+// to) and the opt-in would silently never run. Opting out removes the registry
+// entry; the rebuild then tears the job + triage watch/route down (no targeted
+// watchers, triage off), and removeTriageChannel sweeps any now-unreferenced
 // channel. Returns whether triage is enabled after the change.
 export async function setEmailTriageEnabled(
   config: RuntimeConfig,
@@ -895,6 +907,12 @@ export async function setEmailTriageEnabled(
     if (enabled && !has) state.emailTriageAgents = [...current, key];
     else if (!enabled && has) state.emailTriageAgents = current.filter((k) => k !== key);
   });
+  // Ensure the shared job before the rebuild so the triage watch + route have a
+  // job to attach to. Checked against a LIVE shared job, not a watcher's pointer,
+  // so a triage-only opt-in (no targeted watchers) still provisions one.
+  if (enabled && !findSharedJobId(readState(config.instance), agentId)) {
+    await ensureSharedJobAndSession(config, agentId);
+  }
   await rebuildSharedJobWatches(config, agentId);
   if (!enabled) await removeTriageChannel(config, agentId);
   return enabled;
