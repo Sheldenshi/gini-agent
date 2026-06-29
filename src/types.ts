@@ -697,6 +697,12 @@ export interface RuntimeState {
   // sender/thread watch never adds an entry, so it never provisions the broad
   // `in:inbox` triage concern. Absent/empty for installs that never opted in.
   emailTriageAgents?: string[];
+  // Durable ids of Gmail drafts the user has SENT from the email-draft card's
+  // Send button (POST /api/email/drafts/send). The card reads this on mount
+  // (GET /api/email/drafts/sent?ids=…) to render a persistent "Sent" state that
+  // survives a page refresh. Ids only; deduped. Absent for installs that never
+  // sent a draft from the card.
+  sentDrafts?: string[];
   events: RuntimeEvent[];
   jobRuns: JobRunRecord[];
   // Durable per-day token-usage rollup across every generative provider call

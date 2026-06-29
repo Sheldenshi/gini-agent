@@ -64,6 +64,7 @@ export function createEmptyState(instance: Instance): RuntimeState {
     relays: [],
     notifications: [],
     emailWatchers: [],
+    sentDrafts: [],
     events: [],
     jobRuns: [],
     usageLedger: [],
@@ -1491,6 +1492,7 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
   state.relays ??= [];
   state.notifications ??= [];
   state.emailWatchers ??= [];
+  state.sentDrafts ??= [];
   state.events ??= [];
   state.jobRuns ??= [];
   state.usageLedger ??= [];

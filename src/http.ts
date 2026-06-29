@@ -61,6 +61,7 @@ import { listProviders } from "./integrations/connectors/registry";
 import { runConnectorDetection } from "./jobs/connector-detection";
 import { createScheduledJob, listJobRuns, removeJob, replayJobRun, runJobNow, updateJob, updateJobStatus } from "./jobs";
 import { addEmailWatcher, clearEmailWatcherObjective, getEmailWatcher, listEmailWatchers, removeEmailWatcher, setEmailTriageEnabled, setEmailWatcherEnabled, setEmailWatcherObjective } from "./state/email-watchers";
+import { resolveDraftSendConfigDir, sendGmailDraft } from "./integrations/connectors/gmail-draft-send";
 import { migrateLegacyMemories, recall, reflect, retain } from "./memory";
 import { embeddingStatus, reembedAllBanks, reembedBank } from "./memory/embedding";
 import { rerankerStatus } from "./memory/reranker";
@@ -1896,6 +1897,56 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       }
       if (!updated) return json({ error: `Email watcher not found: ${params[0]}` }, 404);
       return json(updated);
+    }],
+    // Direct, server-side send of a SAVED Gmail draft by id — the email-draft
+    // card's Send button. The agent embeds the gws draft id (+ sending account)
+    // in the rendered email-draft fence; the card POSTs them here. No LLM/agent
+    // turn runs — the explicit Send click IS the user approval (the global
+    // request_confirmation gate), so we stamp an audit row and send via gws.
+    // The draft id is validated to gws's opaque-token charset and rides INSIDE
+    // the gws --json request body (see gmail-draft-send.ts), never the shell.
+    ["POST", /^\/api\/email\/drafts\/send$/, async (request) => {
+      const payload = await body(request);
+      const draftId = typeof payload.draftId === "string" ? payload.draftId.trim() : "";
+      if (!draftId || !/^[A-Za-z0-9_-]+$/.test(draftId)) {
+        return json({ ok: false, message: "Invalid input: draftId must be a non-empty opaque token." }, 400);
+      }
+      const account = typeof payload.account === "string" && payload.account.trim().length > 0 ? payload.account.trim() : undefined;
+      // Resolve the sending account → its gws config dir against the registered
+      // Google accounts (same resolution the email watchers use). An unresolved
+      // / unset account falls back to the default gws session.
+      const configDir = await resolveDraftSendConfigDir(account);
+      const result = await sendGmailDraft({ draftId, ...(configDir ? { configDir } : {}) });
+      if (!result.ok) {
+        return json({ ok: false, message: result.message ?? "Failed to send the draft." }, 502);
+      }
+      // Record the sent id durably (deduped) so the card renders a persistent
+      // "Sent" across refresh, and stamp the audit row for the side effect.
+      await mutateState(config.instance, (state) => {
+        const ids = state.sentDrafts ?? [];
+        if (!ids.includes(draftId)) state.sentDrafts = [...ids, draftId];
+        addAudit(
+          state,
+          {
+            actor: "user",
+            action: "email.draft_sent",
+            target: draftId,
+            risk: "medium",
+            evidence: { draftId, account, messageId: result.messageId }
+          },
+          { system: true }
+        );
+      });
+      return json({ ok: true, ...(result.messageId ? { messageId: result.messageId } : {}) });
+    }],
+    // Persistent sent-marker read for the email-draft card. Given a CSV of draft
+    // ids, returns the subset already recorded in sentDrafts, so the card can
+    // render "Sent" on mount without re-sending.
+    ["GET", /^\/api\/email\/drafts\/sent$/, (request) => {
+      const requested = new URL(request.url).searchParams.get("ids") ?? "";
+      const ids = new Set(requested.split(",").map((s) => s.trim()).filter(Boolean));
+      const sent = (readState(config.instance).sentDrafts ?? []).filter((id) => ids.has(id));
+      return json({ sent });
     }],
     ["GET", /^\/api\/connectors$/, async () => {
       const connectors = readState(config.instance).connectors;
