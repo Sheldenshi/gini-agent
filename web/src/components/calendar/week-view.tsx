@@ -23,26 +23,35 @@ interface WeekViewProps {
   eventsByDay: Map<string, CalendarEvent[]>;
   // Hour the time grid auto-scrolls to on mount (jobs default 7; inline 8).
   scrollToHour?: number;
+  // Pixel height of one hour row. Jobs use the full-width default (96); the
+  // compact inline chat preview passes a smaller value so 8 AM–8 PM fits the card.
+  hourPx?: number;
 }
 
-export function WeekView({ days, today, eventsByDay, scrollToHour = 7 }: WeekViewProps) {
+export function WeekView({
+  days,
+  today,
+  eventsByDay,
+  scrollToHour = 7,
+  hourPx = HOUR_PX
+}: WeekViewProps) {
   const scrollRef = React.useRef<HTMLDivElement>(null);
-  const [currentTimePx, setCurrentTimePx] = React.useState(getCurrentTimeTopPx);
+  const [currentTimePx, setCurrentTimePx] = React.useState(() => getCurrentTimeTopPx(hourPx));
   const todayVisible = days.some((d) => isSameDay(d, today));
 
   // Auto-scroll to the configured hour on mount
   React.useEffect(() => {
     if (scrollRef.current) {
-      scrollRef.current.scrollTop = scrollToHour * HOUR_PX - 20;
+      scrollRef.current.scrollTop = scrollToHour * hourPx - 20;
     }
-  }, [scrollToHour]);
+  }, [scrollToHour, hourPx]);
 
   // Update current time indicator every 60s
   React.useEffect(() => {
     if (!todayVisible) return;
-    const interval = setInterval(() => setCurrentTimePx(getCurrentTimeTopPx()), 60_000);
+    const interval = setInterval(() => setCurrentTimePx(getCurrentTimeTopPx(hourPx)), 60_000);
     return () => clearInterval(interval);
-  }, [todayVisible]);
+  }, [todayVisible, hourPx]);
 
   // Separate all-day vs timed events per day
   const dayData = days.map((day) => {
@@ -54,7 +63,7 @@ export function WeekView({ days, today, eventsByDay, scrollToHour = 7 }: WeekVie
   });
 
   const hasAllDay = dayData.some((d) => d.allDay.length > 0);
-  const totalHeight = 24 * HOUR_PX;
+  const totalHeight = 24 * hourPx;
 
   return (
     <div className="flex flex-1 flex-col overflow-hidden">
@@ -65,7 +74,7 @@ export function WeekView({ days, today, eventsByDay, scrollToHour = 7 }: WeekVie
             key={`wh-${dayKey(day)}`}
             className="relative flex w-full flex-col items-center justify-center gap-1 border-b border-border bg-card p-2 md:flex-row md:gap-1"
           >
-            <span className="text-xs font-medium text-muted-foreground">
+            <span className="text-xs font-medium whitespace-nowrap text-muted-foreground">
               {WEEKDAY_LABELS[day.getDay()]}
             </span>
             <span
@@ -103,7 +112,7 @@ export function WeekView({ days, today, eventsByDay, scrollToHour = 7 }: WeekVie
             <div
               key={label}
               className="group relative flex items-start justify-end bg-muted/40 pr-2"
-              style={{ height: `${HOUR_PX}px` }}
+              style={{ height: `${hourPx}px` }}
             >
               <span
                 className={cn(
@@ -127,13 +136,13 @@ export function WeekView({ days, today, eventsByDay, scrollToHour = 7 }: WeekVie
                   <div
                     key={label}
                     className="absolute w-full border-b border-border/50 border-r border-border"
-                    style={{ top: `${i * HOUR_PX}px`, height: `${HOUR_PX}px` }}
+                    style={{ top: `${i * hourPx}px`, height: `${hourPx}px` }}
                   />
                 ))}
 
                 {/* Events */}
                 {computeOverlapLayout(timed).map(({ event, column, totalColumns }) => {
-                  const top = getEventTopPx(event.hour ?? 0, event.minute ?? 0);
+                  const top = getEventTopPx(event.hour ?? 0, event.minute ?? 0, hourPx);
                   const widthPct = 100 / totalColumns;
                   const leftPct = column * widthPct;
                   return (
@@ -142,7 +151,7 @@ export function WeekView({ days, today, eventsByDay, scrollToHour = 7 }: WeekVie
                       className="absolute px-0.5 py-0.5"
                       style={{
                         top: `${top}px`,
-                        height: `${getEventHeightPx(event)}px`,
+                        height: `${getEventHeightPx(event, hourPx)}px`,
                         left: `${leftPct}%`,
                         width: `${widthPct}%`,
                         zIndex: 1

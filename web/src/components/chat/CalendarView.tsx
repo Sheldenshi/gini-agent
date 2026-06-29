@@ -41,6 +41,11 @@ export type ParsedCalendar = {
   events: CalEvent[];
 };
 
+// Compact hour-row height for the inline preview. The viewport below is sized to
+// 12 of these rows so the 8 AM–8 PM window is fully visible by default while
+// scrolling still reveals the earlier/later hours. (Jobs use the grid's 96px.)
+const INLINE_HOUR_PX = 44;
+
 const HEADER_KEYS = ["view", "date", "tz"] as const;
 
 function normalizeStatus(raw: string | undefined): Status {
@@ -229,9 +234,16 @@ export function CalendarView({ raw }: { raw: string }) {
         <span className="ml-auto text-[12px] font-medium text-foreground">{range}</span>
       </div>
 
-      {/* Fixed-height viewport so the grid opens on ~8 AM–8 PM and scrolls. */}
-      <div className="flex max-h-[520px] flex-col overflow-hidden">
-        <WeekView days={days} today={anchorDate} eventsByDay={eventsByDay} scrollToHour={8} />
+      {/* Fixed-height viewport sized to exactly the 8 AM–8 PM window (12 rows ×
+          INLINE_HOUR_PX) so that range fills the card; scrolling reveals the rest. */}
+      <div className="flex flex-col overflow-hidden" style={{ height: `${12 * INLINE_HOUR_PX}px` }}>
+        <WeekView
+          days={days}
+          today={anchorDate}
+          eventsByDay={eventsByDay}
+          scrollToHour={8}
+          hourPx={INLINE_HOUR_PX}
+        />
       </div>
     </div>
   );

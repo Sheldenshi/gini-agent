@@ -494,19 +494,20 @@ export function computeOverlapLayout(events: CalendarEvent[]): OverlapLayout[] {
 
 // ─── Time grid positioning ─────────────────────────────────
 
-export function getEventTopPx(hour: number, minute: number): number {
-  return (hour + minute / 60) * HOUR_PX;
+export function getEventTopPx(hour: number, minute: number, hourPx: number = HOUR_PX): number {
+  return (hour + minute / 60) * hourPx;
 }
 
-// Block height from the event's duration, clamped to the half-hour minimum so a
+// Block height from the event's duration, clamped to half the row height so a
 // short (or end-less) event stays legible. End-less events (jobs) get exactly
-// HALF_HOUR_PX, preserving the original fixed-height job rendering.
-export function getEventHeightPx(event: CalendarEvent): number {
+// half a row, preserving the original fixed-height job rendering. The clamp
+// scales with hourPx so the compact inline preview keeps the same proportions.
+export function getEventHeightPx(event: CalendarEvent, hourPx: number = HOUR_PX): number {
   const durationMin = getEventEndMin(event) - getEventStartMin(event);
-  return Math.max(HALF_HOUR_PX, (durationMin / 60) * HOUR_PX);
+  return Math.max(hourPx / 2, (durationMin / 60) * hourPx);
 }
 
-export function getCurrentTimeTopPx(): number {
+export function getCurrentTimeTopPx(hourPx: number = HOUR_PX): number {
   const now = new Date();
-  return getEventTopPx(now.getHours(), now.getMinutes());
+  return getEventTopPx(now.getHours(), now.getMinutes(), hourPx);
 }
