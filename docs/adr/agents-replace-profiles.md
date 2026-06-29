@@ -288,7 +288,8 @@ Two consequences:
   resumes it). This is the "stop running" half of archiving.
 - **Client surface.** `POST /api/agents/:id/archive` and `/unarchive`,
   the `gini agent archive` / `unarchive` CLI subcommands, and the web
-  sidebar's per-agent Archive control plus a collapsible "Archived"
-  group with a Restore action all drive the same two capability
-  functions. The trimmed `AgentRow` view-type carries `archivedAt` so
-  the web can split active from archived agents.
+  agent switcher (the sidebar-header dropdown) — which carries the
+  per-agent Archive control and an "Archived" Restore group alongside
+  agent selection — all drive the same two capability functions. The
+  trimmed `AgentRow` view-type carries `archivedAt` so the web can split
+  active from archived agents.
