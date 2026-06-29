@@ -206,6 +206,61 @@ export function markUnread(
   );
 }
 
+// A Topic forwards every turn into its parent Chat (render-only mirror
+// blocks carrying `forwardedFromTopicId`; see ADR
+// chat-topics-tasks-subagents.md). The forwarded run is durable on the
+// Topic, not the Chat, so a Topic stays badged even after the user read
+// the same content in the Chat. This maps the Chat's read cursor back to
+// each source Topic and advances that Topic's own cursor to the tail of
+// the forwarded turn — so reading the Chat clears the Topic's badge
+// without the user having to open each Topic. markRead's monotonicity
+// guard keeps it idempotent and prevents advancing a Topic past a newer
+// turn the Chat cursor hasn't reached yet.
+export function markForwardedTopicsRead(
+  instance: Instance,
+  chatSessionId: string,
+  deviceToken: string,
+  lastReadBlockId: string
+): void {
+  const db = getMemoryDb(instance);
+  // Resolve the Chat cursor's ordinal; if the block isn't in this Chat,
+  // there's nothing to map back.
+  const cursor = db
+    .query<{ ordinal: number }, [string, string]>(
+      "SELECT ordinal FROM chat_blocks WHERE id = ? AND session_id = ?"
+    )
+    .get(lastReadBlockId, chatSessionId);
+  if (!cursor) return;
+
+  // For each Topic with a forwarded block at/before the cursor, take the
+  // taskId of its latest seen forwarded turn. The bare `task_id` resolves
+  // to the MAX(ordinal) row's value (SQLite's documented single-aggregate
+  // bare-column rule).
+  const topics = db
+    .query<{ topic_id: string | null; task_id: string | null }, [string, number]>(
+      `SELECT json_extract(payload_json,'$.forwardedFromTopicId') AS topic_id, task_id, MAX(ordinal) AS ord
+       FROM chat_blocks
+       WHERE session_id = ? AND ordinal <= ?
+         AND json_extract(payload_json,'$.forwardedFromTopicId') IS NOT NULL
+       GROUP BY topic_id`
+    )
+    .all(chatSessionId, cursor.ordinal);
+
+  for (const topic of topics) {
+    if (!topic.topic_id || !topic.task_id) continue;
+    // Find the Topic's own tail block for that turn and advance its cursor.
+    const tail = db
+      .query<{ id: string }, [string, string]>(
+        `SELECT id FROM chat_blocks
+         WHERE session_id = ? AND task_id = ?
+         ORDER BY ordinal DESC LIMIT 1`
+      )
+      .get(topic.topic_id, topic.task_id);
+    if (!tail) continue;
+    markRead(instance, topic.topic_id, deviceToken, tail.id);
+  }
+}
+
 // Returns the per-session last-read cursor for a device as a Map
 // keyed by sessionId.
 export function getLastReadByDevice(

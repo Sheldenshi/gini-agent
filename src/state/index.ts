@@ -148,6 +148,7 @@ export {
 export {
   markRead,
   markUnread,
+  markForwardedTopicsRead,
   clearReadState,
   getLastReadByDevice,
   getReadState,

@@ -17,6 +17,7 @@ import {
   getLastReadByDevice,
   getReadState,
   insertChatBlock,
+  markForwardedTopicsRead,
   markRead,
   markUnread,
   unreadCountForDevice,
@@ -411,6 +412,81 @@ describe("chat-read-state", () => {
     clearReadState(instance, "chat_a", "tok_iphone_a");
     expect(getReadState(instance, "chat_a", "tok_iphone_a")).toBeNull();
     expect(getReadState(instance, "chat_a", "tok_iphone_b")?.lastReadBlockId).toBe(a.id);
+  });
+
+  test("reading a Chat clears its forwarded Topics' badges", () => {
+    // A Topic forwards its turn into the parent Chat; reading the Chat
+    // must clear the Topic's badge too, instead of forcing the user to
+    // open each Topic just to dismiss it.
+    const instance = "crs-forward-clear" as Instance;
+    // The Chat carries a render-only forwarded copy of the Topic's turn.
+    const chatForwarded = insertChatBlock(instance, {
+      kind: "assistant_text",
+      sessionId: "chat_main",
+      text: "done",
+      streaming: false,
+      taskId: "task_1",
+      forwardedFromTopicId: "topic_y"
+    });
+    // The Topic owns the authoritative run.
+    insertChatBlock(instance, {
+      kind: "assistant_text",
+      sessionId: "topic_y",
+      text: "done",
+      streaming: false,
+      taskId: "task_1"
+    });
+    // Before reading the Chat, the Topic badges (no read cursor on it).
+    expect(unreadCountsByDevice(instance, "tok_x").get("topic_y")).toBeGreaterThanOrEqual(1);
+
+    markRead(instance, "chat_main", "tok_x", chatForwarded.id);
+    markForwardedTopicsRead(instance, "chat_main", "tok_x", chatForwarded.id);
+    // The Topic's badge is now cleared without opening it.
+    expect(unreadCountsByDevice(instance, "tok_x").has("topic_y")).toBe(false);
+  });
+
+  test("a forwarded turn beyond the Chat cursor stays unread in the Topic", () => {
+    // Reading the Chat only up to task_1's forwarded block must NOT mark
+    // a newer task_2 turn read — markForwardedTopicsRead only advances a
+    // Topic to the turn the Chat cursor has actually reached.
+    const instance = "crs-forward-newer" as Instance;
+    const chatForwarded1 = insertChatBlock(instance, {
+      kind: "assistant_text",
+      sessionId: "chat_main",
+      text: "first",
+      streaming: false,
+      taskId: "task_1",
+      forwardedFromTopicId: "topic_y"
+    });
+    insertChatBlock(instance, {
+      kind: "assistant_text",
+      sessionId: "topic_y",
+      text: "first",
+      streaming: false,
+      taskId: "task_1"
+    });
+    // A second forwarded turn lands in the Chat ABOVE the cursor.
+    insertChatBlock(instance, {
+      kind: "assistant_text",
+      sessionId: "chat_main",
+      text: "second",
+      streaming: false,
+      taskId: "task_2",
+      forwardedFromTopicId: "topic_y"
+    });
+    insertChatBlock(instance, {
+      kind: "assistant_text",
+      sessionId: "topic_y",
+      text: "second",
+      streaming: false,
+      taskId: "task_2"
+    });
+
+    // Read the Chat only up to the first forwarded turn.
+    markRead(instance, "chat_main", "tok_x", chatForwarded1.id);
+    markForwardedTopicsRead(instance, "chat_main", "tok_x", chatForwarded1.id);
+    // task_2 is still unseen in the Topic, so it keeps its badge.
+    expect(unreadCountsByDevice(instance, "tok_x").get("topic_y")).toBe(1);
   });
 
   test("read state is isolated per device", () => {
