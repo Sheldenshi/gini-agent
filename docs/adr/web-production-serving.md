@@ -25,7 +25,13 @@ Only the update and install flows ever **create** prod dirs:
 - `updateRuntime` (`src/runtime/update.ts`) runs `bun run build` in `web/`
   with `GINI_DIST_DIR=.next-prod-<sha12-of-the-new-HEAD>` after the web
   `bun install`. The build is skipped when that dir already carries a
-  `BUILD_ID` (idempotent re-update onto the same head). On success, the new
+  `BUILD_ID` (idempotent re-update onto the same head). Before the build it
+  deletes the generated route-type dirs (`types/`, `dev/types/`) under every
+  `.next*` dist dir: the web tsconfig pulls route validators from *all* dist
+  dirs, so a stale one left by an old `next dev` or build — importing a route
+  since removed from source — would fail the prod type-check, abort the update
+  with no restart, and silently strand the runtime on old code after git HEAD
+  already advanced. On success, the new
   HEAD's bundle **and the previous HEAD's bundle** are kept; every
   strictly-older `web/.next-prod-*` dir is deleted — a non-matching sha can
   never be served again, and each bundle is a full Next build's worth of
