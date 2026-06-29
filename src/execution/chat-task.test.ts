@@ -4461,7 +4461,7 @@ describe("chat-task loop", () => {
     // transcript sits below the chars/4 high-water mark given the always-on
     // tool-schema floor and system-prompt slice.
     for (let i = 0; i < 12; i++) {
-      writeFileSync(join(workspaceRoot, `chunk${i}.md`), `chunk-${i} `.repeat(362));
+      writeFileSync(join(workspaceRoot, `chunk${i}.md`), `chunk-${i} `.repeat(340));
       setEchoToolCallingResponse({
         provider,
         text: "",
