@@ -173,6 +173,76 @@ describe("web production bundle", () => {
     expect(existsSync(join(runtimeDir, "web", `${WEB_PROD_DIST_PREFIX}0dd5a00000000`))).toBe(true);
   });
 
+  // A stale generated route-validator (left by a past `next dev` run or an
+  // older build, importing a since-deleted route) under any dist dir's
+  // `types`/`dev/types` would fail the prod `next build` type-check and abort
+  // the whole self-update. The build must therefore see those dirs already
+  // gone. Records the filesystem at the moment the build subprocess fires and
+  // simulates `next build` writing the active dist's BUILD_ID on success.
+  function makeBuildRecorderWithFsSnapshot(runtimeDir: string, distDir: string) {
+    const sawAtBuild: Record<string, boolean> = {};
+    const runStepImpl: RunStepImpl = async (_cmd, _args, _options) => {
+      sawAtBuild["staleDevTypes"] = existsSync(join(runtimeDir, "web", ".next-default", "dev", "types"));
+      sawAtBuild["staleBuildCache"] = existsSync(join(runtimeDir, "web", ".next-default", "cache"));
+      sawAtBuild["servedServer"] = existsSync(join(runtimeDir, "web", ".next-default", "server"));
+      sawAtBuild["servedStatic"] = existsSync(join(runtimeDir, "web", ".next-default", "static"));
+      markBuilt(runtimeDir, distDir);
+      return { status: 0, stdout: "", stderr: "" };
+    };
+    return { sawAtBuild, runStepImpl };
+  }
+
+  test("prunes stale generated route-types under every dist dir BEFORE building, leaving served bundles and build caches intact", async () => {
+    const runtimeDir = makeRuntimeDir();
+    const distDir = `${WEB_PROD_DIST_PREFIX}${SHA}`;
+    // A stale dev-types validator that imports a since-deleted route — the
+    // thing that would abort the prod build's type-check if left in place.
+    mkdirSync(join(runtimeDir, "web", ".next-default", "dev", "types"), { recursive: true });
+    writeFileSync(
+      join(runtimeDir, "web", ".next-default", "dev", "types", "validator.ts"),
+      "import '../../../src/app/threads/page.js';\n"
+    );
+    // Pure generated `types` under another dist dir must also go.
+    mkdirSync(join(runtimeDir, "web", ".next", "types"), { recursive: true });
+    // Non-types artifacts that must survive: a served bundle's runtime files
+    // and the build cache (so incremental builds stay fast).
+    mkdirSync(join(runtimeDir, "web", ".next-default", "cache"), { recursive: true });
+    writeFileSync(join(runtimeDir, "web", ".next-default", "cache", "x"), "cache\n");
+    mkdirSync(join(runtimeDir, "web", ".next-default", "server"), { recursive: true });
+    writeFileSync(join(runtimeDir, "web", ".next-default", "server", "app.js"), "served\n");
+    mkdirSync(join(runtimeDir, "web", ".next-default", "static"), { recursive: true });
+    writeFileSync(join(runtimeDir, "web", ".next-default", "static", "chunk.js"), "served\n");
+
+    const { sawAtBuild, runStepImpl } = makeBuildRecorderWithFsSnapshot(runtimeDir, distDir);
+    const result = await buildWebProdBundle(runtimeDir, SHA, "pipe", { runStepImpl });
+
+    expect(result.built).toBe(true);
+    // The prune ran BEFORE the build: the stale validator dir was already gone
+    // when the build subprocess fired.
+    expect(sawAtBuild["staleDevTypes"]).toBe(false);
+    // Generated `types` under other dist dirs are pruned too.
+    expect(existsSync(join(runtimeDir, "web", ".next", "types"))).toBe(false);
+    expect(existsSync(join(runtimeDir, "web", ".next-default", "dev", "types"))).toBe(false);
+    // Served bundles and build caches are NOT touched by the prune (verified at
+    // build time, before any post-build GC could run).
+    expect(sawAtBuild["staleBuildCache"]).toBe(true);
+    expect(sawAtBuild["servedServer"]).toBe(true);
+    expect(sawAtBuild["servedStatic"]).toBe(true);
+  });
+
+  test("does not prune (or build) when the sha dir already carries a BUILD_ID", async () => {
+    const runtimeDir = makeRuntimeDir();
+    markBuilt(runtimeDir, `${WEB_PROD_DIST_PREFIX}${SHA}`);
+    // Stale dev-types present, but an idempotent re-update must skip the build
+    // entirely — and thus the prune — leaving the dir as-is.
+    mkdirSync(join(runtimeDir, "web", ".next-default", "dev", "types"), { recursive: true });
+    const { calls, runStepImpl } = makeBuildRecorder();
+    const result = await buildWebProdBundle(runtimeDir, SHA, "pipe", { runStepImpl });
+    expect(result.built).toBe(false);
+    expect(calls.length).toBe(0);
+    expect(existsSync(join(runtimeDir, "web", ".next-default", "dev", "types"))).toBe(true);
+  });
+
   // resolveWebProdDistDir reads the real `git rev-parse --short=12 HEAD`, so
   // these tests commit into a scratch repo and key the dist dir off that sha.
   function initRepoWithCommit(path: string): string {

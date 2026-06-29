@@ -427,6 +427,39 @@ export interface BuildWebProdOptions {
   preserveDistDirs?: string[];
 }
 
+// next build type-checks the project with web/tsconfig.base.json, whose
+// `include` globs (".next-*/types/**/*.ts", ".next-*/dev/types/**/*.ts") pull
+// generated route-type validators from EVERY dist dir, not just the one being
+// built. A validator left behind by a past `next dev` run or an older build
+// still imports the routes that existed then; once such a route is deleted
+// from source, that stale validator fails the type-check and aborts `next
+// build` — which aborts the whole self-update (buildWebProdBundle throws
+// before any restart is scheduled), silently stranding the user on old code.
+// These `types`/`dev/types` dirs are type-check-only generated artifacts (never
+// loaded by `next start`), so we delete them across all dist dirs before
+// building: this build regenerates the active dist's `types`, and `next dev`
+// regenerates `dev/types` on demand. Served bundles' runtime files and each
+// dist's build `cache/` are left intact.
+function pruneStaleGeneratedRouteTypes(webDir: string): void {
+  let entries: string[];
+  try {
+    entries = readdirSync(webDir);
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (!/^\.next(-.*)?$/.test(entry)) continue;
+    for (const sub of ["types", join("dev", "types")]) {
+      try {
+        rmSync(join(webDir, entry, sub), { recursive: true, force: true });
+      } catch {
+        // Best-effort: a leftover types dir can only cause the very build
+        // failure we're preventing, never a serving problem.
+      }
+    }
+  }
+}
+
 // Build the production web bundle for sha12 into web/<prefix><sha12>.
 // Idempotent: a dir that already carries a BUILD_ID is kept as-is (re-update
 // onto the same head). On success, the new dir AND any dirs named in
@@ -449,6 +482,7 @@ export async function buildWebProdBundle(
   const distDir = `${WEB_PROD_DIST_PREFIX}${sha12}`;
   const alreadyBuilt = existsSync(join(webDir, distDir, "BUILD_ID"));
   if (!alreadyBuilt) {
+    pruneStaleGeneratedRouteTypes(webDir);
     const env = { ...process.env, GINI_DIST_DIR: distDir };
     const result = await runStepImpl("bun", ["run", "build"], { cwd: webDir, env, stdio });
     if (result.status !== 0) {
