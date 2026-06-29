@@ -128,6 +128,60 @@ yc tools run search --input '{"entity":"investors","query":"<fund>","limit":3}' 
 - Real-vs-fixture is decided ahead of time; if going real via `yc`, keep a
   seeded fixture as the pre-recorded fallback.
 
+## 2a. Investor profile — required output format
+
+When the user asks for an **investor profile**, gather the data with the three
+commands below, then present it in EXACTLY the markdown format that follows.
+
+### Data-gathering commands
+
+```bash
+# 1. Identity, bio, education, followers (profile tool, by user_id)
+yc tools run profile --input '{"action":"get","user_id":{user_id}}'
+
+# 2. Ratings, stats, tags, and portfolio company IDs
+yc search "{investor_name}" --type investors --json
+
+# 3. Bulk batch breakdown (IDs extracted from command 2's results)
+yc tools run search --input '{"entity":"companies","ids":"{comma_separated_ids}"}'
+```
+
+### Required output format
+
+```
+# {investor_name}
+> {tag_1} · {tag_2} · {tag_3} · ...
+
+| Field | Value |
+|---|---|
+| **Location** | {location} |
+| **LinkedIn** | {linkedin_url} |
+| **Background** | {background} |
+| **Education** | {education} |
+| **Followers** | {followers} |
+
+| Rating | Score |
+|---|---|
+| **YC Rating** | {yc_rating} |
+| **Founder Rating** | {founder_rating} |
+
+| Metric | Value |
+|---|---|
+| **Fund Type** | {fund_type} |
+| **Total Investments** | {total_investments} |
+| **YC Seed Investments** | {yc_seed_investments} |
+| **Series A Leads** | {series_a_leads} |
+| **Invests Internationally** | {invests_internationally} |
+
+| Batch | # | Companies |
+|---|---|---|
+| {batch_1} | {count_1} | {companies_1} |
+| {batch_2} | {count_2} | {companies_2} |
+| {batch_3} | {count_3} | {companies_3} |
+| {batch_4} | {count_4} | {companies_4} |
+| {batch_5} | {count_5} | {companies_5} |
+```
+
 ## 3. Other commands the demo might touch
 
 ```bash
