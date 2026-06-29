@@ -17,10 +17,14 @@ interface EventChipProps {
 // macOS-style accent classes for the dense chip. Each pairs a translucent fill, a
 // solid left bar, and a title tone that reads in both light and dark mode.
 const DENSE_ACCENT = {
+  // Proposed is the emphasis slot: a solid, saturated blue block (the brand
+  // accent, pinned to the raw palette so it stays blue in dark mode rather than
+  // flipping to the near-white `primary`) with white text, so it dominates the
+  // faint teal existing events.
   proposed: {
-    bar: "border-l-primary",
-    fill: "bg-primary/10 dark:bg-primary/20",
-    title: "text-foreground"
+    bar: "border-l-blue-800 dark:border-l-blue-400",
+    fill: "bg-blue-600 dark:bg-blue-500",
+    title: "text-white"
   },
   cancel: {
     bar: "border-l-muted-foreground/40",
@@ -67,7 +71,7 @@ export function EventChip({ event, dense }: EventChipProps) {
   const inner = dense ? (
     <div className="flex w-full items-center gap-1 overflow-hidden">
       {event.status === "proposed" ? (
-        <span className="shrink-0 rounded-[2px] bg-primary px-1 text-[8px] font-semibold tracking-wide uppercase text-primary-foreground">
+        <span className="shrink-0 rounded-[2px] bg-white px-1 text-[8px] font-semibold tracking-wide uppercase text-blue-700">
           Proposed
         </span>
       ) : null}
