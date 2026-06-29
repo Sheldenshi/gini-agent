@@ -26,6 +26,24 @@ interface WeekViewProps {
   // Pixel height of one hour row. Jobs use the full-width default (96); the
   // compact inline chat preview passes a smaller value so 8 AM–8 PM fits the card.
   hourPx?: number;
+  // Dense applies the inline chat preview's macOS-Calendar styling: smaller
+  // header/hour-label fonts, "Noon" + small-meridiem labels, and bar-style event
+  // chips. Jobs omit it, keeping the original ring style.
+  dense?: boolean;
+}
+
+// macOS-style hour label for the dense preview: the meridiem rides small after
+// the hour, and 12 PM reads "Noon". The Jobs grid keeps the plain label.
+function HourLabel({ label, dense }: { label: string; dense?: boolean }) {
+  if (!dense) return <>{label}</>;
+  const [hour, meridiem] = label.split(" ");
+  if (hour === "12" && meridiem === "PM") return <>Noon</>;
+  return (
+    <>
+      {hour}
+      <span className="ml-0.5 text-[8px] font-normal">{meridiem}</span>
+    </>
+  );
 }
 
 export function WeekView({
@@ -33,7 +51,8 @@ export function WeekView({
   today,
   eventsByDay,
   scrollToHour = 7,
-  hourPx = HOUR_PX
+  hourPx = HOUR_PX,
+  dense = false
 }: WeekViewProps) {
   const scrollRef = React.useRef<HTMLDivElement>(null);
   const [currentTimePx, setCurrentTimePx] = React.useState(() => getCurrentTimeTopPx(hourPx));
@@ -72,14 +91,23 @@ export function WeekView({
         {dayData.map(({ day, isToday }) => (
           <div
             key={`wh-${dayKey(day)}`}
-            className="relative flex w-full flex-col items-center justify-center gap-1 border-b border-border bg-card p-2 md:flex-row md:gap-1"
+            className={cn(
+              "relative flex w-full flex-col items-center justify-center gap-1 border-b border-border bg-card md:flex-row md:gap-1",
+              dense ? "p-1.5" : "p-2"
+            )}
           >
-            <span className="text-xs font-medium whitespace-nowrap text-muted-foreground">
+            <span
+              className={cn(
+                "font-medium whitespace-nowrap text-muted-foreground",
+                dense ? "text-[10px]" : "text-xs"
+              )}
+            >
               {WEEKDAY_LABELS[day.getDay()]}
             </span>
             <span
               className={cn(
-                "flex size-8 items-center justify-center rounded-full text-sm font-semibold",
+                "flex items-center justify-center rounded-full font-semibold",
+                dense ? "size-6 text-xs" : "size-8 text-sm",
                 isToday ? "bg-primary text-primary-foreground" : "text-foreground"
               )}
             >
@@ -96,7 +124,7 @@ export function WeekView({
             <div key={`ad-${key}`} className="border-r border-border p-1.5">
               <div className="flex flex-col gap-1">
                 {allDay.map((event) => (
-                  <EventChip key={`ad-${event.key}-${key}`} event={event} />
+                  <EventChip key={`ad-${event.key}-${key}`} event={event} dense={dense} />
                 ))}
               </div>
             </div>
@@ -116,11 +144,12 @@ export function WeekView({
             >
               <span
                 className={cn(
-                  "text-right text-xs font-medium whitespace-nowrap text-muted-foreground",
+                  "text-right font-medium whitespace-nowrap text-muted-foreground",
+                  dense ? "text-[10px]" : "text-xs",
                   i === 0 ? "translate-y-1" : "-translate-y-1/2"
                 )}
               >
-                {label}
+                <HourLabel label={label} dense={dense} />
               </span>
             </div>
           ))}
@@ -130,7 +159,11 @@ export function WeekView({
         <div className="grid flex-1 grid-cols-7">
           {dayData.map(({ key, timed, isToday }) => {
             return (
-              <div key={`wc-${key}`} className="relative" style={{ height: `${totalHeight}px` }}>
+              <div
+                key={`wc-${key}`}
+                className={cn("relative", dense && isToday && "bg-muted/30")}
+                style={{ height: `${totalHeight}px` }}
+              >
                 {/* Hour grid lines */}
                 {HOUR_LABELS.map((label, i) => (
                   <div
@@ -157,7 +190,7 @@ export function WeekView({
                         zIndex: 1
                       }}
                     >
-                      <EventChip event={event} />
+                      <EventChip event={event} dense={dense} />
                     </div>
                   );
                 })}

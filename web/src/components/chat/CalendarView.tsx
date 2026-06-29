@@ -243,6 +243,7 @@ export function CalendarView({ raw }: { raw: string }) {
           eventsByDay={eventsByDay}
           scrollToHour={8}
           hourPx={INLINE_HOUR_PX}
+          dense
         />
       </div>
     </div>
