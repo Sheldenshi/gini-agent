@@ -10,6 +10,7 @@
 import { afterEach, beforeEach, describe, expect, jest, mock, test } from "bun:test";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { EmailDraftCard } from "./EmailDraftCard";
+import { ChatActionsProvider } from "./ChatActionsContext";
 
 const writeText = mock((_: string) => Promise.resolve());
 
@@ -75,5 +76,46 @@ describe("EmailDraftCard", () => {
     await waitFor(() => expect(writeText).toHaveBeenCalled());
     expect(screen.queryByText("Copied")).toBeNull();
     expect(screen.queryByText(/body only/)).not.toBeNull();
+  });
+
+  // Without the ChatActions context (doc viewer / file preview / skills page)
+  // the card stays read-only — no Send affordance.
+  test("renders no Send button outside a chat surface", () => {
+    render(<EmailDraftCard raw={"To: a@b.c\nSubject: Hi\n\nbody"} />);
+    expect(screen.queryByText("Send")).toBeNull();
+  });
+
+  // Inside a chat surface the Send button posts a precise instruction composed
+  // from the headers, then disables itself so it can't double-fire.
+  test("inside a chat surface, Send posts the composed instruction and then disables", () => {
+    const sendUserMessage = mock((_: string) => {});
+    render(
+      <ChatActionsProvider value={{ sessionId: "s1", sendUserMessage }}>
+        <EmailDraftCard raw={"To: a@b.c\nCc: d@e.f\nSubject: Quarterly sync\n\nbody"} />
+      </ChatActionsProvider>
+    );
+    const button = screen.getByRole("button", { name: /Send/ });
+    fireEvent.click(button);
+    expect(sendUserMessage).toHaveBeenCalledWith(
+      'Send the draft to a@b.c, cc d@e.f — subject "Quarterly sync". Send it now.'
+    );
+    // After the click the label flips to "Sent" and the button is disabled, so
+    // a second click can't re-fire.
+    const sentButton = screen.getByRole("button", { name: /Sent/ }) as HTMLButtonElement;
+    expect(sentButton.disabled).toBe(true);
+    fireEvent.click(sentButton);
+    expect(sendUserMessage).toHaveBeenCalledTimes(1);
+  });
+
+  // A draft with no Cc omits the ", cc …" clause from the composed instruction.
+  test("the composed instruction omits the cc clause when there is no Cc", () => {
+    const sendUserMessage = mock((_: string) => {});
+    render(
+      <ChatActionsProvider value={{ sessionId: "s1", sendUserMessage }}>
+        <EmailDraftCard raw={"To: a@b.c\nSubject: Solo\n\nbody"} />
+      </ChatActionsProvider>
+    );
+    fireEvent.click(screen.getByRole("button", { name: /Send/ }));
+    expect(sendUserMessage).toHaveBeenCalledWith('Send the draft to a@b.c — subject "Solo". Send it now.');
   });
 });
