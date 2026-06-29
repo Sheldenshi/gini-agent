@@ -2524,8 +2524,12 @@ async function emailWatchTool(
     followUpAfterHours = args.followUpAfterHours;
   }
   // Inherit the originating task's agent so the watcher + its dedicated chat
-  // session (and the future woken turns) attribute to the right agent.
-  const owningAgentId = readState(config.instance).tasks.find((t) => t.id === taskId)?.agentId;
+  // session (and the future woken turns) attribute to the right agent, and its
+  // chat session so a broad/topic watch delivers drafts into the conversation
+  // where it was set up (addEmailWatcher ignores this for sender/thread watches).
+  const originatingTask = readState(config.instance).tasks.find((t) => t.id === taskId);
+  const owningAgentId = originatingTask?.agentId;
+  const deliverToSessionId = originatingTask?.chatSessionId;
 
   // Whole-inbox triage opt-in: `triage: true` provisions the broad respond-or-flag
   // concern over the ENTIRE inbox; `triage: false` tears it down. Triage is OPT-IN
@@ -2563,7 +2567,7 @@ async function emailWatchTool(
     return selectionHint;
   }
 
-  const watcher = await addEmailWatcher(config, { sender, query: rawQuery, account, objective, threadId, followUpAfterHours, agentId: owningAgentId });
+  const watcher = await addEmailWatcher(config, { sender, query: rawQuery, account, objective, threadId, followUpAfterHours, agentId: owningAgentId, deliverToSessionId });
 
   appendTrace(config.instance, taskId, {
     type: "tool",

@@ -948,6 +948,89 @@ describe("per-concern channels + fan-out routes", () => {
   });
 });
 
+describe("broad/topic watch delivers into the originating session", () => {
+  // Mint the conversation/topic the watch was set up in, owned by the active
+  // agent (the one addEmailWatcher stamps onto its watchers), and return its id.
+  async function createTopic(config: ReturnType<typeof buildConfig>, title: string): Promise<string> {
+    const agentId = readState(config.instance).activeAgentId;
+    return mutateState(config.instance, (state) =>
+      createChatSession(state, title, undefined, agentId, undefined, "topic").id
+    );
+  }
+
+  test("a broad watch with deliverToSessionId routes drafts into that session, minting no generic channel", async () => {
+    const config = buildConfig("ew-broad-deliver");
+    const topicId = await createTopic(config, "Investor inbound");
+    const watcher = await addEmailWatcher(config, {
+      query: "in:inbox",
+      objective: "Flag investor intros",
+      deliverToSessionId: topicId
+    });
+    // The watcher delivers into the originating topic, not a new concern channel.
+    expect(watcher.channelId).toBe(topicId);
+    const state = readState(config.instance);
+    // The shared job routes this concern's bucket into the originating topic.
+    const job = state.jobs.find((j) => j.id === watcher.jobId);
+    expect(job?.routes?.[watcher.id]?.chatSessionId).toBe(topicId);
+    // No generic "Email watch" concern channel was minted for this watch — the
+    // only email-watch-feature sessions are the shared job session (and nothing
+    // else titled "Email watch" as a NEW channel for this concern).
+    const concernChannels = state.chatSessions.filter(
+      (s) => s.kind === "channel" && s.feature === "email-watch" && s.id !== job?.chatSessionId
+    );
+    expect(concernChannels).toHaveLength(0);
+    // The originating topic keeps its own identity (not stamped as email-watch).
+    expect(state.chatSessions.find((s) => s.id === topicId)?.feature).toBeUndefined();
+  });
+
+  test("a broad watch with a non-existent deliverToSessionId falls back to a created concern channel", async () => {
+    const config = buildConfig("ew-broad-fallback-missing");
+    const watcher = await addEmailWatcher(config, {
+      query: "in:inbox",
+      deliverToSessionId: "does-not-exist"
+    });
+    const state = readState(config.instance);
+    const job = state.jobs.find((j) => j.id === watcher.jobId);
+    // No matching session => fall back to a dedicated concern channel (current behavior).
+    expect(watcher.channelId).toBeString();
+    expect(watcher.channelId).not.toBe("does-not-exist");
+    expect(watcher.channelId).not.toBe(job?.chatSessionId);
+    const channel = state.chatSessions.find((s) => s.id === watcher.channelId);
+    expect(channel?.feature).toBe("email-watch");
+    expect(channel?.kind).toBe("channel");
+    expect(job?.routes?.[watcher.id]?.chatSessionId).toBe(watcher.channelId);
+  });
+
+  test("a SENDER watch ignores deliverToSessionId and keeps its descriptive concern channel", async () => {
+    const config = buildConfig("ew-sender-ignores-deliver");
+    const topicId = await createTopic(config, "Receipts");
+    const watcher = await addEmailWatcher(config, {
+      sender: "alice@x.com",
+      deliverToSessionId: topicId
+    });
+    // The broad-only gate: a sender watch never delivers into the originating
+    // session — it gets its own descriptive "Email: <sender>" channel.
+    expect(watcher.channelId).not.toBe(topicId);
+    const channel = readState(config.instance).chatSessions.find((s) => s.id === watcher.channelId);
+    expect(channel?.title).toBe("Email: alice@x.com");
+    expect(channel?.feature).toBe("email-watch");
+  });
+
+  test("removing a broad watch whose channel is the originating topic does NOT delete that topic", async () => {
+    const config = buildConfig("ew-broad-remove-keeps-topic");
+    const topicId = await createTopic(config, "Investor inbound");
+    const watcher = await addEmailWatcher(config, { query: "in:inbox", deliverToSessionId: topicId });
+    expect(watcher.channelId).toBe(topicId);
+    await removeEmailWatcher(config, watcher.id);
+    const state = readState(config.instance);
+    // The watcher is gone; the originating topic survives the teardown + orphan sweep
+    // (it carries no email-watch feature marker, so the identity sweep never deletes it).
+    expect(state.emailWatchers.find((w) => w.id === watcher.id)).toBeUndefined();
+    expect(state.chatSessions.some((s) => s.id === topicId)).toBe(true);
+    expect(state.chatSessions.find((s) => s.id === topicId)?.feature).toBeUndefined();
+  });
+});
+
 describe("triage concern + intelligent router", () => {
   // The agent's triage channel by identity (feature marker + the triage title).
   function triageChannels(config: ReturnType<typeof buildConfig>) {

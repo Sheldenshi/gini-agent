@@ -388,6 +388,14 @@ export interface AddEmailWatcherInput {
   // internal callers (the email_watch tool) so the woken turns attribute to
   // the originating agent; the HTTP path leaves it to the active agent.
   agentId?: string;
+  // The conversation session the watch was set up in (Task.chatSessionId for
+  // the email_watch tool call). For a BROAD watch (no sender, no threadId — the
+  // topic/category `in:inbox` classifier shape) drafts deliver HERE, into the
+  // originating topic, so they surface where the user created the watch instead
+  // of in a generic "Email watch" channel. Ignored for sender/thread watches
+  // (they keep their descriptive per-concern channels) and falls back to a
+  // created concern channel if the session no longer exists for the owning agent.
+  deliverToSessionId?: string;
 }
 
 // Cap on a watcher objective (chars, after trim) — long enough for standing
@@ -486,10 +494,21 @@ export async function addEmailWatcher(
 
   const shared = await ensureSharedJobAndSession(config, owningAgentId);
 
-  // Provision this concern's OWN channel before the rebuild, so the route built
-  // for it targets the dedicated channel (not the shared session). The shared
-  // session stays the fallback for legacy/unmigrated watchers.
-  const channel = await createConcernChannel(config, owningAgentId, concernChannelTitle({ sender, threadId }));
+  // Pick this concern's delivery channel. A BROAD watch (no sender, no threadId
+  // — the topic/category `in:inbox` classifier shape) delivers into the
+  // originating conversation session, so drafts surface where the user set the
+  // watch up instead of in a generic "Email watch" concern channel; the session
+  // must still exist for the owning agent (else we fall back). A sender/thread
+  // watch keeps its descriptive per-concern channel. The shared session stays
+  // the fallback for legacy/unmigrated watchers.
+  const broad = !sender && !threadId;
+  const deliverToSessionId =
+    broad && input.deliverToSessionId && sessionExistsForAgent(config, input.deliverToSessionId, owningAgentId)
+      ? input.deliverToSessionId
+      : undefined;
+  const channelId =
+    deliverToSessionId ??
+    (await createConcernChannel(config, owningAgentId, concernChannelTitle({ sender, threadId }))).id;
 
   const watcher = await mutateState(config.instance, (state) =>
     createEmailWatcher(state, {
@@ -502,7 +521,7 @@ export async function addEmailWatcher(
       ...(threadId ? { threadId } : {}),
       ...(followUpAfterHours !== undefined ? { followUpAfterHours } : {}),
       chatSessionId: shared.chatSessionId,
-      channelId: channel.id,
+      channelId,
       jobId: shared.jobId,
       enabled: true,
       status: "ok"
@@ -519,6 +538,17 @@ export async function addEmailWatcher(
     await removeEmailWatcher(config, watcher.id);
     throw error;
   }
+}
+
+// Whether a chat session exists for the owning agent — the guard a broad watch's
+// deliverToSessionId must pass before it becomes the watcher's channelId. Scoping
+// to the same agent keeps a watch from delivering into another agent's session.
+function sessionExistsForAgent(
+  config: RuntimeConfig,
+  sessionId: string,
+  agentId: string | undefined
+): boolean {
+  return readState(config.instance).chatSessions.some((s) => s.id === sessionId && s.agentId === agentId);
 }
 
 // Create a per-concern email-watch channel for one agent: a `channel`-kind chat
