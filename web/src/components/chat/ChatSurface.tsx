@@ -122,12 +122,27 @@ export function ChatSurface({
   const liveSession =
     (sessionsQuery.data ?? []).find((s) => s.id === sessionId) ?? session;
   const liveActivityAt = activityAt(liveSession);
+  // Topics forward every turn into their parent Chat, so viewing the Chat means the user
+  // has seen that forwarded content — mark those child Topics read too, instead of making
+  // the user open each one just to clear its sidebar badge (ADR chat-topics-tasks-subagents.md).
+  const childTopics = useMemo(
+    () =>
+      liveSession.kind === "agent"
+        ? (sessionsQuery.data ?? []).filter(
+            (s) => s.kind === "topic" && s.parentChatSessionId === liveSession.id
+          )
+        : [],
+    [sessionsQuery.data, liveSession.kind, liveSession.id]
+  );
+  // Re-fire when a Topic forwards new content while the Chat is open.
+  const childTopicsActivity = childTopics.map((t) => activityAt(t)).join("|");
   useEffect(() => {
     markRead(liveSession);
     // Re-mark when activity advances while the chat is open (a task finishes
     // or a job run lands) so it doesn't flip back to unread under the user.
+    for (const t of childTopics) markRead(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId, liveActivityAt, markRead]);
+  }, [sessionId, liveActivityAt, childTopicsActivity, markRead]);
 
   // The transcript renders the session's full block list in ordinal order —
   // legacy thread-tagged blocks (the agent no longer creates threads) read

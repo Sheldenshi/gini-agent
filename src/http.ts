@@ -22,6 +22,7 @@ import {
   summarizeThreadsForInstance,
   markRead,
   markUnread,
+  markForwardedTopicsRead,
   mutateState,
   now,
   PairingCapExceededError,
@@ -2260,6 +2261,12 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         return json({ error: "Block does not belong to this session" }, 400);
       }
       const result = markRead(config.instance, sessionId, dev.token, lastReadBlockId);
+      // A Topic forwards its turns into its parent Chat; reading the Chat means the user has
+      // seen that forwarded content, so clear the source Topics' badges too (ADR
+      // chat-topics-tasks-subagents.md).
+      if (state.chatSessions.find((s) => s.id === sessionId)?.kind === "agent") {
+        markForwardedTopicsRead(config.instance, sessionId, dev.token, lastReadBlockId);
+      }
       return json({ ok: true, readState: result });
     }],
     // Mark a chat unread for the calling device. Pins the read cursor
