@@ -104,9 +104,10 @@ describe("BlockRenderer", () => {
     expect(screen.queryByTestId("forward-chip")).toBeNull();
   });
 
-  test("assistant_text with a forwarded topic renders the chip", () => {
+  test("a forwarded final answer renders the chip", () => {
     render(
       <BlockRenderer
+        isFinalAnswer
         block={{
           ...base,
           kind: "assistant_text",
@@ -119,6 +120,26 @@ describe("BlockRenderer", () => {
     );
     expect(screen.getByTestId("assistant-text")).not.toBeNull();
     expect(screen.getByTestId("forward-chip")).not.toBeNull();
+  });
+
+  test("forwarded intermediate narration (not the final answer) renders no chip", () => {
+    // A forwarded Topic turn mirrors its per-iteration narration as
+    // assistant_text too; only the final answer should carry the "# topic"
+    // deep-link, so a narration line (isFinalAnswer unset) shows the bare text.
+    render(
+      <BlockRenderer
+        block={{
+          ...base,
+          kind: "assistant_text",
+          updatedAt: base.createdAt,
+          text: "let me check",
+          streaming: false,
+          forwardedFromTopicId: "topic-1"
+        }}
+      />
+    );
+    expect(screen.getByTestId("assistant-text")).not.toBeNull();
+    expect(screen.queryByTestId("forward-chip")).toBeNull();
   });
 
   test("routes the remaining kinds to their components", () => {

@@ -345,6 +345,7 @@ export function ChatSurface({
           block={block}
           toolResult={block.kind === "tool_call" ? toolResultsByCallId.get(block.callId) : undefined}
           agent={messageAgent}
+          isFinalAnswer={item.isFinalAnswer}
         />
       </li>
     );

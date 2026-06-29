@@ -19,10 +19,16 @@ import { TopicForwardChip } from "./TopicForwardChip";
 // here so each row can find its own result without scanning the list.
 export function BlockRenderer({
   block,
-  toolResult
+  toolResult,
+  isFinalAnswer
 }: {
   block: ChatBlock;
   toolResult?: ToolResultBlock;
+  // True only for the turn's closing answer (see ChatRenderItem). A forwarded
+  // Topic turn mirrors its per-iteration narration as assistant_text too, so the
+  // "# topic" chip is shown only on the final answer — not under every thinking
+  // line — by gating the chip on this flag.
+  isFinalAnswer?: boolean;
 }) {
   switch (block.kind) {
     case "user_text":
@@ -30,7 +36,7 @@ export function BlockRenderer({
     case "assistant_text":
       // A forwarded Topic answer carries its source Topic; render a deep-link
       // chip below the answer text so the user can open the Topic conversation.
-      return block.forwardedFromTopicId ? (
+      return block.forwardedFromTopicId && isFinalAnswer ? (
         <View style={{ gap: 8 }}>
           <BlockAssistantText block={block} />
           <TopicForwardChip

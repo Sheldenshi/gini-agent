@@ -19,11 +19,17 @@ import { assertNever } from "@/lib/utils";
 export function BlockRenderer({
   block,
   toolResult,
-  agent
+  agent,
+  isFinalAnswer
 }: {
   block: ChatBlock;
   toolResult?: ToolResultBlock;
   agent?: { id: string; name: string };
+  // True only for the turn's closing answer (see ChatRenderItem). A forwarded
+  // Topic turn mirrors its per-iteration narration as assistant_text too, so the
+  // "# topic" chip is shown only on the final answer — not under every thinking
+  // line — by gating the chip on this flag.
+  isFinalAnswer?: boolean;
 }) {
   switch (block.kind) {
     case "user_text":
@@ -31,7 +37,7 @@ export function BlockRenderer({
     case "assistant_text":
       // A forwarded Topic answer carries its source Topic; render a deep-link
       // chip under the answer text, aligned to the message in the avatar gutter.
-      return block.forwardedFromTopicId ? (
+      return block.forwardedFromTopicId && isFinalAnswer ? (
         <div className="space-y-2">
           <BlockAssistantText block={block} agent={agent} />
           <div className="pl-[46px]">

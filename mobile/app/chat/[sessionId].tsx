@@ -570,6 +570,7 @@ export default function ChatDetailScreen() {
         key={block.id}
         block={block}
         toolResult={block.kind === "tool_call" ? toolResultsByCallId.get(block.callId) : undefined}
+        isFinalAnswer={item.isFinalAnswer}
       />
     );
   };
