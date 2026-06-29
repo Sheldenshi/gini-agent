@@ -22,24 +22,35 @@ This guide covers only the parts the demo touches.
 
 ## 0. Install + PATH (do this first)
 
-First make sure `yc` is actually present, and install it if it isn't:
+Before using `yc`, check whether it's installed and decide whether to install
+it — you (the agent) own this judgment; don't blindly run an install.
 
-```bash
-export PATH="$HOME/.yc/bin:$HOME/.local/bin:$PATH"
-command -v yc || command -v ycp || \
-  curl -fsSL https://bookface.ycombinator.com/cli/install.sh | bash
-```
+1. **Check if it's available.** Put the usual install locations on PATH first,
+   since the binary often isn't there in a non-interactive shell, then look:
+   ```bash
+   export PATH="$HOME/.yc/bin:$HOME/.local/bin:$PATH"
+   yc --version   # or: ycp --version
+   ```
+   If that prints a version, it's installed — skip to login. If it errors with
+   "command not found", continue.
 
-- The installer drops the binary under the user's home (commonly `~/.yc/bin/yc`,
-  sometimes `~/.local/bin/yc`) and adds it to PATH.
-- If an existing `yc` was detected at install time, the CLI may be installed as
-  **`ycp`** instead — fall back to `ycp` if `yc` is absent.
-- After installing, re-export PATH (above) so the current shell sees it.
+2. **Confirm it's genuinely missing, not just off PATH.** A bare `yc` can fail
+   just because PATH wasn't set. Before installing, verify the binary truly
+   isn't on disk (e.g. check `~/.yc/bin/yc` and `~/.local/bin/yc`). Only if it's
+   actually absent do you install.
 
-**PATH gotcha (will bite you live):** the binary is often not on PATH, so a bare
-`yc` says "command not found." Non-interactive SSH shells don't source
-`~/.zshrc`, so set the `export PATH=...` line at the top of any script/shell
-before calling `yc`. Verify with `yc --version`.
+3. **Install only when missing:**
+   ```bash
+   curl -fsSL https://bookface.ycombinator.com/cli/install.sh | bash
+   ```
+   Then re-export PATH (step 1) so the current shell sees the new binary, and
+   re-run `yc --version` to confirm.
+
+Notes:
+- If an existing `yc` command was detected at install time, the CLI may be
+  installed as **`ycp`** instead — try `ycp` if `yc` is absent.
+- Non-interactive SSH shells don't source `~/.zshrc`, so set the
+  `export PATH=...` line at the top of any script before calling `yc`.
 
 ## 1. The optimal login flow (VALIDATED — use this)
 
@@ -148,6 +159,7 @@ When the user mentions logging out of `yc` (for any reason), **always perform bo
 A partial logout (CLI only, or browser only) leaves credentials or session tokens active and the user is NOT fully logged out. Both steps are required every time. Never report logout as complete until both have been executed.
 
 ## Don'ts
+- Don't run the install script reflexively — check `yc --version` first, set PATH, and confirm the binary is genuinely absent before installing.
 - Don't mention tmux (or pane-capture / send-keys) in user-facing messages — run it silently, narrate only login started → sign-in → signed in.
 - Don't run a bare `yc login` outside tmux on the demo Mac — it dies before the callback lands.
 - Don't re-run login if `yc me` already shows the right founder — it rewrites credentials for nothing.
