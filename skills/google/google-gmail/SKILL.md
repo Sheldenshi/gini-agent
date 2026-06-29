@@ -5,7 +5,7 @@ license: MIT
 compatibility: "macOS and Linux. Requires the `gws` CLI authenticated against a Google account with Gmail scopes."
 metadata:
   gini:
-    version: 1.2.1
+    version: 1.2.3
     author: Gini
     platforms: [macos, linux]
     prerequisites:
@@ -125,7 +125,23 @@ Thanks
 
 Use the same recipient, subject, and body you passed to `gws gmail +send … --draft` so the card matches the saved draft. The app renders the `email-draft` block as a draft card; any non-rendering client degrades it to a readable code block.
 
-If the draft proposes or changes a meeting time, also render a `calendar` block previewing that day/week so the user can see the slot against their schedule — see "Preview a calendar change inline" in the `google-calendar` skill.
+### Preview a meeting change inline
+
+When the draft proposes, confirms, reschedules, or cancels a meeting at a specific time, render a `calendar` preview right after the draft card so the user can see the proposed slot against their existing schedule and catch a conflict. First pull that day's agenda (`gws calendar +agenda --today` / `--tomorrow`, or `gws calendar events list` for the date) so existing events show as context, then emit a fenced `calendar` block:
+
+````text
+Here's where that lands on your Thursday — your morning is clear of it:
+
+```calendar
+date: 2026-07-02
+tz: PT
+
+2026-07-02 15:00-16:00 | Team sync | proposed
+2026-07-02 09:30-10:00 | Standup
+```
+````
+
+One event per line: `YYYY-MM-DD HH:MM-HH:MM | title | status` (24-hour times). Use `proposed` for the slot you're proposing, `cancel` for one going away, and omit the status for the user's existing events. Add a `view: week` header line for multi-day context. It is a read-only preview — the real calendar create/update still goes through `gws calendar +insert` / `events.patch`. See "Preview a calendar change inline" in the `google-calendar` skill for the full grammar.
 
 ### Read
 
@@ -186,5 +202,6 @@ gws gmail +watch        # streams new messages as NDJSON (one JSON object per li
 6. Attachment cap is 25 MB total. For larger files, upload via `google-drive` and send the share link instead.
 7. Never paste raw message bodies that contain secrets (API keys, passwords, MFA codes) back into the chat transcript. Summarize, redact, or write to a file the user controls.
 8. When you save a draft, surface it to the user with an `email-draft` fenced block (see "Show a saved draft to the user") instead of pointing them at Gmail. The user should be able to read the draft without leaving the app.
+9. When that draft proposes, confirms, reschedules, or cancels a meeting at a specific time, you are not done after the `email-draft` block: pull that day's agenda (`gws calendar +agenda` for the date) and render a `calendar` preview right after it (see "Preview a meeting change inline"), with the proposed slot marked `proposed`, so the user sees it against their existing schedule. This is part of the deliverable for a meeting email, not an optional extra — do it without being asked.
 
 For flags not shown here, run `gws gmail --help` or `gws gmail <verb> --help` (e.g. `gws gmail +send --help`).
