@@ -141,7 +141,7 @@ const EMAIL_WATCH_TRIAGE_PROMPT = [
 
 // The minimal toolset whitelist the triage worker needs: `email` owns email_watch
 // (escalation), `terminal` owns terminal_exec (drive the gws CLI to read threads /
-// reply on approval). `read_skill` (skills toolset) is always allowed by the
+// save a threaded draft via `+reply --draft`). `read_skill` (skills toolset) is always allowed by the
 // subagent tool filter, and the google-gmail skill rides in the inherited skill
 // catalog (no skill whitelist set, so the worker can read_skill it). Posting the
 // proposed reply / flag is the worker's plain text turn output into its channel —
