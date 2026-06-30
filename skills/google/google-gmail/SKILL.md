@@ -127,7 +127,7 @@ Thanks
 
 Use the same recipient, subject, and body you passed to `gws gmail +send … --draft` so the card matches the saved draft. The app renders the `email-draft` block as a draft card; any non-rendering client degrades it to a readable code block.
 
-The `DraftId` and `Account` lines let the user send the draft straight from the card (its **Send** button), with no extra chat turn: use the exact draft id `gws gmail +send … --draft` returned at `.id`, and the account you saved the draft under. They are metadata, not recipients — the card extracts them and never shows them as `To`/`Cc` rows. Omit both only when there is no saved draft to send (then the card is read-only).
+The `DraftId` and `Account` lines let the user send the draft straight from the card (its **Send** button), with no extra chat turn: use the exact draft id `gws gmail +send … --draft` returned at `.id`, and the account you saved the draft under. They are metadata, not recipients — the card extracts them and never shows them as `To`/`Cc` rows. Always save the draft first and include both lines — the card is always sendable.
 
 ### Preview a meeting change inline
 
