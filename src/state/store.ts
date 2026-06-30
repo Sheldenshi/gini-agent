@@ -1040,9 +1040,9 @@ function migrateJobsToTopics(state: RuntimeState): void {
 // Stamp the active-at-migration-time agent onto records that pre-date the
 // per-agent isolation field. Idempotent and audit-emitting. Covers Task,
 // ChatSessionRecord, JobRecord, JobRunRecord,
-// SubagentRecord, Approval in one pass so the backfill audit doesn't fan
-// out into six separate rows. RuntimeEvent and AuditEvent are deliberately
-// excluded — see the comment at the stamp loop below.
+// SubagentRecord, Approval, EmailWatcherRecord in one pass so the backfill
+// audit doesn't fan out into separate rows. RuntimeEvent and AuditEvent are
+// deliberately excluded — see the comment at the stamp loop below.
 function migrateRecordAgentIds(state: RuntimeState): void {
   // When the state file has no agents at all (e.g. a hand-edited or
   // partially-restored file that lost both the seed pass and the
@@ -1086,6 +1086,7 @@ function migrateRecordAgentIds(state: RuntimeState): void {
   stamp(state.subagents, "subagents");
   stamp(state.authorizations, "authorizations");
   stamp(state.setupRequests, "setupRequests");
+  stamp(state.emailWatchers, "emailWatchers");
   // Events and audits are deliberately NOT backfilled here. After the
   // AgentContext refactor, a missing agentId on an event/audit is a
   // first-class signal that the row is system-attributed (instance boot,

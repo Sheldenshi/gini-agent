@@ -10,6 +10,7 @@ import {
   readState
 } from "../state";
 import { addAudit } from "../state/audit";
+import { listEmailWatchers, removeEmailWatcher, setEmailTriageEnabled } from "../state/email-watchers";
 import { now } from "../state/ids";
 import { providerCatalog } from "../provider";
 import { renameSeededSoulName, seedAgentSoulFile } from "../runtime/identity-files";
@@ -253,6 +254,13 @@ export async function setAgentProvider(
 //     job lifecycle detaches them separately. Removing the topic rows here
 //     is what keeps normalizeState's orphan-rehome pass from re-stamping a
 //     deleted agent's Topics onto another agent.
+//   - The agent's email-watch cluster — every EmailWatcherRecord it owns
+//     (via removeEmailWatcher, which tears down the shared backing job +
+//     per-concern channels as the last watcher goes) and its whole-inbox
+//     triage opt-in (via setEmailTriageEnabled(false)). Without this, the
+//     watchers strand under a now-dead agentId and the shared "Email watch"
+//     job keeps polling. Done BEFORE the row-removal mutateState below
+//     because those helpers run their own mutateState passes.
 //   - Per-agent Hindsight bank (`bank_${agentId}`) + all units in it.
 //   - The agent row is removed from `state.agents`.
 // The legacy `state.memories` per-agent purge was removed alongside the
@@ -267,6 +275,33 @@ export async function deleteAgent(
   config: RuntimeConfig,
   idOrName: string
 ): Promise<{ ok: true; id: string; unitsDeleted: number; bankDeleted: boolean }> {
+  // Resolve + guard up front so the email-watch teardown (which runs its own
+  // mutateState passes and so can't live inside the single removal block
+  // below) only fires for a deletable agent. The same guards are re-checked
+  // inside the removal mutateState as the atomic safety net.
+  const target = (() => {
+    const state = readState(config.instance);
+    const agent = state.agents.find((item) => item.id === idOrName || item.name === idOrName);
+    if (!agent) throw new Error(`Agent not found: ${idOrName}`);
+    if (agent.id === "agent_default") {
+      throw new Error("Cannot delete the default agent.");
+    }
+    if (state.activeAgentId === agent.id) {
+      throw new Error("Cannot delete the active agent; switch to another agent first.");
+    }
+    return agent;
+  })();
+
+  // Tear down the agent's email-watch cluster before the row is removed so
+  // nothing is orphaned under a dead agentId. removeEmailWatcher rebuilds /
+  // tears down the shared job + per-concern channels as each (last) watcher
+  // goes; setEmailTriageEnabled(false) tears down a triage-only job + channel
+  // if the agent had opted in.
+  for (const watcher of listEmailWatchers(config).filter((w) => w.agentId === target.id)) {
+    await removeEmailWatcher(config, watcher.id);
+  }
+  await setEmailTriageEnabled(config, target.id, false);
+
   const result = await mutateState(config.instance, (state) => {
     const agent = state.agents.find((item) => item.id === idOrName || item.name === idOrName);
     if (!agent) throw new Error(`Agent not found: ${idOrName}`);

@@ -1442,3 +1442,32 @@ describe("normalizeState thread-tag strip (v10)", () => {
     expect(pending.parentBlockId).toBeUndefined();
   });
 });
+
+describe("normalizeState emailWatchers agentId rehome", () => {
+  test("rehomes a watcher whose agentId points at a non-existent agent onto the default agent", () => {
+    // When the owning agent disappears, the watcher's backing job gets
+    // rehomed to agent_default but the watcher kept the dead agentId — so
+    // they split apart and the startup backfill mints duplicate shared jobs.
+    // migrateRecordAgentIds must re-stamp the orphaned watcher onto the
+    // default agent in lockstep with its job.
+    const state = createEmptyState("ew-agentid-rehome");
+    const at = "2026-01-01T00:00:00.000Z";
+    state.emailWatchers = [
+      {
+        id: "emailwatch_orphan",
+        instance: state.instance,
+        agentId: "agent_dead",
+        provider: "gmail",
+        query: "in:inbox",
+        enabled: true,
+        status: "ok",
+        createdAt: at,
+        updatedAt: at
+      }
+    ];
+
+    const normalized = normalizeState(state.instance, state);
+    expect(normalized.emailWatchers.find((w) => w.id === "emailwatch_orphan")!.agentId).toBe("agent_default");
+    expect(normalized.audit.some((e) => e.action === "records.agentid.backfill")).toBe(true);
+  });
+});

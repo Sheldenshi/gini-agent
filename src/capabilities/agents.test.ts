@@ -9,6 +9,8 @@ import { dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { archiveAgent, createAgent, deleteAgent, listAgents, renameAgent, setAgentProvider, unarchiveAgent, useAgent } from "./agents";
+import "../hooks/builtins"; // populates the hook registry so createScheduledJob resolves isKnownHook("skill-script")
+import { addEmailWatcher } from "../state/email-watchers";
 import { soulPath } from "../runtime/identity-files";
 import { install } from "../runtime";
 import {
@@ -370,6 +372,39 @@ describe("createAgent", () => {
     expect(
       after.chatSessions.some(
         (session) => session.kind === "topic" && session.agentId === created.id
+      )
+    ).toBe(false);
+  });
+
+  test("deleteAgent tears down the agent's email-watch cluster", async () => {
+    // Deleting an agent must cascade its email-watch teardown: the watcher
+    // row, the shared gmail-watch backing job, and the per-concern channels
+    // all go with the agent. Without this they strand under a now-dead
+    // agentId and the shared "Email watch" job keeps polling.
+    const config = buildConfig(workspaceRoot, "delete-agent-email-watch", root);
+    await install(config);
+    const created = await createAgent(config, { name: "watcher-agent" });
+
+    const watcher = await addEmailWatcher(config, { agentId: created.id, sender: "alice@x.com" });
+
+    const before = readState(config.instance);
+    const sharedJob = before.jobs.find(
+      (job) => (job.preRunHook?.config as { skill?: string })?.skill === "gmail-watch"
+    );
+    expect(sharedJob).toBeDefined();
+    const channelsBefore = before.chatSessions.filter(
+      (session) => session.feature === "email-watch" && session.agentId === created.id
+    );
+    expect(channelsBefore.length).toBeGreaterThan(0);
+
+    await deleteAgent(config, created.id);
+
+    const after = readState(config.instance);
+    expect(after.emailWatchers.find((w) => w.id === watcher.id)).toBeUndefined();
+    expect(after.jobs.find((job) => job.id === sharedJob!.id)).toBeUndefined();
+    expect(
+      after.chatSessions.some(
+        (session) => session.feature === "email-watch" && session.agentId === created.id
       )
     ).toBe(false);
   });
