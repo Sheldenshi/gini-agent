@@ -11,11 +11,14 @@ export type ProcessStep =
 // calls, those calls AND the per-iteration narration the model emitted
 // between them collapse into a single "tool_group" item — the narration
 // renders as "Thinking" rows alongside the tool-call rows — leaving only the
-// final answer as a standalone bubble. This holds while the turn is still
-// streaming and after it settles, so the process reads the same the whole way
-// through (no reflow when the turn finishes); the only difference is the
-// generated-files card, which waits until the turn is complete. A turn with no
-// tool calls passes its blocks through as raw bubbles.
+// final answer as a standalone bubble. The grouping is identical while the
+// turn streams and after it settles (the process reads the same the whole way
+// through, so no steps reflow when the turn finishes). What differs is
+// presentation: an in-flight group (`inProgress`) renders expanded so the user
+// watches each tool call land as it happens, then collapses to the one-line
+// summary once the turn completes. The generated-files card likewise waits
+// until the turn is complete. A turn with no tool calls passes its blocks
+// through as raw bubbles.
 //
 // `isFinalAnswer` marks the one block that is the turn's closing answer —
 // only set on a standalone assistant_text that comes after the last tool call
@@ -24,7 +27,7 @@ export type ProcessStep =
 // suppressed; only the final answer carries it.
 export type ChatRenderItem =
   | { kind: "block"; block: ChatBlock; isFinalAnswer?: boolean }
-  | { kind: "tool_group"; id: string; calls: ToolCallBlock[]; steps: ProcessStep[] }
+  | { kind: "tool_group"; id: string; calls: ToolCallBlock[]; steps: ProcessStep[]; inProgress: boolean }
   | { kind: "file_artifact"; id: string; files: { path: string; toolName: string }[] };
 
 export function groupExchanges(
@@ -132,7 +135,11 @@ function appendExchange(items: ChatRenderItem[], exchange: ChatBlock[], terminal
   for (let i = 0; i < groupIdx; i++) {
     items.push({ kind: "block", block: exchange[i]! });
   }
-  items.push({ kind: "tool_group", id: `group-${calls[0]!.id}`, calls, steps });
+  // While the turn is still generating, the group renders expanded (each tool
+  // call shown as it lands); it collapses to the one-line summary once the turn
+  // settles. The file-artifact card below shares this completeness check.
+  const complete = isExchangeComplete(exchange, terminalTaskIds);
+  items.push({ kind: "tool_group", id: `group-${calls[0]!.id}`, calls, steps, inProgress: !complete });
   for (let i = groupIdx + 1; i < exchange.length; i++) {
     const b = exchange[i]!;
     if (b.kind === "tool_call" || b.kind === "tool_result") continue;
@@ -145,7 +152,7 @@ function appendExchange(items: ChatRenderItem[], exchange: ChatBlock[], terminal
   // toolName. The card is pushed after the trailing blocks (assistant_text) so
   // it renders below the agent's reply rather than above it. Skipped while the
   // turn is still in flight — a mid-stream write isn't a final artifact yet.
-  if (isExchangeComplete(exchange, terminalTaskIds)) {
+  if (complete) {
     const filesByPath = new Map<string, string>();
     for (const call of calls) {
       if (call.toolName !== "file_write" && call.toolName !== "file_patch") continue;

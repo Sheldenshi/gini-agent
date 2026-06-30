@@ -15,17 +15,27 @@ import { iconForTool } from "./tool-icons";
 // shell commands, hit the browser, etc., without expanding. Expanding
 // replays the turn's process — tool calls and the model's pre-tool
 // narration — in chronological order.
+//
+// While the turn is still generating (`inProgress`), the group defaults to
+// expanded so the user watches each tool call land; it collapses to the
+// summary row once the turn settles. A manual toggle overrides that default
+// and sticks across the in-flight → settled transition.
 
 export function BlockToolCallsCollapsed({
   calls,
   steps,
-  resultsByCallId
+  resultsByCallId,
+  inProgress = false
 }: {
   calls: ToolCallBlock[];
   steps: ProcessStep[];
   resultsByCallId: Map<string, ToolResultBlock>;
+  inProgress?: boolean;
 }) {
-  const [expanded, setExpanded] = useState(false);
+  // null = follow the in-flight default; once the user taps, their choice
+  // wins and persists even after the turn finishes.
+  const [override, setOverride] = useState<boolean | null>(null);
+  const expanded = override ?? inProgress;
   const agentCount = calls.filter((c) => c.toolName === "spawn_subagent").length;
   const toolCount = calls.length;
 
@@ -46,7 +56,7 @@ export function BlockToolCallsCollapsed({
   return (
     <View style={styles.container}>
       <Pressable
-        onPress={() => setExpanded((v) => !v)}
+        onPress={() => setOverride(!expanded)}
         style={styles.header}
         hitSlop={{ top: 8, bottom: 8 }}
         accessibilityRole="button"

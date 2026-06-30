@@ -558,6 +558,7 @@ export default function ChatDetailScreen() {
           calls={item.calls}
           steps={item.steps}
           resultsByCallId={toolResultsByCallId}
+          inProgress={item.inProgress}
         />
       );
     }

@@ -321,7 +321,56 @@ describe("groupExchanges narration folding", () => {
     expect(standaloneAssistant.length).toBe(1);
     expect(standaloneAssistant[0]!.kind === "block" && standaloneAssistant[0]!.isFinalAnswer).toBe(true);
   });
+});
 
+describe("groupExchanges in-flight expansion", () => {
+  // The tool_group carries `inProgress` so the renderer can keep an actively
+  // generating turn EXPANDED (each tool call visible as it lands) and collapse
+  // it to the one-line summary only once the turn settles.
+  test("a turn still mid-tool-call is inProgress", () => {
+    const items = groupExchanges([
+      user("search", "task_live"),
+      toolCall({ toolName: "web_search", argsPreview: "q", status: "running", taskId: "task_live" })
+    ]);
+    const groups = items.filter((i) => i.kind === "tool_group");
+    expect(groups.length).toBe(1);
+    expect(groups[0]!.inProgress).toBe(true);
+  });
+
+  test("a turn whose reply is still streaming is inProgress", () => {
+    const items = groupExchanges([
+      user("look", "task_stream2"),
+      toolCall({ toolName: "web_search", argsPreview: "q", status: "ok", taskId: "task_stream2" }),
+      assistant("typing", "task_stream2", /* streaming */ true)
+    ]);
+    const groups = items.filter((i) => i.kind === "tool_group");
+    expect(groups[0]!.inProgress).toBe(true);
+  });
+
+  test("a settled turn is not inProgress (collapses to the summary)", () => {
+    const items = groupExchanges([
+      user("look", "task_done2"),
+      toolCall({ toolName: "web_search", argsPreview: "q", status: "ok", taskId: "task_done2" }),
+      assistant("here you go", "task_done2")
+    ]);
+    const groups = items.filter((i) => i.kind === "tool_group");
+    expect(groups[0]!.inProgress).toBe(false);
+  });
+
+  test("a terminal run that stopped on a tool call is not inProgress", () => {
+    const items = groupExchanges(
+      [
+        toolCall({ toolName: "web_search", argsPreview: "q", status: "ok", taskId: "task_term3" }),
+        toolResult("call-x", "task_term3")
+      ],
+      new Set(["task_term3"])
+    );
+    const groups = items.filter((i) => i.kind === "tool_group");
+    expect(groups[0]!.inProgress).toBe(false);
+  });
+});
+
+describe("groupExchanges terminal narration folding", () => {
   test("a terminal run that ended on a tool call (no final answer) folds all narration with no standalone bubble", () => {
     // The run carries a "Completed" phase (terminal) but the model stopped
     // after a tool call — its last assistant_text precedes that call. The
