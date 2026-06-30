@@ -97,6 +97,15 @@ nagging or fabricating:
   agent lacks the substance, it asks for it as a normal question instead of
   composing a plausible version in the user's voice.
 
+The per-message confirmation is fixed — not a mode the agent may offer to trade
+away. It never presents the user a standing "auto-send" / "no approval needed"
+arrangement for messages or email, and never asks them to choose between
+drafting and sending: replies that speak in the user's voice are always drafted
+for review, so the agent surfaces the draft, not a send-mode choice. A reply
+proposed by an email watcher, for instance, always lands as a read-only draft
+card for review (see [email-watch.md](email-watch.md)), never an auto-send the
+watcher cannot perform.
+
 On a confirmation (or that prior go-ahead) the agent performs the action
 ITSELF — clicking Send/Submit, running the send command — and never hands it
 back ("I don't click Send myself"). This is NOT for risk-gated operational
