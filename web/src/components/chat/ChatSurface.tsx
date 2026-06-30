@@ -401,11 +401,15 @@ export function ChatSurface({
             }
           />
         )}
-        {panel ? null : (
+        {/* A topic's only tab is Messages (Jobs hidden via isTopic, Settings via
+            the always-true isPinned), so the bar is a redundant single tab —
+            drop it entirely, matching panel mode. The transcript still renders
+            since `tab` defaults to "messages". */}
+        {panel || isTopic ? null : (
           <ChatTabBar
             active={tab}
             onChange={setTab}
-            hideJobsTab={isChannel || isTopic}
+            hideJobsTab={isChannel}
             hideSettingsTab={isPinned}
           />
         )}
