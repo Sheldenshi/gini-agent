@@ -130,12 +130,15 @@ unchanged.
 
 ### Forwarding
 
-A **forward** copies a Topic's final `assistant_text` into the Chat session as a render-only
-block tagged with `forwardedFromTopicId` + `forwardedFromTopicTitle` (carried in the block's
-`payload_json` — no schema migration), rendered as a "from #topic · View topic →" chip
-(generalizing the existing "from \<job name\>" segment). Pending gate cards
-(`setup_requested` / `authorization_requested`) from a Topic turn forward the same way and
-stay actionable in Chat (gates are global by id).
+A **forward** mirrors a Topic turn render-only into the Chat session: every block it emits —
+tool calls, intermediate narration, phases, system notes, and the final `assistant_text` — is
+copied across, each tagged with `forwardedFromTopicId` + `forwardedFromTopicTitle` (carried in
+the block's `payload_json` — no schema migration) and never replayed into the model context.
+The "from #topic · View topic →" deep-link chip rides only on the turn's **final answer**, not
+under every mirrored narration line (the client flags the closing answer when grouping the
+exchange), generalizing the existing "from \<job name\>" segment. Pending gate cards
+(`setup_requested` / `authorization_requested`) from a Topic turn forward the same way and keep
+their own chip while staying actionable in Chat (gates are global by id).
 The reverse — a Chat reply routed into a Topic — mirrors the user message into the Topic,
 runs the turn in the Topic's context, and forwards the answer back. `transcriptSessionId`
 for `persistFinalAnswerRow` must point at the **Topic** (replay correctness), even though
