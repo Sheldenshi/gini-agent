@@ -34,7 +34,9 @@ duration-aware `CalendarEvent` (the Jobs view adapts jobs onto it).
 
 **Direct draft-send.** The draft card carries the saved gws draft id and account
 as extracted metadata lines (`DraftId` / `Account`, never shown as recipients).
-When present, the card shows a **Send** button that sends the ALREADY-SAVED draft
+Every emitter — the interactive Gmail flow and the email-watch worker — saves a
+real Gmail draft and tags the fence with its `DraftId`, so the card ALWAYS shows a
+**Send** button that sends the ALREADY-SAVED draft
 **directly, server-side, with no agent turn**: the browser POSTs through the BFF
 to `POST /api/email/drafts/send { draftId, account? }`, the gateway resolves the
 account to its gws config dir and runs `gws gmail users drafts send`, records the
@@ -55,7 +57,7 @@ BFF — see [bff-trust-boundary.md](./bff-trust-boundary.md)).
 
 ## Context
 
-A read-only `email-draft` card already let the agent show a saved Gmail draft in
+An `email-draft` card already let the agent show a saved Gmail draft in
 chat instead of telling the user to open Gmail. Two needs generalized it:
 
 - A meeting email is more useful with the week it lands in. Rather than a bespoke
