@@ -289,7 +289,12 @@ Two consequences:
 - **Client surface.** `POST /api/agents/:id/archive` and `/unarchive`,
   the `gini agent archive` / `unarchive` CLI subcommands, and the web
   agent switcher (the sidebar-header dropdown) — which carries the
-  per-agent Archive control and an "Archived" Restore group alongside
-  agent selection — all drive the same two capability functions. The
-  trimmed `AgentRow` view-type carries `archivedAt` so the web can split
-  active from archived agents.
+  per-agent Archive control and an "Archived" group alongside agent
+  selection — all drive the archive/unarchive capability functions. The
+  "Archived" group exposes two controls per agent: Restore (`/unarchive`)
+  and a permanent-Delete control wired to the existing
+  `DELETE /api/agents/:id` cascade, so the irreversible hard delete sits
+  behind the reversible archive (active → archive → delete permanently)
+  and never collides with the active-agent / default-agent delete guards.
+  The trimmed `AgentRow` view-type carries `archivedAt` so the web can
+  split active from archived agents.
