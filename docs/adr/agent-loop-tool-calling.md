@@ -34,16 +34,16 @@ through the same loop. So the loop comes first.
 - `Task.mode` distinguishes `chat` and `imperative`. `submitTask` accepts
   a `{ mode }` option; chat callers (`submitChatMessage`) set it.
 - `runTask` dispatches `mode === "chat"` to `runChatTask` in
-  `src/execution/chat-task.ts`. Imperative tasks keep the prefix-dispatch
+  `packages/runtime/src/execution/chat-task.ts`. Imperative tasks keep the prefix-dispatch
   branch.
-- `generateToolCallingResponse` in `src/provider.ts` is the provider-level
+- `generateToolCallingResponse` in `packages/runtime/src/provider.ts` is the provider-level
   entry: it speaks `/chat/completions` with a `tools` array, supports
   streaming (buffering tool-call argument deltas across SSE events), and
   surfaces `{ text, toolCalls, finishReason, usage, cost, responseId }`.
 - The Codex (responses API) and echo providers fall back to text-only
   mode. Echo can be primed with a queue of canned tool-calling responses
   for tests.
-- `src/execution/tool-catalog.ts` produces OpenAI-shape specs filtered
+- `packages/runtime/src/execution/tool-catalog.ts` produces OpenAI-shape specs filtered
   by enabled toolsets. The catalog is hashed; the loop captures the hash
   on pause so a reader can see which catalog the resume runs against (the
   hash is telemetry, not enforced on resume).
@@ -53,7 +53,7 @@ through the same loop. So the loop comes first.
   persists on `Task.loadedTools`. This keeps the live full-schema tool
   count low. See ADR deferred-tools.md for the mechanism, the
   persistence / resume contract, and which clusters are deferred.
-- `src/execution/tool-dispatch.ts` is the per-tool handler: low-risk
+- `packages/runtime/src/execution/tool-dispatch.ts` is the per-tool handler: low-risk
   tools (`file_read`, `file_list`, `file_search`, `web_fetch`) execute
   synchronously and return a string; high-risk tools (`file_write`,
   `file_patch`, `terminal_exec`, `code_exec`, `browser_upload_file`,
@@ -146,7 +146,7 @@ being re-read every turn.
   orphan tool rows and assistant rows missing any paired result are
   dropped, so a partially-persisted turn can never produce a provider
   400 on the ordering invariant. The tool-pairing-strict request
-  builders (Anthropic Messages, Bedrock Converse) in `src/provider.ts`
+  builders (Anthropic Messages, Bedrock Converse) in `packages/runtime/src/provider.ts`
   re-run the same window-bounded pairing pass (`pairToolCallingMessages`)
   as a request-build backstop, so any non-replay path that reaches them
   — resume snapshots, in-turn compaction, future callers — is held to
@@ -154,7 +154,7 @@ being re-read every turn.
 - These rows are model-facing replay state, **not** the human-facing
   transcript. The chat UI renders from the ChatBlock stream (ADR
   chat-block-protocol.md), and the JSON view-builders in
-  `src/execution/chat.ts` (`getChatSession`, `listChatSessions`) plus
+  `packages/runtime/src/execution/chat.ts` (`getChatSession`, `listChatSessions`) plus
   `syncChatTaskResult`'s terminal-summary short-circuit all exclude
   `kind:"tool_transcript"` rows, so they never leak into or corrupt
   what the user sees.

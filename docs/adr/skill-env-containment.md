@@ -16,7 +16,7 @@ and it is scoped to one skill at a time:
   secrets are ever injected, regardless of which skills are enabled.
 
 `resolveSkillEnv(config, skill, taskId?)` in
-`src/integrations/connectors/index.ts` is the single resolver. It maps a
+`packages/runtime/src/integrations/connectors/index.ts` is the single resolver. It maps a
 skill's declared env names to its required credentials' encrypted secrets
 via `bindingsForCredentials` (name-based) and returns a
 `{ENV_NAME: secret-value}` map. There is no aggregate "all active skills"
@@ -107,7 +107,7 @@ an effect, so the generic command path never carries credentials at all.
   script under `<skill>/scripts/` and is invoked via `skill_run`.
   `terminal_exec` never carries connector env, so there is no way to
   pass a credential to a model-authored command string. The
-  `terminal_exec` tool description in `src/execution/tool-catalog.ts`
+  `terminal_exec` tool description in `packages/runtime/src/execution/tool-catalog.ts`
   documents the clean-env guarantee and points credentialed work at
   `skill_run`.
 
@@ -168,28 +168,28 @@ the user accepted at install time.
 
 ## Implementation surface
 
-- `src/integrations/connectors/index.ts`:
+- `packages/runtime/src/integrations/connectors/index.ts`:
   - `resolveSkillEnv(config, skill, taskId?)` is the single resolver,
     name-based via `bindingsForCredentials`.
   - An in-code NOTE marks the single-path invariant so neither an
     aggregate-across-active-skills helper nor a by-name terminal resolver
     is reintroduced.
-- `src/execution/tool-catalog.ts`: `terminal_exec` parameter schema has
+- `packages/runtime/src/execution/tool-catalog.ts`: `terminal_exec` parameter schema has
   no `skill` property. Description documents the clean-env guarantee and
   routes credentialed commands to `skill_run`.
-- `src/execution/policy.ts`: `TerminalExecPayload` is just `{ command }`.
-- `src/execution/tool-dispatch.ts`: `terminalExecDispatch` and
+- `packages/runtime/src/execution/policy.ts`: `TerminalExecPayload` is just `{ command }`.
+- `packages/runtime/src/execution/tool-dispatch.ts`: `terminalExecDispatch` and
   `requestTerminalExec` carry no `skill` arg; the spawn paths inject no
   connector env.
-- `src/agent.ts`: `runTerminalCommandClaimed` and the post-approval
+- `packages/runtime/src/agent.ts`: `runTerminalCommandClaimed` and the post-approval
   executor both spawn with `env: { ...process.env }` (no connector env).
-- `src/capabilities/skill-scripts.ts`: `invokeSkillScript` uses
+- `packages/runtime/src/capabilities/skill-scripts.ts`: `invokeSkillScript` uses
   `resolveSkillEnv` directly (the script always knows its owning
   skill) — the sole connector-env path.
 
 ## Acceptance checks
 
-- `bun test src/integrations/connectors/index.test.ts` covers
+- `bun test packages/runtime/src/integrations/connectors/index.test.ts` covers
   `resolveSkillEnv`: a disabled/error connector does not inject its
   secret, a configured + healthy connector does.
 - `terminal_exec` has no `skill` arg anywhere (catalog, policy,

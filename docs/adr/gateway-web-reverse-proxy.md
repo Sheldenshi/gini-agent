@@ -2,7 +2,7 @@
 
 ## Decision
 
-The gateway (`src/http.ts` / `src/server.ts`) reverse-proxies the Next.js web
+The gateway (`packages/runtime/src/http.ts` / `packages/runtime/src/server.ts`) reverse-proxies the Next.js web
 app so the whole product — UI, BFF, and assets — is reachable on **one origin**
 (the gateway port), in addition to the web server's own port. Routing is by
 path in the request handler's fall-through:
@@ -21,8 +21,8 @@ HTTP proxying uses Bun's `fetch` with `decompress: false`, so the upstream
 normally (without it, Bun decompresses the body but leaves stale headers →
 `ERR_CONTENT_DECODING_FAILED`). The upstream `Response` is returned directly.
 
-The upstream port is resolved through `src/web-target.ts`, a runtime-safe module
-(no `src/cli/*` import) that reads the per-instance `web.port` and **validates**
+The upstream port is resolved through `packages/runtime/src/web-target.ts`, a runtime-safe module
+(no `packages/runtime/src/cli/*` import) that reads the per-instance `web.port` and **validates**
 it against the BFF `/api/runtime/__healthz` endpoint (`service: "gini-web"` +
 matching `instance`) before forwarding, with a short per-instance cache. When the
 port is unresolvable (web down, `--no-web`, or a reused/foreign port), the proxy
@@ -53,8 +53,8 @@ bearer-injecting BFF calls to a foreign instance.
 - The product is reachable on one origin (gateway port), enabling single-port
   tunnel exposure. Direct access to the inner Next.js port is unchanged except for
   one loopback-only addition: because that port binds loopback (`127.0.0.1`), a
-  Next BFF passthrough (`web/src/app/api/pairing/[...path]`, forwarding via
-  `web/src/lib/pairing-proxy.ts`) bridges device pairing `/api/pairing/*` to the
+  Next BFF passthrough (`packages/web/src/app/api/pairing/[...path]`, forwarding via
+  `packages/web/src/lib/pairing-proxy.ts`) bridges device pairing `/api/pairing/*` to the
   gateway so the dev port's pairing UI works like the gateway origin; a
   non-loopback front is refused (404). See ADR
   [device-pairing-auth.md](./device-pairing-auth.md).
@@ -76,8 +76,8 @@ bearer-injecting BFF calls to a foreign instance.
   purely internal and needs no relay awareness. External (non-relay,
   non-loopback) exposure still requires `GINI_TRUSTED_ORIGINS` to include the
   gateway's external origin (ADR bff-trust-boundary.md).
-- `src/http.ts` no longer imports from `src/cli/*`; web-port discovery lives in
-  the runtime-safe `src/web-target.ts`.
+- `packages/runtime/src/http.ts` no longer imports from `packages/runtime/src/cli/*`; web-port discovery lives in
+  the runtime-safe `packages/runtime/src/web-target.ts`.
 - The healthz-validated port is cached briefly (`ttlMs`, default 5s) to keep the
   probe off the per-request hot path. This leaves a bounded window in which a
   port that dies and is immediately reused by another process could be trusted;
@@ -102,9 +102,9 @@ bearer-injecting BFF calls to a foreign instance.
   the banner.
 - A chat turn driven through the gateway origin (`/api/runtime/chat/*`) reaches
   the BFF, injects the token, and returns the assistant reply.
-- HMR: editing a `web/` source file hot-updates a page loaded through the
+- HMR: editing a `packages/web/` source file hot-updates a page loaded through the
   gateway port, with no `ERR_CONTENT_DECODING_FAILED` or RSV-bit console errors.
 - `resolveWebPort` returns null (→ banner/502) when healthz reports a different
   `instance` or a non-`gini-web` service. Pinned by `bun test
-  src/web-target.test.ts`; carve-out and WS-pump behavior by `bun test
-  src/http.test.ts src/http-ws-proxy.test.ts`.
+  packages/runtime/src/web-target.test.ts`; carve-out and WS-pump behavior by `bun test
+  packages/runtime/src/http.test.ts packages/runtime/src/http-ws-proxy.test.ts`.

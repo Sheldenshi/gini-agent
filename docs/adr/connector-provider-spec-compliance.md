@@ -30,8 +30,8 @@ The cost of fixing all three is small (mechanical renames + frontmatter migratio
 
 - `IdentityRecord` → `ConnectorRecord`. Field `kind` → `provider`.
 - `RuntimeState.identities` → `RuntimeState.connectors`.
-- `src/integrations/identities/` → `src/integrations/connectors/`.
-- `src/cli/commands/identities.ts` → `src/cli/commands/connectors.ts`.
+- `packages/runtime/src/integrations/identities/` → `packages/runtime/src/integrations/connectors/`.
+- `packages/runtime/src/cli/commands/identities.ts` → `packages/runtime/src/cli/commands/connectors.ts`.
 - Routes: `/api/identities*` → `/api/connectors*`.
 - CLI: `gini identity ...` → `gini connector ...`.
 - Audit event names: `identity.*` → `connector.*`.
@@ -138,7 +138,7 @@ Both are bundled, enabled by default, and declare `metadata.gini.requires.connec
 ## Consequences For Coding Agents
 
 - Use `ConnectorRecord`, `/api/connectors`, `gini connector ...`, `metadata.gini.requires.connectors[].provider` everywhere. Do not introduce or revive `Identity` or `kind`.
-- When adding a provider, place per-provider code under `src/integrations/connectors/<provider>.ts`. Export a `ProviderModule` conforming to the central contract. Add a registry entry. Do not let provider-specific code leak into the generic connector runtime.
+- When adding a provider, place per-provider code under `packages/runtime/src/integrations/connectors/<provider>.ts`. Export a `ProviderModule` conforming to the central contract. Add a registry entry. Do not let provider-specific code leak into the generic connector runtime.
 - When authoring or migrating skills, use the spec frontmatter. Gini extensions live under `metadata.gini.*`. Run `gini skill validate` before shipping.
 - The skill is the integration package. Do not introduce an "Integration" type, "Provider" record (separate from the connector's provider field), or any other concept above Skill.
 - Filesystem-based skill discovery is the contract. `POST /api/skills` writes to the same directory; it is not a separate registration plane.
@@ -149,7 +149,7 @@ Both are bundled, enabled by default, and declare `metadata.gini.requires.connec
 - `bun run typecheck` clean (root + web).
 - `bun test` passes including new tests for connector CRUD, skill loader spec compliance, allowed-tools parsing, validate command, generic provider fields.
 - `bun run gini smoke` runs to completion with renamed routes.
-- `rg connector` returns expected matches (production code, ADRs, tests). `rg "kind:" src/integrations/` returns no production matches in the new provider registry code.
+- `rg connector` returns expected matches (production code, ADRs, tests). `rg "kind:" packages/runtime/src/integrations/` returns no production matches in the new provider registry code.
 - `rg identity src web` returns no production-code matches outside migration helpers and ADR history.
 - `bun run gini skill validate skills/apple/apple-notes/SKILL.md` passes for every bundled skill.
 - `bun run gini connector add --provider demo --name test` works; `bun run gini connector list` shows it; `bun run gini connector remove <id>` removes it.

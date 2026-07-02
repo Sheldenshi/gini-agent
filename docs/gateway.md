@@ -17,14 +17,14 @@ Gini's runtime is the gateway: one Bun process per instance owns state, executio
       (also reachable through the gateway as a single origin)
 ```
 
-The gateway starts from `src/server.ts`. `gini start` launches it as a daemon. `gini run` launches it in the foreground and ties its lifecycle to the terminal.
+The gateway starts from `packages/runtime/src/server.ts`. `gini start` launches it as a daemon. `gini run` launches it in the foreground and ties its lifecycle to the terminal.
 
 ## Next.js BFF
 
-The web app in `web/` is both a browser UI and a backend-for-frontend:
+The web app in `packages/web/` is both a browser UI and a backend-for-frontend:
 
 - browser requests go to `/api/runtime/*`
-- `web/src/app/api/runtime/[...path]/route.ts` forwards to the gateway
+- `packages/web/src/app/api/runtime/[...path]/route.ts` forwards to the gateway
 - the gateway bearer token stays server-side in the Next.js process
 - the browser never receives the token
 
@@ -32,18 +32,18 @@ The web app is stateless. Restarting it does not lose runtime data because all s
 
 ## Single-origin reverse proxy
 
-The gateway can also front the web app so the whole product is reachable on **one origin** (the gateway port) instead of two. `src/http.ts` routes by path:
+The gateway can also front the web app so the whole product is reachable on **one origin** (the gateway port) instead of two. `packages/runtime/src/http.ts` routes by path:
 
 - `/api/*` (except `/api/runtime/*`) — handled natively by the gateway, bearer-gated.
 - `/api/runtime/*` — proxied to the Next.js BFF so its server-side token injection still runs.
 - everything else (HTML, `/_next/*` assets) — proxied to the Next.js server.
-- WebSocket upgrades (Next HMR at `/_next/webpack-hmr`) — bridged socket-to-socket (`src/server.ts` wires `proxyWebSocketUpgrade` + `webSocketProxyHandler`).
+- WebSocket upgrades (Next HMR at `/_next/webpack-hmr`) — bridged socket-to-socket (`packages/runtime/src/server.ts` wires `proxyWebSocketUpgrade` + `webSocketProxyHandler`).
 
-When the web server is down (or a `--no-web` instance) the proxy falls back to the runtime banner. The upstream port is resolved through `src/web-target.ts`, which validates the recorded `web.port` against the BFF `/api/runtime/__healthz` (`service: "gini-web"` + matching `instance`) before forwarding — a reused/stale port can't route to a foreign instance. This single origin is what lets a tunnel expose UI + API over one public URL. The gateway is the single operator front (`gini run`/`start` advertise the gateway origin): direct access to the inner Next.js port still serves the proxied UI and the `/api/runtime/*` BFF, but the gateway-native `/api/*` surface is not served there — with one exception. Because the inner port binds loopback (`-H 127.0.0.1`, reachable only from the local machine, never the LAN), a Next BFF passthrough (`web/src/app/api/pairing/[...path]`, forwarding via `web/src/lib/pairing-proxy.ts`) bridges device pairing `/api/pairing/*` to the gateway for that loopback origin, so the dev port's pairing UI works like the gateway origin. A non-loopback front is refused (404) and must use the gateway.
+When the web server is down (or a `--no-web` instance) the proxy falls back to the runtime banner. The upstream port is resolved through `packages/runtime/src/web-target.ts`, which validates the recorded `web.port` against the BFF `/api/runtime/__healthz` (`service: "gini-web"` + matching `instance`) before forwarding — a reused/stale port can't route to a foreign instance. This single origin is what lets a tunnel expose UI + API over one public URL. The gateway is the single operator front (`gini run`/`start` advertise the gateway origin): direct access to the inner Next.js port still serves the proxied UI and the `/api/runtime/*` BFF, but the gateway-native `/api/*` surface is not served there — with one exception. Because the inner port binds loopback (`-H 127.0.0.1`, reachable only from the local machine, never the LAN), a Next BFF passthrough (`packages/web/src/app/api/pairing/[...path]`, forwarding via `packages/web/src/lib/pairing-proxy.ts`) bridges device pairing `/api/pairing/*` to the gateway for that loopback origin, so the dev port's pairing UI works like the gateway origin. A non-loopback front is refused (404) and must use the gateway.
 
 ## CLI
 
-The CLI entrypoint is `src/cli.ts`, which delegates to the modular command tree under `src/cli/`. CLI commands read the selected instance config, attach the bearer token, and call the same gateway API used by other clients.
+The CLI entrypoint is `packages/runtime/src/cli.ts`, which delegates to the modular command tree under `packages/runtime/src/cli/`. CLI commands read the selected instance config, attach the bearer token, and call the same gateway API used by other clients.
 
 Some local harness operations, such as smoke setup and evidence bundle generation, can use domain helpers directly when they need to manage a runtime process or local files. The `gini import apply openclaw` command is the load-bearing exception: it requires the gateway stopped for the target instance and mutates `state.json`, `secrets.env`, workspace files, skills, and `memory.db` in-process. See [Openclaw Migration](./adr/openclaw-migration.md) for the lock model.
 

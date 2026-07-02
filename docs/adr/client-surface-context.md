@@ -2,7 +2,7 @@
 
 ## Decision
 
-Every inbound chat message resolves to an optional **client surface** — `"web" | "mobile" | "cli" | "telegram" | "discord" | "openclaw"` (`ChatClientSurface` in `src/types.ts`) — and the chat-task loop injects a one-line description of the CURRENT turn's surface into the per-turn model context. UI clients claim their surface with an optional `client` field on the message POST body; messaging bridges never send the field — their surface derives from the chat session's `source.kind`. An unknown surface injects nothing: the prompt makes no claim rather than guessing.
+Every inbound chat message resolves to an optional **client surface** — `"web" | "mobile" | "cli" | "telegram" | "discord" | "openclaw"` (`ChatClientSurface` in `packages/runtime/src/types.ts`) — and the chat-task loop injects a one-line description of the CURRENT turn's surface into the per-turn model context. UI clients claim their surface with an optional `client` field on the message POST body; messaging bridges never send the field — their surface derives from the chat session's `source.kind`. An unknown surface injects nothing: the prompt makes no claim rather than guessing.
 
 ## Context
 
@@ -20,11 +20,11 @@ Validation is deliberately lenient: an unrecognized `client` value resolves to u
 
 ## Storage: stamped on the Task
 
-`resolveClientSurface` in `src/execution/chat.ts` runs inside the shared submit-preparation path (both main-chat messages and thread replies), and the resolved value is threaded through `submitTask` onto `Task.clientSurface`. The Task is the right per-message carrier for the same reason `Task.images` lives there: the agent loop reads a single record stamped at submission instead of racing the asynchronous chat-message write. Chat tasks are one-per-inbound-message, so Task storage IS per-message storage.
+`resolveClientSurface` in `packages/runtime/src/execution/chat.ts` runs inside the shared submit-preparation path (both main-chat messages and thread replies), and the resolved value is threaded through `submitTask` onto `Task.clientSurface`. The Task is the right per-message carrier for the same reason `Task.images` lives there: the agent loop reads a single record stamped at submission instead of racing the asynchronous chat-message write. Chat tasks are one-per-inbound-message, so Task storage IS per-message storage.
 
 ## Prompt injection shape
 
-`buildClientSurfaceBlock` (`src/system-prompt.ts`) renders the line; `runChatTask` passes it to `renderEphemeralContext`, so it rides in the ephemeral `role:"user"` tail placed immediately before the real user message — NOT in the byte-stable system prefix, which must stay byte-identical across turns for prompt caching (see [stable-system-prefix.md](stable-system-prefix.md)). Because the tail is rebuilt fresh each turn and never replayed from durable history, each turn carries exactly its own surface.
+`buildClientSurfaceBlock` (`packages/runtime/src/system-prompt.ts`) renders the line; `runChatTask` passes it to `renderEphemeralContext`, so it rides in the ephemeral `role:"user"` tail placed immediately before the real user message — NOT in the byte-stable system prefix, which must stay byte-identical across turns for prompt caching (see [stable-system-prefix.md](stable-system-prefix.md)). Because the tail is rebuilt fresh each turn and never replayed from durable history, each turn carries exactly its own surface.
 
 The rendered lines:
 
@@ -45,6 +45,6 @@ Subagents are excluded (they keep their single override prompt and don't drive u
 
 ## Acceptance checks
 
-- POST `/api/chat/<id>/messages` with `client: "mobile"` stamps `clientSurface: "mobile"` on the spawned task; `client: "fridge"` and an absent field both leave it undefined without rejecting the message (`src/http.test.ts`, `src/execution/chat.test.ts`).
-- A message on a telegram/discord/openclaw-sourced session resolves its surface with no body field (`src/execution/chat.test.ts`).
-- For each known surface, the expected line appears in the ephemeral tail immediately before the current user message and never in the system prefix; alternating web→mobile turns in one session each carry only their own line; an unknown surface injects no line anywhere in the turn (`src/execution/chat-task.test.ts`, `src/system-prompt.test.ts`).
+- POST `/api/chat/<id>/messages` with `client: "mobile"` stamps `clientSurface: "mobile"` on the spawned task; `client: "fridge"` and an absent field both leave it undefined without rejecting the message (`packages/runtime/src/http.test.ts`, `packages/runtime/src/execution/chat.test.ts`).
+- A message on a telegram/discord/openclaw-sourced session resolves its surface with no body field (`packages/runtime/src/execution/chat.test.ts`).
+- For each known surface, the expected line appears in the ephemeral tail immediately before the current user message and never in the system prefix; alternating web→mobile turns in one session each carry only their own line; an unknown surface injects no line anywhere in the turn (`packages/runtime/src/execution/chat-task.test.ts`, `packages/runtime/src/system-prompt.test.ts`).

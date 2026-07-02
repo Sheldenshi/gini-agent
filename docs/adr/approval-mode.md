@@ -21,7 +21,7 @@ Replace the binary `dangerouslyAutoApprove` flag with a three-state
   entry. Operator override via
   `RuntimeConfig.dangerousTerminalPatterns`; built-ins in
   `DEFAULT_DANGEROUS_TERMINAL_PATTERNS`
-  (`src/execution/auto-approve.ts`). The `autoApproveCommands`
+  (`packages/runtime/src/execution/auto-approve.ts`). The `autoApproveCommands`
   allowlist always short-circuits the blocklist.
 - `"yolo"` — **new instance default**. Full bypass for every
   approval-gated tool. Same audit
@@ -129,10 +129,10 @@ and [telegram-bridge.md](telegram-bridge.md) for the lifecycle.
   derived boolean in GET `/api/settings/auto-approve` responses;
   accepted on PATCH and the `create_job` tool spec; aliased on load
   by the migration shim below.
-- `src/execution/policy.ts` exports
+- `packages/runtime/src/execution/policy.ts` exports
   `resolveApprovalPolicy(config, action, payload)` — the single
   policy seam. Every dispatcher reads from it.
-- `src/execution/auto-approve.ts` exports
+- `packages/runtime/src/execution/auto-approve.ts` exports
   `matchDangerousTerminal(patterns, command)` and
   `DEFAULT_DANGEROUS_TERMINAL_PATTERNS` (rm -rf to absolute paths or
   $HOME, sudo, pipe-to-shell, chmod 777, destructive git operations,
@@ -218,7 +218,7 @@ about "was this auto").
   `dangerouslyAutoApprove` alias. Both persist onto the JobRecord;
   `approvalMode` wins when both are set.
 - `bun run typecheck`, `bun test`, and `bun run gini smoke` are
-  green; `src/execution/approval-mode.test.ts` covers the
+  green; `packages/runtime/src/execution/approval-mode.test.ts` covers the
   `{strict, auto, yolo}` × `{file_write, file_patch, terminal_exec
   safe + dangerous, code_exec, browser_upload_file, send_message}`
   matrix, plus

@@ -7,7 +7,7 @@ per-`(skill, credential)` **user grant**, keyed on the credential name.
 Declaring the credential is no longer sufficient.
 
 - `resolveSkillEnv(config, skill, taskId?)` in
-  `src/integrations/connectors/index.ts` injects a credential's secret into a
+  `packages/runtime/src/integrations/connectors/index.ts` injects a credential's secret into a
   skill's spawn env only when **either** the skill is first-party
   (`source === "bundled"`, auto-granted) **or** the skill's
   `grantedConnectors` array includes that credential **name**
@@ -132,49 +132,49 @@ single point where a credential would enter a process.
 
 ## Implementation surface
 
-- `src/types.ts`: `SkillRecord.grantedConnectors?: string[]`; new
+- `packages/runtime/src/types.ts`: `SkillRecord.grantedConnectors?: string[]`; new
   `"skill.grant_connector"` member of `SetupRequestAction`.
-- `src/integrations/connectors/index.ts`: `resolveSkillEnv` resolves env
+- `packages/runtime/src/integrations/connectors/index.ts`: `resolveSkillEnv` resolves env
   through a single name-based path. It maps each required credential name to
   its usable connector record, resolves env vars via `bindingsForCredentials`,
   and injects a value only when `bundled || grantedConnectors.includes(credentialName)`
   holds for the credential that owns the env var. There is no provider-keyed
   or generic-fallback branch.
-- `src/capabilities/skills.ts`: `grantConnectorToSkill` /
+- `packages/runtime/src/capabilities/skills.ts`: `grantConnectorToSkill` /
   `revokeConnectorGrant` mutate `grantedConnectors` and write the audit
   rows; a shared `clearConnectorGrantsOnDisable` helper clears grants and
   emits one `skill.connector.revoked` row per cleared credential from both the
   `setSkillStatus` and `updateSkill` PATCH disable paths.
-- `src/execution/tool-dispatch.ts`: `setSkillStatusTool` returns a
+- `packages/runtime/src/execution/tool-dispatch.ts`: `setSkillStatusTool` returns a
   `DispatchResult`; on enable of a non-bundled credentialed skill it mints a
   `skill.grant_connector` SetupRequest (surface-guarded) and returns
   `{ kind: "pending" }`. The dispatcher's `enable_skill` / `disable_skill`
   cases return the dispatch result directly.
-- `src/http.ts`: the `/complete` `skill.grant_connector` branch appends the
+- `packages/runtime/src/http.ts`: the `/complete` `skill.grant_connector` branch appends the
   grant, then enables the skill only when no credentialed requirements remain
   ungranted — otherwise it mints the next grant card and leaves the task
   pending. The settings-page `/enable` endpoint never grants connectors.
-- `src/execution/tool-catalog.ts`: `enable_skill` description notes the
+- `packages/runtime/src/execution/tool-catalog.ts`: `enable_skill` description notes the
   one-time consent prompt.
-- `web/src/components/chat/BlockSetupRequested.tsx`: Grant / Cancel card for
+- `packages/web/src/components/chat/BlockSetupRequested.tsx`: Grant / Cancel card for
   the `skill.grant_connector` action.
-- `web/src/app/permissions/page.tsx`: "Grant skill access" label for the new
+- `packages/web/src/app/permissions/page.tsx`: "Grant skill access" label for the new
   action in the setup-request list.
 
 ## Acceptance checks
 
-- `bun test src/integrations/connectors/index.test.ts` — ungranted
+- `bun test packages/runtime/src/integrations/connectors/index.test.ts` — ungranted
   non-bundled skill resolves to `{}`; granted non-bundled and bundled skills
   inject.
-- `bun test src/capabilities/skills.test.ts` — grant / revoke audit rows;
+- `bun test packages/runtime/src/capabilities/skills.test.ts` — grant / revoke audit rows;
   both the `setSkillStatus` and `updateSkill` PATCH disable paths clear grants
   and emit one `skill.connector.revoked` row per cleared credential.
-- `bun test src/execution/skill-dispatch.test.ts` — non-bundled credentialed
+- `bun test packages/runtime/src/execution/skill-dispatch.test.ts` — non-bundled credentialed
   enable mints the SetupRequest (pending); bundled and already-granted enable
   immediately; the messaging-bridge and `origin: "job"` surfaces return a sync
   error with no setup row; re-entering enable while a grant is pending
   references the existing request instead of minting a duplicate.
-- `bun test src/http.test.ts` — the `skill.grant_connector` `/complete`
+- `bun test packages/runtime/src/http.test.ts` — the `skill.grant_connector` `/complete`
   branch grants the credential and enables a single-credential skill; for a
   multi-credential skill it grants one credential, stays disabled, and mints
   the next grant card.

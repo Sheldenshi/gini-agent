@@ -33,10 +33,10 @@ read at request time:
   regardless of `GINI_TRUSTED_ORIGINS`, so an operator who connects a
   tunnel does not also have to enumerate the (randomly assigned)
   subdomain in the env var. This lane now lives at the **gateway front**
-  (`src/lib/origin-trust.ts`, `webBoundRequestAllowed`), which validates it
+  (`packages/runtime/src/lib/origin-trust.ts`, `webBoundRequestAllowed`), which validates it
   for every web-bound request and then rewrites `Host`/`Origin` to loopback
-  before proxying — so the inner BFF (`web/src/proxy.ts`,
-  `web/src/lib/runtime.ts`) carries no relay lane of its own and only ever
+  before proxying — so the inner BFF (`packages/web/src/proxy.ts`,
+  `packages/web/src/lib/runtime.ts`) carries no relay lane of its own and only ever
   sees loopback.
 
 Method-tiered fail-closed behavior: unsafe methods (POST, PUT, PATCH,
@@ -123,7 +123,7 @@ The gateway fronts the BFF as a single origin (ADR
 [gateway-web-reverse-proxy.md](./gateway-web-reverse-proxy.md)) and is the
 authoritative trust front. For every web-bound request (non-`/api` and
 `/api/runtime/*`) the gateway runs the host/origin guard
-(`webBoundRequestAllowed` in `src/lib/origin-trust.ts`) — the loopback /
+(`webBoundRequestAllowed` in `packages/runtime/src/lib/origin-trust.ts`) — the loopback /
 gini-relay / runtime-managed-tunnel / `GINI_TRUSTED_ORIGINS` lanes plus the
 `Sec-Fetch-Site` check (with the top-level-navigation exemption) — and
 only then reverse-proxies to the Next.js BFF, rewriting `Host` and `Origin` to
@@ -142,7 +142,7 @@ doesn't know about, the gateway guard fails closed unless
 non-loopback cases are auto-trusted, both because the runtime established the
 front and the name's DNS is provider-owned: the relay lane, and a
 **runtime-managed tunnel's connected URL** (`setRuntimeTunnelTrust` in
-`src/lib/origin-trust.ts` — admitted exactly while the tunnel record is
+`packages/runtime/src/lib/origin-trust.ts` — admitted exactly while the tunnel record is
 `connected`, revoked atomically with any transition away; see
 [Tunnel Connectivity](tunnel-connectivity.md)).
 
@@ -183,9 +183,9 @@ front and the name's DNS is provider-owned: the relay lane, and a
   `GINI_TRUSTED_ORIGINS` unset, while a non-relay, non-loopback `Host` without
   `GINI_TRUSTED_ORIGINS` returns 404 (page) / 403 (`/api/runtime/*`).
 - The gateway guard's `GINI_TRUSTED_ORIGINS` / loopback / relay / Origin-match
-  / `Sec-Fetch-Site` cases are pinned by `src/lib/origin-trust.test.ts`
+  / `Sec-Fetch-Site` cases are pinned by `packages/runtime/src/lib/origin-trust.test.ts`
   (`webBoundRequestAllowed`), and the gate + `Host`/`Origin` rewrite by
-  `src/http.test.ts`. The inner BFF guard (loopback + allowlist + loopback
-  short-circuit, relay-agnostic) is pinned by `web/src/lib/runtime.test.ts`
-  (`guardCsrf`) and `web/src/proxy.test.ts` (`classifyHost`), with pure-helper
-  coverage in `web/src/lib/trusted-origins.test.ts`.
+  `packages/runtime/src/http.test.ts`. The inner BFF guard (loopback + allowlist + loopback
+  short-circuit, relay-agnostic) is pinned by `packages/web/src/lib/runtime.test.ts`
+  (`guardCsrf`) and `packages/web/src/proxy.test.ts` (`classifyHost`), with pure-helper
+  coverage in `packages/web/src/lib/trusted-origins.test.ts`.

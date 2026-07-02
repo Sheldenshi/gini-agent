@@ -30,7 +30,7 @@ The OpenAI-compatible chat machinery (streaming SSE reader, function-call argume
 
 ## Routing Helpers
 
-Two helpers in `src/provider.ts` centralize the per-call decision:
+Two helpers in `packages/runtime/src/provider.ts` centralize the per-call decision:
 
 - `chatCompletionsUrl(provider, baseUrl)` — returns the Azure deployment-scoped URL for the `azure` provider (percent-encoding the deployment and version), else `${baseUrl}/chat/completions`.
 - `chatCompletionsAuthHeader(provider, apiKey)` — returns `{ "api-key": key }` for the `azure` provider unless its `authScheme` is `bearer`, in which case `{ authorization: "Bearer <key>" }`; every other provider uses Bearer. Returns `{}` when no key is present, preserving the keyless-local-gateway path.
@@ -59,7 +59,7 @@ An earlier release configured Azure as a mode of the `openai` provider —
 Because `normalizeProvider` now carries `apiVersion`/`deployment`/`authScheme`
 only for the `azure` provider, a persisted config of that shape would otherwise
 lose its routing and fall back to the flat `api.openai.com` path. `loadConfig`
-(`src/paths.ts`) detects the legacy shape — an `openai` provider carrying a
+(`packages/runtime/src/paths.ts`) detects the legacy shape — an `openai` provider carrying a
 non-empty `apiVersion` only ever came from the azure-on-openai path — and
 rewrites it once to `{name:"azure", ...}`, persisting the upgrade on load. The
 migration **preserves `apiKeyEnv`** (defaulting to `OPENAI_API_KEY`, where the

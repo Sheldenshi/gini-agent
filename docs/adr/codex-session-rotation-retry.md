@@ -39,7 +39,7 @@ The `originator` header (`codex_cli_rs`) is unchanged and the version placeholde
 
 The codex CLI's non-atomic rewrite of `auth.json` typically completes in microseconds. The 50 ms wait is two-to-three orders of magnitude longer than the writer's window, so retry observes a flushed file with overwhelming probability. The cost is negligible — the user only pays 50 ms when a retry was already going to fire, never on the happy path — and the alternative (a long-running parse-retry loop inside `readCodexCredentials`) would muddle the read API and propagate async-ness through every caller.
 
-50 ms is also short enough that cancellation doesn't materially suffer. The provider pipeline carries the chat-task turn's `AbortSignal` (see `src/execution/turn-abort.ts`), and the two turn-facing codex paths (`callToolCallingResponses`, the `callOpenAIResponses` codex branch) pass it into `withCodexSessionRetry`. The pre-retry wait is an `abortableSleep(CODEX_RETRY_REWRITE_DELAY_MS, signal)`: a user cancel during the 50 ms window rejects the wait with the signal's `AbortError` before `make()` runs a second time, so attempt 2 is never constructed and no second request egresses. Each attempt's `make()` also threads the same `signal` into its fetch, so a cancel landing during attempt 2's own request still tears it down at the source; the chat-task loop's post-await terminal-status re-check remains as defense-in-depth. (`callStructuredCodex` and `callVisionCodex` are not turn-cancellable surfaces — Hindsight extraction and vision analysis carry no turn signal — so they call `withCodexSessionRetry` without one and the wait stays a plain timer there.)
+50 ms is also short enough that cancellation doesn't materially suffer. The provider pipeline carries the chat-task turn's `AbortSignal` (see `packages/runtime/src/execution/turn-abort.ts`), and the two turn-facing codex paths (`callToolCallingResponses`, the `callOpenAIResponses` codex branch) pass it into `withCodexSessionRetry`. The pre-retry wait is an `abortableSleep(CODEX_RETRY_REWRITE_DELAY_MS, signal)`: a user cancel during the 50 ms window rejects the wait with the signal's `AbortError` before `make()` runs a second time, so attempt 2 is never constructed and no second request egresses. Each attempt's `make()` also threads the same `signal` into its fetch, so a cancel landing during attempt 2's own request still tears it down at the source; the chat-task loop's post-await terminal-status re-check remains as defense-in-depth. (`callStructuredCodex` and `callVisionCodex` are not turn-cancellable surfaces — Hindsight extraction and vision analysis carry no turn signal — so they call `withCodexSessionRetry` without one and the wait stays a plain timer there.)
 
 ## Why CodexAuthRaceError Is Separate From CodexSessionExpiredError
 
@@ -62,7 +62,7 @@ The `[_\s-]+` separator class accepts whitespace, underscores, and hyphens so bo
 
 ## Test Surface
 
-Retry behavior is pinned in `src/provider.test.ts`:
+Retry behavior is pinned in `packages/runtime/src/provider.test.ts`:
 
 - Tool-calling path: SSE error event, post-`onDelta` no-retry, buffered text without `onDelta` (retries), buffered tool-call args (retries), initial 401, no-retry on generic 500, `response.failed` event, snake_case `incomplete_details.reason`, retry cap, 50 ms wait, reader cancellation, bearer rotation across attempts, auth.json mid-rewrite race.
 - Per-path coverage: `generateTaskSummary`, `generateStructured`, and `generateVisionAnalysis` each have their own retry test exercising the `callOpenAIResponses` codex branch, `callStructuredCodex`, and `callVisionCodex` respectively.
@@ -73,7 +73,7 @@ Retry behavior is pinned in `src/provider.test.ts`:
 
 - **Multi-retry strategy.** A second consecutive session-expired usually means the CLI hasn't yet refreshed; looping further would burn quota without helping. The fixed cap-at-one stays.
 - **Caching the parsed `auth.json`.** Every request re-reads. Caching would require an invalidation surface; the cost is one `readFileSync` per request, which is negligible compared to the model call.
-- **ADR for the chat-task post-await cancellation model.** That contract lives in `src/execution/chat-task.ts` comments today; promoting it to an ADR is independent of this one.
+- **ADR for the chat-task post-await cancellation model.** That contract lives in `packages/runtime/src/execution/chat-task.ts` comments today; promoting it to an ADR is independent of this one.
 
 ## Consequences
 

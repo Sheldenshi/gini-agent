@@ -59,21 +59,21 @@ Gini's **runtime is the gateway**: a single Bun process per instance owns all du
 - One process per instance.
 - Authenticated HTTP API plus SSE event stream.
 - JSON state for broad runtime records and SQLite for memory.
-- Starts from `src/server.ts`.
+- Starts from `packages/runtime/src/server.ts`.
 
 ### Next.js Control Plane
 
-- Lives in `web/`.
+- Lives in `packages/web/`.
 - Browser talks to `/api/runtime/*`.
 - Server-side BFF attaches the gateway bearer token.
 - Uses the same API that CLI and future clients use.
 - Can be disabled with `--no-web` for smoke and runtime-only testing.
-- Reachable two ways: directly on its own port, or **through the gateway as a single origin** — the gateway reverse-proxies non-`/api` traffic and the `/api/runtime/*` BFF namespace to Next.js and bridges the HMR WebSocket, so UI + API share one origin. The upstream is healthz-validated per instance (`src/web-target.ts`). This single origin is what the gini-relay tunnel exposes for off-LAN access (see [Off-LAN Access](#off-lan-access)). See [Gateway And Control Plane](./gateway.md) and ADR [gateway-web-reverse-proxy.md](./adr/gateway-web-reverse-proxy.md).
+- Reachable two ways: directly on its own port, or **through the gateway as a single origin** — the gateway reverse-proxies non-`/api` traffic and the `/api/runtime/*` BFF namespace to Next.js and bridges the HMR WebSocket, so UI + API share one origin. The upstream is healthz-validated per instance (`packages/runtime/src/web-target.ts`). This single origin is what the gini-relay tunnel exposes for off-LAN access (see [Off-LAN Access](#off-lan-access)). See [Gateway And Control Plane](./gateway.md) and ADR [gateway-web-reverse-proxy.md](./adr/gateway-web-reverse-proxy.md).
 
 ### CLI
 
-- Entry shim: `src/cli.ts`.
-- Command implementation: `src/cli/`.
+- Entry shim: `packages/runtime/src/cli.ts`.
+- Command implementation: `packages/runtime/src/cli/`.
 - Reads instance config and calls the gateway API.
 - Also owns local process management for install/start/run/stop/smoke workflows.
 - The `gini import apply openclaw` migrator is the one documented exception to "all writes go through the gateway." It refuses to run while the instance's gateway is alive (see [Openclaw Migration](./adr/openclaw-migration.md)) and writes directly to `state.json`, `secrets.env`, workspace files, skills, and `memory.db` through the in-process `mutateState` path. Single-process serialization is what makes the offline-only constraint necessary.
@@ -139,7 +139,7 @@ Off-LAN access is available through **four runtime-driven tunnel providers** —
 
 ## Mobile + Push
 
-A basic Expo mobile client lives under `mobile/` — agent picker, per-agent chat list, and chat detail with task polling. It speaks the same `/api/*` contract directly with its own bearer token (no BFF), so it does not change the runtime/source-of-truth model.
+A basic Expo mobile client lives under `packages/mobile/` — agent picker, per-agent chat list, and chat detail with task polling. It speaks the same `/api/*` contract directly with its own bearer token (no BFF), so it does not change the runtime/source-of-truth model.
 
 Push notification delivery is built: the gateway signs APNs JWTs and pushes directly to Apple, an iOS Notification Service Extension enriches the banner on-device (fetching the real title/body over the device's own authenticated connection so chat text never transits Apple), and a per-device SSE watch registry suppresses redundant completion pushes while a device is actively streaming the session. A parallel per-session registry tracks tokenless web/CLI stream presence: while the user is reading a chat on the web app, the completion alert to their phones is downgraded to a silent badge tick so the phone doesn't buzz for a message they're already looking at (the badge still ticks, since web reads don't clear a phone's read cursor). See [Mobile Push Notifications](./adr/mobile-push-notifications.md).
 

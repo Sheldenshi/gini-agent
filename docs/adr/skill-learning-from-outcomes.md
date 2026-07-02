@@ -34,7 +34,7 @@ see [Skill Learning From Skills](../skill-learning.md) for the narrative):
      right?" This fills the silent-wrong gap that approval and error-harvesting both
      miss.
    `SkillRecord.successCount`/`failureCount` are deliberately **NOT** the reward — they
-   are bumped only by `testSkill()` static manifest validation (`src/capabilities/skills.ts`),
+   are bumped only by `testSkill()` static manifest validation (`packages/runtime/src/capabilities/skills.ts`),
    uncorrelated with whether a run worked.
 
 2. **The daily review IS the cadence and the ask.** An offline pass runs on a slow
@@ -129,15 +129,15 @@ safety boundary edits must preserve).
   "correct", so it is never self-verifiable, and the sampled-human-feedback tier exists to
   judge exactly those rows. A failure's terminal/exit status is itself an objective signal,
   so failures stay self-verifiable. `defectClass`/`attributable` are stamped by the reflection
-  pass (below) when a batch is reviewed. CRUD in `src/state/records.ts`; all writes via
+  pass (below) when a batch is reviewed. CRUD in `packages/runtime/src/state/records.ts`; all writes via
   `mutateState`. Retention is **per skill** (a chatty skill can't evict a quiet skill's history,
   which would corrupt a per-skill reliability metric), with a generous global backstop.
   `normalizeState` defaults the array to `[]` so older state files load.
 
-- **Objective extraction** (`src/learning/outcomes.ts`): `recordObjectiveOutcomes(config, task)`
+- **Objective extraction** (`packages/runtime/src/learning/outcomes.ts`): `recordObjectiveOutcomes(config, task)`
   is called fire-and-forget at **every** task-terminal site alongside `scheduleAutoRetain` —
   the agent.ts helpers (`completeTask`/`finishTaskTransition`/`failTask`) AND the chat-turn
-  completion paths in `src/execution/chat-task.ts` (the real chat surface completes there, not
+  completion paths in `packages/runtime/src/execution/chat-task.ts` (the real chat surface completes there, not
   through the agent.ts helpers). It reads the task's already-persisted `skill.script.invoked`
   audit rows + `task.status` and writes one `SkillOutcome` **per attributed skill, collapsed
   across that task's invocations** (a task is one trajectory, so retries of the same skill do
@@ -157,13 +157,13 @@ safety boundary edits must preserve).
   at capture, so the layer is self-protecting). It only reads + appends a bounded array, so it adds
   negligible terminal-path cost and never throws into the task.
 
-- **Edit contract** (`src/learning/edits.ts`): `SkillEditOp =
+- **Edit contract** (`packages/runtime/src/learning/edits.ts`): `SkillEditOp =
   { op:"append", content } | { op:"insert_after", anchor, content } | { op:"replace", target, content }
   | { op:"delete", target }`, and a pure `applySkillEdits(body, ops): { body, applied, skipped[] }`
   that operates on the markdown body, matches `anchor`/`target` as exact substrings, and
   **skips (records) rather than throws** on a no-match. Unit-tested per op.
 
-- **Reflection / optimizer** (`src/learning/reflect.ts`): `reflectOnSkillOutcomes(config, { agentId?, maxProposals=2 })`
+- **Reflection / optimizer** (`packages/runtime/src/learning/reflect.ts`): `reflectOnSkillOutcomes(config, { agentId?, maxProposals=2 })`
   gathers unreviewed failure outcomes, groups by `skillId`, and for each skill with **≥ 2**
   unreviewed failures makes one `generateStructured` call (provider resolved from the agent,
   like reinforce) returning `{ defectClass, attributable, edits: SkillEditOp[], rationale,
@@ -178,7 +178,7 @@ safety boundary edits must preserve).
 
 - **Proposal payload (edit mode).** A skill-edit proposal reuses `ImprovementProposal`
   (`kind:"skill"`) with `payload = { mode:"edit", targetSkillId, baseVersion, baseBody, edits:
-  SkillEditOp[], candidateBody }`. `applyImprovement` (`src/governance/improvements.ts`) gains an
+  SkillEditOp[], candidateBody }`. `applyImprovement` (`packages/runtime/src/governance/improvements.ts`) gains an
   edit branch: when `payload.mode === "edit"`, resolve the target skill; refuse if it is not a
   `source:"user"` skill with a `manifestPath` (bundled/legacy → throw, surfaced to the reviewer);
   otherwise rebuild the full `SKILL.md` from the current file, apply the edits to its body, and
@@ -191,7 +191,7 @@ safety boundary edits must preserve).
   sourceTaskIds[], status:"open"|"dismissed", createdAt }`. Surfaced in the digest and via a
   read-only endpoint; never auto-actioned.
 
-- **Daily review** (`src/learning/daily-review.ts`): `runDailyReview(config)` calls
+- **Daily review** (`packages/runtime/src/learning/daily-review.ts`): `runDailyReview(config)` calls
   `reflectOnSkillOutcomes`, selects up to 3 **feedback candidates** (recent `objective` `success`
   outcomes that are `!selfVerifiable` — i.e. consequential and unverified — and `!feedbackPrompted`,
   marked `feedbackPrompted:true`), assembles a digest (proposals awaiting approval + open findings +
@@ -200,7 +200,7 @@ safety boundary edits must preserve).
   **"Skill review"** `channel` session (stable feature marker, created once, never the main chat).
   Proposals/findings carry a per-item `digestedAt` flag set when surfaced, so a standing item is never
   re-posted and a same-millisecond item is never lost (a timestamp watermark would collide).
-  Single-flighted per instance. Hosted by a slow, abortable loop in `src/server.ts` modeled on the
+  Single-flighted per instance. Hosted by a slow, abortable loop in `packages/runtime/src/server.ts` modeled on the
   connector-reprobe loop (default 24h, `GINI_SKILL_REVIEW_TICK_MS` override; runs DB writes off the
   agent-turn path), plus a manual `POST /api/learning/review`. The loop participates in the SIGTERM drain.
 
@@ -210,7 +210,7 @@ safety boundary edits must preserve).
   tier of the loop into the same store the next review reads. Registered in the tool catalog +
   dispatch.
 
-- **Skill score (read-only).** `src/learning/score.ts` derives a per-skill **observed-reliability**
+- **Skill score (read-only).** `packages/runtime/src/learning/score.ts` derives a per-skill **observed-reliability**
   indicator from `SkillOutcome` rows for human display only — it **gates nothing** (no control flow
   reads it). It is `defectClass`-filtered (failures classified `environment`/`credential`/`transient`,
   or `attributable:false`, are excluded — a service outage is not the skill's fault; `skill_defect`,
@@ -286,22 +286,22 @@ safety boundary edits must preserve).
 
 ## Verification
 
-- `bun test src/learning/edits.test.ts` — each edit op against a sample `SKILL.md` body
+- `bun test packages/runtime/src/learning/edits.test.ts` — each edit op against a sample `SKILL.md` body
   (append/insert_after/replace/delete; no-match is skipped + recorded, never thrown).
-- `bun test src/learning/outcomes.test.ts` — extraction from synthetic `skill.script.invoked` audit
+- `bun test packages/runtime/src/learning/outcomes.test.ts` — extraction from synthetic `skill.script.invoked` audit
   rows + task status: a non-zero exit yields an attributed `failure`, an `ok` invocation a `success`,
   a script-less `failed` task an unattributed failure row; error text is scrubbed.
-- `bun test src/learning/reflect.test.ts` (echo provider) — a skill with ≥2 failures produces a
+- `bun test packages/runtime/src/learning/reflect.test.ts` (echo provider) — a skill with ≥2 failures produces a
   bounded edit proposal; a bundled skill produces a finding not a disk edit; `environment`/`credential`
   verdicts produce findings; the ≥2 floor and `maxProposals` clip hold; instance-specific edits are
   refused.
-- `bun test src/state` — `SkillOutcome` / `LearningFinding` CRUD + per-skill retention +
+- `bun test packages/runtime/src/state` — `SkillOutcome` / `LearningFinding` CRUD + per-skill retention +
   `normalizeState` defaults; the `applyImprovement` edit branch (user-skill body rewritten via
   `installSkillFromBody`; bundled target rejected; `baseBody` stored).
-- `bun test src/learning/score.test.ts` — the read-only score: UNRATED below the floor;
+- `bun test packages/runtime/src/learning/score.test.ts` — the read-only score: UNRATED below the floor;
   environment/credential/transient failures excluded; unclassified failures counted at full weight;
   unverified consequential successes never raise the score; the low-coverage "reliable" cap; recency decay.
-- Adversarial **probe suites** (`*.probe.test.ts` across `src/learning`, `src/governance`, `src/state`)
+- Adversarial **probe suites** (`*.probe.test.ts` across `packages/runtime/src/learning`, `packages/runtime/src/governance`, `packages/runtime/src/state`)
   cover capture/attribution + the phantom-success guard, classification routing + classification
   persistence, edit-apply/revert/concurrency, daily-review single-flight + digest rendering + no-respam,
   scoring honesty, and per-skill retention.

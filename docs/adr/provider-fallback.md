@@ -17,26 +17,26 @@ missing credential.
 
 Four pieces:
 
-1. **`resolveDispatchProvider(config)`** (`src/provider.ts`) — pure. Returns the
+1. **`resolveDispatchProvider(config)`** (`packages/runtime/src/provider.ts`) — pure. Returns the
    active provider when `providerHealth(config).configured`; otherwise the first
    `configured`, non-`echo`, non-self provider from `providerCatalogWithStatus`
    (model = that provider's catalog default); otherwise the active provider
    unchanged (nothing else is usable). Never writes config.
 2. **Resolution applies it** in `resolveEffectiveContext`
-   (`src/execution/effective-context.ts`) on BOTH the agent-pinned and instance
+   (`packages/runtime/src/execution/effective-context.ts`) on BOTH the agent-pinned and instance
    branches, recording `providerFallback?: { selected, using }` on
    `EffectiveContext`. `chat-task.ts` passes the resolved `effective.provider` to
    every generator (the instance path previously passed `undefined`), and
    `providerOverrideForRuntime` returns the fallback so memory LLM side-calls
    degrade too rather than throwing.
 3. **The BFF setup gate is fallback-aware.** `getSetupStatus`
-   (`src/runtime/setup-api.ts`) reports
+   (`packages/runtime/src/runtime/setup-api.ts`) reports
    `providerConfigured = isRealProvider && (active configured || a configured
    fallback exists)`, plus `selectedProvider` / `activeProvider` / `usingFallback`.
-   `web/src/proxy.ts` is unchanged — it still reads only `providerConfigured`, so
+   `packages/web/src/proxy.ts` is unchanged — it still reads only `providerConfigured`, so
    it now redirects to `/setup` only when NO provider is usable.
 4. **The fallback is surfaced.** `status()` / `RuntimeStatus` carry
-   `providerFallback`; `web/src/components/ProviderFallbackBanner.tsx` renders
+   `providerFallback`; `packages/web/src/components/ProviderFallbackBanner.tsx` renders
    "<Selected> isn't configured — using <Using>. Finish setup in Settings."
 
 ## Context
@@ -102,12 +102,12 @@ codex/echo — that is the explicit provider-*removal* path, not this.)
 
 ## Critical Files
 
-- `src/provider.ts` — `resolveDispatchProvider`.
-- `src/execution/effective-context.ts` — fallback applied in
+- `packages/runtime/src/provider.ts` — `resolveDispatchProvider`.
+- `packages/runtime/src/execution/effective-context.ts` — fallback applied in
   `resolveEffectiveContext`; the `providerFallback` field; `providerOverrideForRuntime`.
-- `src/execution/chat-task.ts` — passes the resolved provider to every generator.
-- `src/runtime/setup-api.ts` — fallback-aware `getSetupStatus.providerConfigured`
+- `packages/runtime/src/execution/chat-task.ts` — passes the resolved provider to every generator.
+- `packages/runtime/src/runtime/setup-api.ts` — fallback-aware `getSetupStatus.providerConfigured`
   + `selectedProvider` / `activeProvider` / `usingFallback`.
-- `src/runtime/index.ts`, `src/types.ts` — `providerFallback` on `RuntimeStatus`.
-- `web/src/components/ProviderFallbackBanner.tsx`,
-  `web/src/components/providers.tsx` — the banner.
+- `packages/runtime/src/runtime/index.ts`, `packages/runtime/src/types.ts` — `providerFallback` on `RuntimeStatus`.
+- `packages/web/src/components/ProviderFallbackBanner.tsx`,
+  `packages/web/src/components/providers.tsx` — the banner.

@@ -7,15 +7,15 @@ Status: Proposed (known issue, fix pending)
 The Next.js control plane keeps itself live two ways at once:
 
 - A single long-lived **Server-Sent Events** stream per browser tab. `RuntimeStreamBridge`
-  (`web/src/components/RuntimeStreamBridge.tsx`) opens an `EventSource` to
+  (`packages/web/src/components/RuntimeStreamBridge.tsx`) opens an `EventSource` to
   `/api/runtime/events/stream` and maps runtime ticks to React Query
   invalidations (e.g. a `pairing` tick invalidates `["pairingRequests","devices"]`).
-  It is mounted in `AppShell` (`web/src/components/AppShell.tsx`), so **every route in
+  It is mounted in `AppShell` (`packages/web/src/components/AppShell.tsx`), so **every route in
   every tab holds one EventSource open for the lifetime of the tab.**
 - Per-feature **polling** on top of that. The device-pairing panel uses
-  `usePairingRequests()` (`web/src/lib/pairing.ts`) — query key `["pairingRequests"]`,
+  `usePairingRequests()` (`packages/web/src/lib/pairing.ts`) — query key `["pairingRequests"]`,
   `refetchInterval: 3000` — to `GET /api/pairing/requests` (server-filtered to pending
-  rows in `src/state/records.ts` `listPendingPairingRequests`).
+  rows in `packages/runtime/src/state/records.ts` `listPendingPairingRequests`).
 
 An `EventSource` over HTTP/1.1 is a normal persistent HTTP connection that is **never
 released** while the tab is open. Browsers cap concurrent connections per host on
@@ -104,12 +104,12 @@ one-per-tab). Re-verify the relay path still works (it already does).
 
 ## References
 
-- `web/src/components/RuntimeStreamBridge.tsx` — per-tab EventSource → query invalidation.
-- `web/src/components/AppShell.tsx` — mounts the bridge on every route.
-- `web/src/lib/pairing.ts` — `usePairingRequests()` poll (`refetchInterval: 3000`).
-- `web/src/components/pairing/PairRequestsPanel.tsx` — the panel + its empty "Waiting for a
+- `packages/web/src/components/RuntimeStreamBridge.tsx` — per-tab EventSource → query invalidation.
+- `packages/web/src/components/AppShell.tsx` — mounts the bridge on every route.
+- `packages/web/src/lib/pairing.ts` — `usePairingRequests()` poll (`refetchInterval: 3000`).
+- `packages/web/src/components/pairing/PairRequestsPanel.tsx` — the panel + its empty "Waiting for a
   device to scan…" state.
-- `src/state/records.ts` — `listPendingPairingRequests` (server-side pending filter).
+- `packages/runtime/src/state/records.ts` — `listPendingPairingRequests` (server-side pending filter).
 - ADR [gateway-web-reverse-proxy.md](gateway-web-reverse-proxy.md) — single-origin proxy and
   the HTTP/1.1-vs-HTTP/2 distinction between localhost and the relay front.
 - ADR [device-pairing-auth.md](device-pairing-auth.md) — the pairing trust model and request

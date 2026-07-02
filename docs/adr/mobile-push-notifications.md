@@ -37,7 +37,7 @@ tap instead.
 
 The mobile build moves from purely managed Expo to a **dev client +
 `expo prebuild`** workflow on iOS to host the NSE. The plugin
-(`mobile/plugins/with-approval-notification-service.js`) is idempotent
+(`packages/mobile/plugins/with-approval-notification-service.js`) is idempotent
 and runs as part of the standard Expo config-plugin pipeline.
 
 ## Context
@@ -83,7 +83,7 @@ The chosen design uses two transports in concert:
   `threadId`) are opaque identifiers, not user content. Silent payloads
   carry the same routing fields and `content-available: 1`. The
   exhaustive privacy assertion is pinned in
-  `src/integrations/apns/dispatcher.test.ts` — any future regression that
+  `packages/runtime/src/integrations/apns/dispatcher.test.ts` — any future regression that
   adds user content to the **wire** surface fails the suite. The rich
   preview the user sees is fetched on-device by the NSE (see "NSE
   enrichment" below), never placed on the wire.
@@ -131,11 +131,11 @@ phone — a buzz for a message they're already reading.
 
 So the gateway tracks tokenless stream presence in a second, per-session
 registry (`addPushlessSubscription` / `isSessionWebWatched` in
-`src/state/sse-subscriptions.ts`). When a `Completed`-with-`assistant_text`
+`packages/runtime/src/state/sse-subscriptions.ts`). When a `Completed`-with-`assistant_text`
 push would fire an alert, the dispatcher first checks whether a web/CLI
 client is live-watching that session; if so it **downgrades the alert to a
 silent badge tick** for every phone (`sendAlert = wouldAlert &&
-!webWatched` in `src/integrations/apns/dispatcher.ts`). The badge still
+!webWatched` in `packages/runtime/src/integrations/apns/dispatcher.ts`). The badge still
 ticks — web reads do not advance a phone's per-device read cursor, so the
 message is genuinely unread on the phone — but the phone does not buzz.
 
@@ -169,8 +169,8 @@ Apple's servers — the NSE fetches the real preview on-device after the
 push arrives:
 
 1. **Server**: `GET /api/push/preview?sessionId=&event=&approvalId=&threadId=`
-   (`src/http.ts`) returns a notification-ready `{ title, body }` built by
-   `src/integrations/apns/preview.ts`. The optional `threadId` is forwarded
+   (`packages/runtime/src/http.ts`) returns a notification-ready `{ title, body }` built by
+   `packages/runtime/src/integrations/apns/preview.ts`. The optional `threadId` is forwarded
    from the push payload by the NSE. Three event kinds resolve:
    - `message_completed` → the **latest** non-empty `assistant_text` in
      the session (`latestAssistantTextForSession`), or in the thread when
@@ -190,7 +190,7 @@ push arrives:
    the app's AsyncStorage. The main app mirrors `{ baseUrl, token,
    deviceToken }` into an **App Group** shared container
    (`group.<bundleId>`) via `expo-file-system`'s
-   `Paths.appleSharedContainers` (`mobile/src/shared-credentials.ts`),
+   `Paths.appleSharedContainers` (`packages/mobile/src/shared-credentials.ts`),
    written on credential save and after push registration, cleared on
    sign-out. The NSE reads the same file via
    `FileManager.containerURL(forSecurityApplicationGroupIdentifier:)` —
@@ -218,13 +218,13 @@ lock-screen entry always reflects the newest assistant reply.
 
 ## NSE + category model
 
-- The NSE target (`mobile/ios-extensions/ApprovalNotificationService/`)
+- The NSE target (`packages/mobile/ios-extensions/ApprovalNotificationService/`)
   is registered by the Expo config plugin during `expo prebuild`.
   Without the NSE, an APNs payload with `mutable-content: 1` cannot
   be mutated before display, and the category id never attaches.
 - The main app calls `Notifications.setNotificationCategoryAsync` on
   every push registration, registering the `APPROVAL_REQUEST` category
-  with two actions (specs live in `mobile/src/push-dispatch.ts` as
+  with two actions (specs live in `packages/mobile/src/push-dispatch.ts` as
   `APPROVAL_CATEGORY_ACTIONS` so the invariant below is unit-testable):
   - `APPROVE` — `opensAppToForeground: false`, `isAuthenticationRequired: true`.
     Approving grants the high-risk action the agent paused on, so iOS must
@@ -235,7 +235,7 @@ lock-screen entry always reflects the newest assistant reply.
   - `DENY` — `opensAppToForeground: false`, `isDestructive: true`. No auth
     gate: denying is fail-safe (it cancels the pending action, never
     grants), and the destructive flag gives it the red lock-screen styling.
-- When the user taps an action, `mobile/src/push-dispatch.ts` extracts
+- When the user taps an action, `packages/mobile/src/push-dispatch.ts` extracts
   `approvalId` (the authorization id) from the payload and POSTs to the
   existing `/api/authorizations/:id/approve|deny` route. The app never
   foregrounds (Approve runs only after the OS-required unlock). Failures
@@ -274,8 +274,8 @@ paths below, so a tap routes identically regardless of app state:
 
 - **App alive (foreground or suspended)**: iOS delivers the tap through
   `addNotificationResponseReceivedListener`. The listener
-  (`mobile/src/push.ts`) hands the response to
-  `dispatchNotificationResponse` (`mobile/src/push-dispatch.ts`), whose
+  (`packages/mobile/src/push.ts`) hands the response to
+  `dispatchNotificationResponse` (`packages/mobile/src/push-dispatch.ts`), whose
   default-tap branch calls `navigateToChat`. The listener is installed at
   root (`app/_layout.tsx` via `installNotificationResponseListener`) on every
   launch — it needs no notification permission — so a tap that arrives while
@@ -331,7 +331,7 @@ recovers it.
   stays — they may recover or require human intervention.
 - **De-registration on logout**: sign-out (and credential swap) fires a
   best-effort `DELETE /api/push/devices/:token` via `clearCredentials` →
-  `tryDeregisterCachedDevice` (`mobile/src/auth.ts`), draining any
+  `tryDeregisterCachedDevice` (`packages/mobile/src/auth.ts`), draining any
   in-flight registration first (bounded wait) so the delete can't race a
   late register. Sign-out also clears the shared App Group credentials so
   a backgrounded NSE can't keep fetching previews with the signed-out
@@ -348,7 +348,7 @@ recovers it.
   iOS-only.
 - The generated `ios/` directory is `.gitignore`'d. The source of truth
   is the plugin + the Swift file under
-  `mobile/ios-extensions/ApprovalNotificationService/`. Re-run
+  `packages/mobile/ios-extensions/ApprovalNotificationService/`. Re-run
   `prebuild --clean` to pick up plugin changes.
 
 ## Alternatives considered
@@ -380,7 +380,7 @@ recovers it.
   dispatcher's `listAllDevices` broadcast into a per-credential
   fan-out — the helper (`listDevicesForCredential`) already exists.
 - The mobile build flow is two-step: `bunx expo prebuild` once, then
-  the normal Metro loop. Documented in `mobile/README.md`.
+  the normal Metro loop. Documented in `packages/mobile/README.md`.
 - A future "Resolve approval directly from the watch face" or "macOS
   notification mirror" feature can reuse the category + NSE plumbing —
   the action identifiers are already public-facing.

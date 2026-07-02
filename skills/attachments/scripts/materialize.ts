@@ -18,7 +18,7 @@ import {
   WorkspaceEscapeError,
   assertInsideWorkspace,
   writeInsideWorkspace
-} from "../../../src/capabilities/workspace-write";
+} from "./workspace-write";
 
 interface Args {
   uploadId: string;

@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
     paths:
-      - 'mobile/**'
+      - 'packages/mobile/**'
   workflow_dispatch:
     inputs:
       branch:
@@ -37,16 +37,16 @@ jobs:
           base="${{ github.event.before }}"
           head="${{ github.sha }}"
           git fetch --depth=1 origin "$base"
-          changed=$(git diff --name-only "$base" "$head" -- mobile/)
-          echo "Changed files in mobile/:"
+          changed=$(git diff --name-only "$base" "$head" -- packages/mobile/)
+          echo "Changed files in packages/mobile/:"
           echo "$changed"
-          if echo "$changed" | grep -E '^mobile/(app\.json|eas\.json|plugins/|ios-extensions/|ios/|android/)' >/dev/null; then
+          if echo "$changed" | grep -E '^packages/mobile/(app\.json|eas\.json|plugins/|ios-extensions/|ios/|android/)' >/dev/null; then
             echo "::error::Native config changed (app.json / eas.json / plugins/ / ios-extensions/ / ios/ / android/). Run \`eas build\` + \`eas submit\` manually instead of OTA."
             echo "needs_build=true" >> "$GITHUB_OUTPUT"
             exit 1
           fi
-          if echo "$changed" | grep -E '^mobile/package\.json$' >/dev/null; then
-            echo "::warning::mobile/package.json changed — make sure no native dependency was added. If you added something like react-native-* or expo-* with a config plugin, cancel this run and do a full eas build."
+          if echo "$changed" | grep -E '^packages/mobile/package\.json$' >/dev/null; then
+            echo "::warning::packages/mobile/package.json changed — make sure no native dependency was added. If you added something like react-native-* or expo-* with a config plugin, cancel this run and do a full eas build."
           fi
           echo "needs_build=false" >> "$GITHUB_OUTPUT"
 
@@ -61,13 +61,14 @@ jobs:
           eas-version: latest
           token: ${{ secrets.EXPO_TOKEN }}
 
-      - name: Install mobile deps
+      # Workspace install from the repo root covers packages/mobile against
+      # the single root lockfile.
+      - name: Install dependencies
         run: bun install --frozen-lockfile
-        working-directory: mobile
 
       - name: Typecheck
         run: bun run typecheck
-        working-directory: mobile
+        working-directory: packages/mobile
 
       - name: Publish update
         env:
@@ -79,4 +80,4 @@ jobs:
             --branch "$EAS_BRANCH" \
             --message "$message" \
             --non-interactive
-        working-directory: mobile
+        working-directory: packages/mobile

@@ -60,7 +60,7 @@ parsing runtime artifacts that were never meant to drive a UI directly:
   authorization-vs-setup-request.md).
 
 The web client carried this translation logic. When the mobile client
-landed (`mobile/`), it had to reimplement the same vocabulary —
+landed (`packages/mobile/`), it had to reimplement the same vocabulary —
 copying the phase-string regex, the partialSummary swap, the approval
 join — and any divergence between the two clients silently produced a
 different rendering for the same task.
@@ -74,7 +74,7 @@ remote previews, screen readers) would need the same translation code.
 
 ## Required Now
 
-- A typed `ChatBlock` discriminated union in `src/types.ts`. The
+- A typed `ChatBlock` discriminated union in `packages/runtime/src/types.ts`. The
   current set:
 
   ```ts
@@ -120,7 +120,7 @@ remote previews, screen readers) would need the same translation code.
   result already does). A browser screenshot or a promoted-file upload is
   surfaced this way. See ADR outbound-chat-attachments.md.
 
-- Persistence in `src/state/chat-blocks.ts`. SQLite is the source of
+- Persistence in `packages/runtime/src/state/chat-blocks.ts`. SQLite is the source of
   truth, not the JSON `RuntimeState` blob. `ordinal` is allocated as
   `MAX(ordinal) + 1` per `session_id` inside a `SAVEPOINT` transaction;
   the `UNIQUE (session_id, ordinal)` constraint is the last-line
@@ -151,8 +151,8 @@ remote previews, screen readers) would need the same translation code.
   agent-decided routing (`start_thread` control tool + `<route>thread</route>`
   fallback).
 
-- Emission in `src/execution/chat-task.ts` via helpers in
-  `src/execution/chat-task-emit.ts`. The loop resolves an emission
+- Emission in `packages/runtime/src/execution/chat-task.ts` via helpers in
+  `packages/runtime/src/execution/chat-task-emit.ts`. The loop resolves an emission
   context once per `runLoop` entry (`(instance, sessionId, agentId,
   runId)`) and threads emit calls through the existing mutation points
   rather than scattering SQLite writes inline. Tasks without a chat
@@ -226,12 +226,12 @@ remote previews, screen readers) would need the same translation code.
 
 - Tool catalog labels live with the catalog. `displayLabel` on each
   `TOOL_DEFS` entry plus `chatBlockLabelFor` / `chatBlockArgsPreviewFor`
-  helpers in `src/execution/tool-catalog.ts` keep the per-tool
+  helpers in `packages/runtime/src/execution/tool-catalog.ts` keep the per-tool
   vocabulary in one place. `argsPreview` is capped at 80 chars (single
   bubble line on a phone); `argsFull` is the parsed JSON for
   "show full args" affordances, with credential-bearing keys
   (`apiKey`, `token`, `headers`, …) replaced by `[redacted]` via
-  `redactSensitiveToolArgs` (`src/execution/tool-args-redact.ts`). The
+  `redactSensitiveToolArgs` (`packages/runtime/src/execution/tool-args-redact.ts`). The
   same helper scrubs the resolved `self.config` approval payload, so a
   tool's secret args never persist to a client-rendered surface (the
   real values still reach the handler for execution). Browser ref tools
@@ -239,13 +239,13 @@ remote previews, screen readers) would need the same translation code.
   `argsPreview` by resolving the `@eN` ref to the snapshot element's
   role + name — e.g. `button "Buy a License"` instead of `@e38` — via an
   optional resolver `chatBlockArgsPreviewFor` accepts, wired at emit time
-  to the live browser session by `peekRefLabel` (`src/tools/browser.ts`).
+  to the live browser session by `peekRefLabel` (`packages/runtime/src/tools/browser.ts`).
   The opaque ref stays in `argsFull`, and the preview falls back to the
   bare ref when the element has no recorded name or the session is gone.
   jobId-only job tools (`run_job`, `delete_job`) use the same shape: a
   second optional resolver enriches `argsPreview` by resolving the
   `jobId` to the job's stored name — e.g. `Hydration reminder` instead of
-  `job_6e0fd00b` — wired at emit time to `listJobs` (`src/jobs`). A
+  `job_6e0fd00b` — wired at emit time to `listJobs` (`packages/runtime/src/jobs`). A
   model-supplied `name` (e.g. `create_job`) still wins, and the preview
   falls back to the bare id when the job can't be resolved. `terminal_exec`
   masks its `argsPreview` (returns `""`) because a raw shell command line is
@@ -254,13 +254,13 @@ remote previews, screen readers) would need the same translation code.
   expansion.
 
 - The SSE endpoint is its own handler (`chatBlockStream` in
-  `src/http.ts`), not a reuse of the existing global `eventStream`.
+  `packages/runtime/src/http.ts`), not a reuse of the existing global `eventStream`.
   The global stream polls the runtime ring buffer; the per-session
   chat stream subscribes to an `EventEmitter` keyed on
   `(instance, sessionId)` so each browser tab only receives its
   session's traffic and reconnects don't replay unrelated activity.
 
-- Cascade delete. `deleteChatSession` in `src/state/records.ts` clears
+- Cascade delete. `deleteChatSession` in `packages/runtime/src/state/records.ts` clears
   the matching `chat_blocks` rows so a deleted session doesn't leave
   orphan rows the `/blocks` endpoint would surface after re-create.
   Best-effort: a SQLite open failure during the cascade does not
@@ -275,7 +275,7 @@ remote previews, screen readers) would need the same translation code.
    run unchanged. The runtime dual-publishes during the migration
    window.
 
-2. **Phase 2 (web):** rewrite `web/src/app/chat/page.tsx` to fetch
+2. **Phase 2 (web):** rewrite `packages/web/src/app/chat/page.tsx` to fetch
    `/api/chat/:id/blocks` and subscribe to `/api/chat/:id/stream`.
    The legacy `MessageBubble`, `PhaseIndicator`, and `ApprovalActions`
    components either retire or get embedded inside per-block
@@ -340,7 +340,7 @@ remote previews, screen readers) would need the same translation code.
     `AbortSignal`; `cancelTask` aborts it at the source so the in-flight
     provider fetch + stream reader stop immediately (rejecting with an
     `AbortError`) instead of producing deltas until the connection's
-    natural end (see `src/execution/turn-abort.ts`). As defense-in-depth
+    natural end (see `packages/runtime/src/execution/turn-abort.ts`). As defense-in-depth
     for the brief window before the abort unwinds the stream, the streaming
     flush re-checks terminal status and drops post-cancel deltas (no new
     `assistant_text` block is born after the cancel); the same
@@ -390,8 +390,8 @@ remote previews, screen readers) would need the same translation code.
     the canonical title without a separate REST round-trip) and again
     whenever the session is renamed — both via `PATCH /api/chat/:id`
     and via the auto-rename path in
-    `src/execution/chat.ts:autoRenameChatAfterTurn`. The pub/sub lives
-    in `src/state/chat-session-events.ts`; publishers fire **after**
+    `packages/runtime/src/execution/chat.ts:autoRenameChatAfterTurn`. The pub/sub lives
+    in `packages/runtime/src/state/chat-session-events.ts`; publishers fire **after**
     `mutateState` resolves so subscribers only observe durable
     records, matching the chat-block post-commit semantics. The
     `chat_session` event has no `id:` line and is not part of the
@@ -471,15 +471,15 @@ Con:
 
 ## Acceptance Checks
 
-- `bun test src/state/chat-blocks.test.ts` covers ordinal allocation,
+- `bun test packages/runtime/src/state/chat-blocks.test.ts` covers ordinal allocation,
   upsert idempotence, the callId-based tool_call lookup, cursor-based
   list, subscriber isolation, and cascade delete.
-- `bun test src/execution/chat-task.test.ts` covers the
+- `bun test packages/runtime/src/execution/chat-task.test.ts` covers the
   end-to-end block emission for a tool-calling turn, the action field
   on `approval_requested`, parallel-fan-out distinct callIds and
   ordinals, the subagent emission skip, cancellation system_notes,
   and `deleteChatSession` cascade.
-- `bun test src/http.test.ts` smoke-tests `GET /blocks` and `GET
+- `bun test packages/runtime/src/http.test.ts` smoke-tests `GET /blocks` and `GET
   /stream` including the 404 paths and SSE frame shape.
 - The live-gateway verification (kigali instance) confirms the
   protocol works end-to-end: a chat session POST + message produces

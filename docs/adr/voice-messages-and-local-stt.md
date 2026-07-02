@@ -14,7 +14,7 @@ model/provider — the agent is text-based, so audio is a render-only
 artifact, not model input.
 
 Transcription is a new local-model capability that mirrors the
-embeddings/reranker pattern (`src/stt.ts`): in-process Transformers.js
+embeddings/reranker pattern (`packages/runtime/src/stt.ts`): in-process Transformers.js
 running `onnx-community/whisper-small` at `q8` by default, lazy-loaded on
 first use, cached under the shared `~/.gini/models` dir. Selection is
 env-driven (`GINI_STT_PROVIDER` = `local` | `echo`, default `local`;
@@ -58,8 +58,8 @@ images) — it has no audio input. Two boundaries had to be decided:
 
 ## Required Now
 
-- **`src/stt.ts`** — `SttProvider` abstraction with `local` and `echo`
-  implementations, mirroring `src/embeddings.ts`/`src/reranker.ts`
+- **`packages/runtime/src/stt.ts`** — `SttProvider` abstraction with `local` and `echo`
+  implementations, mirroring `packages/runtime/src/embeddings.ts`/`packages/runtime/src/reranker.ts`
   (lazy dynamic import, warn-once, `~/.gini/models` cache, a test seam).
   A pure-JS WAV decoder reads the RIFF header and yields a
   `Float32Array` of 16 kHz mono samples (16-bit PCM, stereo downmix,
@@ -130,19 +130,19 @@ Con:
 
 ## Acceptance Checks
 
-- `bun test src/stt.test.ts` covers provider selection, the WAV decoder
+- `bun test packages/runtime/src/stt.test.ts` covers provider selection, the WAV decoder
   (downmix, resample, rejected formats/sample-rates), dtype-aware
   readiness, and the local provider via the test seam (including that a
   load failure rejects rather than echoing a placeholder).
-- `bun test src/execution/chat.test.ts` covers transcribe-on-submit,
+- `bun test packages/runtime/src/execution/chat.test.ts` covers transcribe-on-submit,
   rejection of failed/empty transcriptions, stored-mime validation of
   the audio attachment, and the post-transcription session re-check.
-- `bun test src/http.test.ts` covers `GET /api/uploads/:id` range
+- `bun test packages/runtime/src/http.test.ts` covers `GET /api/uploads/:id` range
   semantics: full-body `200` with `Accept-Ranges`, bounded/mid/open-ended/
   suffix `206` slices with the right `Content-Range`, end clamping, `416`
   for a start past EOF (and a zero-byte file), and malformed ranges
   falling back to the full body. `HEAD` advertises `Accept-Ranges`.
-- `bun test mobile/src/components/chat/BlockUserText.test.tsx` covers the
+- `bun test packages/mobile/src/components/chat/BlockUserText.test.tsx` covers the
   voice bubble's play/pause toggle — including that replaying a finished
   clip rewinds to 0 (awaiting `seekTo`) **before** `play()`, so the
   AVQueuePlayer restarts at the beginning instead of at the end.

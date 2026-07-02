@@ -78,7 +78,7 @@ greenfield build:
 
 ### Session kind
 
-`ChatSessionRecord.kind` (`src/types.ts`) extends from `"agent" | "channel"` to add
+`ChatSessionRecord.kind` (`packages/runtime/src/types.ts`) extends from `"agent" | "channel"` to add
 **`"topic"`** — and **Chat is the existing `kind:"agent"` session**, kept as-is (it is
 already the single always-present per-agent chat). We deliberately do **not** rename
 `"agent"`→`"chat"`: `kind` is consulted in dozens of value checks across the gateway, web,

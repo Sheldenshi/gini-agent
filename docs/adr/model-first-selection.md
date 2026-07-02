@@ -13,7 +13,7 @@ reachable through more than one connected provider.
 
 Three pieces implement this:
 
-1. **A model-major catalog view.** `buildModelCatalog` (`src/model-routes.ts`)
+1. **A model-major catalog view.** `buildModelCatalog` (`packages/runtime/src/model-routes.ts`)
    folds the configured slice of `providerCatalogWithStatus()` into
    `ModelCatalogEntry[]` — canonical model ids, each with its
    `ModelRoute[]` (`{ provider, providerModelId, label, default }`). Exposed
@@ -24,7 +24,7 @@ Three pieces implement this:
    model vendor's own API first (`openai`, `anthropic`, `deepseek`), then
    `codex`, then the metered clouds (`azure`, `bedrock`), then the
    deliberate opt-ins (`openrouter`, `local`).
-2. **One shared picker.** `web/src/components/ModelPicker.tsx` renders a
+2. **One shared picker.** `packages/web/src/components/ModelPicker.tsx` renders a
    collapsed trigger leading with the serving route's brand icon and the
    model name, with the route spelled out ("gpt-5.5 · Codex") — the model
    name alone can't say whether gpt-5.5 rides Codex or OpenAI, so the route
@@ -36,11 +36,11 @@ Three pieces implement this:
    brand-iconed, with the default tagged. Picking a model name takes its
    default route; picking a route in the flyout takes that exact pair. The
    brand icons come from the shared `PROVIDER_ICONS` map
-   (`web/src/components/provider-logos.tsx`), which the Settings provider
+   (`packages/web/src/components/provider-logos.tsx`), which the Settings provider
    rows reuse. The same component serves the Settings page and the
    per-agent chat Settings tab.
 3. **A default-model write path that updates both layers and detaches
-   followers.** `setDefaultModel` (`src/runtime/default-model.ts`), exposed
+   followers.** `setDefaultModel` (`packages/runtime/src/runtime/default-model.ts`), exposed
    at `POST /api/settings/default-model` with body `{ provider, model }`,
    writes `RuntimeConfig.provider` via `setSetupProvider` (preserving stored
    transport config on a same-provider save) **and** mirrors the persisted
@@ -74,7 +74,7 @@ provider row first, then a model from that provider's list. Two problems:
   and Azure). Provider-first UI made the common case (pick a model) two
   decisions deep and hid the equivalence between routes.
 - **The "active provider" radio was inert for the default chat.**
-  `seedDefaultAgentFromConfig` (`src/state/store.ts`) seeds `agent_default`'s
+  `seedDefaultAgentFromConfig` (`packages/runtime/src/state/store.ts`) seeds `agent_default`'s
   override from `config.provider` on boot, and that override wins in
   `resolveEffectiveContext` from then on. Writing only `config.provider`
   (all the radio did) therefore did not change what the default chat — or
@@ -86,7 +86,7 @@ provider row first, then a model from that provider's list. Two problems:
 
 There is no upstream source of truth for "these provider-specific ids are
 the same model", so the mapping is a small hand-curated table in
-`src/model-routes.ts` — explicit alias entries only, no prefix-stripping
+`packages/runtime/src/model-routes.ts` — explicit alias entries only, no prefix-stripping
 heuristics, so a new catalog id can never silently merge with the wrong
 model. Unaliased ids (Nova, Llama, Mistral profiles, `openrouter/auto`)
 surface verbatim as their own single-route entries. Adding a catalog model
@@ -162,16 +162,16 @@ catalog.
 
 ## Critical Files
 
-- `src/model-routes.ts` — model-major catalog fold, alias table, route
+- `packages/runtime/src/model-routes.ts` — model-major catalog fold, alias table, route
   priority.
-- `src/runtime/default-model.ts` — two-layer default-model write.
-- `src/http.ts` — `GET /api/providers/models`,
+- `packages/runtime/src/runtime/default-model.ts` — two-layer default-model write.
+- `packages/runtime/src/http.ts` — `GET /api/providers/models`,
   `POST /api/settings/default-model`.
-- `src/types.ts` — `ModelRoute`, `ModelCatalogEntry`.
-- `web/src/components/ModelPicker.tsx` — the shared picker (trigger, search
+- `packages/runtime/src/types.ts` — `ModelRoute`, `ModelCatalogEntry`.
+- `packages/web/src/components/ModelPicker.tsx` — the shared picker (trigger, search
   list, route flyout).
-- `web/src/app/settings/_components/DefaultModelControl.tsx` — Settings
+- `packages/web/src/app/settings/_components/DefaultModelControl.tsx` — Settings
   "Default model" control.
-- `web/src/app/settings/_components/ProviderCard.tsx` — provider rows,
+- `packages/web/src/app/settings/_components/ProviderCard.tsx` — provider rows,
   credential management only.
-- `web/src/components/chat/SettingsTab.tsx` — per-agent picker surface.
+- `packages/web/src/components/chat/SettingsTab.tsx` — per-agent picker surface.

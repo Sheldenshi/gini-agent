@@ -34,14 +34,14 @@ self-descriptively.
 
 ## Required Now
 
-- **Catalog (`src/execution/tool-catalog.ts`).** A def carries `deferred?: boolean`
+- **Catalog (`packages/runtime/src/execution/tool-catalog.ts`).** A def carries `deferred?: boolean`
   and `indexSummary?: string`. Pure helpers: `applyDeferralFilter(catalog,
   loaded)` drops deferred-and-unloaded tools; `deferredToolIndex(catalog,
   loaded)` returns `{name, summary}` for deferred-and-unloaded tools;
   `resolveLoadableTools` / `handleLoadTools` validate requested names and build
   the load result envelope. `load_tools` is a core tool (toolset `core`, never
   deferred) that bypasses toolset gating.
-- **Loop (`src/execution/chat-task.ts`).** `load_tools` is handled INLINE in
+- **Loop (`packages/runtime/src/execution/chat-task.ts`).** `load_tools` is handled INLINE in
   the dispatch loop, not via the dispatch switch: it unions the requested names
   into a per-task loaded set, recomputes the provider `tools` array so the NEXT
   provider call ships the new schemas, and persists the set on

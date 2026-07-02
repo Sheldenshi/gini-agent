@@ -18,7 +18,7 @@ The runtime classifies the failure, tags it with the provider that served the
 turn, and stamps the chat block so every client renders the same thing:
 
 - `ProviderAuthError` originates in two places:
-  - The provider layer (`src/provider.ts`) throws it directly, with the
+  - The provider layer (`packages/runtime/src/provider.ts`) throws it directly, with the
     provider name fixed at the throw site, for credential failures detected
     before or without a backend rejection: anthropic's missing env key
     (`readAnthropicKey`), bedrock's unresolved AWS credentials
@@ -28,14 +28,14 @@ turn, and stamps the chat block so every client renders the same thing:
     after `withCodexSessionRetry`'s single retry into
     `ProviderAuthError("codex")`: a persistent auth.json read failure is
     classified as a credential problem, not a mid-write race.
-  - The provider-call sites (`src/execution/chat-task.ts` — both the main
+  - The provider-call sites (`packages/runtime/src/execution/chat-task.ts` — both the main
     loop call and the iteration-cap summary call) wrap a backend-rejected
     credential only when the error is not already a `ProviderAuthError` and
     `isAuthExpiredError` matches its message, carrying the provider from the
     effective context — accurate even if the active agent changed while the
     call was in flight.
 - Enrichment is keyed on that typed error, not on message-sniffing. `failTask`
-  (`src/agent.ts`) and the iteration-cap path enrich a failure **only** when the
+  (`packages/runtime/src/agent.ts`) and the iteration-cap path enrich a failure **only** when the
   error is a `ProviderAuthError`, so a tool/browser/terminal failure whose text
   merely mentions "401" is never misread as a provider re-auth. They persist
   `task.authErrorProvider` and emit a `system_note` whose `authError` carries
@@ -45,7 +45,7 @@ turn, and stamps the chat block so every client renders the same thing:
 - The raw provider message is run through `redactSecrets` before it is stored
   (`task.error`, audit) or rendered (`detail`), since some providers echo a
   partial key in their error.
-- `providerReauth(name)` (`src/provider.ts`) derives `reauthKind`/`reauthUrl`
+- `providerReauth(name)` (`packages/runtime/src/provider.ts`) derives `reauthKind`/`reauthUrl`
   from the catalog `auth` field — the single place the routing lives.
 - The web `BlockSystemNote` renders the alert card + CTA (and falls back to the
   Settings form if a legacy row lacks the routing fields; `rowToBlock` also
@@ -53,7 +53,7 @@ turn, and stamps the chat block so every client renders the same thing:
   doc section inline via `DocReference` (ADR in-app-doc-references.md) rather
   than a new tab; the hosted URL it carries remains the source of the prose and
   the Open full docs ↗ target. Text-only clients (CLI, messaging) get the same
-  actionable line via `syncChatTaskResult` (`src/execution/chat.ts`), which
+  actionable line via `syncChatTaskResult` (`packages/runtime/src/execution/chat.ts`), which
   reads `task.authErrorProvider`.
 
 ### Persistent needs-reauth state (issue #233)
@@ -71,8 +71,8 @@ therefore also persists a per-provider auth-failure record:
   on `RuntimeState`, so legacy state files need no migration.
 - **Write seams.** The same two places that stamp `task.authErrorProvider`
   write the record via `recordProviderAuthFailure`
-  (`src/state/provider-auth.ts`): `failTask` (`src/agent.ts`) and the
-  chat-task summary-failure path (`src/execution/chat-task.ts`, which settles
+  (`packages/runtime/src/state/provider-auth.ts`): `failTask` (`packages/runtime/src/agent.ts`) and the
+  chat-task summary-failure path (`packages/runtime/src/execution/chat-task.ts`, which settles
   the task itself rather than routing through `failTask`). Repeated failures
   refresh the record's detail/timestamp; the `provider.auth.needs_reauth`
   audit/event fires only on the ok→needs_reauth transition.
@@ -108,7 +108,7 @@ therefore also persists a per-provider auth-failure record:
 - **Exposure.** `GET /api/providers/catalog` enriches each row with
   `authStatus: "ok" | "needs_reauth"` plus, when flagged, a `reauth` payload
   `{ detail, at, reauthKind, reauthUrl }` (`withProviderAuthStatus`,
-  `src/provider.ts`) — the same `providerReauth` routing the chat note
+  `packages/runtime/src/provider.ts`) — the same `providerReauth` routing the chat note
   carries, derived at read time. Settings → Providers renders needs-reauth
   rows with an amber "Needs re-authentication" status, the redacted detail,
   and a kind-routed CTA (docs slide-over for `docs`, the row's key-edit
@@ -117,7 +117,7 @@ therefore also persists a per-provider auth-failure record:
   `provider.auth.*` events invalidate the web `providers` query through the
   runtime stream so an open Settings page updates live.
 - **Connector-probe honesty.** The codex connector probe
-  (`src/integrations/connectors/codex.ts`) resolves credentials through the
+  (`packages/runtime/src/integrations/connectors/codex.ts`) resolves credentials through the
   provider's own reader (`probeCodexCredentials`, honoring `CODEX_AUTH_JSON`)
   instead of a bare `existsSync(~/.codex/auth.json)`, and decodes the OAuth
   access token's JWT `exp` claim locally: an expired token probes unhealthy
@@ -164,7 +164,7 @@ avoids that entirely.
   `## Re-authentication` section; the URL is derived by convention
   (`/providers/<id>#re-authentication`, the heading's natural slug), so no per-provider routing data is added.
 - The runtime owns `reauthUrl`, so clients stay dumb. The hosted-docs base URL
-  is a constant in `src/provider.ts`. The web client derives the inline doc path
+  is a constant in `packages/runtime/src/provider.ts`. The web client derives the inline doc path
   from that URL (ADR in-app-doc-references.md); the runtime contract is
   unchanged.
 

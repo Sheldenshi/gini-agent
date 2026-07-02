@@ -47,7 +47,7 @@ panel to refetch the request list over SSE; the panel also polls as a backstop.
 ### The session IS a `PairedDevice`
 
 A relay browser session is a `PairedDevice` row (`state.devices`,
-`src/state/records.ts`), the same revocable, hashed-token credential the
+`packages/runtime/src/state/records.ts`), the same revocable, hashed-token credential the
 code-claim mobile flow mints. The `gini_session` cookie value is the device
 token. The relay cookie gate validates it via `findActiveSessionByToken`
 (`resolveSessionFromCookie`); presented as a `Bearer`, the same token resolves via
@@ -146,7 +146,7 @@ outcome). Only the device-pairing routes (`request`, `request/:id*`,
 `requests*`) additionally pass through `webBoundRequestAllowed` for
 host/origin/CSRF trust; the two legacy routes do not (`POST /api/pairing` is
 bearer-gated, `POST /api/pairing/claim` is public + rate-limited only). The WS
-upgrade path (`src/server.ts`) mirrors the same relay session gate.
+upgrade path (`packages/runtime/src/server.ts`) mirrors the same relay session gate.
 
 The device rows above describe the **browser** client. A **verified native
 client** (the mobile app) reaches the same `request`/`request/:id*` routes
@@ -189,13 +189,13 @@ for the unpaired device.
 Legacy code creation (`POST /api/pairing`) is bearer-gated and is reached through
 the BFF (owner bearer), so any paired session can create codes.
 
-**Loopback dev-port bridge (`web/src/app/api/pairing/[...path]`).** In the
+**Loopback dev-port bridge (`packages/web/src/app/api/pairing/[...path]`).** In the
 gateway-fronted topology the browser is always on the gateway origin, so its
 same-origin `/api/pairing/*` calls reach the gateway natively and this BFF route
 never fires. But the inner Next dev server binds its own loopback port, and a page
 loaded from THAT origin sends its `/api/pairing` fetches to Next — which has no
 pairing route — so they 404 and the operator's approve/reject panel renders an
-empty queue. `web/src/lib/pairing-proxy.ts` bridges that gap for **loopback only**:
+empty queue. `packages/web/src/lib/pairing-proxy.ts` bridges that gap for **loopback only**:
 it forwards `/api/pairing/*` to the gateway behind the same `guardCsrf` the
 `/api/runtime` lane uses, carrying the browser's `gini_pair` / `gini_session`
 cookies (NOT a bearer — the browser must never hold the gateway token) and a
@@ -367,9 +367,9 @@ remote devices access interactively, one comparison at a time.
 
 `/pair` is a pre-auth entry point and must render regardless of provider-setup
 state and without the authenticated app shell: the web setup-gate
-(`web/src/proxy.ts`) exempts `/pair` (otherwise an unpaired device loops
+(`packages/web/src/proxy.ts`) exempts `/pair` (otherwise an unpaired device loops
 `/pair → /setup` while the gateway loops `/setup → /pair`), and a client shell
-wrapper (`web/src/components/AppShell.tsx`) plus a gated `RuntimeStreamBridge`
+wrapper (`packages/web/src/components/AppShell.tsx`) plus a gated `RuntimeStreamBridge`
 keep the app's authenticated `/api/runtime/*` queries (which would 401) off the
 pairing screen.
 
@@ -380,7 +380,7 @@ pairing screen.
   are listed (device label, front, last-seen) and individually revocable in the
   Active Sessions UI. The list shows only `active`/`pending`/`expired` sessions;
   revoked rows survive in durable state for the audit trail but are filtered out
-  of the UI (`isListedSession`, `web/.../deviceStatus.ts`) — a revoked device can
+  of the UI (`isListedSession`, `packages/web/.../deviceStatus.ts`) — a revoked device can
   never become active again.
 - Re-pairing a device replaces its prior session rather than stacking a second
   live one beside it, so the Active Sessions list reflects the count of distinct
@@ -451,14 +451,14 @@ pairing screen.
   still supersedes its own prior session by `(origin, name)`.
 - `GET /.well-known/apple-app-site-association` returns the AASA JSON (with the
   configured app id) unpaired on both relay and loopback fronts, with no redirect.
-- State mutators are pinned by `src/state/pairing-requests.test.ts` (including
+- State mutators are pinned by `packages/runtime/src/state/pairing-requests.test.ts` (including
   supersede-on-re-pair and the `pairedDeviceIdentityKey`/`isSamePairedDevice`
-  predicates) and the heal sweep by `src/state/store.test.ts`
+  predicates) and the heal sweep by `packages/runtime/src/state/store.test.ts`
   (`dedupeStaleDeviceSessions`); the routes,
   gate, cookies, loopback enforcement, native-client path, AASA, and rate limiter
-  by `src/http-pairing.test.ts`; the governance wrappers by
-  `src/governance/pairing-requests.test.ts`; cookie + rate-limit helpers by
-  `src/lib/cookies.test.ts` and `src/lib/rate-limit.test.ts`; the `/pair`
-  setup-gate exemption by `web/src/proxy.test.ts`. On the mobile side, the native
-  handshake client is pinned by `mobile/src/pairing.test.ts` and the universal-link
-  rewrite by `mobile/src/relay-link.test.ts`.
+  by `packages/runtime/src/http-pairing.test.ts`; the governance wrappers by
+  `packages/runtime/src/governance/pairing-requests.test.ts`; cookie + rate-limit helpers by
+  `packages/runtime/src/lib/cookies.test.ts` and `packages/runtime/src/lib/rate-limit.test.ts`; the `/pair`
+  setup-gate exemption by `packages/web/src/proxy.test.ts`. On the mobile side, the native
+  handshake client is pinned by `packages/mobile/src/pairing.test.ts` and the universal-link
+  rewrite by `packages/mobile/src/relay-link.test.ts`.

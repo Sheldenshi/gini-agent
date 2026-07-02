@@ -22,8 +22,8 @@ Two producers write redacted reports into a local queue; neither files
 anything:
 
 - **Runtime crashes.** The gateway installs process-level `uncaughtException`
-  and `unhandledRejection` handlers (`src/runtime/crash-handlers.ts`, wired in
-  `src/server.ts`). On a crash the *dying* process, in order: appends a
+  and `unhandledRejection` handlers (`packages/runtime/src/runtime/crash-handlers.ts`, wired in
+  `packages/runtime/src/server.ts`). On a crash the *dying* process, in order: appends a
   structured `runtime.<event>` line to `runtime.jsonl` (so the crash is in the
   log stream even if the next step fails); builds a structured, redacted report
   — error name/message/stack, system context, and a bounded tail of
@@ -52,7 +52,7 @@ to publish lives entirely in the consent flow below.
 
 The report is **already redacted before it is written to the queue** — before
 it can be read by the agent or shown to the user. `buildCrashReport`
-(`src/runtime/crash-report.ts`) runs every text field through
+(`packages/runtime/src/runtime/crash-report.ts`) runs every text field through
 `redactReportText`, which scrubs:
 
 - the repo's existing browser secret patterns (`sk-…`, `ghp_…`,
@@ -91,8 +91,8 @@ outside the queue. There is no un-redacted path from the queue to GitHub.
 
 ### Consent flow: ask on restart, file through skills
 
-On gateway boot, `maybeAskAboutCrashes` (`src/runtime/crash-recovery.ts`, called
-best-effort from `src/server.ts`) decides whether to ask:
+On gateway boot, `maybeAskAboutCrashes` (`packages/runtime/src/runtime/crash-recovery.ts`, called
+best-effort from `packages/runtime/src/server.ts`) decides whether to ask:
 
 1. **Gate.** It returns immediately unless the instance is on the ask-allowlist
    **and** `supervisor()` is `"launchd"`. The allowlist defaults to the primary

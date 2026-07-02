@@ -15,7 +15,7 @@ verbatim, and stdout/web lines are returned as-is. A **"Redact for sharing"**
 toggle (default off) requests a redacted copy that is safe to attach to a bug
 report.
 
-The reader (`src/state/logs.ts`) is pure: `readLogTail(instance, stream, limit)`
+The reader (`packages/runtime/src/state/logs.ts`) is pure: `readLogTail(instance, stream, limit)`
 parses the JSONL stream into structured entries (skipping any unparseable line
 rather than throwing), returns the raw streams line-for-line, treats a missing
 file as an empty tail, and flags `truncated` when the file held more than
@@ -43,7 +43,7 @@ handshake, and an *unpaired* relay visitor never reaches the route.
 
 ### Redaction reuses the crash-report definition
 
-Share mode (`src/runtime/log-redaction.ts`) reuses `redactReportText` from
+Share mode (`packages/runtime/src/runtime/log-redaction.ts`) reuses `redactReportText` from
 [crash-reporting-and-issue-filing.md](crash-reporting-and-issue-filing.md) — the
 same `REPORT_SECRET_PATTERNS` plus literal `secrets.env` scrubbing that gates
 crash-report bodies before they reach a published GitHub issue. There is no
@@ -83,6 +83,6 @@ of relying on any externally-hosted link. This page is the resolution of #232.
 - Default (`redact` unset) returns runtime entries with the `data` payload
   intact; `redact=true` drops `data` and scrubs a planted `Bearer <token>` and a
   literal `secrets.env` value from messages/lines while leaving benign text.
-- The reader, redaction layer, and endpoint are pinned by `src/state/logs.test.ts`,
-  `src/runtime/log-redaction.test.ts`, and the `/api/logs` cases in
-  `src/http.test.ts`.
+- The reader, redaction layer, and endpoint are pinned by `packages/runtime/src/state/logs.test.ts`,
+  `packages/runtime/src/runtime/log-redaction.test.ts`, and the `/api/logs` cases in
+  `packages/runtime/src/http.test.ts`.

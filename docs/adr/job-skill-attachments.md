@@ -13,12 +13,12 @@ on every fire at 10x the token cost).
 The contract:
 
 - **One validation choke point.** `createScheduledJob` and `updateJob`
-  (`src/jobs/index.ts`) validate `skillNames` — shape up-front, registry
+  (`packages/runtime/src/jobs/index.ts`) validate `skillNames` — shape up-front, registry
   resolution inside the `mutateState` lock. Every surface (HTTP
   `POST /api/jobs` + `PATCH /api/jobs/<id>`, the agent's
   `create_job`/`update_job` tools, CLI via the HTTP API) delegates to those
   two functions, so they all validate identically. Resolution uses the same
-  semantics as the `read_skill` tool (`src/execution/tool-dispatch.ts`):
+  semantics as the `read_skill` tool (`packages/runtime/src/execution/tool-dispatch.ts`):
   exact name match, enabled bundled preferred over enabled user. An unknown
   or disabled name rejects with a typed `Invalid input: …` naming the bad
   entry so the agent can self-correct. On update the list is
@@ -60,9 +60,9 @@ the trace file — otherwise the model can flail or hallucinate a result the
 missing recipe would have produced, and the user reading the briefing sees no
 degradation signal. Skips surface on four layers:
 
-- **Run record.** `JobRunRecord.skillSkips` (`src/types.ts`) is the durable,
+- **Run record.** `JobRunRecord.skillSkips` (`packages/runtime/src/types.ts`) is the durable,
   structured record of what was skipped this fire. Both dispatch paths
-  (`dispatchPromptRun`, `dispatchFanOut` in `src/jobs/index.ts`) stamp it from
+  (`dispatchPromptRun`, `dispatchFanOut` in `packages/runtime/src/jobs/index.ts`) stamp it from
   `resolveJobSkillAttachments`' `skipped[]` when non-empty, so `/api/job-runs`
   and the jobs UI carry it without parsing the trace.
 - **In-prompt directive.** When some attachments were skipped,
@@ -72,7 +72,7 @@ degradation signal. Skips surface on four layers:
   model-awareness only — it does NOT ask the model to emit a user-facing
   notice (the deterministic surfaces below own that, avoiding double-noting).
   The all-skipped case still yields a block of just this directive.
-- **Chat system_note.** `finalizeJobRunFromTask` (`src/jobs/finalize.ts`)
+- **Chat system_note.** `finalizeJobRunFromTask` (`packages/runtime/src/jobs/finalize.ts`)
   captures the run's `skillSkips` inside its `mutateState` and, after the
   answer syncs, inserts **one** `system_note` ChatBlock into the job session
   (keyed `{sessionId, taskId, runId, threadId, parentBlockId}` so it lands
@@ -137,9 +137,9 @@ registry-resolved bodies at fire time. No new execution surface.
 
 ## Acceptance Checks
 
-- `bun test src/jobs/skill-attachments.test.ts` — create/update validation
+- `bun test packages/runtime/src/jobs/skill-attachments.test.ts` — create/update validation
   (unknown/disabled names rejected by name, 8-name cap, `[]`/`null` clear),
   fenced-block injection on both dispatch paths, skip-with-trace for a
   skill disabled after create, and 32k truncation with trace.
-- `bun test src/execution/tool-catalog.test.ts` — `create_job`/`update_job`
+- `bun test packages/runtime/src/execution/tool-catalog.test.ts` — `create_job`/`update_job`
   schemas carry the `skillNames` steering text.

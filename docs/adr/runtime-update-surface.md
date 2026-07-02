@@ -140,7 +140,7 @@ installer-origin guardrails rather than adding a browser-only shortcut.
   respawns it with the freshly checked-out code — no detached stop+start
   helper that would reparent and orphan the respawn outside supervision —
   plus detached `gini autostart kick` children re-exec the web service (for
-  any new `web/` dependencies) and the watchdog — the watchdog is a
+  any new `packages/web/` dependencies) and the watchdog — the watchdog is a
   long-lived probe loop, so neither KeepAlive (it never exits) nor the
   plist-stamp reconcile (the template is unchanged by a code-only update)
   would otherwise replace its process with the new code. Foreground /
@@ -175,7 +175,7 @@ installer-origin guardrails rather than adding a browser-only shortcut.
   `updateInProgress: true` exactly while an update is in flight; the
   update-in-progress marker exists exactly for the duration of
   `updateRuntime` (removed on success and on failure).
-- After a non-upToDate update, `web/` contains a `.next-prod-*` dir keyed to
+- After a non-upToDate update, `packages/web/` contains a `.next-prod-*` dir keyed to
   the new HEAD's short sha AND the previous HEAD's bundle (kept so a
   still-running server isn't pulled out from under it; strictly-older bundles
   are GC'd, and the previous one is reclaimed by a later update); a failed web

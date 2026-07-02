@@ -1,13 +1,8 @@
 version: 2
 updates:
+  # The workspace root lockfile covers every package (runtime, web, mobile).
   - package-ecosystem: bun
     directory: "/"
-    schedule:
-      interval: weekly
-    open-pull-requests-limit: 5
-
-  - package-ecosystem: bun
-    directory: "/web"
     schedule:
       interval: weekly
     open-pull-requests-limit: 5

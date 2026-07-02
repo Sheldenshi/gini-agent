@@ -10,7 +10,7 @@ levels of a recurring job (the dumb deterministic pre-run hook, and the single
 smart model turn): one detection pass feeds many independent concern workers. It
 is a **domain-agnostic** extension of the jobs + hooks primitives
 ([Pre-LLM Job Hooks](job-pre-run-hooks.md)) — the email watcher is the first
-consumer (see [Email Watch](email-watch.md)), but `src/jobs` and `src/hooks` carry
+consumer (see [Email Watch](email-watch.md)), but `packages/runtime/src/jobs` and `packages/runtime/src/hooks` carry
 zero email knowledge.
 
 The three layers a fan-out job runs through:
@@ -65,22 +65,22 @@ subagents — rather than adding a new one.
 
 ## Required Now
 
-- **Routed hook result (`src/hooks/`).** The `kind: "context"` `HookResult` carries
+- **Routed hook result (`packages/runtime/src/hooks/`).** The `kind: "context"` `HookResult` carries
   either a flat `items?: HookContextItem[]` OR `buckets?: Record<string, HookContextItem[]>`
   (exactly one). The runner renders each bucket through the SAME untrusted-content
   fence as a flat result (JSON-encode + sentinel-strip-to-fixpoint + per-item
   nonce-suffixed close delimiter + char-cap), producing `buckets: Record<string, string[]>`
   on the `HookOutcome`; `items`-only is byte-identical to before. The hooks layer
-  stays domain-free — it never imports `src/jobs`, `src/state`, or any domain
+  stays domain-free — it never imports `packages/runtime/src/jobs`, `packages/runtime/src/state`, or any domain
   handler. (See [Pre-LLM Job Hooks](job-pre-run-hooks.md).)
-- **`JobRecord.routes` + `JobRoute` (`src/types.ts`).**
+- **`JobRecord.routes` + `JobRoute` (`packages/runtime/src/types.ts`).**
   `JobRoute = { chatSessionId: string; systemPrompt?; toolsets?; skills?; prompt? }`
   and `JobRecord.routes?: Record<string, JobRoute>` map a `routeKey` to where/how
   that bucket's worker dispatches. Domain-agnostic and optional: a job with no
   `routes` and a hook returning a flat `items[]` behaves EXACTLY as today (one
   turn into `job.chatSessionId`). An unmapped routeKey falls back to
   `job.chatSessionId` (audited `job.route.missing`).
-- **Fan-out dispatch in the scheduler (`src/jobs/`).** When a pre-run hook returns
+- **Fan-out dispatch in the scheduler (`packages/runtime/src/jobs/`).** When a pre-run hook returns
   non-empty `buckets`, `runDueJobs` and `runJobNow` take the fan-out path instead
   of the single `dispatchPromptRun`:
   - `dispatchFanOut` iterates the non-empty buckets. For each, it resolves the
@@ -139,7 +139,7 @@ subagents — rather than adding a new one.
   because the UI renders chat BLOCKS, the in-flight `assistant_text` block is also
   retracted when the final text reads as silent — the literal token, or a trailing
   standalone `[SILENT]` line after a no-op preamble (a leading/inline sentinel like
-  `[SILENT] but here's an update` still delivers; see `src/jobs/silent.ts`) — so the
+  `[SILENT] but here's an update` still delivers; see `packages/runtime/src/jobs/silent.ts`) — so the
   channel never shows a literal `[SILENT]` row, and the durable-message persistence
   above skips it identically.
 
@@ -170,7 +170,7 @@ subagents — rather than adding a new one.
 
 ## Verification
 
-- `bun test src/jobs/fanout.test.ts` pins the scheduler fan-out: two non-empty
+- `bun test packages/runtime/src/jobs/fanout.test.ts` pins the scheduler fan-out: two non-empty
   buckets dispatch two workers into two sessions (each carrying its route prompt +
   bucket context; the job session gets none); one run, finalized completed; both
   sub-states committed. An empty bucket spawns no worker. A deleted route session
@@ -180,9 +180,9 @@ subagents — rather than adding a new one.
   route spawns a PARENTLESS subagent whose `SubagentRecord` carries the route's
   systemPrompt + toolset whitelist. A bucket that advanced its cursor but spawned
   no worker still commits its fresh slice (silent-advance at-least-once).
-- `bun test src/hooks/hooks.test.ts` pins the routed render: a `buckets` context
+- `bun test packages/runtime/src/hooks/hooks.test.ts` pins the routed render: a `buckets` context
   renders each bucket through the fence with its own nonce-suffixed close marker
   (distinct nonces); a flat `items` result leaves `buckets` absent.
-- `bun test src/hooks/boundary.test.ts` pins that `src/hooks` imports no
-  `src/jobs`/`src/state`/email/gmail module — the fan-out carrier stays
+- `bun test packages/runtime/src/hooks/boundary.test.ts` pins that `packages/runtime/src/hooks` imports no
+  `packages/runtime/src/jobs`/`packages/runtime/src/state`/email/gmail module — the fan-out carrier stays
   domain-free.

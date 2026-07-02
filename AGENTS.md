@@ -6,6 +6,8 @@ These instructions apply to the whole repository unless a nested `AGENTS.md` ove
 
 Gini is a Bun TypeScript personal agent runtime. The gateway owns durable state and execution; CLI, Next.js, future mobile, MCP, messaging, and scripts are clients of the same `/api/*` contract.
 
+The repository is a Bun workspaces monorepo: the root `package.json` is a private workspace root (single `bun.lock`, shared dependency versions via the workspace `catalog`), with `packages/runtime` (`@gini/runtime`, the gateway + CLI), `packages/web` (`@gini/web`, the Next.js control plane), and `packages/mobile` (`@gini/mobile`, the Expo app). Bundled `skills/`, `docs/`, `scripts/`, `vendor/`, and `patches/` live at the repository root, which the runtime discovers by walking up to the workspace marker (`projectRoot()` in `packages/runtime/src/paths.ts`). Run `bun install` once at the root — it covers every package. See ADR bun-workspaces-monorepo.md.
+
 Start with `README.md` for the docs index. Keep `docs/whitepaper.md`, `docs/architecture-overview.md`, focused docs, and `docs/adr/` in sync with architecture changes.
 
 ## ADRs
@@ -22,13 +24,13 @@ Keep ADRs current when architecture changes.
 ## Boundaries
 
 - Prefer existing module patterns over new abstractions.
-- API handlers should delegate behavior to bounded runtime modules (`src/execution`, `src/memory`, `src/jobs`, `src/hooks`, `src/governance`, `src/capabilities`, `src/integrations`, `src/runtime`).
-- Storage and low-level persistence belong in `src/state/*`.
+- API handlers should delegate behavior to bounded runtime modules (`packages/runtime/src/execution`, `packages/runtime/src/memory`, `packages/runtime/src/jobs`, `packages/runtime/src/hooks`, `packages/runtime/src/governance`, `packages/runtime/src/capabilities`, `packages/runtime/src/integrations`, `packages/runtime/src/runtime`).
+- Storage and low-level persistence belong in `packages/runtime/src/state/*`.
 - CLI commands should prefer the public runtime API for product behavior.
 - Browser code must not receive gateway bearer tokens; token injection stays server-side in the Next.js BFF.
 - Side-effecting tools must preserve approval, audit, and trace behavior.
 - Instance-aware paths, ports, logs, and state must remain isolated.
-- Skill scripts (`skills/**/scripts/*.ts`) are first-class code: typechecked via the root `tsconfig` and run by `bun run test` (which spans `./skills`). Put a script's tests in `<skill>/scripts/__tests__/` — never directly in `scripts/`, which the loader advertises as runnable scripts — and keep scripts self-contained (no `src/` imports) so the skill stays portable; export a pure function and import it from the test when you need coverage.
+- Skill scripts (`skills/**/scripts/*.ts`) are first-class code: typechecked via the root `tsconfig` and run by `bun run test` (which spans `./skills`). Put a script's tests in `<skill>/scripts/__tests__/` — never directly in `scripts/`, which the loader advertises as runnable scripts — and keep scripts self-contained (no `packages/runtime/src/` imports) so the skill stays portable; export a pure function and import it from the test when you need coverage.
 
 ## Branches
 
@@ -78,8 +80,8 @@ rg -n "v0|v1|v2|v3|lane|v1-readiness|single HTML|src/state\\.ts|src/api" README.
 
 After a UI-related change or new feature, verify it end-to-end by driving the real running app the way the user would — through the browser — before declaring the task done. You are the user here: open the app, get to the change, and exercise it in context. Depending on the change, that's a **visual inspection** (does it render correctly — take a `screenshot` and look at it), a **flow** check (does the interaction path actually work — click, type, and navigate through it), or both.
 
-- Web changes (`web/`): run the Next.js dev server and drive it in a browser with `agent-browser` (run `agent-browser skills get dogfood` first for the exploratory-QA workflow, or `skills get core` for the command reference). Walk the flow by `@ref` from `snapshot -i`, wait with `--load networkidle`, `screenshot` to eyeball the result, and check `errors`/`console` per page.
-- Mobile changes (`mobile/`): run it on the iOS simulator (`bun run mobile:ios`) AND in the RN Web target (`cd mobile && bun run web`). The web target lets `agent-browser` drive the actual UI (flow and visual check); the iOS simulator is what catches native-only behavior (long-press selection, gesture handling, native text input, etc.).
+- Web changes (`packages/web/`): run the Next.js dev server and drive it in a browser with `agent-browser` (run `agent-browser skills get dogfood` first for the exploratory-QA workflow, or `skills get core` for the command reference). Walk the flow by `@ref` from `snapshot -i`, wait with `--load networkidle`, `screenshot` to eyeball the result, and check `errors`/`console` per page.
+- Mobile changes (`packages/mobile/`): run it on the iOS simulator (`bun run mobile:ios`) AND in the RN Web target (`cd packages/mobile && bun run web`). The web target lets `agent-browser` drive the actual UI (flow and visual check); the iOS simulator is what catches native-only behavior (long-press selection, gesture handling, native text input, etc.).
 - Shared changes that affect both: verify on both.
 
 Don't stop at typecheck — "it compiles" and "the screen loaded" are not "it works." Native RN behavior in particular often differs from RN Web (e.g. `selectable` on `<Text>` is a no-op on web because browser text is selectable by default), so a web-only check can pass while the native build is still broken.

@@ -49,7 +49,7 @@ The instance default approval mode is `"yolo"` (see
 [approval-mode.md](approval-mode.md)), a full bypass for every
 *approval-gated* tool. But `approvalMode` only governs **agent-actor**
 authorizations: only the `PolicyAction` subset flows through
-`resolveApprovalPolicy` (`src/execution/policy.ts`). SetupRequest actions are
+`resolveApprovalPolicy` (`packages/runtime/src/execution/policy.ts`). SetupRequest actions are
 **user-actor** and never call `resolveApprovalPolicy` — there is no auto-resolve
 path for them at any approval mode. `request_confirmation` is therefore
 yolo-immune by construction: minting a `confirmation.request` SetupRequest
@@ -84,7 +84,7 @@ irreversible action and asks the user what to change.
 
 ## When the model should reach for it
 
-The tool description, reinforced by `src/runtime/defaults/INSTRUCTIONS.md`,
+The tool description, reinforced by `packages/runtime/src/runtime/defaults/INSTRUCTIONS.md`,
 steers the model to call `request_confirmation` before any irreversible action
 that goes to another person, EVEN under yolo. Two carve-outs keep it from
 nagging or fabricating:

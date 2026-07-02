@@ -5,6 +5,7 @@ Each file in this directory captures one architecture decision: the context, the
 ## Index
 
 - [Local Runtime Architecture](local-runtime-architecture.md)
+- [Bun Workspaces Monorepo](bun-workspaces-monorepo.md)
 - [Approval And Audit Substrate](approval-and-audit-substrate.md) — supersedes [Trust Substrate](trust-substrate.md)
 - [Browser Fill-Secret Tool](browser-fill-secret.md)
 - [Browser Stealth Identity](browser-stealth-identity.md)

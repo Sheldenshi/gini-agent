@@ -161,20 +161,20 @@ in legacy code paths keeps working.
 
 ## Critical Files
 
-- `src/state/memory-db.ts` — schema bump, `agent_id` columns and
+- `packages/runtime/src/state/memory-db.ts` — schema bump, `agent_id` columns and
   indexes, `bankIdForAgent`, `ensureAgentBank`,
   `listMemoryUnits` filter.
-- `src/memory/recall.ts` — `RecallInput.agentId` required; all four
+- `packages/runtime/src/memory/recall.ts` — `RecallInput.agentId` required; all four
   channels filter on `agent_id`.
-- `src/memory/retain.ts`, `src/memory/reflect.ts` — required
+- `packages/runtime/src/memory/retain.ts`, `packages/runtime/src/memory/reflect.ts` — required
   `agentId`; stamp on write.
-- `src/memory/legacy.ts`, `src/agent.ts` — legacy `MemoryRecord`
+- `packages/runtime/src/memory/legacy.ts`, `packages/runtime/src/agent.ts` — legacy `MemoryRecord`
   flows resolve and stamp the active agent.
-- `src/state/store.ts` — `migrateMemoryAgentId` and
+- `packages/runtime/src/state/store.ts` — `migrateMemoryAgentId` and
   `migrateHindsightAgentIdColumns` in `normalizeState`.
-- `src/capabilities/agents.ts` — `createAgent` calls
+- `packages/runtime/src/capabilities/agents.ts` — `createAgent` calls
   `ensureAgentBank`.
-- `src/execution/effective-context.ts` — `memoryNamespace` surfaced
+- `packages/runtime/src/execution/effective-context.ts` — `memoryNamespace` surfaced
   alongside `agentId`.
-- `src/http.ts` — `/api/memory*` routes filter by active agent and
+- `packages/runtime/src/http.ts` — `/api/memory*` routes filter by active agent and
   reject when no agent is active for recall/retain/reflect.

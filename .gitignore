@@ -6,7 +6,7 @@ coverage/
 .playwright-mcp/
 .claude/*
 !.claude/skills/
-web/.next/
-web/.turbo/
-web/next-env.d.ts
-web/tsconfig.tsbuildinfo
+packages/web/.next/
+packages/web/.turbo/
+packages/web/next-env.d.ts
+packages/web/tsconfig.tsbuildinfo

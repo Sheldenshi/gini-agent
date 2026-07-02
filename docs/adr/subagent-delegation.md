@@ -60,7 +60,7 @@ calling, approvals, audit, and trace records for free.
   `toolsetIds?`, `skillNames?`, and result mirrors
   (`resultSummary?`, `resultError?`). A migration default in
   `normalizeState` backfills `systemPrompt = ""` for legacy rows.
-- `spawnSubagent` (in `src/capabilities/subagents.ts`) creates the
+- `spawnSubagent` (in `packages/runtime/src/capabilities/subagents.ts`) creates the
   record, submits a chat-mode child task with `parentTaskId` and
   `subagentId` set, and links the task back to the record. Default
   system prompt is a generic "focused subagent" preamble.
@@ -106,7 +106,7 @@ calling, approvals, audit, and trace records for free.
 
 A contiguous run of two or more `spawn_subagent` calls within one
 assistant turn (the threshold is the literal `j - i >= 2` in the
-batch-grouping scan in `src/execution/chat-task.ts`) is detected in the
+batch-grouping scan in `packages/runtime/src/execution/chat-task.ts`) is detected in the
 chat-task loop and dispatched together under `Promise.all`. The
 semantics:
 

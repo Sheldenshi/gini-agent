@@ -2,7 +2,7 @@
 
 ## Decision
 
-An **interactive-client** chat submission serializes its turns through a **per-session FIFO message queue owned by the gateway**. "Interactive client" means the web/mobile/CLI composer, where a human queues follow-ups while watching a turn run. While a session has an in-flight chat task, a newly posted interactive message is enqueued on the session record (`ChatSessionRecord.pendingMessages: PendingChatMessage[]` in `src/types.ts`) instead of starting a concurrent task. When the current turn ends — for any reason — the next queued message auto-dispatches as its own real chat turn (one per turn). The queue is part of durable session state and propagates to every client over the existing `chat_session` SSE event.
+An **interactive-client** chat submission serializes its turns through a **per-session FIFO message queue owned by the gateway**. "Interactive client" means the web/mobile/CLI composer, where a human queues follow-ups while watching a turn run. While a session has an in-flight chat task, a newly posted interactive message is enqueued on the session record (`ChatSessionRecord.pendingMessages: PendingChatMessage[]` in `packages/runtime/src/types.ts`) instead of starting a concurrent task. When the current turn ends — for any reason — the next queued message auto-dispatches as its own real chat turn (one per turn). The queue is part of durable session state and propagates to every client over the existing `chat_session` SSE event.
 
 The **messaging bridge** (Telegram/Discord inbound) bypasses the queue: each inbound message runs immediately, retaining its prior concurrent behavior by design (see "Why messaging bypasses the queue" below).
 
@@ -23,13 +23,13 @@ The gateway owns durable state and execution; web, mobile, CLI, and messaging br
 
 ## Data model
 
-`PendingChatMessage` (`src/types.ts`) is `{ id; content; images?; clientSurface?; threadId?; parentBlockId?; alsoToMain?; createdAt }`. Audio is intentionally absent: a voice message is transcribed to `content` during `prepareChatSubmission`, so only the resulting text plus image refs are queued. `threadId`/`parentBlockId`/`alsoToMain` are set only for a queued thread reply so auto-dispatch can re-run it inside its thread exactly as the run-now path would: dropping `threadId`/`parentBlockId` would drain the reply as a main-chat turn, and dropping `alsoToMain` would silently lose the reply's "also show in main chat" mirror. They are optional, so `pendingMessages` is optional on `ChatSessionRecord` and existing persisted state stays valid without a migration.
+`PendingChatMessage` (`packages/runtime/src/types.ts`) is `{ id; content; images?; clientSurface?; threadId?; parentBlockId?; alsoToMain?; createdAt }`. Audio is intentionally absent: a voice message is transcribed to `content` during `prepareChatSubmission`, so only the resulting text plus image refs are queued. `threadId`/`parentBlockId`/`alsoToMain` are set only for a queued thread reply so auto-dispatch can re-run it inside its thread exactly as the run-now path would: dropping `threadId`/`parentBlockId` would drain the reply as a main-chat turn, and dropping `alsoToMain` would silently lose the reply's "also show in main chat" mirror. They are optional, so `pendingMessages` is optional on `ChatSessionRecord` and existing persisted state stays valid without a migration.
 
-The state helpers operate on `RuntimeState` inside a `mutateState` callback, matching the sibling record helpers (`src/state/records.ts`): `enqueuePendingChatMessage`, `removePendingChatMessage`, `shiftPendingChatMessage`, and `sessionHasInFlightChatTask` (true when `state.tasks` has any task for the session whose status is not terminal — queued/running/waiting_approval all count as in-flight).
+The state helpers operate on `RuntimeState` inside a `mutateState` callback, matching the sibling record helpers (`packages/runtime/src/state/records.ts`): `enqueuePendingChatMessage`, `removePendingChatMessage`, `shiftPendingChatMessage`, and `sessionHasInFlightChatTask` (true when `state.tasks` has any task for the session whose status is not terminal — queued/running/waiting_approval all count as in-flight).
 
 ## Enqueue policy
 
-`submitChatMessage` (`src/execution/chat.ts`) runs `prepareChatSubmission` first, so audio transcription and content/image validation surface errors at enqueue time exactly as on the run-now path. It then enqueues when **either** the session has an in-flight chat task **or** its `pendingMessages` is already non-empty — the second condition keeps a later submit from jumping ahead of earlier queued messages while the current turn runs. On enqueue it appends inside `mutateState`, publishes the updated session via `publishChatSession`, and returns `{ sessionId, queued: true, pendingId }`. Otherwise it delegates to the shared run-now body.
+`submitChatMessage` (`packages/runtime/src/execution/chat.ts`) runs `prepareChatSubmission` first, so audio transcription and content/image validation surface errors at enqueue time exactly as on the run-now path. It then enqueues when **either** the session has an in-flight chat task **or** its `pendingMessages` is already non-empty — the second condition keeps a later submit from jumping ahead of earlier queued messages while the current turn runs. On enqueue it appends inside `mutateState`, publishes the updated session via `publishChatSession`, and returns `{ sessionId, queued: true, pendingId }`. Otherwise it delegates to the shared run-now body.
 
 An optional `{ bypassQueue: true }` skips the enqueue decision entirely and always runs now. Only the messaging bridge passes it (see "Why messaging bypasses the queue"); a function overload narrows the return type to the run-now shape for that caller so it gets a `taskId` without discriminating on `queued`. Interactive clients omit the option and keep the discriminated union.
 
@@ -45,10 +45,10 @@ Because `sessionHasInFlightChatTask` treats queued/running/**waiting_approval** 
 
 The chokepoint is fired from four owners, each gated to a top-level chat task (`task.mode === "chat" && task.chatSessionId && !task.parentTaskId`) and firing only AFTER the terminal state is committed:
 
-- **`submitTask` (`src/agent.ts`)** — the fire-and-forget `runTask(...)` chain gets a `.finally(...)` that calls the chokepoint. This covers an active run's normal completion, failure (the preceding `.catch(failTask)` runs first), and user cancel of a running turn. It also fires when a turn pauses for approval — `runChatTask` returns the non-terminal `waiting_approval` task, resolving the promise — but the in-flight guard makes that a deliberate no-op rather than a premature second turn.
-- **`resumeChatTask` (`src/execution/chat-task.ts`)** — after the resumed loop settles. An approval resume continues the turn inside this separate call path; its original `runTask` promise already resolved at the pause, so the `.finally` would never drain a queue stranded behind the resumed turn.
-- **`decideApproval` deny branch (`src/agent.ts`)** — the deny path flips the paused task to `failed` INLINE in its own `mutateState` (not via `failTask`), and its `runTask` promise already resolved at the pause, so the `.finally` doesn't fire for it.
-- **`cancelTask` (`src/agent.ts`)** — cancelling a `waiting_approval` task sets it terminal with no active `runTask` promise, so the `.finally` never fires for it.
+- **`submitTask` (`packages/runtime/src/agent.ts`)** — the fire-and-forget `runTask(...)` chain gets a `.finally(...)` that calls the chokepoint. This covers an active run's normal completion, failure (the preceding `.catch(failTask)` runs first), and user cancel of a running turn. It also fires when a turn pauses for approval — `runChatTask` returns the non-terminal `waiting_approval` task, resolving the promise — but the in-flight guard makes that a deliberate no-op rather than a premature second turn.
+- **`resumeChatTask` (`packages/runtime/src/execution/chat-task.ts`)** — after the resumed loop settles. An approval resume continues the turn inside this separate call path; its original `runTask` promise already resolved at the pause, so the `.finally` would never drain a queue stranded behind the resumed turn.
+- **`decideApproval` deny branch (`packages/runtime/src/agent.ts`)** — the deny path flips the paused task to `failed` INLINE in its own `mutateState` (not via `failTask`), and its `runTask` promise already resolved at the pause, so the `.finally` doesn't fire for it.
+- **`cancelTask` (`packages/runtime/src/agent.ts`)** — cancelling a `waiting_approval` task sets it terminal with no active `runTask` promise, so the `.finally` never fires for it.
 
 Each dispatched message becomes the new in-flight task; when IT settles the chain fires again, so the queue drains one message per turn. Subagent and imperative tasks are excluded — they have no session queue.
 
@@ -60,7 +60,7 @@ A negligible, documented residual race exists: between shifting the last pending
 
 ## Propagation
 
-Every queue mutation publishes the full session over the existing `chat_session` SSE event (`publishChatSession`, `src/state/chat-session-events.ts`) on the `/api/chat/:id/stream` socket, so the queue pill updates live on every subscribed client. No new event type is introduced.
+Every queue mutation publishes the full session over the existing `chat_session` SSE event (`publishChatSession`, `packages/runtime/src/state/chat-session-events.ts`) on the `/api/chat/:id/stream` socket, so the queue pill updates live on every subscribed client. No new event type is introduced.
 
 ## HTTP
 
@@ -69,7 +69,7 @@ Every queue mutation publishes the full session over the existing `chat_session`
 
 ## Why messaging bypasses the queue
 
-The Telegram/Discord pollers mirror the agent's reply back to the originating chat via a per-inbound-message task: `receiveMessagingInput` (`src/integrations/messaging.ts`) returns the `taskId` of the task it just created, and the poller's `maintainTypingAndMirrorReply` waits on exactly that task (`syncChatTaskResult`) to show "typing…" and send the reply out (`sendMessagingOutput`). That mirror is the only path that delivers the assistant's response back to the user.
+The Telegram/Discord pollers mirror the agent's reply back to the originating chat via a per-inbound-message task: `receiveMessagingInput` (`packages/runtime/src/integrations/messaging.ts`) returns the `taskId` of the task it just created, and the poller's `maintainTypingAndMirrorReply` waits on exactly that task (`syncChatTaskResult`) to show "typing…" and send the reply out (`sendMessagingOutput`). That mirror is the only path that delivers the assistant's response back to the user.
 
 A queued submit returns `{ queued: true }` with no `taskId` — the task is created later at auto-dispatch — so routing messaging through the interactive queue would strand the inbound message without a task for the mirror to wait on, and the agent's eventual reply would never be sent back. This is routine: a user double-texting, or two updates arriving in one poll batch, both produce an inbound message while a turn is already in flight.
 
@@ -77,12 +77,12 @@ So messaging passes `{ bypassQueue: true }` to `submitChatMessage` and always ru
 
 ## Acceptance checks
 
-- Idle session: `submitChatMessage` runs immediately (returns `taskId`, no `queued` flag); `pendingMessages` stays empty (`src/execution/chat-queue.test.ts`).
-- Busy session (a non-terminal chat task seeded on the session): `submitChatMessage` enqueues (`queued: true` + `pendingId`, `pendingMessages` grows, no second task) (`src/execution/chat-queue.test.ts`, `src/http.test.ts`).
-- A submit behind a non-empty queue with no running task still enqueues, preserving FIFO order (`src/execution/chat-queue.test.ts`).
-- `dispatchNextPendingChatMessage` pops FIFO and runs the next message once the session is idle (creates a task + user row for the popped content; the queue shrinks); it is a no-op on an empty queue (`src/execution/chat-queue.test.ts`).
-- The guard holds the queue while a turn is paused at `waiting_approval` (calling the chokepoint pops nothing and starts no second task), then drains the queued message once the paused task reaches a terminal status (`src/execution/chat-queue.test.ts`).
-- A thread reply posted while the session has an in-flight task enqueues (`queued: true`, no second task) with `threadId`/`parentBlockId` on the pending entry; auto-dispatch re-runs it back into the same thread (the dispatched task carries the original `threadId`) (`src/execution/chat-queue.test.ts`).
-- `removePendingChatMessageById` removes the right item and returns false for an unknown id; the DELETE route maps that to 404 (`src/execution/chat-queue.test.ts`, `src/http.test.ts`).
-- `bypassQueue: true` runs immediately even while a turn is in flight: it returns the run-now shape with a `taskId`, creates a new task, and leaves `pendingMessages` empty (`src/execution/chat-queue.test.ts`).
-- Two inbound bridge messages to the same session bypass the queue and each runs its own task immediately; both user rows land in order, synchronously (`src/integrations/messaging.test.ts`).
+- Idle session: `submitChatMessage` runs immediately (returns `taskId`, no `queued` flag); `pendingMessages` stays empty (`packages/runtime/src/execution/chat-queue.test.ts`).
+- Busy session (a non-terminal chat task seeded on the session): `submitChatMessage` enqueues (`queued: true` + `pendingId`, `pendingMessages` grows, no second task) (`packages/runtime/src/execution/chat-queue.test.ts`, `packages/runtime/src/http.test.ts`).
+- A submit behind a non-empty queue with no running task still enqueues, preserving FIFO order (`packages/runtime/src/execution/chat-queue.test.ts`).
+- `dispatchNextPendingChatMessage` pops FIFO and runs the next message once the session is idle (creates a task + user row for the popped content; the queue shrinks); it is a no-op on an empty queue (`packages/runtime/src/execution/chat-queue.test.ts`).
+- The guard holds the queue while a turn is paused at `waiting_approval` (calling the chokepoint pops nothing and starts no second task), then drains the queued message once the paused task reaches a terminal status (`packages/runtime/src/execution/chat-queue.test.ts`).
+- A thread reply posted while the session has an in-flight task enqueues (`queued: true`, no second task) with `threadId`/`parentBlockId` on the pending entry; auto-dispatch re-runs it back into the same thread (the dispatched task carries the original `threadId`) (`packages/runtime/src/execution/chat-queue.test.ts`).
+- `removePendingChatMessageById` removes the right item and returns false for an unknown id; the DELETE route maps that to 404 (`packages/runtime/src/execution/chat-queue.test.ts`, `packages/runtime/src/http.test.ts`).
+- `bypassQueue: true` runs immediately even while a turn is in flight: it returns the run-now shape with a `taskId`, creates a new task, and leaves `pendingMessages` empty (`packages/runtime/src/execution/chat-queue.test.ts`).
+- Two inbound bridge messages to the same session bypass the queue and each runs its own task immediately; both user rows land in order, synchronously (`packages/runtime/src/integrations/messaging.test.ts`).

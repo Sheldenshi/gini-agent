@@ -28,19 +28,19 @@ A pure-delta approach (tell once, then only emit changes forever) would minimize
 
 ## Required Now
 
-- `AgentIdentity` (in `src/types.ts`) carries the seven fields surfaced in the block. It is the snapshot unit and the runtime-time render input.
+- `AgentIdentity` (in `packages/runtime/src/types.ts`) carries the seven fields surfaced in the block. It is the snapshot unit and the runtime-time render input.
 - `IdentitySnapshotRecord` carries the last-emitted `AgentIdentity` plus `lastFullTurn: number`. The refresh trigger is `currentTurn - lastFullTurn >= IDENTITY_FULL_REFRESH_INTERVAL`.
 - `RuntimeState.identitySnapshots?: Record<string, IdentitySnapshotRecord>` keys on `conversationId` (the chat session id). The field is optional so legacy state files do not need a normalizeState migration; readers default to `{}`.
-- `decideIdentityEmission(current, snapshot, currentTurn)` (in `src/system-prompt.ts`) is the pure decision function. Three outcomes: full block + snapshot reset, delta block + snapshot identity advance (keeping `lastFullTurn`), or empty string + no snapshot change.
+- `decideIdentityEmission(current, snapshot, currentTurn)` (in `packages/runtime/src/system-prompt.ts`) is the pure decision function. Three outcomes: full block + snapshot reset, delta block + snapshot identity advance (keeping `lastFullTurn`), or empty string + no snapshot change.
 - `renderFullIdentity` and `renderIdentityDelta` produce the human-readable block content. The toolset list is sorted for stable output, and a missing `toolsetFilter` (no agent-level restriction) renders the actual enabled toolset names from `state.toolsets` — never `(none)` when the agent has unrestricted access.
-- `buildAgentIdentity(config, state, effective)` in `src/execution/chat-task.ts` is the gateway from runtime state into `AgentIdentity`. It resolves the agent name from `state.agents` and follows the existing `effectiveForAgent` pattern for provider/toolsets/memory namespace.
+- `buildAgentIdentity(config, state, effective)` in `packages/runtime/src/execution/chat-task.ts` is the gateway from runtime state into `AgentIdentity`. It resolves the agent name from `state.agents` and follows the existing `effectiveForAgent` pattern for provider/toolsets/memory namespace.
 - `runChatTask` computes the would-be snapshot but defers persistence. The deferred snapshot rides into `runLoop` as a parameter; `runLoop` commits it inside the same `mutateState` block that runs after the first successful `generateToolCallingResponse`. Subsequent iterations within the same `runLoop` entry never re-commit (the local variable is cleared after the first write).
 
 ## Boundary
 
 - **Subagents are excluded.** Subagents receive their own override prompt in `subagent.systemPrompt`; injecting parent identity into a subagent prompt would mislead the child about its own context. The identity block lives only on the parent chat-task path.
 - **Non-chat-session callers get the full block every turn.** When a chat-mode task has no `conversationId` (e.g. CLI/imperative entries that route through `runChatTask` without a chat session), there is no snapshot key to track against. These paths emit the full block unconditionally and skip snapshot persistence.
-- **Snapshot lifecycle follows the chat session.** `deleteChatSession` in `src/state/records.ts` drops `state.identitySnapshots[id]` alongside the session's chat messages, so deleted chats do not leak orphan snapshots.
+- **Snapshot lifecycle follows the chat session.** `deleteChatSession` in `packages/runtime/src/state/records.ts` drops `state.identitySnapshots[id]` alongside the session's chat messages, so deleted chats do not leak orphan snapshots.
 - **Snapshot persistence is gated on the model call.** Persistence happens only after the prompt actually reaches the provider. A task cancelled between `runChatTask`'s exit and `runLoop`'s first iteration leaves the snapshot untouched — the next turn computes its delta against the prior snapshot, which the model actually saw.
 
 ## Read and Write Semantics
@@ -77,8 +77,8 @@ A pure-delta approach (tell once, then only emit changes forever) would minimize
 
 ## Critical Files
 
-- `src/types.ts` — `AgentIdentity`, `IdentitySnapshotRecord`, `RuntimeState.identitySnapshots?`.
-- `src/system-prompt.ts` — `IDENTITY_FULL_REFRESH_INTERVAL`, `renderFullIdentity`, `renderIdentityDelta`, `decideIdentityEmission`; `renderEphemeralContext` renders the emitted-identity + recalled-memory tail body (`buildAgentSystemContext` builds only the stable prefix). See ADR stable-system-prefix.md.
-- `src/execution/chat-task.ts` — `buildAgentIdentity`, deferred snapshot persistence in `runChatTask` and `runLoop`, subagent-skip branch.
-- `src/state/records.ts` — `deleteChatSession` clears the matching snapshot.
-- `src/system-prompt.test.ts`, `src/execution/chat-task.test.ts`, `src/http.test.ts` — render/decision/lifecycle coverage.
+- `packages/runtime/src/types.ts` — `AgentIdentity`, `IdentitySnapshotRecord`, `RuntimeState.identitySnapshots?`.
+- `packages/runtime/src/system-prompt.ts` — `IDENTITY_FULL_REFRESH_INTERVAL`, `renderFullIdentity`, `renderIdentityDelta`, `decideIdentityEmission`; `renderEphemeralContext` renders the emitted-identity + recalled-memory tail body (`buildAgentSystemContext` builds only the stable prefix). See ADR stable-system-prefix.md.
+- `packages/runtime/src/execution/chat-task.ts` — `buildAgentIdentity`, deferred snapshot persistence in `runChatTask` and `runLoop`, subagent-skip branch.
+- `packages/runtime/src/state/records.ts` — `deleteChatSession` clears the matching snapshot.
+- `packages/runtime/src/system-prompt.test.ts`, `packages/runtime/src/execution/chat-task.test.ts`, `packages/runtime/src/http.test.ts` — render/decision/lifecycle coverage.

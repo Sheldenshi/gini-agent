@@ -14,7 +14,7 @@ turn stays low even as the number of self operations grows — which matters for
 weaker local providers whose tool-selection accuracy degrades with that count.
 
 The tools front a registry of `SelfOperation` records in
-`src/execution/self-registry.ts`, the single source of truth for each
+`packages/runtime/src/execution/self-registry.ts`, the single source of truth for each
 capability's BEHAVIOR: its `tag` (`query` => synchronous read; `mutate` =>
 routed through the approval seam), its `handler`, and its arg `schema` (the
 catalog entry mirrors this schema in its `function.parameters`). Adding a
@@ -50,10 +50,10 @@ is actually used.
 
 ## Required Now
 
-- `src/execution/self-registry.ts` is a **leaf module**: it must not import
+- `packages/runtime/src/execution/self-registry.ts` is a **leaf module**: it must not import
   from `agent.ts` or `tool-dispatch.ts` (tool-dispatch imports the registry;
   `agent.ts` imports `findSelfOperation` to re-run a mutate handler on
-  approval). Its low-risk audit write is inlined against `src/state` so no
+  approval). Its low-risk audit write is inlined against `packages/runtime/src/state` so no
   helper transitively re-enters `agent.ts` and forms a cycle. The inlined
   audit is best-effort: a task deleted mid-flight skips the row rather than
   throwing and discarding the handler's already-computed result.
@@ -125,7 +125,7 @@ operations, add their catalog entries (deferred), and tag their risk.
 ## Consequences For Coding Agents
 
 - To add a self-config / self-introspection capability, register a
-  `SelfOperation` in `src/execution/self-registry.ts` AND add a matching
+  `SelfOperation` in `packages/runtime/src/execution/self-registry.ts` AND add a matching
   deferred catalog entry (toolset `self`, `deferred: true`, `function.
   parameters` mirroring the op's schema) plus a dispatch case routed through
   `dispatchSelfOp`. The on-demand index and the gini self-skill breadcrumb

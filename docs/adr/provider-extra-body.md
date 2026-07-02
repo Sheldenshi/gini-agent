@@ -36,16 +36,16 @@ OpenRouter routing fields (`provider`, `models`, `route`, `transforms`) are inte
 
 ## Reserved-Key Maintenance Rule
 
-When you add a runtime-owned request field anywhere in `src/provider.ts`, add it to the relevant denylist — a chat-completions field to `RESERVED_EXTRA_BODY_KEYS`, or a Messages-API field (like `system`) to the anthropic per-call denylist (`ANTHROPIC_RESERVED_EXTRA_BODY_KEYS`). The denylist is the single source of truth — if a maintainer adds a new field but forgets the denylist entry, the protection silently weakens. This rule is also documented inline above each constant.
+When you add a runtime-owned request field anywhere in `packages/runtime/src/provider.ts`, add it to the relevant denylist — a chat-completions field to `RESERVED_EXTRA_BODY_KEYS`, or a Messages-API field (like `system`) to the anthropic per-call denylist (`ANTHROPIC_RESERVED_EXTRA_BODY_KEYS`). The denylist is the single source of truth — if a maintainer adds a new field but forgets the denylist entry, the protection silently weakens. This rule is also documented inline above each constant.
 
 ## Agent Override Inheritance
 
-`AgentRecord` stores only `providerName` and `model`. `resolveEffectiveContext()` in `src/execution/effective-context.ts` decides whether an agent's override inherits the instance's transport config (`baseUrl`, `apiKeyEnv`, `extraBody`) by comparing `agent.providerName` to `config.provider.name`:
+`AgentRecord` stores only `providerName` and `model`. `resolveEffectiveContext()` in `packages/runtime/src/execution/effective-context.ts` decides whether an agent's override inherits the instance's transport config (`baseUrl`, `apiKeyEnv`, `extraBody`) by comparing `agent.providerName` to `config.provider.name`:
 
 - **Same-provider override** (agent overrides to the same provider family as the instance): the resolver spreads `config.provider` first and overwrites only `name` + `model`. Local-only transport (e.g. an `oMLX` base URL + `chat_template_kwargs` `extraBody`) is preserved across model swaps so an operator can keep their existing endpoint when swapping models on the same agent.
 - **Cross-provider override** (agent overrides to a different provider family): the resolver does NOT spread `config.provider`. Instead `normalizeProvider` supplies the per-provider defaults for `baseUrl` and `apiKeyEnv`, and `extraBody` defaults to undefined. Local-only fields like `chat_template_kwargs` therefore stay on the local instance and never leak into an OpenAI / OpenRouter call.
 
-This is the load-bearing invariant for the openclaw migration path (`docs/adr/openclaw-migration.md`): a migrated openrouter agent on an openai instance won't accidentally inherit the openai endpoint or auth env. Tests pin both branches in `src/execution/effective-context.test.ts` ("cross-provider agent override does not inherit instance baseUrl/apiKeyEnv" + "same-provider agent override still inherits instance baseUrl/apiKeyEnv").
+This is the load-bearing invariant for the openclaw migration path (`docs/adr/openclaw-migration.md`): a migrated openrouter agent on an openai instance won't accidentally inherit the openai endpoint or auth env. Tests pin both branches in `packages/runtime/src/execution/effective-context.test.ts` ("cross-provider agent override does not inherit instance baseUrl/apiKeyEnv" + "same-provider agent override still inherits instance baseUrl/apiKeyEnv").
 
 ## Security Boundary
 
@@ -57,11 +57,11 @@ This is the load-bearing invariant for the openclaw migration path (`docs/adr/op
 
 Three test layers cover the change:
 
-- `src/provider.test.ts` — fetch-mock unit tests for the merge behavior, denylist, override semantics, vision token-cap protection, baseUrl normalization, and prototype-pollution defense.
-- `src/provider.integration.test.ts` — real HTTP round-trips against the bundled mock server in `src/test-utils/openai-mock-server.ts`. Each test creates its own server and env scope inside `withMockServer()`, so the file is safe under `bun test --concurrent`.
-- `src/cli/commands/provider.test.ts` — CLI flag-parsing, malformed input rejection, and the warning surface for unsupported provider+flag combinations.
+- `packages/runtime/src/provider.test.ts` — fetch-mock unit tests for the merge behavior, denylist, override semantics, vision token-cap protection, baseUrl normalization, and prototype-pollution defense.
+- `packages/runtime/src/provider.integration.test.ts` — real HTTP round-trips against the bundled mock server in `packages/runtime/src/test-utils/openai-mock-server.ts`. Each test creates its own server and env scope inside `withMockServer()`, so the file is safe under `bun test --concurrent`.
+- `packages/runtime/src/cli/commands/provider.test.ts` — CLI flag-parsing, malformed input rejection, and the warning surface for unsupported provider+flag combinations.
 
-The mock server in `src/test-utils/openai-mock-server.ts` is bundled so anyone cloning the repo can run integration tests with no API keys, no model downloads, and no native bindings — `bun install` is the only prerequisite.
+The mock server in `packages/runtime/src/test-utils/openai-mock-server.ts` is bundled so anyone cloning the repo can run integration tests with no API keys, no model downloads, and no native bindings — `bun install` is the only prerequisite.
 
 ## Out Of Scope, Linked Follow-Ups
 
@@ -75,5 +75,5 @@ The mock server in `src/test-utils/openai-mock-server.ts` is bundled so anyone c
 
 - The `local` provider is now a first-class transport for OpenAI-compatible servers (oMLX, vLLM, LM Studio, llama.cpp). The studio deployment runs gini against oMLX-served Gemma with `chat_template_kwargs` reasoning control end-to-end.
 - The denylist is the security boundary for chat-completions request bodies. Future runtime fields must extend it.
-- `parseSubArgs()` (added in `src/cli/args.ts`) is now available for any other command that needs strict positionals + value-bearing flags. The provider command is the first user.
-- The mock server in `src/test-utils/` establishes a convention for HTTP-level integration tests in this codebase. Future modules that speak HTTP can reuse the pattern.
+- `parseSubArgs()` (added in `packages/runtime/src/cli/args.ts`) is now available for any other command that needs strict positionals + value-bearing flags. The provider command is the first user.
+- The mock server in `packages/runtime/src/test-utils/` establishes a convention for HTTP-level integration tests in this codebase. Future modules that speak HTTP can reuse the pattern.

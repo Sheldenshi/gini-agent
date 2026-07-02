@@ -32,9 +32,9 @@ Browser configuration goes through the same server-side path as every other env-
 
 ## Test Surface
 
-- `src/provider.test.ts` — fetch-mocked unit tests covering the non-stream and streaming paths, request shape and headers (`x-api-key`, `anthropic-version`), message/tool/multimodal translation, `stop_reason` mapping, error surfaces (HTTP + in-stream error events + missing body), `max_tokens` resolution, structured output (plain/fenced/invalid JSON), the vision path, the configured/catalog gates, verbatim model id, the `/v1` trailing-path normalization, and fine-grained tool streaming gating (the `anthropic-beta: fine-grained-tool-streaming-2025-05-14` header present on a streaming Claude-4 tool turn; absent on a tool-less turn, a non-streaming turn, and a non-Claude-4 model). The Claude-family allowlist itself is unit-tested via `claudeSupportsFineGrainedToolStreaming` in `src/provider-capabilities.test.ts`.
-- `src/runtime/setup-api.test.ts` — the anthropic env-keyed setup path and provider removal.
-- `src/cli/commands/provider.test.ts` — `gini provider set anthropic` with `--base-url` / `--api-key-env`, and default-model fallback.
+- `packages/runtime/src/provider.test.ts` — fetch-mocked unit tests covering the non-stream and streaming paths, request shape and headers (`x-api-key`, `anthropic-version`), message/tool/multimodal translation, `stop_reason` mapping, error surfaces (HTTP + in-stream error events + missing body), `max_tokens` resolution, structured output (plain/fenced/invalid JSON), the vision path, the configured/catalog gates, verbatim model id, the `/v1` trailing-path normalization, and fine-grained tool streaming gating (the `anthropic-beta: fine-grained-tool-streaming-2025-05-14` header present on a streaming Claude-4 tool turn; absent on a tool-less turn, a non-streaming turn, and a non-Claude-4 model). The Claude-family allowlist itself is unit-tested via `claudeSupportsFineGrainedToolStreaming` in `packages/runtime/src/provider-capabilities.test.ts`.
+- `packages/runtime/src/runtime/setup-api.test.ts` — the anthropic env-keyed setup path and provider removal.
+- `packages/runtime/src/cli/commands/provider.test.ts` — `gini provider set anthropic` with `--base-url` / `--api-key-env`, and default-model fallback.
 
 ## Out Of Scope, Linked Follow-Ups
 
@@ -45,5 +45,5 @@ Browser configuration goes through the same server-side path as every other env-
 ## Consequences
 
 - Claude is reachable end-to-end with full Messages-API fidelity (tool use, streaming, vision, documents) from the first-party API with just an `ANTHROPIC_API_KEY`.
-- The provider is the first non-OpenAI-shaped transport in `src/provider.ts`; the translation helpers (`translateMessagesToAnthropic`, `translateToolsToAnthropic`, `parseAnthropicMessage`, `readAnthropicMessagesStream`) are self-contained and reuse the existing `resolveBaseUrl` / `sanitizeExtraBody` / `estimateCost` helpers — and the bedrock provider's Converse transport reuses the same `estimateCost` / cost-record shape.
+- The provider is the first non-OpenAI-shaped transport in `packages/runtime/src/provider.ts`; the translation helpers (`translateMessagesToAnthropic`, `translateToolsToAnthropic`, `parseAnthropicMessage`, `readAnthropicMessagesStream`) are self-contained and reuse the existing `resolveBaseUrl` / `sanitizeExtraBody` / `estimateCost` helpers — and the bedrock provider's Converse transport reuses the same `estimateCost` / cost-record shape.
 - `apiKeyEnv` + `baseUrl` being first-class on `ProviderConfig` (see `provider-extra-body.md`) is what keeps this provider a zero-schema-change addition.

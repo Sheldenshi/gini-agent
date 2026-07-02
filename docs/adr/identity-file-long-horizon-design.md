@@ -41,7 +41,7 @@ Gini deliberately departs from Hermes on three points:
 
 ### Char budget visibility
 
-`src/system-prompt.ts` exports `USER_SOFT_CAP_CHARS = 1500`, `SOUL_SOFT_CAP_CHARS = 1500`, and `identityBudgetState(content, cap)` which returns `{ used, cap, pct, overCap, nearCap }`. `buildAgentSystemContext` wraps non-BLOCKED USER.md and SOUL.md content with a budget header:
+`packages/runtime/src/system-prompt.ts` exports `USER_SOFT_CAP_CHARS = 1500`, `SOUL_SOFT_CAP_CHARS = 1500`, and `identityBudgetState(content, cap)` which returns `{ used, cap, pct, overCap, nearCap }`. `buildAgentSystemContext` wraps non-BLOCKED USER.md and SOUL.md content with a budget header:
 
 ```
 USER profile (412 / 1500 chars, 27%):
@@ -67,7 +67,7 @@ The convention is encouraged, not enforced. The runtime does not parse the file 
 
 ### History snapshots
 
-`src/runtime/identity-files.ts` snapshots the previous body to `<file>.history/<ISO-timestamp>.md` before every approved write. Covered paths:
+`packages/runtime/src/runtime/identity-files.ts` snapshots the previous body to `<file>.history/<ISO-timestamp>.md` before every approved write. Covered paths:
 
 - `writeUserProfile` / `writeSoul` with `status: "approved"`.
 - `approveUserProfile` / `approveSoul` (proposed → approved promotion).
@@ -151,11 +151,11 @@ The earlier instructions and the two tool descriptions were quietly contradictor
 
 ## Critical Files
 
-- `src/system-prompt.ts` — `USER_SOFT_CAP_CHARS`, `SOUL_SOFT_CAP_CHARS`, `identityBudgetState`, `renderUserProfileBlock`, `renderSoulBlock`, `buildAgentSystemContext`.
-- `src/runtime/identity-files.ts` — `snapshotIdentityFile`, `pruneSnapshotHistory`, `listUserProfileHistory`, `listSoulHistory`, `restoreUserProfileFromHistory`, `restoreSoulFromHistory`, `HISTORY_MAX_SNAPSHOTS`.
-- `src/runtime/defaults/INSTRUCTIONS.md` — declarative phrasing rule, SKIP list, section convention, set-over-append, budget awareness.
-- `src/execution/tool-catalog.ts` — `edit_user_profile` and `edit_soul` tool descriptions advertise the section convention and the soft cap.
-- `src/execution/chat-task.ts` — emits `identity file budget exceeded` trace when files go over cap.
-- `src/http.ts` — `/api/identity-files` (show), `/api/identity-files/history` (list), `/api/identity-files/rollback` (restore).
-- `src/cli/commands/identity.ts` — `gini identity show|history|rollback`.
+- `packages/runtime/src/system-prompt.ts` — `USER_SOFT_CAP_CHARS`, `SOUL_SOFT_CAP_CHARS`, `identityBudgetState`, `renderUserProfileBlock`, `renderSoulBlock`, `buildAgentSystemContext`.
+- `packages/runtime/src/runtime/identity-files.ts` — `snapshotIdentityFile`, `pruneSnapshotHistory`, `listUserProfileHistory`, `listSoulHistory`, `restoreUserProfileFromHistory`, `restoreSoulFromHistory`, `HISTORY_MAX_SNAPSHOTS`.
+- `packages/runtime/src/runtime/defaults/INSTRUCTIONS.md` — declarative phrasing rule, SKIP list, section convention, set-over-append, budget awareness.
+- `packages/runtime/src/execution/tool-catalog.ts` — `edit_user_profile` and `edit_soul` tool descriptions advertise the section convention and the soft cap.
+- `packages/runtime/src/execution/chat-task.ts` — emits `identity file budget exceeded` trace when files go over cap.
+- `packages/runtime/src/http.ts` — `/api/identity-files` (show), `/api/identity-files/history` (list), `/api/identity-files/rollback` (restore).
+- `packages/runtime/src/cli/commands/identity.ts` — `gini identity show|history|rollback`.
 - `~/.gini/instances/<inst>/USER.md.history/`, `~/.gini/instances/<inst>/agents/<agentId>/SOUL.md.history/` — on-disk artifacts.

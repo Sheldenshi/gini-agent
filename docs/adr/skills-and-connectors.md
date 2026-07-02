@@ -46,7 +46,7 @@ Cardinality forces this separation. A single Google connector powers Gmail, Cale
 - `RuntimeState.connectors` holds them. No back-compat shim is exposed outside the normalizer.
 - HTTP route prefix is `/api/connectors`. The old `/api/identities` prefix has been removed.
 - CLI command is `gini connector ...`. The old `gini identity ...` command has been removed.
-- Per-provider health probes live in `src/integrations/connectors/<provider>.ts`. The `demo` provider keeps its no-op behavior; real providers (e.g. `linear`) make remote authenticated calls during health checks.
+- Per-provider health probes live in `packages/runtime/src/integrations/connectors/<provider>.ts`. The `demo` provider keeps its no-op behavior; real providers (e.g. `linear`) make remote authenticated calls during health checks.
 
 ### Activation by dependency
 
@@ -83,7 +83,7 @@ Cardinality forces this separation. A single Google connector powers Gmail, Cale
 ## Consequences For Coding Agents
 
 - Use `ConnectorRecord`, `/api/connectors`, and `gini connector` everywhere. Do not introduce or revive `Identity` naming.
-- When adding a provider, place per-provider code under `src/integrations/connectors/<provider>.ts`. Export a `ProviderModule` (ADR connector-provider-spec-compliance.md) — fields, optional probe, optional detect — and register it in `registry.ts`.
+- When adding a provider, place per-provider code under `packages/runtime/src/integrations/connectors/<provider>.ts`. Export a `ProviderModule` (ADR connector-provider-spec-compliance.md) — fields, optional probe, optional detect — and register it in `registry.ts`.
 - When adding a skill that needs credentials, declare them in the skill's frontmatter under `metadata.gini.requires.connectors` and reference them in scripts via env vars. Do not read connector records directly from skill code.
 - Skill activation filtering is a runtime concern. Do not duplicate the "is this skill active" check at the UI layer; ask the gateway.
 - Do not introduce an "Integration" type, table, or route. The skill is the package.
@@ -97,4 +97,4 @@ Cardinality forces this separation. A single Google connector powers Gmail, Cale
 - Adding a healthy `linear` connector makes the same skill appear; deleting or breaking the connector makes it disappear again.
 - A subprocess launched by a skill receives the connector's resolved env vars; the skill record contains no plaintext secret.
 - `bun run gini smoke` exercises connector CRUD and the activation gate.
-- `rg "kind:" src/integrations/connectors` returns no matches in the new provider registry code.
+- `rg "kind:" packages/runtime/src/integrations/connectors` returns no matches in the new provider registry code.

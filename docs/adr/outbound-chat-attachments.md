@@ -26,7 +26,7 @@ bytes → get a referenceable id" half was built; only the chat-render half was
 missing.
 
 The upload store and HTTP routes were already symmetric and author-gate-free:
-`storeUpload`/`readUpload` (`src/state/uploads.ts`) take no author parameter,
+`storeUpload`/`readUpload` (`packages/runtime/src/state/uploads.ts`) take no author parameter,
 `POST /api/uploads` validates only mime + size, and `GET /api/uploads/:id`
 serves bytes to any bearer-authed client. So agent-authored bytes can use the
 exact same storage and serving path as user uploads — no new endpoint needed.
@@ -39,7 +39,7 @@ in its prose (so an image can land mid-sentence, between paragraphs the model
 wrote), symmetric with how all the agent's other markdown renders inline.
 
 The canonical reference is a dedicated scheme, `gini-upload://<id>`
-(`src/lib/upload-ref.ts`). Image-producing tools hand the model a ready-to-paste
+(`packages/runtime/src/lib/upload-ref.ts`). Image-producing tools hand the model a ready-to-paste
 markdown tag in their result; the model drops it into its reply; each client
 rewrites the ref to its own authed image source when rendering.
 
@@ -65,20 +65,20 @@ Specific choices:
   use an absolute `<gatewayOrigin>/api/uploads/<id>` + a bearer header.
 
 - **Tools hand the model a ready-to-paste tag, not a raw id.** `browser_vision`
-  (`src/tools/browser.ts`) returns `imageMarkdown` in its envelope;
+  (`packages/runtime/src/tools/browser.ts`) returns `imageMarkdown` in its envelope;
   `skill_run attachments/promote-file` has `withPromoteFileAttachmentTag`
-  (`src/execution/tool-dispatch.ts`) add an `attachmentMarkdown` tag for ANY
+  (`packages/runtime/src/execution/tool-dispatch.ts`) add an `attachmentMarkdown` tag for ANY
   successful promote (image tag for an image mime, link tag otherwise). Handing
   the model an exact string to copy is far more reliable than asking it to build
   markdown from a UUID. The `attachments` skill steer tells the model to paste
   the provided tag where the attachment should appear.
 
-- **Per-client renderers.** Web `MarkdownContent` (`web/src/components/chat/MarkdownContent.tsx`)
+- **Per-client renderers.** Web `MarkdownContent` (`packages/web/src/components/chat/MarkdownContent.tsx`)
   overrides the `img`/`a` components to rewrite an upload ref to the BFF URL
   (with a custom `urlTransform` so react-markdown's sanitizer doesn't strip the
   scheme first). An image ref becomes an inline `<img>`; a non-image ref becomes
   a paperclip download chip. Mobile `BlockAssistantText`
-  (`mobile/src/components/chat/BlockAssistantText.tsx`) overrides the markdown
+  (`packages/mobile/src/components/chat/BlockAssistantText.tsx`) overrides the markdown
   `image` rule to render `AuthedImage` (bearer on native, blob fetch on web — RN
   Web's `<img>` can't send a header) and the `link` rule to render the non-image
   chip inline. Neither AUTO-FETCHES a non-upload ref: a foreign `http(s)` image
@@ -91,7 +91,7 @@ Specific choices:
 - **A non-image chip OPENS A PREVIEW, not a forced download.** `GET
   /api/uploads/:id` defaults to `content-disposition: attachment`, but `?inline=1`
   opts a safe-allowlisted upload into `content-disposition: inline`
-  (`resolveInlineUpload` in `src/http.ts`): PDFs + raster images keep their real
+  (`resolveInlineUpload` in `packages/runtime/src/http.ts`): PDFs + raster images keep their real
   type, while `.md` / `.csv` / `.json` / `.txt` are coerced to `text/plain` so a
   text upload previews as raw text rather than executing as a document.
   Unsafe/unknown mimes (html, svg, xml, octet-stream) ignore the flag and still
@@ -104,8 +104,8 @@ Specific choices:
   — so it can't open `/api/uploads/:id` directly. Instead the chip mints a
   short-lived SIGNED url: `POST /api/uploads/:id/sign` (bearer-authed) returns a
   path carrying `?inline=1&exp=&sig=`, where `sig` is `HMAC-SHA256(<id>.<exp>)`
-  keyed by the owner `config.token` (`src/lib/upload-signing.ts`). The
-  `authorized()` gate (`src/http.ts`) accepts a valid, unexpired signature as an
+  keyed by the owner `config.token` (`packages/runtime/src/lib/upload-signing.ts`). The
+  `authorized()` gate (`packages/runtime/src/http.ts`) accepts a valid, unexpired signature as an
   alternative to a bearer, but ONLY for a GET/HEAD of that exact upload id, so a
   signed url authorizes one file until it expires and nothing else. The mobile
   chip (`openUploadInBrowser`) mints then opens the signed url via the in-app
@@ -117,7 +117,7 @@ Specific choices:
 
 - **Reuse the upload store + `GET /api/uploads/:id`.** No new media endpoint.
   Bytes are stored via `storeUpload` and served from the existing route. The blob
-  reader (`resolveBlobPath` in `src/state/uploads.ts`) tolerates writer extension
+  reader (`resolveBlobPath` in `packages/runtime/src/state/uploads.ts`) tolerates writer extension
   drift: `storeUpload` and the `promote-file` skill script choose a file
   extension from independent mime→ext maps that can disagree (e.g. `text/markdown`
   → `.md` from promote-file but `markdown` from `extensionFor`), so the reader
@@ -130,7 +130,7 @@ Specific choices:
 - **Screenshot secret-redaction parity is preserved for free.** The bytes
   stored as the upload are the SAME bytes sent to the vision model — already
   DOM-blurred for any `[data-gini-secret]` element before capture
-  (`src/tools/browser.ts`). A user-visible screenshot therefore cannot leak a
+  (`packages/runtime/src/tools/browser.ts`). A user-visible screenshot therefore cannot leak a
   secret the vision answer would have redacted.
 
 - **`[SILENT]` is handled structurally.** Because the reference lives inside the
@@ -139,7 +139,7 @@ Specific choices:
   needed on any surface.
 
 - **Messaging mirror.** The Telegram reply-mirror
-  (`src/integrations/telegram-poller.ts`) parses upload refs out of the reply
+  (`packages/runtime/src/integrations/telegram-poller.ts`) parses upload refs out of the reply
   text and sends each IMAGE as its own caption-less photo. Text and photo are
   always separate sends — never a photo+caption — so the reply can't be lost to
   Telegram's 1024-char caption limit or a photo-send failure. When it rewrites

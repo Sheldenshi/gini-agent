@@ -32,7 +32,7 @@ Pinning `default` to fixed memorable ports lets `gini start` produce a stable UR
 - **Per-instance LaunchAgents (macOS).** Each instance now writes three
   user-domain LaunchAgents under `~/Library/LaunchAgents/`:
   `ai.lilaclabs.gini.<instance>.gateway` (Bun runtime, runs
-  `src/server.ts` directly), `ai.lilaclabs.gini.<instance>.web`
+  `packages/runtime/src/server.ts` directly), `ai.lilaclabs.gini.<instance>.web`
   (Next.js server — prod or dev per
   [Web Production Serving](web-production-serving.md) — gated on the
   gateway becoming healthy via a
@@ -50,7 +50,7 @@ Pinning `default` to fixed memorable ports lets `gini start` produce a stable UR
   enable|disable|status|kick` manage the set; uninstall tears them
   down and reports any launchctl failures. See
   [Always-Up Supervision](always-up-supervision.md),
-  `src/cli/autostart.ts`, and `src/cli/commands/autostart.ts`.
+  `packages/runtime/src/cli/autostart.ts`, and `packages/runtime/src/cli/commands/autostart.ts`.
 
 ## Deferred
 

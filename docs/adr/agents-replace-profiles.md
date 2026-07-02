@@ -12,7 +12,7 @@ activating an agent now actually changes inference, tool dispatch, and
 messaging.
 
 A single resolution chokepoint, `resolveEffectiveContext(state, config)`
-in `src/execution/effective-context.ts`, returns the effective provider,
+in `packages/runtime/src/execution/effective-context.ts`, returns the effective provider,
 toolset filter, messaging target filter, memory namespace, and a list of
 warnings for unknown or disabled references. Every runtime path that
 needs agent-aware behavior reads from this helper instead of consulting
@@ -47,7 +47,7 @@ label.
 - `/api/profiles*` → `/api/agents*`. `gini profiles ...` → `gini agents
   ...`. Web `ProfileCard` → `AgentCard`, query key `["profiles"]` →
   `["agents"]`.
-- `src/execution/effective-context.ts` exposes `EffectiveContext` and
+- `packages/runtime/src/execution/effective-context.ts` exposes `EffectiveContext` and
   `resolveEffectiveContext(state, config)`. Fields:
   - `provider: ProviderConfig` — agent override when both
     `providerName` and `model` are set, else fall through to
@@ -213,21 +213,21 @@ silently bypassing the filter.
 
 ## Critical Files
 
-- `src/execution/effective-context.ts` — resolution chokepoint.
-- `src/execution/chat-task.ts` — calls `resolveEffectiveContext` once
+- `packages/runtime/src/execution/effective-context.ts` — resolution chokepoint.
+- `packages/runtime/src/execution/chat-task.ts` — calls `resolveEffectiveContext` once
   on loop entry and threads `effective.toolsetFilter` and
   `effective.provider` into the tool catalog and provider call.
-- `src/execution/tool-catalog.ts` — agent + subagent filter
+- `packages/runtime/src/execution/tool-catalog.ts` — agent + subagent filter
   composition, always-on bypass.
-- `src/integrations/messaging.ts` — messaging target intersection and
+- `packages/runtime/src/integrations/messaging.ts` — messaging target intersection and
   rejection.
-- `src/state/store.ts` — `normalizeState` migration and
+- `packages/runtime/src/state/store.ts` — `normalizeState` migration and
   `seedDefaultAgentFromRuntimeConfig`.
-- `src/state/defaults.ts` — `defaultAgent` (provider seeded from
+- `packages/runtime/src/state/defaults.ts` — `defaultAgent` (provider seeded from
   config, not hardcoded).
-- `src/runtime/index.ts` — `install()` seeding and `status()`
+- `packages/runtime/src/runtime/index.ts` — `install()` seeding and `status()`
   `activeAgent` block.
-- `src/types.ts` — `AgentRecord`, `ActiveAgentSnapshot`,
+- `packages/runtime/src/types.ts` — `AgentRecord`, `ActiveAgentSnapshot`,
   `RuntimeStatus.activeAgent`.
 
 ## Amendment 2026-05-13: Provider override extends to memory LLM calls
@@ -255,7 +255,7 @@ Resolution semantics are now:
 
 The plumbing helper is
 `providerOverrideForRuntime(config)` in
-`src/execution/effective-context.ts`, which reads state, resolves the
+`packages/runtime/src/execution/effective-context.ts`, which reads state, resolves the
 effective context, and returns the agent's provider when
 `providerSource === "agent"` (else `undefined`). Each memory pipeline
 resolves the override once at function entry and threads it through.
@@ -270,7 +270,7 @@ restoring clears the field. `archivedAt` lives in its own field rather
 than as an `AgentStatus` value because `activateAgent` rewrites every
 agent's `status` on each switch and would clobber an "archived" status.
 
-`archiveAgent` and `unarchiveAgent` in `src/capabilities/agents.ts`
+`archiveAgent` and `unarchiveAgent` in `packages/runtime/src/capabilities/agents.ts`
 mirror `deleteAgent`'s structure (load state, mutate, persist, audit,
 return the updated record) and emit `agent.archived` / `agent.unarchived`
 audit events attributed to the subject agent (see ADR

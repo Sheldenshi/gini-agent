@@ -62,17 +62,17 @@ No `/api/approvals*` alias is exposed; the legacy endpoint family is removed and
 
 ## Chat Blocks
 
-`approval_requested` splits into `authorization_requested` and `setup_requested`. Renderers in `web/src/components/chat/` and `mobile/src/components/chat/` are split accordingly. The setup renderer never shows a risk pill — the rule is structural now, not a per-action suppression list.
+`approval_requested` splits into `authorization_requested` and `setup_requested`. Renderers in `packages/web/src/components/chat/` and `packages/mobile/src/components/chat/` are split accordingly. The setup renderer never shows a risk pill — the rule is structural now, not a per-action suppression list.
 
 ## Side-Effect Ownership
 
 `resolveAuthorization` keeps the executor pattern: mark approved, run the per-action side effect via `executeApprovedAction`, write the per-action audit row, resume the chat-task loop.
 
-`resolveSetupRequest` flips status and owns the action-specific continuation policy. Per-action side effects (screencast sign-in teardown, connector creation, credential routing) run inside the `/complete` handler, which claims the row before running them. The `browser.connect` non-screencast fallback uses `completeBrowserConnectSetup` in `src/capabilities/browser-connect.ts` so the HTTP path and the test path share one audit-writing implementation.
+`resolveSetupRequest` flips status and owns the action-specific continuation policy. Per-action side effects (screencast sign-in teardown, connector creation, credential routing) run inside the `/complete` handler, which claims the row before running them. The `browser.connect` non-screencast fallback uses `completeBrowserConnectSetup` in `packages/runtime/src/capabilities/browser-connect.ts` so the HTTP path and the test path share one audit-writing implementation.
 
 `connector.request` and `chat.choice` cancellations resume the paused chat loop with a negative tool result (continue without the connector / continue past the skipped question) so the agent can keep going or explain what input is still required. Setup actions without an explicit continuation contract may mark the task failed on cancel rather than inventing a generic fallback.
 
-**Expiry.** A pending `SetupRequest` the user never acts on is not left to strand its task indefinitely. A periodic runtime sweep (`runSetupRequestSweep`, wired alongside the connector re-probe loop in `src/server.ts`) auto-cancels any request older than a TTL (`GINI_SETUP_REQUEST_TTL_MS`, default 24h) through the same `cancel` resolution as a manual dismissal, passing `actor: "runtime"` and `awaitResume: false` so the per-action continuation runs in the background and one slow or failing resume can't stall the pass. Per-action resolution still applies — connector/choice/confirmation requests resume as declined, fill-secret/login requests fail the task. The TTL is deliberately long: the queue serialization above already covers the live-reply case, so the sweep only reaps genuinely abandoned requests.
+**Expiry.** A pending `SetupRequest` the user never acts on is not left to strand its task indefinitely. A periodic runtime sweep (`runSetupRequestSweep`, wired alongside the connector re-probe loop in `packages/runtime/src/server.ts`) auto-cancels any request older than a TTL (`GINI_SETUP_REQUEST_TTL_MS`, default 24h) through the same `cancel` resolution as a manual dismissal, passing `actor: "runtime"` and `awaitResume: false` so the per-action continuation runs in the background and one slow or failing resume can't stall the pass. Per-action resolution still applies — connector/choice/confirmation requests resume as declined, fill-secret/login requests fail the task. The TTL is deliberately long: the queue serialization above already covers the live-reply case, so the sweep only reaps genuinely abandoned requests.
 
 ## Consequences
 

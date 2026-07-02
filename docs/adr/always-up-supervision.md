@@ -6,7 +6,7 @@ A launchd-managed Gini instance is supervised to stay up across crashes,
 clean exits, and self-restarts. Three per-instance LaunchAgents under
 `~/Library/LaunchAgents/` enforce this:
 
-- `ai.lilaclabs.gini.<instance>.gateway` — the Bun runtime (`src/server.ts`).
+- `ai.lilaclabs.gini.<instance>.gateway` — the Bun runtime (`packages/runtime/src/server.ts`).
 - `ai.lilaclabs.gini.<instance>.web` — the Next.js server (the BFF). The
   plist's shim execs `next start` from the sha-keyed production bundle when
   one matches the current checkout, `next dev` otherwise — see
@@ -50,7 +50,7 @@ The model rests on four pieces:
 
 - **Supervisor detection via a baked-in plist env var.** Each plist's
   `EnvironmentVariables` carries `GINI_SUPERVISOR=launchd`. At runtime
-  `supervisor()` (`src/integrations/launchd.ts`) reads that env var and
+  `supervisor()` (`packages/runtime/src/integrations/launchd.ts`) reads that env var and
   returns `"launchd"` only when the marker is present. Foreground paths
   never set it and get `null`. Every launchd-native branch (bootout as
   stop, KeepAlive respawn after self-SIGTERM, the restart-time crash-report
@@ -113,7 +113,7 @@ The model rests on four pieces:
   one process can hold, but supervision races can still spawn a second — a
   KeepAlive respawn racing the incumbent's drain, or dual supervision (a manual
   foreground `gini run` on a launchd instance). Before any boot work,
-  `src/server.ts` probes `/api/status` on its own `config.port`; if a healthy
+  `packages/runtime/src/server.ts` probes `/api/status` on its own `config.port`; if a healthy
   gateway already answers, it logs `runtime.boot.incumbent` and exits 0 instead
   of running the full boot and throwing an uncaught "Failed to start server. Is
   port `<port>` in use?" from `Bun.serve`. Under always-respawn KeepAlive that
@@ -138,7 +138,7 @@ secret values, `HOME`, `SHELL`, the state/log roots, and the stdout/err paths
 are deliberately excluded because they vary legitimately between machines and
 between the shell-merge/no-merge paths — hashing them would cause a
 false-positive reconcile loop. At gateway startup
-`reconcileAutostartPlistOnStartup` (`src/runtime/autostart-reconcile.ts`)
+`reconcileAutostartPlistOnStartup` (`packages/runtime/src/runtime/autostart-reconcile.ts`)
 compares the stamp the current code would generate against the stamp baked into
 each on-disk plist (gateway/web/watchdog). When everything matches it is a
 silent no-op; it is also skipped entirely when no managed gateway plist exists
@@ -172,7 +172,7 @@ on-disk plist equals what the code generates, so the next boot no-ops), and a
 once-per-process latch backs that up.
 
 The reload itself never double-binds the port. `enable` awaits
-`waitForPortFree` (`src/cli/process.ts`) on a port-binding kind's port after a
+`waitForPortFree` (`packages/runtime/src/cli/process.ts`) on a port-binding kind's port after a
 successful `bootout` and before the `bootstrap` retry — closing the window
 where `launchctl bootout` returns (the unload was *accepted*) but the old
 process hasn't yet released its socket. This makes every reload caller safe,
@@ -180,8 +180,8 @@ including the detached reconcile/refresh relaunch racing KeepAlive's own
 respawn. The watchdog binds nothing, so it skips the wait.
 
 Auto-update no longer orphans the runtime. Both restart paths — the web-update
-self-restart (`scheduleRuntimeRestart`, `src/runtime/update.ts`) and the
-`gini update` CLI restart (`src/cli/commands/admin.ts`) — route on whether the
+self-restart (`scheduleRuntimeRestart`, `packages/runtime/src/runtime/update.ts`) and the
+`gini update` CLI restart (`packages/runtime/src/cli/commands/admin.ts`) — route on whether the
 **gateway is actively loaded** under launchd (`isLoaded(instance, "gateway")`),
 not solely the gateway's own `GINI_SUPERVISOR` env. This is narrower than the
 `isLaunchdManaged` predicate that `gini stop`/`gini start` use, and
@@ -210,7 +210,7 @@ idle keep-alive connections would otherwise never let the graceful
 `server.stop(false)` resolve — and every background loop interrupts its
 inter-tick sleep on shutdown instead of sleeping out its full interval (up to
 60s for the connector re-probe). A detached
-`gini autostart kick --kind web` re-execs the web service so any new `web/`
+`gini autostart kick --kind web` re-execs the web service so any new `packages/web/`
 dependencies take effect. The `gini update` CLI restart, on a launchd
 instance, `launchctl bootout`s the gateway (a plain SIGTERM would be respawned
 by KeepAlive) and re-ensures it via launchd; foreground keeps the

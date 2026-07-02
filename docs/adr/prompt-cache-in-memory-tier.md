@@ -11,7 +11,7 @@ warmer or refresh** — there is no background loop, probe, config field, HTTP
 endpoint, CLI command, or web control for keeping the cache warm.
 
 1. **Hardcoded `prompt_cache_retention: "in_memory"`** on every
-   OpenAI-compatible request body in `src/provider.ts`
+   OpenAI-compatible request body in `packages/runtime/src/provider.ts`
    (`callToolCallingChatCompletions`, `callStructuredChatCompletions`,
    `callOpenAIResponses` openai branch, `callChatCompletions`,
    `callVisionChatCompletions`) via the `promptCacheRetentionBody` helper. Two
@@ -104,20 +104,20 @@ warmer was removed rather than reworked.
 
 ## Acceptance checks
 
-- Every OpenAI-compatible builder in `src/provider.ts` emits
+- Every OpenAI-compatible builder in `packages/runtime/src/provider.ts` emits
   `prompt_cache_retention: "in_memory"` via `promptCacheRetentionBody`, except
   the two documented exclusions: codex `/responses` builders and the `azure`
   provider both omit the field.
 - `prompt_cache_retention` is in `RESERVED_EXTRA_BODY_KEYS`.
-- No cache warmer / refresh loop runs in `src/server.ts`, and no
+- No cache warmer / refresh loop runs in `packages/runtime/src/server.ts`, and no
   `/api/settings/cache-warmer` endpoint, `gini cache-warmer` command,
   `cacheWarmerMinutes` config field, or cache-warmer web card exists.
 - `bun run typecheck`, `bun test`, and `bun run gini smoke` are green.
 
 ## Critical files
 
-- `src/provider.ts` — the pinned `in_memory` tier and the
+- `packages/runtime/src/provider.ts` — the pinned `in_memory` tier and the
   `RESERVED_EXTRA_BODY_KEYS` denylist.
-- `src/provider.test.ts` — pins the `in_memory` value on each builder and the
+- `packages/runtime/src/provider.test.ts` — pins the `in_memory` value on each builder and the
   codex omission, and demonstrates that no Anthropic `cache_control` markers
   are emitted.

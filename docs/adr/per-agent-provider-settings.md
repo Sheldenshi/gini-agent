@@ -90,7 +90,7 @@ provider and the web surfaces a banner — see
 
 ## UI
 
-`web/src/components/chat/SettingsTab.tsx` renders next to the Jobs tab on the
+`packages/web/src/components/chat/SettingsTab.tsx` renders next to the Jobs tab on the
 agent surface (`ChatTabBar` gains a `settings` tab). Like the Jobs tab, both
 are per-agent surfaces and are hidden on the recurring-job channel view, which
 is not scoped to the active agent.
@@ -145,15 +145,15 @@ agent.
 
 ## Critical Files
 
-- `src/capabilities/agents.ts` — `setAgentProvider` (validation, no-op,
+- `packages/runtime/src/capabilities/agents.ts` — `setAgentProvider` (validation, no-op,
   audit).
-- `src/http.ts` — `POST /api/agents/:id/provider` route.
-- `src/execution/effective-context.ts` — the resolution chokepoint the override
+- `packages/runtime/src/http.ts` — `POST /api/agents/:id/provider` route.
+- `packages/runtime/src/execution/effective-context.ts` — the resolution chokepoint the override
   feeds; it also applies the transient credential fallback
   ([Transient Provider Fallback](./provider-fallback.md)).
-- `web/src/components/chat/SettingsTab.tsx` — the per-agent provider/model
+- `packages/web/src/components/chat/SettingsTab.tsx` — the per-agent provider/model
   picker.
-- `web/src/components/chat/ChatTabBar.tsx`, `web/src/app/chat/page.tsx` — the
+- `packages/web/src/components/chat/ChatTabBar.tsx`, `packages/web/src/app/chat/page.tsx` — the
   Settings tab wiring.
 
 ## Amendment 2026-06-09: Model-First Picker

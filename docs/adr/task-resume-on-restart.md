@@ -2,13 +2,13 @@
 
 ## Decision
 
-When the gateway boots, `reconcileInFlightTasks` (in `src/agent.ts`) reconciles
+When the gateway boots, `reconcileInFlightTasks` (in `packages/runtime/src/agent.ts`) reconciles
 every task left in-flight by the previous process so none hang forever. A
 top-level chat turn interrupted mid-flight is **resumed** by re-running the turn
 from durable chat state; every other orphaned task is **failed** so its UI
 spinner clears.
 
-The boot hook lives in `src/server.ts`: it captures `bootStartedAt = now()`
+The boot hook lives in `packages/runtime/src/server.ts`: it captures `bootStartedAt = now()`
 before `install()`, and after the HTTP port binds (so tool callbacks to
 localhost work) and the `runtime.started` log, it fires
 `reconcileInFlightTasks(config, { cutoffIso: bootStartedAt })` best-effort —
@@ -47,7 +47,7 @@ side-effecting tool parked at an approval gate) is never re-run by a restart.
   streamed text), resets `currentStep` to `Thinking`, bumps `updatedAt`, then
   fire-and-forget dispatches via `runTask` (which routes chat tasks to
   `runChatTask`). Resume is clean because `priorChatMessages`
-  (`src/execution/chat-task.ts`) replays only OTHER tasks' committed rows
+  (`packages/runtime/src/execution/chat-task.ts`) replays only OTHER tasks' committed rows
   (`m.taskId !== task.id`) and rebuilds the current user message from
   `task.input`, so re-running the turn produces no duplicate user message and the
   defensive tool-call pairing pass drops any partially-persisted tool round.
@@ -62,7 +62,7 @@ side-effecting tool parked at an approval gate) is never re-run by a restart.
 
 A poison task that crashes the process on every resume would brick the gateway in
 a restart loop. The per-task cumulative counter `bootResumeCount` (on the `Task`
-interface in `src/types.ts`) caps re-dispatches at `MAX_BOOT_RESUMES = 3`; over
+interface in `packages/runtime/src/types.ts`) caps re-dispatches at `MAX_BOOT_RESUMES = 3`; over
 the cap the task is failed instead of resumed. No progress-reset is needed: a
 normal chat turn runs for seconds, so the only way to accumulate 3
 boot-interruptions on ONE task is a task that keeps failing to complete across
@@ -97,7 +97,7 @@ separate, larger reliability concern and is future work, not solved here.
 
 - `bun run typecheck` clean.
 - `bun run test` clean.
-- `src/agent-reconcile.test.ts` covers: running and queued chat orphans resume
+- `packages/runtime/src/agent-reconcile.test.ts` covers: running and queued chat orphans resume
   (dispatched, `partialSummary` cleared, `bootResumeCount === 1`);
   `waiting_approval` and terminal tasks untouched; a `running` chat task with
   `updatedAt >= cutoffIso` untouched (race guard); subagent and imperative

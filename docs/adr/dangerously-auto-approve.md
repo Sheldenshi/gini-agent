@@ -160,7 +160,7 @@ through the same shared path.
   used to land bytes outside `workspaceRoot` from `file_write` /
   `file_patch`; the throw says `Path escapes workspace via symlink`.
 - `bun run typecheck`, `bun test`, and `bun run gini smoke` are
-  green; `src/execution/dangerously-auto-approve.test.ts` covers the
+  green; `packages/runtime/src/execution/dangerously-auto-approve.test.ts` covers the
   flag-on/flag-off matrix for `file_write`, `terminal_exec`
   (allowlist and non-allowlist), the imperative dispatch path, the
   symlink-escape rejection, the side-effect-failure propagation, and
@@ -250,8 +250,8 @@ shifts the opt-in point from operator config to a chat exchange:
   keeps the operator's global RuntimeConfig isolated from the
   per-job envelope. Failing to clone would silently leak the job's
   bypass into every other task on the instance.
-- `src/jobs/auto-approve.test.ts` covers the end-to-end matrix
+- `packages/runtime/src/jobs/auto-approve.test.ts` covers the end-to-end matrix
   (allowlist fast-path, full bypass via `resolveApproval`, default
   behavior preserved without the envelope) plus the validators on the
-  persistence layer; `src/jobs.test.ts` adds the equivalent matrix at
+  persistence layer; `packages/runtime/src/jobs.test.ts` adds the equivalent matrix at
   the `create_job` tool-dispatch entry point.

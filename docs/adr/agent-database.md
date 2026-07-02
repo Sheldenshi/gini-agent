@@ -13,7 +13,7 @@ tools — `db_query` (read-only SELECT/WITH), `db_execute` (one DDL/DML statemen
 enabled-by-default `database` toolset.
 
 Each agent's data lives in its **own SQLite file**, `~/.gini/instances/<inst>/
-agent-data/<agentId>.db` (`src/state/agent-data-db.ts`), entirely separate from
+agent-data/<agentId>.db` (`packages/runtime/src/state/agent-data-db.ts`), entirely separate from
 Gini's system databases (`memory.db`, `state.json`). The agent defines its own
 schema; everything imported is TEXT until the agent reshapes it.
 
@@ -66,11 +66,11 @@ The agent runs its own SQL, so isolation is the safety property:
 
 ## Required Now
 
-- `src/state/agent-data-db.ts`: per-(instance, agentId) cached SQLite handle
+- `packages/runtime/src/state/agent-data-db.ts`: per-(instance, agentId) cached SQLite handle
   (WAL); `dbQuery` (read-only guard + row cap `MAX_RESULT_ROWS` with a
   `truncated` flag so an unbounded SELECT can't flood context), `dbExecute`,
   `dbListTables`.
-- `src/data/import-table.ts`: deterministic CSV/XLSX → table loader. Domain
+- `packages/runtime/src/data/import-table.ts`: deterministic CSV/XLSX → table loader. Domain
   agnostic — columns come from the file's own header (sanitized to snake_case,
   de-duplicated), preamble lines (`< 2` non-empty cells) are skipped (or pinned
   with `skipLines`), one file row → one table row in a transaction. Reuses the
@@ -93,8 +93,8 @@ The agent runs its own SQL, so isolation is the safety property:
 
 ## Acceptance Checks
 
-- `bun test src/state/agent-data-db.test.ts src/data/import-table.test.ts
-  src/execution/db-dispatch.test.ts` pass, including read-only enforcement,
+- `bun test packages/runtime/src/state/agent-data-db.test.ts packages/runtime/src/data/import-table.test.ts
+  packages/runtime/src/execution/db-dispatch.test.ts` pass, including read-only enforcement,
   ATTACH/multi-statement rejection, per-agent file isolation, the row cap, and a
   mutual-connections JOIN.
 - With the `people-crm` skill, importing a LinkedIn `Connections.csv` and asking

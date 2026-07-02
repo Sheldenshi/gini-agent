@@ -311,21 +311,23 @@ fetch_runtime() {
 }
 
 install_deps() {
+  # The root install covers every workspace package (runtime, web, mobile)
+  # against the single root lockfile — no per-package install needed.
   quiet "Dependencies installed" bash -c "cd '$RUNTIME_DIR' && bun install"
-  if [ -f "$RUNTIME_DIR/web/package.json" ]; then
-    quiet "Web app installed" bash -c "cd '$RUNTIME_DIR/web' && bun install"
+  if [ -f "$RUNTIME_DIR/packages/web/package.json" ]; then
     # Build the sha-keyed production web bundle so the fresh install serves
     # `next start` from prebuilt assets instead of JIT-compiling every route
     # under `next dev`. The serving paths (launchd web shim, gini start) pick
-    # web/.next-prod-<sha12> iff <sha12> matches `git rev-parse --short=12
-    # HEAD` and the dir carries a BUILD_ID; the runtime's update flow
-    # (src/runtime/update.ts) rebuilds + GCs these on every update. See ADR
-    # web-production-serving.md. A build failure is tolerated: the serving
-    # paths fall back to `next dev` when no bundle matches, so the install
-    # continues with a working (dev-mode) web UI rather than aborting.
+    # packages/web/.next-prod-<sha12> iff <sha12> matches `git rev-parse
+    # --short=12 HEAD` and the dir carries a BUILD_ID; the runtime's update
+    # flow (packages/runtime/src/runtime/update.ts) rebuilds + GCs these on
+    # every update. See ADR web-production-serving.md. A build failure is
+    # tolerated: the serving paths fall back to `next dev` when no bundle
+    # matches, so the install continues with a working (dev-mode) web UI
+    # rather than aborting.
     local web_sha
     web_sha="$(git -C "$RUNTIME_DIR" rev-parse --short=12 HEAD)"
-    quiet_optional "Web app built" bash -c "cd '$RUNTIME_DIR/web' && GINI_DIST_DIR='.next-prod-$web_sha' bun run build"
+    quiet_optional "Web app built" bash -c "cd '$RUNTIME_DIR/packages/web' && GINI_DIST_DIR='.next-prod-$web_sha' bun run build"
   fi
 }
 
@@ -448,12 +450,12 @@ enable_autostart() {
 # Read the per-instance web port from ~/.gini/instances/<inst>/web.port,
 # polling for up to INSTALL_READ_WEB_PORT_TIMEOUT_S seconds while the
 # autostart web shim writes it. The default web port is hash-derived
-# (src/paths.ts:defaultWebPort) so it is almost never 3000 for non-`main`
+# (packages/runtime/src/paths.ts:defaultWebPort) so it is almost never 3000 for non-`main`
 # instances; even for `main` install.sh must not assume 3000 because future
 # versions could change the hashing scheme. Echoes the port on success,
 # empty on timeout.
 #
-# Cross-boundary contract with src/cli/autostart.ts:
+# Cross-boundary contract with packages/runtime/src/cli/autostart.ts:
 #   - The autostart web shim (buildWebShim) has a budget of
 #     WEB_SHIM_WAIT_ATTEMPTS * WEB_SHIM_WAIT_INTERVAL_SECONDS = 60s to
 #     wait for the gateway to come up before exec'ing `bun run dev` and
@@ -463,7 +465,7 @@ enable_autostart() {
 #     90s leaves comfortable headroom (60s shim wait + a few seconds for
 #     Next.js startup before web.port is touched).
 # If you change either side, change both — and update the comments here
-# and in src/cli/autostart.ts:buildWebShim.
+# and in packages/runtime/src/cli/autostart.ts:buildWebShim.
 INSTALL_READ_WEB_PORT_TIMEOUT_S=90
 # Per-instance web port healthcheck budget after web.port appears. Covers
 # Next.js dev-server compile + first response; usually fast but a cold
@@ -491,7 +493,7 @@ read_web_port() {
 
 # Read the gateway (runtime) port for an instance from
 # ~/.gini/instances/<inst>/runtime.port (written by the runtime at boot,
-# src/server.ts). The gateway is the single operator front — its origin is what
+# packages/runtime/src/server.ts). The gateway is the single operator front — its origin is what
 # the post-install browser should open. Returns the port or empty on timeout.
 read_runtime_port() {
   local instance="$1"
@@ -563,7 +565,7 @@ open_setup_in_browser() {
   # operator front and the only origin that serves the native /api/* surface
   # (device pairing, tunnel). The inner port serves /setup too, but landing
   # there leaves pairing/tunnel unreachable. This matches operatorWebUrl
-  # (src/cli/process.ts: http://localhost:<gateway port>), which `gini status`
+  # (packages/runtime/src/cli/process.ts: http://localhost:<gateway port>), which `gini status`
   # and the start banner advertise. The inner web is already up (probed above),
   # so its parent gateway — and runtime.port — are present.
   local gateway_port

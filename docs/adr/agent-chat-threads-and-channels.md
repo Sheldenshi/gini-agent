@@ -85,7 +85,7 @@ untouched.
 ### Session kind
 
 `ChatSessionRecord` gains `kind?: "agent" | "channel"` (in
-`src/types.ts`), distinct from `source?.kind` (the messaging-bridge
+`packages/runtime/src/types.ts`), distinct from `source?.kind` (the messaging-bridge
 kind):
 
 - `"agent"` — the single canonical chat for an agent.
@@ -95,7 +95,7 @@ kind):
   undefined as **hidden** (not deleted) — legacy multi-session history
   is preserved on disk but not surfaced.
 
-`getOrCreateAgentChat(instance, agentId)` (`src/execution/chat.ts`) is
+`getOrCreateAgentChat(instance, agentId)` (`packages/runtime/src/execution/chat.ts`) is
 the one resolver for an agent's canonical chat. It runs inside a single
 `mutateState` and:
 
@@ -123,7 +123,7 @@ carries `threadId` and the thread's root carries `parentBlockId`
 pointing at the main-chat block it branched from — the human `user_text`
 for an agent-started thread, the `assistant_text` for a user-started one.
 
-Schema `MEMORY_SCHEMA_VERSION` 8 → 9 (`src/state/memory-db.ts`):
+Schema `MEMORY_SCHEMA_VERSION` 8 → 9 (`packages/runtime/src/state/memory-db.ts`):
 
 - `ADD COLUMN thread_id TEXT` and `parent_block_id TEXT` (nullable, so
   every pre-9 row is a main-chat block with `NULL thread_id`);
@@ -151,7 +151,7 @@ Legacy rows omit them and are treated as main-chat context.
 
 ### Thread read helpers
 
-In `src/state/chat-blocks.ts`, surfaced through the `src/state` barrel:
+In `packages/runtime/src/state/chat-blocks.ts`, surfaced through the `packages/runtime/src/state` barrel:
 
 - `listThreadBlocks(instance, sessionId, threadId)` — ordinal-ascending
   blocks of one thread.
@@ -167,7 +167,7 @@ In `src/state/chat-blocks.ts`, surfaced through the `src/state` barrel:
   `chat_blocks` is SQLite, so the helper can't discover which sessions
   are `kind:"agent"` on its own.
 
-`ThreadSummary` (`src/types.ts`) carries `threadId`, `sessionId`,
+`ThreadSummary` (`packages/runtime/src/types.ts`) carries `threadId`, `sessionId`,
 optional `agentId` / `parentBlockId` / `rootPreview` / `rootAuthor`,
 `replyCount`, `lastReplyAt`, optional `lastReplyPreview` /
 `lastReplyAuthor`, and optional `activity`. `rootAuthor` (`user` /
@@ -202,12 +202,12 @@ malformed block can't pin a thread active.
 Two emission points keep the scan truthful through gate-resolution
 windows: approving an authorization emits a best-effort
 `Working: <action>` phase block before the side effect executes
-(`src/agent.ts` `resolveAuthorization`), and completing a setup request
+(`packages/runtime/src/agent.ts` `resolveAuthorization`), and completing a setup request
 emits the same block for actions whose side effects run after the
 complete-claim (connector probe, playwright secret fill, messaging
 connect/remove/pairing) — decided per action by the exhaustive
 `SETUP_COMPLETE_EMITS_WORKING_PHASE` map keyed by `SetupRequestAction`
-inside `resolveSetupRequest` (`src/agent.ts`) — without these, a long
+inside `resolveSetupRequest` (`packages/runtime/src/agent.ts`) — without these, a long
 side effect would leave the resolved gate as the newest block and the
 thread would keep reading `waiting_approval` after the user already
 acted. `skill.grant_connector` deliberately does not
@@ -221,7 +221,7 @@ and the inline thread chip dot.
 
 A recurring job that creates a dedicated delivery session tags it
 `kind:"channel"` + `origin:"job"` at the create site
-(`createChatSession(..., "job", "channel")` in `src/jobs/index.ts`),
+(`createChatSession(..., "job", "channel")` in `packages/runtime/src/jobs/index.ts`),
 and `normalizeState` backfills the kind on existing job sessions. A
 channel is therefore a **view over the job's existing session** — there
 is no `ChannelRecord`. The user can chat into a channel exactly as into
@@ -230,7 +230,7 @@ drive the rail grouping and the unread-until-opened behavior job
 sessions already had.
 
 Session-level unread is computed client-side
-(`web/src/lib/use-chat-read-state.ts`) and keys on **delivered replies
+(`packages/web/src/lib/use-chat-read-state.ts`) and keys on **delivered replies
 only** — the activity timestamp is the newest `updatedAt` among the
 session's runs that carry an `assistantMessageId` (set when a final
 answer is persisted as a durable chat message, with `run.updatedAt`
@@ -277,7 +277,7 @@ watcher/reminder fire legible as the job's output rather than a mis-ordered
 conversation turn.
 
 The binding stays modifiable after creation: `update_job` accepts the
-same `deliverTo` enum (`rebindJobDelivery` in `src/jobs/index.ts`,
+same `deliverTo` enum (`rebindJobDelivery` in `packages/runtime/src/jobs/index.ts`,
 audited as `job.delivery.rebound`). Switching to `"channel"` always
 mints a **new** dedicated channel and leaves the previously bound
 conversation untouched — it's the user's chat. Switching to `"chat"`
@@ -304,10 +304,10 @@ owning agent is archived and must keep counting until it is archived in
 its own right. The predicate is therefore `!isJobChannel && archived-agent`,
 not `kind === "agent"` — narrowing it to `=== "agent"` would re-pin the
 badge on an archived agent's hidden legacy sessions. `GET /api/badge` and `GET /api/unread`
-resolve the unreachable set via `unreachableSessionIds` (`src/http.ts`)
+resolve the unreachable set via `unreachableSessionIds` (`packages/runtime/src/http.ts`)
 and pass it to
 `unreadCountForDevice` / `unreadCountsByDevice`
-(`src/state/chat-read-state.ts`) so their blocks don't count. Without
+(`packages/runtime/src/state/chat-read-state.ts`) so their blocks don't count. Without
 this a deleted recurring job's channel (which can hold hundreds of
 blocks) or an archived agent's chat pins the badge at a number the user
 can't clear. Rebinding when already bound the requested way is a no-op.
@@ -318,7 +318,7 @@ semantics.
 
 **Deleting a job archives its dedicated channel.** A channel is a view
 over the job's session, so removing the job leaves the channel with
-nothing to surface. `removeJob` (`src/jobs/index.ts`) therefore stamps
+nothing to surface. `removeJob` (`packages/runtime/src/jobs/index.ts`) therefore stamps
 the channel's `archivedAt` (audited as `chat.session.archived`,
 `reason: "job.removed"`) the same way the `deliverTo:"chat"` rebind
 does — history preserved, still addressable by id/URL, excluded from
@@ -329,7 +329,7 @@ lifecycle), and never one another surviving job still delivers into via
 `chatSessionId` or a fan-out route (raw `POST`/`PATCH /api/jobs` can
 bind several jobs to one channel, so archiving while a sibling still
 fires would hide a live delivery surface). A one-time `normalizeState`
-sweep (`archiveOrphanJobChannels`, `src/state/store.ts`) applies the
+sweep (`archiveOrphanJobChannels`, `packages/runtime/src/state/store.ts`) applies the
 same rule to channels orphaned by deletions that pre-dated this cleanup,
 so a state file carrying a leftover `kind:"channel"` session with no
 owning job is healed on load. This complements Decision D: deleting the
@@ -337,7 +337,7 @@ owning job is healed on load. This complements Decision D: deleting the
 deleting the **job** archives its channel.
 
 Beyond the channel itself, a finished job run's reply can reach
-messaging bridges two ways (`src/jobs/finalize.ts`): the session's
+messaging bridges two ways (`packages/runtime/src/jobs/finalize.ts`): the session's
 origin mirror (`outboundMirror`/`source`, set when the job was created
 from a Telegram/Discord conversation) mirrors the reply back to that
 bridge, and `JobRecord.deliveryTargets` names additional bridges to
@@ -352,7 +352,7 @@ terminal finalize: a job with no chat session (created via `POST
 the task summary instead of the synced chat reply, and both paths
 honor the `[SILENT]` suppression contract (the literal token, or a
 trailing standalone `[SILENT]` line after a no-op preamble; a
-leading/inline sentinel still delivers — see `src/jobs/silent.ts`). A bridge the origin
+leading/inline sentinel still delivers — see `packages/runtime/src/jobs/silent.ts`). A bridge the origin
 mirror already delivered to is skipped. Fire-time resolution failures
 and send failures are logged (`job.delivery.target.error`) and audited
 (`job.delivery.failed`) without failing the run.
@@ -363,10 +363,10 @@ Routing is resolved per turn, before the user sees any text, by three
 mechanisms in priority order:
 
 1. **`start_thread` control tool (primary).** Defined in
-   `src/execution/tool-catalog.ts`, it is a core tool — always-on,
+   `packages/runtime/src/execution/tool-catalog.ts`, it is a core tool — always-on,
    never deferred (allowlisted alongside `load_tools` in the deferral
    gate), and never approval-gated. It is handled **inline** in the
-   chat-task loop (`src/execution/chat-task.ts`), not through the
+   chat-task loop (`packages/runtime/src/execution/chat-task.ts`), not through the
    dispatch switch, so it produces no `phase` / `tool_call` /
    `tool_result` chat block — it is a control action, not visible work.
    On the first model call of a fresh turn it calls `switchTurnToThread()`
@@ -375,7 +375,7 @@ mechanisms in priority order:
    call resolved.
 
 2. **`<route>thread</route>` directive (silent fallback).**
-   `parseLeadingRouteDirective` (`src/execution/route-directive.ts`)
+   `parseLeadingRouteDirective` (`packages/runtime/src/execution/route-directive.ts`)
    inspects the accreted *leading* text of a turn as deltas stream in,
    distinguishing a complete directive, a strict prefix that could still
    become one (buffer and wait), and everything else. A recognized
@@ -414,13 +414,13 @@ readily. A control tool the model invokes as its first action is the
 mechanism it actually reaches for; the directive remains as a
 zero-cost fallback for models that do emit it. The
 "expect multi-turn → thread" guidance lives in the system prompt
-(`src/runtime/defaults/INSTRUCTIONS.md`), instructing the tool as
+(`packages/runtime/src/runtime/defaults/INSTRUCTIONS.md`), instructing the tool as
 primary; there is no programmatic retroactive heuristic, because
 already-streamed blocks cannot be cleanly re-threaded after the fact.
 
 ## Client Contract
 
-New routes (`src/http.ts`):
+New routes (`packages/runtime/src/http.ts`):
 
 - `GET /api/agents/:agentId/chat` — resolve (or lazily create) the
   agent's one canonical chat via `getOrCreateAgentChat`.
@@ -454,7 +454,7 @@ Both list endpoints order newest reply first with a deterministic
 `threadId` tiebreak (the inbox also tiebreaks on `sessionId`). The web
 thread lists — the per-agent Threads tab and the `/threads` inbox —
 re-order client-side through one shared `sortThreads` helper
-(`web/src/components/chat/ThreadsTab.tsx`): threads with a run in
+(`packages/web/src/components/chat/ThreadsTab.tsx`): threads with a run in
 flight first, `waiting_approval` outranking `running` (the actionable
 state wins), then newest reply within each group. The same ranking
 feeds `aggregateActivity`, which drives the chat tab-bar activity dot,
@@ -537,22 +537,22 @@ Con:
 
 ## Acceptance Checks
 
-- `bun test src/execution/agent-chat-resolver.test.ts` covers
+- `bun test packages/runtime/src/execution/agent-chat-resolver.test.ts` covers
   `getOrCreateAgentChat`: the agent-exists guard, returning an existing
   `kind:"agent"` session, preferring the non-empty chat over an empty
   `kind:"agent"` duplicate (and demoting the duplicate), lazy promotion
   of a legacy session, and fresh creation.
-- `bun test src/execution/route-directive.test.ts` covers the
+- `bun test packages/runtime/src/execution/route-directive.test.ts` covers the
   leading-directive parser's `none` / `incomplete` / `directive`
   states.
-- `bun test src/execution/chat-task-route.test.ts` covers the
+- `bun test packages/runtime/src/execution/chat-task-route.test.ts` covers the
   per-turn routing: `start_thread` branching the turn inline (no
   visible block), the `<route>` fallback, the already-threaded and
   no-parent no-ops, and user-reply-stays-threaded.
-- `bun test src/state/chat-blocks.test.ts` covers thread tagging on
+- `bun test packages/runtime/src/state/chat-blocks.test.ts` covers thread tagging on
   insert, `listThreadBlocks` / `listMainChatBlocks`, and the
   `summarizeThreads` / `summarizeThreadsForInstance` aggregates.
-- `bun test src/jobs.test.ts` covers job-output bridge delivery: the
+- `bun test packages/runtime/src/jobs.test.ts` covers job-output bridge delivery: the
   origin-mirror `[SILENT]` contract, and the `deliveryTargets` path
   (resolution by name/id/kind, dedupe against the origin mirror,
   fire-time resolution failure logged without failing the run, and
@@ -564,13 +564,13 @@ Con:
   archived (history intact), a chat-bound conversation is left untouched,
   and a channel a sibling job still delivers into is spared until the last
   job is removed.
-- `bun test src/state/store.test.ts` covers `archiveOrphanJobChannels`:
+- `bun test packages/runtime/src/state/store.test.ts` covers `archiveOrphanJobChannels`:
   a job channel orphaned by a pre-cleanup deletion is archived (with the
   legacy `origin:"job"`→`kind:"channel"` backfill running first), a
   channel a surviving job references via `chatSessionId` or a fan-out
   route is spared, email-watch / already-archived / plain sessions are
   never touched, and the sweep is idempotent across repeat normalizes.
-- `bun test src/http.test.ts` smoke-tests the new routes — the
+- `bun test packages/runtime/src/http.test.ts` smoke-tests the new routes — the
   agent-chat resolver, the three per-session thread routes (including
   create-or-append from a new thread id + `parentBlockId`, the
   session-first 404, and the `parentBlockId` requirement), and the

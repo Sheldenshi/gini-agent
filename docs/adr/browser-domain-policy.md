@@ -4,7 +4,7 @@
 
 Each agent can carry a user-managed browsing boundary,
 `AgentRecord.browserDomainPolicy?: { deny?: string[]; allow?: string[] }`,
-enforced by the browser tool layer in `src/tools/browser.ts`:
+enforced by the browser tool layer in `packages/runtime/src/tools/browser.ts`:
 
 - `deny` — domains the agent's browser may never reach. Always checked
   first.
@@ -77,7 +77,7 @@ applies.
 - A host on both lists is blocked (deny beats allow).
 - Tasks without an `agentId`, and instances where the state read fails,
   browse without domain restrictions but still behind the SSRF gate.
-- `src/tools/browser.test.ts` covers the matching semantics (exact,
+- `packages/runtime/src/tools/browser.test.ts` covers the matching semantics (exact,
   subdomain, case-insensitivity, boundary-not-substring, allow-only,
   deny-beats-allow) and both enforcement points without launching a real
   browser.

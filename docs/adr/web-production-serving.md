@@ -6,7 +6,7 @@ The installed runtime serves its Next.js control plane from a **sha-keyed
 production build** when one exists, and falls back to `next dev` otherwise.
 One rule, applied identically by every serving path:
 
-- If `web/.next-prod-<sha12>` exists **and** contains a `BUILD_ID` (next
+- If `packages/web/.next-prod-<sha12>` exists **and** contains a `BUILD_ID` (next
   build's completion marker), where `<sha12>` is `git rev-parse --short=12
   HEAD` of the checkout being served, exec `next start` with
   `GINI_DIST_DIR=.next-prod-<sha12>`.
@@ -15,14 +15,14 @@ One rule, applied identically by every serving path:
 
 The serving paths that apply the rule:
 
-- The launchd web shim (`buildWebShim`, `src/cli/autostart.ts`) — in sh,
+- The launchd web shim (`buildWebShim`, `packages/runtime/src/cli/autostart.ts`) — in sh,
   after its gateway-health gate.
 - `gini start` / `gini run` (`webLaunchPlan` + `resolveWebProdDistDir`,
-  `src/cli/process.ts` / `src/runtime/update.ts`) — in TypeScript.
+  `packages/runtime/src/cli/process.ts` / `packages/runtime/src/runtime/update.ts`) — in TypeScript.
 
 Only the update and install flows ever **create** prod dirs:
 
-- `updateRuntime` (`src/runtime/update.ts`) runs `bun run build` in `web/`
+- `updateRuntime` (`packages/runtime/src/runtime/update.ts`) runs `bun run build` in `packages/web/`
   with `GINI_DIST_DIR=.next-prod-<sha12-of-the-new-HEAD>` after the web
   `bun install`. The build is skipped when that dir already carries a
   `BUILD_ID` (idempotent re-update onto the same head). Before the build it
@@ -33,7 +33,7 @@ Only the update and install flows ever **create** prod dirs:
   with no restart, and silently strand the runtime on old code after git HEAD
   already advanced. On success, the new
   HEAD's bundle **and the previous HEAD's bundle** are kept; every
-  strictly-older `web/.next-prod-*` dir is deleted — a non-matching sha can
+  strictly-older `packages/web/.next-prod-*` dir is deleted — a non-matching sha can
   never be served again, and each bundle is a full Next build's worth of
   disk. The previous bundle is preserved because the still-running old web
   server is serving from it until the restart lands; it is reclaimed by a
@@ -58,7 +58,7 @@ which both modes honor.
 ## Context
 
 The runtime previously served the control plane with `next dev`
-unconditionally. The old comment in `src/cli/process.ts` explained why:
+unconditionally. The old comment in `packages/runtime/src/cli/process.ts` explained why:
 production serving requires an explicit prior `next build`, and a stale
 `.next/` from a previous checkout would silently serve outdated code, which
 is hostile to fresh-clone and worktree workflows.
@@ -113,8 +113,8 @@ instead.
   cannot 500 on a not-yet-loaded route because the bundle it serves from is
   never deleted out from under it. The restart then lands on the new
   bundle.
-- `web/.next-prod-*` dirs are working artifacts like `.next-<instance>`;
-  `web/.gitignore`'s existing `/.next-*/` entry covers them.
+- `packages/web/.next-prod-*` dirs are working artifacts like `.next-<instance>`;
+  `packages/web/.gitignore`'s existing `/.next-*/` entry covers them.
 - Production mode ignores dev-only conveniences (`allowedDevOrigins`, HMR);
   nothing in the BFF depends on them — the gateway reverse-proxy and
   relay-origin trust decisions live at the gateway, not in Next's dev
@@ -145,7 +145,7 @@ instead.
 
 ## Acceptance Checks
 
-- `updateRuntime` builds `web/.next-prod-<sha12>` for the new HEAD, skips
+- `updateRuntime` builds `packages/web/.next-prod-<sha12>` for the new HEAD, skips
   the build when a `BUILD_ID` is already present, keeps the new bundle and
   the previous HEAD's bundle while deleting strictly-older `.next-prod-*`
   dirs on success, and throws (scheduling no restart) on build failure.

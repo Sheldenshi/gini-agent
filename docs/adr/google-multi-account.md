@@ -22,7 +22,7 @@ skills (`google-gmail`, `google-calendar`, `google-drive`, `google-docs`,
 - **A registered account satisfies the credential for skill activity.** With
   ≥1 account in the registry, the Workspace skills are active even when no
   per-instance `google-workspace-oauth` connector exists: `isSkillActive`
-  (`src/integrations/connectors/index.ts`) consults the owning provider's
+  (`packages/runtime/src/integrations/connectors/index.ts`) consults the owning provider's
   `credentialExternallySatisfied` hook (`google-oauth-desktop.ts`, backed by
   `readGoogleAccounts()`) before declaring a required credential unmet. The
   hook applies only when no connector record with that name exists at all —
@@ -55,7 +55,7 @@ skills (`google-gmail`, `google-calendar`, `google-drive`, `google-docs`,
   `state.json`.
 
 ```ts
-// src/types.ts — the registry shape (persisted machine-globally)
+// packages/runtime/src/types.ts — the registry shape (persisted machine-globally)
 export interface GoogleAccount {
   id: string;          // stable slug, e.g. "gacct_<rand>" (dir basename for managed dirs)
   tag: string;         // user label: "personal" | "work" | "school" | ...
@@ -116,7 +116,7 @@ resource, not as instance state:
   encrypted; only the config-dir *paths* and tags are machine-global. The
   tokens in each config dir are `gws`'s, exactly as before.
 - **Lockless last-writer-wins.** Registry mutations read-modify-write without a
-  lock (matching `src/state/secrets-env.ts`); a concurrent add/remove across
+  lock (matching `packages/runtime/src/state/secrets-env.ts`); a concurrent add/remove across
   instances can drop the loser's change. This is acceptable for the low-frequency,
   operator-driven account churn here, and the atomic temp+rename guarantees no
   reader ever sees a corrupt file.
@@ -142,7 +142,7 @@ This is surfaced two ways, both byte-stable so they don't churn the prompt
 cache:
 
 - A **"Connected Google accounts"** block in the system prompt
-  (`buildConnectedAccountsBlock` in `src/execution/chat-task.ts`, fed by
+  (`buildConnectedAccountsBlock` in `packages/runtime/src/execution/chat-task.ts`, fed by
   `readGoogleAccounts()`), listing each account's tag, email, and config dir,
   plus the selection rule. Emitted only when ≥1 account is connected; preserves
   registry order and carries no timestamps.
@@ -243,8 +243,8 @@ flow.
 - Credentialed Google login ships as the `google-account-login` skill's
   `account-login.ts`, invoked via `skill_run`. The setup skill must stay
   credential-free so `read_skill` can load it during first-time setup.
-- New persistence belongs in `src/state/google-accounts.ts` (low-level
-  registry) and orchestration in `src/integrations/connectors/google-accounts.ts`
+- New persistence belongs in `packages/runtime/src/state/google-accounts.ts` (low-level
+  registry) and orchestration in `packages/runtime/src/integrations/connectors/google-accounts.ts`
   (registry ∪ live status, register/remove/retag). Status fetching is injectable
   so it unit-tests without a real `gws` binary.
 
@@ -259,7 +259,7 @@ account deletes its config dir (its tokens) but never the user's
 
 Registration normally gates the registry write on a live `gws auth status`
 probe, so an empty or signed-out dir is never registered. The relay-provisioned
-grant path (`defaultPersistWorkspaceGrant` in `src/integrations/tunnel.ts`) is
+grant path (`defaultPersistWorkspaceGrant` in `packages/runtime/src/integrations/tunnel.ts`) is
 the one exception: it calls `registerAccount` with `trusted: true`, which skips
 the probe. This is sound because the credential is trustworthy *by
 construction* — the relay only issues a refresh token after a completed OAuth
@@ -273,7 +273,7 @@ internal path: the public `POST /api/google/accounts` route forwards only
 all caller-supplied dirs.
 
 A trusted account carries two extra fields on the registry row (`GoogleAccount`
-in `src/types.ts`), both set only on this path and never by a user/manual
+in `packages/runtime/src/types.ts`), both set only on this path and never by a user/manual
 account:
 
 - `provisioned: true` — immutable provenance. The grant path re-finds *its own*
@@ -302,10 +302,10 @@ risk.
 
 ## Acceptance checks
 
-- `bun test src/state/google-accounts.test.ts` — registry round-trips
+- `bun test packages/runtime/src/state/google-accounts.test.ts` — registry round-trips
   (atomic write + read-back), missing/corrupt file → `[]`, case-insensitive tag
   uniqueness rejects a colliding add/retag, remove is a no-op for an unknown id.
-- `bun test src/integrations/connectors/google-accounts.test.ts` —
+- `bun test packages/runtime/src/integrations/connectors/google-accounts.test.ts` —
   `registerAccount` derives the id from the dir basename for a gini-managed dir
   (so `removeAccount` cleans that dir) and reuses/mints for an adopted dir;
   `registerAccount` throws for a not-signed-in dir **on the default (probed)
@@ -313,11 +313,11 @@ risk.
   relay-provisioned path below); `removeAccount` deletes a gini-managed dir but
   never `~/.config/gws`; `listAccountsWithStatus` degrades a failing per-dir
   status fetch to `signedIn: false`.
-- `bun test src/integrations/connectors/gws-session.test.ts` —
+- `bun test packages/runtime/src/integrations/connectors/gws-session.test.ts` —
   `gwsSessionStatusForDir` passes `GOOGLE_WORKSPACE_CLI_CONFIG_DIR` and caches
   per dir (each dir spawns at most one `gws auth status` per TTL window);
   `parseGwsAuthStatus` extracts `.user` (email) and `.scopes`.
-- `bun test src/execution/chat-task.test.ts` — `buildConnectedAccountsBlock`
+- `bun test packages/runtime/src/execution/chat-task.test.ts` — `buildConnectedAccountsBlock`
   emits nothing for 0 accounts, the single-account rule for 1, and the
   aggregate-on-unscoped-read / ask-on-write rule for 2+; the block is
   byte-stable for a given registry.

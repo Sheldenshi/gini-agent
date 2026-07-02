@@ -5,7 +5,7 @@
 `cancelTask` propagates an abort signal into every in-flight approved
 action so a task that is cancelled mid-execution can stop the side
 effect rather than waiting for it to complete. A module-scoped registry
-in `src/execution/approval-execution.ts` (`claimApproval` /
+in `packages/runtime/src/execution/approval-execution.ts` (`claimApproval` /
 `releaseApproval` / `abortApprovalsForTask` / `raceWithAbort`) lets
 `agent.executeApprovedAction` register a per-approval `AbortController`
 and lets `agent.cancelTask` fire `controller.abort("task.cancelled")`
@@ -89,7 +89,7 @@ Per-action behaviour:
   for the rationale (the secret values are request-scope only and
   can't be threaded through `runApprovedAction`'s signature without
   persisting them). The bounded module
-  `src/execution/browser-fill-secrets.ts` substitutes a per-slot
+  `packages/runtime/src/execution/browser-fill-secrets.ts` substitutes a per-slot
   `readState` task-status check before each `browserFillByLocator`
   call: a `cancelTask` landing after the atomic resolve will be
   observed at the next iteration, the loop bails, and the audit
@@ -103,7 +103,7 @@ Per-action behaviour:
   shape as `browser.fill_secret`. The chat card collects
   request-scope state (bot token, verification code, confirmation)
   that `executeApprovedAction` can't see. Each bounded module
-  (`src/execution/messaging-*-connect.ts`) calls
+  (`packages/runtime/src/execution/messaging-*-connect.ts`) calls
   `resolveApproval({ resumeChatTask: false })` BEFORE the side
   effect (`addMessagingBridge` / `allowChat` / `removeMessagingBridge`)
   and inspects the resolved approval's status to short-circuit if
@@ -153,7 +153,7 @@ failure.
 
 This registry aborts the **side effect** of an approved tool. The
 parallel mechanism that aborts the **model call** of a chat turn lives
-in `src/execution/turn-abort.ts`; the same three terminal-transition
+in `packages/runtime/src/execution/turn-abort.ts`; the same three terminal-transition
 paths fire it (via `recordInFlightAborted`) alongside
 `abortApprovalsForTask`. See
 [turn-model-call-abort.md](turn-model-call-abort.md) for that protocol.
@@ -161,7 +161,7 @@ paths fire it (via `recordInFlightAborted`) alongside
 ## Errors
 
 Two distinct error classes drive the dispatcher's race-loss handling
-in `src/execution/tool-dispatch.ts::pendingOrAuto`. Keeping them
+in `packages/runtime/src/execution/tool-dispatch.ts::pendingOrAuto`. Keeping them
 separate makes "I lost the race" and "the task is already terminal"
 distinguishable in audit traces and unit tests.
 
@@ -176,7 +176,7 @@ distinguishable in audit traces and unit tests.
   when their `mutateState` callback observes
   `isTerminalTaskStatus(item.status)` and refuses to create an
   approval row against an already-terminal task. The matching
-  imperative helpers in `src/tools/*` (`requestShell`,
+  imperative helpers in `packages/runtime/src/tools/*` (`requestShell`,
   `requestCodeExecution`, `requestFileWrite`, `requestFilePatch`)
   use the same `isTerminalTaskStatus` guard but simply return the
   unchanged task — the imperative dispatcher handles the no-op
@@ -196,7 +196,7 @@ on terminal; let `pendingOrAuto` handle the rest.
 ## Terminal-status discipline
 
 Every `mutateState` callback that flips `task.status` MUST first
-check `isTerminalTaskStatus(item.status)` (from `src/state/store.ts`)
+check `isTerminalTaskStatus(item.status)` (from `packages/runtime/src/state/store.ts`)
 and short-circuit when the task is already terminal. Without this
 discipline a cancel that landed during a long await — the imperative
 dispatcher's pre-dispatch `Bun.sleep(10)`, the chat loop's
@@ -237,7 +237,7 @@ follow-up.
 
 ## Required Now
 
-- `src/execution/approval-execution.ts` — the registry module and the
+- `packages/runtime/src/execution/approval-execution.ts` — the registry module and the
   `raceWithAbort` helper. The registry is a nested
   `Map<instance, Map<approvalId, entry>>` so the instance dimension
   is a true partition (instance names can contain any characters
@@ -253,7 +253,7 @@ follow-up.
   row when entries were aborted.
 - `runChatTask` respects pre-existing terminal status so a cancel
   issued before the loop's first iteration is not overwritten.
-- Regression test suite at `src/execution/approval-execution.test.ts`
+- Regression test suite at `packages/runtime/src/execution/approval-execution.test.ts`
   covering: registry behavior, `raceWithAbort` happy path / abort path
   / pre-aborted / late-rejection swallowing, end-to-end
   `cancelTask`-during-`terminal.exec` killing the proc and emitting
@@ -263,7 +263,7 @@ follow-up.
 ## Deferred
 
 - Threading the signal through `withSession` in
-  `src/tools/browser.ts` so the underlying Playwright call can also
+  `packages/runtime/src/tools/browser.ts` so the underlying Playwright call can also
   be aborted via a generation bump or page close. The current shim
   detaches the upload promise but the browser-side work continues;
   the `browser.upload_file_late_completion` audit row records the
@@ -275,7 +275,7 @@ follow-up.
   or Bun adding a `detached` option to `spawn`. Tracked as a
   follow-up.
 - `code_exec` already routes through the `terminal.exec` approval
-  (see `src/execution/tool-dispatch.ts::requestCodeExec`), so it
+  (see `packages/runtime/src/execution/tool-dispatch.ts::requestCodeExec`), so it
   inherits the SIGTERM behavior described above. The same
   grandchildren limitation applies.
 - True process-tree teardown for `skill.run` grandchildren. The
@@ -330,7 +330,7 @@ not a hardcoded value.
 ## Acceptance checks
 
 - `bun run typecheck` clean.
-- `bun test src/execution/approval-execution.test.ts` clean.
+- `bun test packages/runtime/src/execution/approval-execution.test.ts` clean.
 - `bun test` end-to-end clean.
 - `cancelTask` during a long-running `sleep` invocation kills the proc
   promptly (well below the configured timeout) and writes

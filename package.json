@@ -5,40 +5,39 @@
   "license": "MIT",
   "description": "The agent that remembers and learns.",
   "type": "module",
-  "bin": {
-    "gini": "./src/cli.ts"
+  "workspaces": {
+    "packages": [
+      "packages/*"
+    ],
+    "catalog": {
+      "@tanstack/react-query": "^5.101.1",
+      "@types/bun": "^1.3.0",
+      "typescript": "~6.0.3"
+    }
   },
   "scripts": {
-    "gini": "bun run src/cli.ts",
-    "server": "bun run src/server.ts",
-    "smoke": "bun run src/cli.ts smoke",
-    "test": "bun test --parallel ./src ./skills ./mobile/src ./mobile/plugins",
-    "posttest": "bun --cwd=web test --isolate",
-    "typecheck": "bunx tsc --noEmit && cd web && bunx tsc --noEmit && cd ../mobile && bunx tsc --noEmit",
-    "web:dev": "cd web && bun run dev",
-    "web:build": "cd web && bun run build",
-    "web:start": "cd web && bun run start",
-    "mobile": "cd mobile && bun run start",
-    "mobile:ios": "cd mobile && bun run ios",
-    "mobile:android": "cd mobile && bun run android"
+    "gini": "bun run packages/runtime/src/cli.ts",
+    "server": "bun run packages/runtime/src/server.ts",
+    "smoke": "bun run packages/runtime/src/cli.ts smoke",
+    "test": "bun test --parallel ./packages/runtime/src ./skills ./packages/mobile/src ./packages/mobile/plugins",
+    "posttest": "bun --cwd=packages/web test --isolate",
+    "typecheck": "bunx tsc --noEmit && bun run --filter './packages/*' typecheck",
+    "web:dev": "bun --cwd packages/web run dev",
+    "web:build": "bun --cwd packages/web run build",
+    "web:start": "bun --cwd packages/web run start",
+    "mobile": "bun --cwd packages/mobile run start",
+    "mobile:ios": "bun --cwd packages/mobile run ios",
+    "mobile:android": "bun --cwd packages/mobile run android"
   },
   "devDependencies": {
-    "@types/bun": "latest",
-    "typescript": "latest"
-  },
-  "dependencies": {
-    "@huggingface/transformers": "^4.2.0",
-    "croner": "^10.0.1",
-    "gini-relay": "git+ssh://git@github.com/Open-Curiosity/gini-relay.git#eb1f8f89e26c22b8e5e7af8ab7fcf840c4114cf6",
-    "mammoth": "^1.12.0",
-    "pdfjs-dist": "^6.0.227",
-    "playwright-core": "^1.61.1",
-    "sharp": "^0.35.2",
-    "xlsx": "file:vendor/xlsx-0.20.3.tgz"
+    "@types/bun": "catalog:",
+    "typescript": "catalog:"
   },
   "trustedDependencies": [
     "onnxruntime-node",
-    "protobufjs"
+    "protobufjs",
+    "sharp",
+    "unrs-resolver"
   ],
   "patchedDependencies": {
     "playwright-core@1.61.1": "patches/playwright-core@1.61.1.patch"

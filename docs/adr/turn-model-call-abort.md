@@ -7,14 +7,14 @@ the source, so a turn cancelled mid-stream stops its fetch + SSE stream
 reader the instant the cancel lands instead of reading deltas until the
 upstream connection closes on its own.
 
-A module-scoped per-turn registry in `src/execution/turn-abort.ts`
+A module-scoped per-turn registry in `packages/runtime/src/execution/turn-abort.ts`
 (`registerTurn` / `releaseTurn` / `abortTurnForTask`) holds at most one
 `AbortController` per `(instance, taskId)`. The chat-task entry points
 register a controller, thread its signal into every model/aux call for
 that turn, and the terminal-transition paths fire `controller.abort()`
 on the entry that targets the cancelled task. This is the model-call
 analogue of the approved-action abort registry in
-`src/execution/approval-execution.ts` (see
+`packages/runtime/src/execution/approval-execution.ts` (see
 [approval-execution-abort.md](approval-execution-abort.md)); the two
 registries are independent — one aborts the side effect of an approved
 tool, the other aborts the model call that drives the turn.
@@ -256,9 +256,9 @@ in-flight call at its source rather than relying on the next checkpoint.
 ## Acceptance checks
 
 - `bun run typecheck` clean.
-- `bun test src/execution/turn-abort.test.ts` clean (registry
+- `bun test packages/runtime/src/execution/turn-abort.test.ts` clean (registry
   register/release/abort/supersede semantics).
-- `bun test src/execution/cancel-abort-signal.test.ts` clean: a cancel
+- `bun test packages/runtime/src/execution/cancel-abort-signal.test.ts` clean: a cancel
   during a long held echo call releases the turn registry entry well
   under the held-call delay (source abort), the turn is `cancelled` (not
   `failed`), no provider auth failure is recorded, and an approved action

@@ -55,14 +55,14 @@ Deleting or rewriting old chat would violate the product promise that the agent 
 - Packing never emits a `role:"tool"` result without its preceding assistant `tool_calls` row.
 - A turn packs only its own session's rows; an unrelated session's history never enters the budget (per-topic scoping; the former thread-priority preference was removed).
 - A turn that crosses the in-turn high-water line compacts once (head and recent tail preserved) and continues; anti-thrash bails to a partial result rather than compacting repeatedly. A provider context-overflow error triggers bounded compact-and-retry, then a graceful partial result.
-- `bun test src/execution/context-window.test.ts`
-- `bun test src/execution/chat-task.test.ts`
+- `bun test packages/runtime/src/execution/context-window.test.ts`
+- `bun test packages/runtime/src/execution/chat-task.test.ts`
 
 ## Critical Files
 
-- `src/execution/context-window.ts` — prior-history packing, approximate token accounting, tool-call grouping, elision note. (Replay now scopes to the running session's own rows; the former thread-priority pass was removed with the Topics migration.)
-- `src/execution/chat-task.ts` — rebuilds durable prior rows, applies the packer, records retained/omitted context metrics in task trace, and within the loop: calibrates the live budget to the provider's reported prompt tokens, elides older tool-result content (`elideOldToolResultsToBudget`) before each provider call, runs the in-turn high-water compaction (prune-then-summarize, splicing the synthetic `[Context compacted]` message with head/tail protection and per-turn anti-thrash), and on a provider overflow error compacts-and-retries before completing with a graceful partial result.
-- `src/provider.ts` — `generateAuxText` (the auxiliary-model call that summarizes the in-turn middle) and `isContextOverflowError` (the predicate that classifies a provider error as a recoverable context overflow).
-- `src/execution/tool-dispatch.ts` — caps each tool result at dispatch (`capToolResultText`, `MAX_TOOL_RESULT_CHARS`). (`src/execution/chat.ts` previously stamped thread metadata onto provider-replay rows; that thread-tagging path is legacy under the Topics model.)
-- `src/provider-capabilities.ts` — per-provider/model context-window sizes that set the budget (the codex backend is capped at its real effective window via `CODEX_BACKEND_CONTEXT_WINDOW_TOKENS`).
-- `src/types.ts` — `RuntimeConfig.agent.priorContextTokens`. (`ChatMessageRecord.threadId` / `parentBlockId` survive as legacy provider-replay fields the packer no longer consults under per-topic scoping.)
+- `packages/runtime/src/execution/context-window.ts` — prior-history packing, approximate token accounting, tool-call grouping, elision note. (Replay now scopes to the running session's own rows; the former thread-priority pass was removed with the Topics migration.)
+- `packages/runtime/src/execution/chat-task.ts` — rebuilds durable prior rows, applies the packer, records retained/omitted context metrics in task trace, and within the loop: calibrates the live budget to the provider's reported prompt tokens, elides older tool-result content (`elideOldToolResultsToBudget`) before each provider call, runs the in-turn high-water compaction (prune-then-summarize, splicing the synthetic `[Context compacted]` message with head/tail protection and per-turn anti-thrash), and on a provider overflow error compacts-and-retries before completing with a graceful partial result.
+- `packages/runtime/src/provider.ts` — `generateAuxText` (the auxiliary-model call that summarizes the in-turn middle) and `isContextOverflowError` (the predicate that classifies a provider error as a recoverable context overflow).
+- `packages/runtime/src/execution/tool-dispatch.ts` — caps each tool result at dispatch (`capToolResultText`, `MAX_TOOL_RESULT_CHARS`). (`packages/runtime/src/execution/chat.ts` previously stamped thread metadata onto provider-replay rows; that thread-tagging path is legacy under the Topics model.)
+- `packages/runtime/src/provider-capabilities.ts` — per-provider/model context-window sizes that set the budget (the codex backend is capped at its real effective window via `CODEX_BACKEND_CONTEXT_WINDOW_TOKENS`).
+- `packages/runtime/src/types.ts` — `RuntimeConfig.agent.priorContextTokens`. (`ChatMessageRecord.threadId` / `parentBlockId` survive as legacy provider-replay fields the packer no longer consults under per-topic scoping.)

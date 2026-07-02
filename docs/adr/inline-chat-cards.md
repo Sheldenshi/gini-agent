@@ -28,7 +28,7 @@ client-rendering convention layered on the existing markdown answer — NOT a ne
 `BlockAssistantText` and rendered as a standalone full-width card placed ABOVE
 the reply prose (so a 7-day grid is readable and reads like the standalone
 Question/Setup cards), with the surrounding prose collapsed into one bubble. The
-week-grid primitives are a single shared component (`web/src/components/calendar/`)
+week-grid primitives are a single shared component (`packages/web/src/components/calendar/`)
 used by BOTH this preview and the Jobs-tab calendar, over a generic
 duration-aware `CalendarEvent` (the Jobs view adapts jobs onto it).
 
@@ -90,11 +90,11 @@ Con:
 
 ## Acceptance Checks
 
-- `cd web && bun test src/components/chat/CalendarView.test.tsx` covers the fence
+- `cd packages/web && bun test src/components/chat/CalendarView.test.tsx` covers the fence
   parser (header/event grammar, statuses, malformed-line skipping) and the
   adapter to the shared grid; `EmailDraftCard.test.tsx` covers metadata
   extraction, the Send POST flow, and the durable/eager "Sent" state.
-- `bun test src/http-email-draft-send.test.ts` covers the send route
+- `bun test packages/runtime/src/http-email-draft-send.test.ts` covers the send route
   (account→configDir, durable marker + audit on success, no-mark on failure) and
   the `sent` read (all ids vs `?ids=` filter).
 - The Jobs-tab calendar renders unchanged after the grid was generalized.

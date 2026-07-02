@@ -8,7 +8,7 @@
 
 Every call into `appendEvent` and `addAudit` must declare its agent
 attribution context explicitly. The shared `AgentContext` discriminated
-union in `src/state/audit.ts` is required as the third argument:
+union in `packages/runtime/src/state/audit.ts` is required as the third argument:
 
 ```ts
 export type AgentContext =
@@ -89,7 +89,7 @@ Approximately 120 call sites across the runtime were migrated to pass
 an explicit `AgentContext`. Each site was reviewed for the best source
 of attribution available in scope:
 
-- record creation helpers (`src/state/records.ts`) attribute via the
+- record creation helpers (`packages/runtime/src/state/records.ts`) attribute via the
   just-created record's own context (`taskId`, `jobId`, `sessionId`)
 - job lifecycle, chat lifecycle, task lifecycle, subagent, approval
   audits use the source id their owning record carries
@@ -107,7 +107,7 @@ Pro:
 - The "I forgot to thread `agentId`" bug class is impossible. The
   compiler rejects every two-argument call.
 - The agent-attribution contract lives in one place
-  (`src/state/audit.ts`) and is enforceable by code review without
+  (`packages/runtime/src/state/audit.ts`) and is enforceable by code review without
   expert runtime knowledge.
 - `system: true` is now an explicit, auditable marker. Reviewers can
   ask "is this row really system-level?" at the diff instead of
@@ -129,9 +129,9 @@ Con:
 
 - `bun run typecheck` rejects `appendEvent(state, eventInput)` and
   `addAudit(state, auditInput)` (two arguments). The
-  `// @ts-expect-error` guards in `src/http.test.ts` pin this at the
+  `// @ts-expect-error` guards in `packages/runtime/src/http.test.ts` pin this at the
   type level.
-- Resolution tests in `src/http.test.ts` cover every branch of the
+- Resolution tests in `packages/runtime/src/http.test.ts` cover every branch of the
   `AgentContext` union and the missing-source case.
 - The active-agent-switch regression — a scheduled job fired after an
   agent switch must attribute to the originating job's agent rather
